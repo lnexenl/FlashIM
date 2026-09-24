@@ -104,3 +104,17 @@ def test_local_corr(radius):
     fast, ref = _both(ops.local_corr, "fused_local_corr", f0, f1, warp, radius)
     assert fast.shape == (2, (2 * radius + 1) ** 2, 30, 40)
     assert torch.allclose(fast, ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("channels,hw", [(32, (37, 53)), (32, (256, 256)), (64, (40, 48))])
+def test_depthwise_relu_pointwise_bf16(channels, hw):
+    torch.manual_seed(2)
+    x = torch.randn(2, channels, *hw, device=DEV).to(memory_format=torch.channels_last)
+    dw = (torch.randn(25, channels, device=DEV) * 0.2).to(torch.bfloat16)
+    dwb = torch.randn(channels, device=DEV).to(torch.bfloat16)
+    pw = (torch.randn(channels, channels, device=DEV) * 0.2).to(torch.bfloat16).contiguous()
+    pwb = torch.randn(channels, device=DEV).to(torch.bfloat16)
+    fast, ref = _both(ops.depthwise5x5_relu_pointwise, "triton", x, dw, dwb, pw, pwb)
+    assert fast.shape == ref.shape and fast.is_contiguous(memory_format=torch.channels_last)
+    # Only FP32 reduction order differs: at most one BF16 ulp.
+    assert ((fast.float() - ref.float()).abs() <= ref.float().abs() * 2**-7 + 1e-6).all()

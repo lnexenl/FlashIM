@@ -12,6 +12,7 @@ from flashim.ops._registry import (
 from flashim.ops.local_corr import local_corr
 from flashim.ops.mx import (
     depthwise5x5_relu_mxfp8,
+    depthwise5x5_relu_pointwise,
     fp8_linear,
     gelu_quantize,
     layernorm_quantize,
@@ -26,6 +27,7 @@ __all__ = [
     "call_counts",
     "configure",
     "depthwise5x5_relu_mxfp8",
+    "depthwise5x5_relu_pointwise",
     "fp8_linear",
     "gelu_quantize",
     "layernorm_quantize",

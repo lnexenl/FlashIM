@@ -366,3 +366,84 @@ def fp8_gemm_bf16(activation: QuantizedTensor, weight: QuantizedWeight, bias: Te
         num_stages=num_stages,
     )
     return out
+
+
+@triton.jit
+def _depthwise5x5_relu_pointwise_kernel(
+    input_ptr,
+    dw_weight_ptr,
+    dw_bias_ptr,
+    pw_weight_ptr,
+    pw_bias_ptr,
+    output_ptr,
+    rows,
+    HEIGHT: tl.constexpr,
+    WIDTH: tl.constexpr,
+    CHANNELS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """BF16 refiner block: depthwise 5x5 + bias + ReLU + CxC pointwise + bias, channels-last.
+
+    One program owns ``BLOCK_M`` consecutive pixels (all channels). Tap addresses are a
+    per-row int32 base plus a scalar tap delta (int64 per-element offsets made the
+    kernel integer-bound). The depthwise output is rounded to BF16, as a BF16
+    convolution would, before the pointwise ``tl.dot``; both accumulate in FP32.
+    """
+    row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    channel = tl.arange(0, CHANNELS)
+    image_row = row % (HEIGHT * WIDTH)
+    y = image_row // WIDTH
+    x = image_row - y * WIDTH
+    valid_row = row < rows
+    base = row * CHANNELS
+
+    accumulator = tl.zeros((BLOCK_M, CHANNELS), dtype=tl.float32)
+    for ky in tl.static_range(5):
+        input_y = y + (ky - 2)
+        valid_y = valid_row & (input_y >= 0) & (input_y < HEIGHT)
+        for kx in tl.static_range(5):
+            input_x = x + (kx - 2)
+            valid = valid_y & (input_x >= 0) & (input_x < WIDTH)
+            offset = base + ((ky - 2) * WIDTH + (kx - 2)) * CHANNELS
+            values = tl.load(input_ptr + offset[:, None] + channel[None, :], mask=valid[:, None], other=0.0)
+            weight = tl.load(dw_weight_ptr + (ky * 5 + kx) * CHANNELS + channel).to(tl.float32)
+            accumulator += values.to(tl.bfloat16).to(tl.float32) * weight[None, :]
+    accumulator += tl.load(dw_bias_ptr + channel).to(tl.float32)[None, :]
+    hidden = tl.maximum(accumulator, 0.0).to(tl.bfloat16)
+
+    pw_weight = tl.load(pw_weight_ptr + channel[:, None] * CHANNELS + channel[None, :])  # [out, in]
+    out = tl.dot(hidden, tl.trans(pw_weight))
+    out += tl.load(pw_bias_ptr + channel).to(tl.float32)[None, :]
+    tl.store(output_ptr + base[:, None] + channel[None, :], out.to(tl.bfloat16), mask=valid_row[:, None])
+
+
+def depthwise5x5_relu_pointwise(
+    value: Tensor,
+    dw_weight: Tensor,
+    dw_bias: Tensor,
+    pw_weight: Tensor,
+    pw_bias: Tensor,
+    *,
+    block_m: int = 128,
+    num_warps: int = 4,
+) -> Tensor:
+    batch, channels, height, width = value.shape
+    rows = batch * height * width
+    if (rows + block_m) * channels >= 2**31:
+        raise ValueError("depthwise5x5_relu_pointwise: tensor too large for int32 offsets")
+    out = torch.empty((batch, height, width, channels), device=value.device, dtype=torch.bfloat16)
+    _depthwise5x5_relu_pointwise_kernel[(triton.cdiv(rows, block_m),)](
+        value,
+        dw_weight,
+        dw_bias,
+        pw_weight,
+        pw_bias,
+        out,
+        rows,
+        HEIGHT=height,
+        WIDTH=width,
+        CHANNELS=channels,
+        BLOCK_M=block_m,
+        num_warps=num_warps,
+    )
+    return out.permute(0, 3, 1, 2)

@@ -122,7 +122,7 @@ def main() -> None:
     parser.add_argument("--dataset", choices=("mega1500", "scannet1500"), required=True)
     parser.add_argument("--model", default="romav2")
     parser.add_argument("--preset", default="fp8")
-    parser.add_argument("--engine", default="compile", choices=("eager", "compile"))
+    parser.add_argument("--engine", default="compile", choices=("eager", "compile", "compile-full"))
     parser.add_argument("--data-root", default="")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--max-pairs", type=int, default=0, help="0 = all 1500")

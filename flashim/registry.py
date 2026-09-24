@@ -36,7 +36,7 @@ register_model(
         name="romav2",
         kind="dense",
         loader=_load_romav2,
-        presets=("bf16", "fp8-p8", "fp8-s4", "fp8"),
+        presets=("bf16", "fp8-p8", "fp8-s4", "fp8", "fp8-fast"),
         default_preset="fp8",
         description="RoMa v2 dense matcher (DINOv3 ViT-L/16 + MV-ViT + DPT + conv refiners)",
     )

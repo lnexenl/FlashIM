@@ -71,8 +71,8 @@ def _build_romav2(args):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--impl", choices=("flashim", "romav2"), default="flashim")
-    parser.add_argument("--preset", default="fp8", choices=("bf16", "fp8-p8", "fp8-s4", "fp8"))
-    parser.add_argument("--engine", default="compile", choices=("eager", "compile"))
+    parser.add_argument("--preset", default="fp8", choices=("bf16", "fp8-p8", "fp8-s4", "fp8", "fp8-fast"))
+    parser.add_argument("--engine", default="compile", choices=("eager", "compile", "compile-full"))
     parser.add_argument("--setting", default="mega1500")
     parser.add_argument("--image-a", default=str(IMAGE_A))
     parser.add_argument("--image-b", default=str(IMAGE_B))

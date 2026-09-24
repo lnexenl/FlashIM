@@ -123,6 +123,51 @@ def _depthwise5x5_relu_mxfp8_triton(value: Tensor, weight: Tensor, bias: Tensor)
     return kernel(value, weight, bias)
 
 
+# -- BF16 depthwise 5x5 + bias + ReLU + pointwise + bias (fused refiner block) -----------------
+
+
+def _depthwise5x5_relu_pointwise_reference(
+    value: Tensor, dw_weight: Tensor, dw_bias: Tensor, pw_weight: Tensor, pw_bias: Tensor
+) -> Tensor:
+    """BF16 refiner conv block with FP32 accumulation.
+
+    ``value`` ``[B, C, H, W]`` (rounded to BF16 on load); ``dw_weight`` packed ``[25, C]``;
+    ``pw_weight`` ``[C_out, C_in]``; biases ``[C]``. The depthwise result is rounded to
+    BF16 before the pointwise product. Returns channels-last BF16 ``[B, C, H, W]``.
+    """
+    channels = value.shape[1]
+    kernel = dw_weight.float().t().reshape(channels, 1, 5, 5)
+    hidden = F.conv2d(value.to(torch.bfloat16).float(), kernel, dw_bias.float(), padding=2, groups=channels)
+    hidden = F.relu(hidden).to(torch.bfloat16).float()
+    out = F.conv2d(hidden, pw_weight.float()[:, :, None, None], pw_bias.float())
+    return out.to(torch.bfloat16).contiguous(memory_format=torch.channels_last)
+
+
+depthwise5x5_relu_pointwise = Op("depthwise5x5_relu_pointwise", _depthwise5x5_relu_pointwise_reference)
+
+
+def _dw_pw_eligible(value: Tensor, dw_weight: Tensor, dw_bias: Tensor, pw_weight: Tensor, pw_bias: Tensor) -> bool:
+    channels = value.shape[1] if value.ndim == 4 else 0
+    return (
+        channels in (16, 32, 64)
+        and value.is_contiguous(memory_format=torch.channels_last)
+        and tuple(dw_weight.shape) == (25, channels)
+        and tuple(pw_weight.shape) == (channels, channels)
+        and pw_weight.dtype == torch.bfloat16
+        and pw_weight.is_contiguous()
+        and (value.numel() + 128 * channels) < 2**31
+    )
+
+
+@depthwise5x5_relu_pointwise.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_dw_pw_eligible
+)
+def _depthwise5x5_relu_pointwise_triton(value, dw_weight, dw_bias, pw_weight, pw_bias):
+    from flashim.ops._triton.mx import depthwise5x5_relu_pointwise as kernel
+
+    return kernel(value, dw_weight, dw_bias, pw_weight, pw_bias)
+
+
 # -- block-scaled MXFP8 GEMM -----------------------------------------------------------------
 
 

@@ -157,7 +157,7 @@ def kernel_breakdown(model, inputs, iterations: int) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--preset", default="fp8")
-    parser.add_argument("--engine", default="compile", choices=("eager", "compile"))
+    parser.add_argument("--engine", default="compile", choices=("eager", "compile", "compile-full"))
     parser.add_argument("--setting", default="mega1500")
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=20)

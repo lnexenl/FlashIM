@@ -14,11 +14,20 @@ from flashim.models.romav2.quant import DEFAULT_CALIBRATION, PRESETS, PROTECTED
 from flashim.platforms import Feature, platform_for
 from flashim.quant.apply import quantize_model
 from flashim.quant.calibration import CalibrationTable
-from flashim.quant.passes.refiner_block import fold_refiner_blocks
+from flashim.quant.passes.refiner_block import fold_refiner_blocks, fuse_bf16_refiner_blocks
 
 logger = logging.getLogger(__name__)
 
+ENGINES = ("eager", "compile", "compile-full")
+# RoMaV2's validated regions: compiled numerics are covered by its P8 AUC results.
 COMPILE_REGIONS = ("f", "matcher.mv_vit")
+# compile-full: also VGG, the DPT head and every refiner's conv stack (+ VGG BN fold).
+COMPILE_FULL_REGIONS = (
+    *COMPILE_REGIONS,
+    "refiner_features",
+    "matcher.head",
+    *(f"refiners.{stride}.{part}" for stride in (4, 2, 1) for part in ("block1", "hidden_blocks")),
+)
 
 
 def load_romav2(
@@ -34,14 +43,19 @@ def load_romav2(
 ) -> RoMaV2:
     """Load RoMaV2 weights, apply a quantization preset and an execution engine.
 
-    ``engine``: ``"eager"`` or ``"compile"`` (``torch.compile`` of the DINOv3 and
-    matcher-ViT regions). On platforms without native MXFP8 GEMMs, FP8 presets run
-    with emulation kernels (``strict=True`` raises instead).
+    ``engine``:
+      - ``"eager"``;
+      - ``"compile"``: ``torch.compile`` of the DINOv3 and matcher-ViT regions (RoMaV2's
+        validated configuration);
+      - ``"compile-full"``: additionally folds VGG BatchNorm and compiles VGG, the DPT
+        head and the refiner conv stacks (~20% faster; changes rounding vs ``compile``).
+    On platforms without native MXFP8 GEMMs, FP8 presets run with emulation kernels
+    (``strict=True`` raises instead).
     """
     if preset not in PRESETS:
         raise ValueError(f"Unknown preset {preset!r}; choose from {sorted(PRESETS)}")
-    if engine not in ("eager", "compile"):
-        raise ValueError(f"Unknown engine {engine!r}")
+    if engine not in ENGINES:
+        raise ValueError(f"Unknown engine {engine!r}; choose from {ENGINES}")
     cfg = config or RoMaV2Config(setting=setting)
     model = RoMaV2.from_pretrained(cfg, device=device)
     platform = platform_for(model.device)
@@ -61,7 +75,15 @@ def load_romav2(
             fold_refiner_blocks(model.refiners, channels_last=True)
         model.quant_report = quantize_model(model, spec.config, table, protected=PROTECTED, platform=platform)
         model.calibration_metadata = dict(table.metadata)
+    if spec.fused_bf16_refiners:
+        prefixes = tuple(f"refiners.{stride}." for stride in spec.fused_bf16_refiners)
+        fused = fuse_bf16_refiner_blocks(model, prefixes)
+        if model.quant_report is not None:
+            model.quant_report.fused_refiner_blocks.extend(fused)
     if engine == "compile":
         compile_regions(model, COMPILE_REGIONS, mode=compile_mode)
+    elif engine == "compile-full":
+        model.refiner_features.fold_batchnorm(channels_last=True)
+        compile_regions(model, COMPILE_FULL_REGIONS, mode=compile_mode)
     model.engine = engine
     return model

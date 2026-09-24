@@ -85,3 +85,62 @@ class FusedMXFP8RefinerBlock(nn.Module):
 
     def extra_repr(self) -> str:
         return f"channels={self.channels}, dwconv5x5+relu->mxfp8 dynamic, pointwise mxfp8"
+
+
+class FusedBF16RefinerBlock(nn.Module):
+    """BF16 refiner block as one kernel: depthwise 5x5 + bias + ReLU + pointwise + bias.
+
+    Same precision as the autocast BF16 block (BF16 weights and activations, FP32
+    accumulation); differs only in reduction order and in adding biases before rounding.
+    """
+
+    def __init__(self, block: nn.Module) -> None:
+        super().__init__()
+        depthwise, pointwise = block.conv_depthwise, block.conv_pointwise
+        if not isinstance(block.norm, nn.Identity):
+            raise TypeError("Fold BatchNorm first (fold_refiner_blocks)")
+        channels = depthwise.in_channels
+        if not (
+            depthwise.groups == channels
+            and depthwise.kernel_size == (5, 5)
+            and depthwise.padding == (2, 2)
+            and depthwise.stride == (1, 1)
+            and depthwise.bias is not None
+            and pointwise.kernel_size == (1, 1)
+            and pointwise.in_channels == pointwise.out_channels == channels
+            and pointwise.bias is not None
+        ):
+            raise ValueError(f"Unsupported refiner block geometry: {depthwise}, {pointwise}")
+        self.channels = channels
+        bf16 = dict(dtype=torch.bfloat16)
+        self.register_buffer(
+            "depthwise_weight",
+            depthwise.weight.detach()[:, 0].permute(1, 2, 0).reshape(25, channels).to(**bf16).contiguous(),
+        )
+        self.register_buffer("depthwise_bias", depthwise.bias.detach().to(**bf16))
+        self.register_buffer(
+            "pointwise_weight", pointwise.weight.detach().reshape(channels, channels).to(**bf16).contiguous()
+        )
+        self.register_buffer("pointwise_bias", pointwise.bias.detach().to(**bf16))
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not x.is_contiguous(memory_format=torch.channels_last):
+            x = x.contiguous(memory_format=torch.channels_last)
+        return ops.depthwise5x5_relu_pointwise(
+            x, self.depthwise_weight, self.depthwise_bias, self.pointwise_weight, self.pointwise_bias
+        )
+
+    def extra_repr(self) -> str:
+        return f"channels={self.channels}, bf16 dwconv5x5+relu+pointwise fused"
+
+
+def fuse_bf16_refiner_blocks(model: nn.Module, prefixes: tuple[str, ...]) -> list[str]:
+    """Replace folded refiner blocks under ``prefixes`` with :class:`FusedBF16RefinerBlock`."""
+    replaced = []
+    for name, module in list(model.named_modules()):
+        if is_refiner_block(module) and any(name.startswith(p) for p in prefixes):
+            parent, _, child = name.rpartition(".")
+            fused = FusedBF16RefinerBlock(module).to(module.conv_depthwise.weight.device)
+            model.get_submodule(parent)._modules[child] = fused
+            replaced.append(name)
+    return replaced

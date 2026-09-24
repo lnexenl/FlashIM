@@ -7,6 +7,8 @@ Presets (all MXFP8, E4M3 values + E8M0 block-32 scales):
   calibrated activation scales; SDPA attention stays BF16; refiners BF16.
 - ``fp8-s4``  : ``fp8-p8`` + stride-4 refiner blocks fused (dynamic MXFP8 pointwise).
 - ``fp8``     : ``fp8-p8`` + stride-4 and stride-2 refiner blocks fused (default).
+- ``fp8-fast``: ``fp8`` + FlashIM's fused BF16 stride-1 refiner blocks (numerics differ
+  from RoMaV2 by reduction order / bias rounding only; pending AUC validation).
 
 Accuracy evidence for these configurations (RoMaV2 P8 reports, RTX 5070 Ti,
 3 seeds, AUC@5 delta vs BF16): ``fp8-p8`` Mega -0.0025 / ScanNet -0.0011;
@@ -50,6 +52,8 @@ class Preset:
     name: str
     config: QuantConfig | None
     fold_refiners: bool = False
+    # Refiner stages whose BF16 conv blocks run as one fused kernel each (no quantization).
+    fused_bf16_refiners: tuple[int, ...] = ()
     description: str = ""
 
 
@@ -71,5 +75,12 @@ PRESETS: dict[str, Preset] = {
         QuantConfig({"transformer": _TRANSFORMER, "refiner": _refiner_scheme(4, 2)}, name="fp8"),
         fold_refiners=True,
         description="fp8-p8 + fused MXFP8 stride-4 and stride-2 refiner blocks",
+    ),
+    "fp8-fast": Preset(
+        "fp8-fast",
+        QuantConfig({"transformer": _TRANSFORMER, "refiner": _refiner_scheme(4, 2)}, name="fp8-fast"),
+        fold_refiners=True,
+        fused_bf16_refiners=(1,),
+        description="fp8 + fused BF16 stride-1 refiner blocks (FlashIM kernels; not RoMaV2-exact)",
     ),
 }

@@ -27,6 +27,22 @@ class VGG19BN(nn.Module):
         self.layers = nn.ModuleList(layers)
         self.channels_last = False
 
+    def fold_batchnorm(self, *, channels_last: bool = True) -> int:
+        """Fold eval BatchNorm into the preceding convs (inference only; changes rounding)."""
+        folded = 0
+        for i in range(len(self.layers) - 1):
+            conv, norm = self.layers[i], self.layers[i + 1]
+            if isinstance(conv, nn.Conv2d) and isinstance(norm, nn.BatchNorm2d):
+                self.layers[i] = nn.utils.fusion.fuse_conv_bn_eval(conv, norm)
+                self.layers[i + 1] = nn.Identity()
+                folded += 1
+        if channels_last:
+            self.channels_last = True
+            for layer in self.layers:
+                if isinstance(layer, nn.Conv2d):
+                    layer.weight.data = layer.weight.data.to(memory_format=torch.channels_last)
+        return folded
+
     def forward(self, x: Tensor) -> dict[int, Tensor]:
         x = imagenet_normalize(x)
         if self.channels_last:
