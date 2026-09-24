@@ -80,6 +80,9 @@ def load_romav2(
         fused = fuse_bf16_refiner_blocks(model, prefixes)
         if model.quant_report is not None:
             model.quant_report.fused_refiner_blocks.extend(fused)
+    if spec.fused_refiner_input:
+        for refiner in model.refiners.values():
+            refiner.fused_input = True
     if engine == "compile":
         compile_regions(model, COMPILE_REGIONS, mode=compile_mode)
     elif engine == "compile-full":

@@ -118,3 +118,19 @@ def test_depthwise_relu_pointwise_bf16(channels, hw):
     assert fast.shape == ref.shape and fast.is_contiguous(memory_format=torch.channels_last)
     # Only FP32 reduction order differs: at most one BF16 ulp.
     assert ((fast.float() - ref.float()).abs() <= ref.float().abs() * 2**-7 + 1e-6).all()
+
+
+@pytest.mark.parametrize("proj,emb,radius,hw", [(192, 79, 3, (37, 45)), (48, 23, 1, (64, 80)), (12, 8, -1, (50, 70))])
+def test_refiner_input(proj, emb, radius, hw):
+    torch.manual_seed(3)
+    f_a = torch.randn(2, *hw, proj, device=DEV)
+    f_b = torch.randn(2, *hw, proj, device=DEV)
+    warp = (torch.rand(2, *hw, 2, device=DEV) * 2.4 - 1.2).contiguous()  # includes out-of-frame
+    weight, bias = torch.randn(emb, 2, 1, 1, device=DEV), torch.randn(emb, device=DEV)
+    scale = torch.tensor([1.5625, 2.0], device=DEV)
+    fast, ref = _both(ops.refiner_input, "triton", f_a, f_b, warp, weight, bias, scale, radius)
+    assert fast.shape == ref.shape and fast.dtype == torch.bfloat16
+    # f_a and f_ba are exact; emb/corr differ by FP32 order (and cuDNN TF32 in the reference): <= 1 BF16 ulp
+    assert torch.equal(fast[:, : 2 * proj], ref[:, : 2 * proj])
+    tail_fast, tail_ref = fast[:, 2 * proj :].float(), ref[:, 2 * proj :].float()
+    assert ((tail_fast - tail_ref).abs() <= tail_ref.abs().amax() * 2**-7).all()

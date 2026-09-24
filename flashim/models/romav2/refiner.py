@@ -63,6 +63,8 @@ class ConvRefiner(nn.Module):
         self.confidence_head = nn.Conv2d(channels, cfg.confidence_dim, 1)
         # Set by the refiner optimization pass (BN fold + channels-last weights).
         self.channels_last = False
+        # Build block1's input with one fused op (BF16 output; not RoMaV2-bit-exact).
+        self.fused_input = False
 
     def forward(
         self, f_a: Tensor, f_b: Tensor, prev_warp: Tensor, prev_confidence: Tensor, scale_factor: Tensor
@@ -71,6 +73,12 @@ class ConvRefiner(nn.Module):
         batch, h, w, _ = f_a.shape
         f_a = self.proj(f_a.reshape(batch, h * w, cfg.feat_dim).float()).reshape(batch, h, w, cfg.proj_dim)
         f_b = self.proj(f_b.reshape(batch, h * w, cfg.feat_dim).float()).reshape(batch, h, w, cfg.proj_dim)
+        if self.fused_input:
+            radius = -1 if cfg.local_corr_radius is None else cfg.local_corr_radius
+            d = ops.refiner_input(
+                f_a, f_b, prev_warp.contiguous(), self.disp_emb.weight, self.disp_emb.bias, scale_factor, radius
+            )
+            return self._heads(self.hidden_blocks(self.block1(d)), prev_warp, prev_confidence)
         f_ba = bhwc_grid_sample(f_b, prev_warp, mode="bilinear", align_corners=False)
         displacement = (prev_warp - normalized_grid(batch, h, w, f_a.device)).permute(0, 3, 1, 2)
         emb = self.disp_emb(scale_factor[None, :, None, None] * displacement)
@@ -80,8 +88,12 @@ class ConvRefiner(nn.Module):
         d = torch.cat(parts, dim=1)
         if self.channels_last:
             d = d.to(memory_format=torch.channels_last)
-        z = self.hidden_blocks(self.block1(d)).float()
+        return self._heads(self.hidden_blocks(self.block1(d)), prev_warp, prev_confidence)
 
+    def _heads(self, z: Tensor, prev_warp: Tensor, prev_confidence: Tensor) -> tuple[Tensor, Tensor]:
+        cfg = self.cfg
+        batch, _, h, w = z.shape
+        z = z.float()
         displacement_out = self.warp_head(z).permute(0, 2, 3, 1).reshape(batch, h, w, 2)
         delta = self.confidence_head(z).permute(0, 2, 3, 1).reshape(batch, h, w, cfg.confidence_dim)
         normalization = torch.empty(2, device=prev_warp.device, dtype=prev_warp.dtype)
