@@ -1,0 +1,51 @@
+[project]
+name = "flashim"
+version = "0.0.1"
+description = "FlashIM: fast, quantized, multi-platform inference for image matching"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.11.0",
+    "triton==3.6.0 ; sys_platform == 'linux'",
+    "fused-local-corr==0.3.211 ; sys_platform == 'linux'",
+    "einops>=0.8.1",
+    "numpy>=2.0",
+    "pillow>=12.0.0",
+    "safetensors>=0.5",
+]
+
+[project.optional-dependencies]
+eval = [
+    "opencv-python>=4.12.0.88",
+    "tqdm>=4.67.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "ruff>=0.14.5",
+    "romav2",
+]
+
+[tool.uv.sources]
+romav2 = { path = "../RoMaV2", editable = true }
+
+[build-system]
+requires = ["uv_build>=0.8.15,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "cuda: needs a CUDA device",
+    "sm120: needs compute capability >= 12.0 (MXFP8 scaled_mm)",
+    "weights: needs the romav2.0.1.pt checkpoint",
+    "oracle: needs the romav2 reference package",
+    "slow: long-running (full model / benchmarks)",
+]
+
+[tool.ruff]
+line-length = 110
