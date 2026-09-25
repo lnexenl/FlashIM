@@ -121,73 +121,84 @@ def _layernorm_quantize_kernel(
 
 
 @triton.jit
+def _load_tap_row(input_ptr, row_base, x, row_ok, x_ok, channel, CHANNELS: tl.constexpr, WIDTH: tl.constexpr,
+                  KX: tl.constexpr):
+    """One horizontally shifted input row ``[BW, len(channel)]`` (zero padded), rounded to BF16."""
+    input_x = x + (KX - 2)
+    mask = x_ok & row_ok & (input_x >= 0) & (input_x < WIDTH)
+    values = tl.load(input_ptr + (row_base + input_x)[:, None] * CHANNELS + channel[None, :], mask=mask[:, None],
+                     other=0.0)
+    return values.to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
 def _depthwise5x5_relu_mxfp8_kernel(
     input_ptr,
     weight_ptr,
     bias_ptr,
     output_ptr,
     scale_bits_ptr,
-    rows,
-    rows_per_image,
     HEIGHT: tl.constexpr,
     WIDTH: tl.constexpr,
-    BLOCK_M: tl.constexpr,
     CHANNELS: tl.constexpr,
+    GROUPS: tl.constexpr,
     SCALE_TILES: tl.constexpr,
+    BW: tl.constexpr,
+    TILE_H: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    group = tl.program_id(1)
-    row = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    """Depthwise 5x5 + bias + ReLU + dynamic MXFP8 over a ``BW x TILE_H`` tile, 32 channels.
+
+    Row rolling: each input row's 5 horizontal shifts are loaded once and accumulated into
+    the 5 output rows that use it (5 loads per pixel instead of 25). Per output pixel the
+    FP32 accumulation order is ky-major, kx-minor, as in a direct 25-tap loop.
+    """
+    x = tl.program_id(0) * BW + tl.arange(0, BW)
+    y_start = tl.program_id(1) * TILE_H
+    batch = tl.program_id(2) // GROUPS
+    group = tl.program_id(2) % GROUPS
+    x_ok = x < WIDTH
     channel = group * 32 + tl.arange(0, 32)
-    batch = row // rows_per_image
-    image_row = row - batch * rows_per_image
-    y = image_row // WIDTH
-    x = image_row - y * WIDTH
-    valid_row = row < rows
-    batch_base = batch * rows_per_image * CHANNELS
-
-    accumulator = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
-    for ky in range(5):
-        input_y = y + ky - 2
-        valid_y = (input_y >= 0) & (input_y < HEIGHT)
-        for kx in range(5):
-            input_x = x + kx - 2
-            valid_x = (input_x >= 0) & (input_x < WIDTH)
-            input_offset = (
-                batch_base[:, None]
-                + (input_y[:, None] * WIDTH + input_x[:, None]) * CHANNELS
-                + channel[None, :]
-            )
-            values = (
-                tl.load(
-                    input_ptr + input_offset,
-                    mask=valid_row[:, None] & valid_y[:, None] & valid_x[:, None],
-                    other=0.0,
-                )
-                .to(tl.bfloat16)
-                .to(tl.float32)
-            )
-            weight = tl.load(weight_ptr + (ky * 5 + kx) * CHANNELS + channel).to(tl.float32)
-            accumulator += values * weight[None, :]
-
     bias = tl.load(bias_ptr + channel).to(tl.float32)
-    accumulator = tl.maximum(accumulator + bias[None, :], 0.0)
-    amax = tl.max(tl.abs(accumulator), axis=1)
-    exponent = tl.ceil(tl.log2(amax / 448.0))
-    exponent = tl.maximum(tl.minimum(exponent, 127.0), -127.0)
-    exponent = tl.where(amax == 0.0, -127.0, exponent)
-    quantized = tl.maximum(tl.minimum(accumulator * tl.exp2(-exponent)[:, None], 448.0), -448.0)
-    tl.store(output_ptr + row[:, None] * CHANNELS + channel[None, :], quantized, mask=valid_row[:, None])
-
-    row_in_tile = row % 128
-    scale_offset = (
-        ((row // 128) * SCALE_TILES + group // 4) * 512
-        + (row_in_tile % 32) * 16
-        + (row_in_tile // 32) * 4
-        + group % 4
-    )
-    scale_bits = tl.where(valid_row, exponent + 127.0, 0.0).to(tl.uint8)
-    tl.store(scale_bits_ptr + scale_offset, scale_bits)
+    acc0 = tl.zeros((BW, 32), dtype=tl.float32)
+    acc1 = tl.zeros((BW, 32), dtype=tl.float32)
+    acc2 = tl.zeros((BW, 32), dtype=tl.float32)
+    acc3 = tl.zeros((BW, 32), dtype=tl.float32)
+    acc4 = tl.zeros((BW, 32), dtype=tl.float32)
+    for step in range(TILE_H + 4):
+        input_y = y_start - 2 + step
+        row_ok = (input_y >= 0) & (input_y < HEIGHT)
+        row_base = (batch * HEIGHT + input_y) * WIDTH
+        for kx in tl.static_range(5):
+            values = _load_tap_row(input_ptr, row_base, x, row_ok, x_ok, channel, CHANNELS, WIDTH, kx)
+            # output row input_y + 2 - ky receives tap ky: acc4 <- ky0 ... acc0 <- ky4
+            acc4 += values * tl.load(weight_ptr + (0 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc3 += values * tl.load(weight_ptr + (1 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc2 += values * tl.load(weight_ptr + (2 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc1 += values * tl.load(weight_ptr + (3 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc0 += values * tl.load(weight_ptr + (4 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+        out_y = input_y - 2
+        if (step >= 4) & (out_y < HEIGHT):  # acc0 now holds all 25 taps of row out_y
+            activated = tl.maximum(acc0 + bias[None, :], 0.0)
+            amax = tl.max(tl.abs(activated), axis=1)
+            exponent = tl.ceil(tl.log2(amax / 448.0))
+            exponent = tl.maximum(tl.minimum(exponent, 127.0), -127.0)
+            exponent = tl.where(amax == 0.0, -127.0, exponent)
+            quantized = tl.maximum(tl.minimum(activated * tl.exp2(-exponent)[:, None], 448.0), -448.0)
+            row = (batch * HEIGHT + out_y) * WIDTH + x
+            tl.store(output_ptr + row[:, None] * CHANNELS + channel[None, :], quantized, mask=x_ok[:, None])
+            row_in_tile = row % 128
+            scale_offset = (
+                ((row // 128) * SCALE_TILES + group // 4) * 512
+                + (row_in_tile % 32) * 16
+                + (row_in_tile // 32) * 4
+                + group % 4
+            )
+            tl.store(scale_bits_ptr + scale_offset, (exponent + 127.0).to(tl.uint8), mask=x_ok)
+        acc0 = acc1
+        acc1 = acc2
+        acc2 = acc3
+        acc3 = acc4
+        acc4 = tl.zeros((BW, 32), dtype=tl.float32)
 
 
 @triton.jit
@@ -295,29 +306,29 @@ def gelu_quantize(value: Tensor, scale_exponent: Tensor, approximate: str) -> Qu
 
 
 def depthwise5x5_relu_mxfp8(
-    value: Tensor, weight: Tensor, bias: Tensor, *, block_m: int = 32, num_warps: int = 4
+    value: Tensor, weight: Tensor, bias: Tensor, *, bw: int = 16, tile_h: int | None = None, num_warps: int = 2
 ) -> tuple[Tensor, Tensor]:
     batch, channels, height, width = value.shape
     groups = channels // 32
     scale_tiles = (groups + 3) // 4
-    rows_per_image = height * width
-    rows = batch * rows_per_image
+    rows = batch * height * width
     padded_rows = triton.cdiv(rows, 128) * 128
+    tile_h = tile_h or (32 if height > 64 else 16)
     quantized = torch.empty((rows, channels), device=value.device, dtype=torch.float8_e4m3fn)
     scale_bits = torch.zeros(padded_rows * scale_tiles * 4, device=value.device, dtype=torch.uint8)
-    _depthwise5x5_relu_mxfp8_kernel[(triton.cdiv(padded_rows, block_m), groups)](
+    _depthwise5x5_relu_mxfp8_kernel[(triton.cdiv(width, bw), triton.cdiv(height, tile_h), batch * groups)](
         value,
         weight,
         bias,
         quantized,
         scale_bits,
-        rows,
-        rows_per_image,
         HEIGHT=height,
         WIDTH=width,
-        BLOCK_M=block_m,
         CHANNELS=channels,
+        GROUPS=groups,
         SCALE_TILES=scale_tiles,
+        BW=bw,
+        TILE_H=tile_h,
         num_warps=num_warps,
     )
     return quantized, scale_bits.view(torch.float8_e8m0fnu)
@@ -376,45 +387,53 @@ def _depthwise5x5_relu_pointwise_kernel(
     pw_weight_ptr,
     pw_bias_ptr,
     output_ptr,
-    rows,
     HEIGHT: tl.constexpr,
     WIDTH: tl.constexpr,
     CHANNELS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
+    BW: tl.constexpr,
+    TILE_H: tl.constexpr,
 ):
     """BF16 refiner block: depthwise 5x5 + bias + ReLU + CxC pointwise + bias, channels-last.
 
-    One program owns ``BLOCK_M`` consecutive pixels (all channels). Tap addresses are a
-    per-row int32 base plus a scalar tap delta (int64 per-element offsets made the
-    kernel integer-bound). The depthwise output is rounded to BF16, as a BF16
-    convolution would, before the pointwise ``tl.dot``; both accumulate in FP32.
+    Row rolling over a ``BW x TILE_H`` tile (see the MXFP8 depthwise kernel). The depthwise
+    output is rounded to BF16, as a BF16 convolution would, before the pointwise ``tl.dot``.
     """
-    row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    x = tl.program_id(0) * BW + tl.arange(0, BW)
+    y_start = tl.program_id(1) * TILE_H
+    batch = tl.program_id(2)
+    x_ok = x < WIDTH
     channel = tl.arange(0, CHANNELS)
-    image_row = row % (HEIGHT * WIDTH)
-    y = image_row // WIDTH
-    x = image_row - y * WIDTH
-    valid_row = row < rows
-    base = row * CHANNELS
-
-    accumulator = tl.zeros((BLOCK_M, CHANNELS), dtype=tl.float32)
-    for ky in tl.static_range(5):
-        input_y = y + (ky - 2)
-        valid_y = valid_row & (input_y >= 0) & (input_y < HEIGHT)
-        for kx in tl.static_range(5):
-            input_x = x + (kx - 2)
-            valid = valid_y & (input_x >= 0) & (input_x < WIDTH)
-            offset = base + ((ky - 2) * WIDTH + (kx - 2)) * CHANNELS
-            values = tl.load(input_ptr + offset[:, None] + channel[None, :], mask=valid[:, None], other=0.0)
-            weight = tl.load(dw_weight_ptr + (ky * 5 + kx) * CHANNELS + channel).to(tl.float32)
-            accumulator += values.to(tl.bfloat16).to(tl.float32) * weight[None, :]
-    accumulator += tl.load(dw_bias_ptr + channel).to(tl.float32)[None, :]
-    hidden = tl.maximum(accumulator, 0.0).to(tl.bfloat16)
-
+    bias = tl.load(dw_bias_ptr + channel).to(tl.float32)
     pw_weight = tl.load(pw_weight_ptr + channel[:, None] * CHANNELS + channel[None, :])  # [out, in]
-    out = tl.dot(hidden, tl.trans(pw_weight))
-    out += tl.load(pw_bias_ptr + channel).to(tl.float32)[None, :]
-    tl.store(output_ptr + base[:, None] + channel[None, :], out.to(tl.bfloat16), mask=valid_row[:, None])
+    pw_bias = tl.load(pw_bias_ptr + channel).to(tl.float32)
+    acc0 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
+    acc1 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
+    acc2 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
+    acc3 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
+    acc4 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
+    for step in range(TILE_H + 4):
+        input_y = y_start - 2 + step
+        row_ok = (input_y >= 0) & (input_y < HEIGHT)
+        row_base = (batch * HEIGHT + input_y) * WIDTH
+        for kx in tl.static_range(5):
+            values = _load_tap_row(input_ptr, row_base, x, row_ok, x_ok, channel, CHANNELS, WIDTH, kx)
+            acc4 += values * tl.load(dw_weight_ptr + (0 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc3 += values * tl.load(dw_weight_ptr + (1 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc2 += values * tl.load(dw_weight_ptr + (2 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc1 += values * tl.load(dw_weight_ptr + (3 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc0 += values * tl.load(dw_weight_ptr + (4 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+        out_y = input_y - 2
+        if (step >= 4) & (out_y < HEIGHT):
+            hidden = tl.maximum(acc0 + bias[None, :], 0.0).to(tl.bfloat16)
+            out = tl.dot(hidden, tl.trans(pw_weight)) + pw_bias[None, :]
+            row = (batch * HEIGHT + out_y) * WIDTH + x
+            tl.store(output_ptr + row[:, None] * CHANNELS + channel[None, :], out.to(tl.bfloat16),
+                     mask=x_ok[:, None])
+        acc0 = acc1
+        acc1 = acc2
+        acc2 = acc3
+        acc3 = acc4
+        acc4 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
 
 
 def depthwise5x5_relu_pointwise(
@@ -424,26 +443,27 @@ def depthwise5x5_relu_pointwise(
     pw_weight: Tensor,
     pw_bias: Tensor,
     *,
-    block_m: int = 128,
-    num_warps: int = 4,
+    bw: int = 32,
+    tile_h: int | None = None,
+    num_warps: int = 2,
 ) -> Tensor:
     batch, channels, height, width = value.shape
-    rows = batch * height * width
-    if (rows + block_m) * channels >= 2**31:
+    if (batch * height * width + bw) * channels >= 2**31:
         raise ValueError("depthwise5x5_relu_pointwise: tensor too large for int32 offsets")
+    tile_h = tile_h or (32 if height > 64 else 16)
     out = torch.empty((batch, height, width, channels), device=value.device, dtype=torch.bfloat16)
-    _depthwise5x5_relu_pointwise_kernel[(triton.cdiv(rows, block_m),)](
+    _depthwise5x5_relu_pointwise_kernel[(triton.cdiv(width, bw), triton.cdiv(height, tile_h), batch)](
         value,
         dw_weight,
         dw_bias,
         pw_weight,
         pw_bias,
         out,
-        rows,
         HEIGHT=height,
         WIDTH=width,
         CHANNELS=channels,
-        BLOCK_M=block_m,
+        BW=bw,
+        TILE_H=tile_h,
         num_warps=num_warps,
     )
     return out.permute(0, 3, 1, 2)
