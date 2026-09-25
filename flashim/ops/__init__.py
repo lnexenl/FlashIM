@@ -16,6 +16,7 @@ from flashim.ops.mx import (
     fp8_linear,
     gelu_quantize,
     layernorm_quantize,
+    mxfp8_refiner_block,
     mxfp8_scaled_mm,
 )
 from flashim.ops.refiner_heads import refiner_heads
@@ -35,6 +36,7 @@ __all__ = [
     "gelu_quantize",
     "layernorm_quantize",
     "local_corr",
+    "mxfp8_refiner_block",
     "mxfp8_scaled_mm",
     "refiner_heads",
     "refiner_input",

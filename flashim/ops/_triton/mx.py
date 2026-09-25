@@ -467,3 +467,109 @@ def depthwise5x5_relu_pointwise(
         num_warps=num_warps,
     )
     return out.permute(0, 3, 1, 2)
+
+
+@triton.jit
+def _dw5x5_relu_mx_pointwise_kernel(
+    input_ptr,
+    dw_weight_ptr,
+    dw_bias_ptr,
+    pw_weight_ptr,
+    pw_scale_ptr,
+    pw_bias_ptr,
+    output_ptr,
+    HEIGHT: tl.constexpr,
+    WIDTH: tl.constexpr,
+    CHANNELS: tl.constexpr,
+    BW: tl.constexpr,
+    TILE_H: tl.constexpr,
+):
+    """Whole MXFP8 refiner block in one kernel: depthwise 5x5 + bias + ReLU (row rolling),
+    dynamic per-32-channel MXFP8 quantization, block-scaled ``tl.dot_scaled`` pointwise GEMM
+    against the FP8 weight, bias, BF16 channels-last store. The quantized activations never
+    leave registers. Quantization math is identical to ``_depthwise5x5_relu_mxfp8_kernel``.
+    """
+    GROUPS: tl.constexpr = CHANNELS // 32
+    x = tl.program_id(0) * BW + tl.arange(0, BW)
+    y_start = tl.program_id(1) * TILE_H
+    batch = tl.program_id(2)
+    x_ok = x < WIDTH
+    channel = tl.arange(0, CHANNELS)
+    bias = tl.load(dw_bias_ptr + channel).to(tl.float32)
+    # Pointwise weight ([out, in] in memory) as the [K=in, N=out] operand, plus its [N, K/32] scales.
+    pw_weight = tl.load(pw_weight_ptr + channel[None, :] * CHANNELS + channel[:, None])
+    pw_scale = tl.load(pw_scale_ptr + channel[:, None] * GROUPS + tl.arange(0, GROUPS)[None, :])
+    pw_bias = tl.load(pw_bias_ptr + channel).to(tl.float32)
+    acc0 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
+    acc1 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
+    acc2 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
+    acc3 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
+    acc4 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
+    for step in range(TILE_H + 4):
+        input_y = y_start - 2 + step
+        row_ok = (input_y >= 0) & (input_y < HEIGHT)
+        row_base = (batch * HEIGHT + input_y) * WIDTH
+        for kx in tl.static_range(5):
+            values = _load_tap_row(input_ptr, row_base, x, row_ok, x_ok, channel, CHANNELS, WIDTH, kx)
+            acc4 += values * tl.load(dw_weight_ptr + (0 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc3 += values * tl.load(dw_weight_ptr + (1 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc2 += values * tl.load(dw_weight_ptr + (2 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc1 += values * tl.load(dw_weight_ptr + (3 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+            acc0 += values * tl.load(dw_weight_ptr + (4 * 5 + kx) * CHANNELS + channel).to(tl.float32)[None, :]
+        out_y = input_y - 2
+        if (step >= 4) & (out_y < HEIGHT):
+            activated = tl.maximum(acc0 + bias[None, :], 0.0)
+            blocks = tl.reshape(activated, (BW, GROUPS, 32))
+            amax = tl.max(tl.abs(blocks), axis=2)
+            exponent = tl.ceil(tl.log2(amax / 448.0))
+            exponent = tl.maximum(tl.minimum(exponent, 127.0), -127.0)
+            exponent = tl.where(amax == 0.0, -127.0, exponent)
+            quantized = tl.maximum(tl.minimum(blocks * tl.exp2(-exponent)[:, :, None], 448.0), -448.0)
+            product = tl.dot_scaled(
+                tl.reshape(quantized, (BW, CHANNELS)).to(tl.float8e4nv),
+                (exponent + 127.0).to(tl.uint8),
+                "e4m3",
+                pw_weight,
+                pw_scale,
+                "e4m3",
+            )
+            out = product + pw_bias[None, :]
+            row = (batch * HEIGHT + out_y) * WIDTH + x
+            tl.store(output_ptr + row[:, None] * CHANNELS + channel[None, :], out.to(tl.bfloat16), mask=x_ok[:, None])
+        acc0 = acc1
+        acc1 = acc2
+        acc2 = acc3
+        acc3 = acc4
+        acc4 = tl.zeros((BW, CHANNELS), dtype=tl.float32)
+
+
+def dw5x5_relu_mx_pointwise(
+    value: Tensor,
+    dw_weight: Tensor,
+    dw_bias: Tensor,
+    pw_weight: Tensor,
+    pw_scale_u8: Tensor,
+    pw_bias: Tensor,
+    *,
+    bw: int = 32,
+    tile_h: int = 32,
+    num_warps: int = 8,
+) -> Tensor:
+    batch, channels, height, width = value.shape
+    out = torch.empty((batch, height, width, channels), device=value.device, dtype=torch.bfloat16)
+    _dw5x5_relu_mx_pointwise_kernel[(triton.cdiv(width, bw), triton.cdiv(height, tile_h), batch)](
+        value,
+        dw_weight,
+        dw_bias,
+        pw_weight,
+        pw_scale_u8,
+        pw_bias,
+        out,
+        HEIGHT=height,
+        WIDTH=width,
+        CHANNELS=channels,
+        BW=bw,
+        TILE_H=tile_h,
+        num_warps=num_warps,
+    )
+    return out.permute(0, 3, 1, 2)

@@ -168,6 +168,53 @@ def _depthwise5x5_relu_pointwise_triton(value, dw_weight, dw_bias, pw_weight, pw
     return kernel(value, dw_weight, dw_bias, pw_weight, pw_bias)
 
 
+# -- whole MXFP8 refiner block: depthwise 5x5 + ReLU -> dynamic MXFP8 -> pointwise GEMM -----------
+
+
+def _mxfp8_refiner_block_reference(
+    value: Tensor,
+    dw_weight: Tensor,
+    dw_bias: Tensor,
+    pw_weight: Tensor,
+    pw_scale_swizzled: Tensor,
+    pw_scale_u8: Tensor,
+    pw_bias: Tensor,
+) -> Tensor:
+    """The unfused pipeline through normal op dispatch: ``depthwise5x5_relu_mxfp8`` then
+    ``mxfp8_scaled_mm``. ``pw_weight`` ``[N, K]`` E4M3; ``pw_scale_swizzled`` is the cuBLAS layout
+    of the weight exponents and ``pw_scale_u8`` the plain biased ``[N, K/32]`` bytes."""
+    batch, channels, height, width = value.shape
+    quantized, scale = depthwise5x5_relu_mxfp8(value, dw_weight, dw_bias)
+    out = mxfp8_scaled_mm(quantized, pw_weight.t(), scale, pw_scale_swizzled, pw_bias)
+    return out.reshape(batch, height, width, channels).permute(0, 3, 1, 2)
+
+
+mxfp8_refiner_block = Op("mxfp8_refiner_block", _mxfp8_refiner_block_reference)
+
+
+def _refiner_block_eligible(value, dw_weight, dw_bias, pw_weight, pw_scale_swizzled, pw_scale_u8, pw_bias) -> bool:
+    return (
+        value.ndim == 4
+        and value.shape[1] == 128
+        and value.is_contiguous(memory_format=torch.channels_last)
+        and tuple(dw_weight.shape) == (25, 128)
+        and tuple(pw_weight.shape) == (128, 128)
+        and pw_weight.dtype == torch.float8_e4m3fn
+        and pw_scale_u8.dtype == torch.uint8
+        and tuple(pw_scale_u8.shape) == (128, 4)
+    )
+
+
+@mxfp8_refiner_block.register(
+    "triton_fused", device=DeviceSpec("cuda", min_capability=(10, 0)), requires=[Feature.TRITON],
+    when=_refiner_block_eligible,
+)
+def _mxfp8_refiner_block_triton(value, dw_weight, dw_bias, pw_weight, pw_scale_swizzled, pw_scale_u8, pw_bias):
+    from flashim.ops._triton.mx import dw5x5_relu_mx_pointwise as kernel
+
+    return kernel(value, dw_weight, dw_bias, pw_weight, pw_scale_u8, pw_bias)
+
+
 # -- block-scaled MXFP8 GEMM -----------------------------------------------------------------
 
 

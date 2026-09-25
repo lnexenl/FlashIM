@@ -66,12 +66,27 @@ class FusedMXFP8RefinerBlock(nn.Module):
         values, exponent = mx.quantize_dynamic_2d(weight)
         self.register_buffer("pointwise_weight", values.view(torch.uint8))
         self.register_buffer("pointwise_scale", mx.swizzle_scales(exponent))
+        # Plain biased E8M0 bytes [N, K/32] for the fused kernel (same exponents as above).
+        self.register_buffer("pointwise_scale_u8", (exponent.to(torch.int16) + 127).to(torch.uint8).contiguous())
         self.register_buffer("pointwise_bias", pointwise.bias.detach().to(torch.bfloat16))
+        # Run depthwise + quantize + pointwise as one kernel where available (opt-in: the
+        # summation order of the fused GEMM is not guaranteed to match cuBLAS's).
+        self.fuse_pointwise = False
         self.call_count = 0
 
     def forward(self, x: Tensor) -> Tensor:
         if not torch.compiler.is_compiling():
             self.call_count += 1
+        if self.fuse_pointwise:
+            return ops.mxfp8_refiner_block(
+                x,
+                self.depthwise_weight,
+                self.depthwise_bias,
+                self.pointwise_weight.view(torch.float8_e4m3fn),
+                self.pointwise_scale,
+                self.pointwise_scale_u8,
+                self.pointwise_bias,
+            )
         batch, _, height, width = x.shape
         quantized, scale = ops.depthwise5x5_relu_mxfp8(x, self.depthwise_weight, self.depthwise_bias)
         out = ops.mxfp8_scaled_mm(

@@ -179,3 +179,23 @@ def test_refiner_proj_small(k, p, rows):
         fast, ref = _both(ops.refiner_proj, "triton", x, weight, bias)
     assert fast.shape == ref.shape == (2, rows // 2 + 1, p) and fast.dtype == torch.float32
     assert torch.allclose(fast, ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.sm120
+@pytest.mark.parametrize("batch,hw", [(1, (37, 45)), (2, (64, 64)), (2, (100, 33))])
+def test_mxfp8_refiner_block_fused(batch, hw):
+    """The fused kernel equals depthwise5x5_relu_mxfp8 -> mxfp8_scaled_mm (up to BF16 rounding of a
+    different FP32 summation order)."""
+    torch.manual_seed(6)
+    channels = 128
+    x = torch.randn(batch, channels, *hw, device=DEV).to(torch.bfloat16).to(memory_format=torch.channels_last)
+    dw = (torch.randn(25, channels, device=DEV) * 0.3).to(torch.bfloat16)
+    dwb = torch.randn(channels, device=DEV).to(torch.bfloat16)
+    weight, exponent = mx.quantize_dynamic_2d(torch.randn(channels, channels, device=DEV) * 0.1)
+    args = (
+        x, dw, dwb, weight, mx.swizzle_scales(exponent), (exponent.to(torch.int16) + 127).to(torch.uint8),
+        torch.randn(channels, device=DEV).to(torch.bfloat16),
+    )
+    fast, ref = _both(ops.mxfp8_refiner_block, "triton_fused", *args)
+    assert fast.shape == ref.shape and fast.dtype == torch.bfloat16
+    assert ((fast.float() - ref.float()).abs() <= ref.float().abs() * 2**-7 + 1e-6).all()

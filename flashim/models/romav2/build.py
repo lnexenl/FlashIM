@@ -14,7 +14,7 @@ from flashim.models.romav2.quant import DEFAULT_CALIBRATION, PRESETS, PROTECTED
 from flashim.platforms import Feature, platform_for
 from flashim.quant.apply import quantize_model
 from flashim.quant.calibration import CalibrationTable
-from flashim.quant.passes.refiner_block import fold_refiner_blocks, fuse_bf16_refiner_blocks
+from flashim.quant.passes.refiner_block import FusedMXFP8RefinerBlock, fold_refiner_blocks, fuse_bf16_refiner_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,10 @@ def load_romav2(
         for refiner in model.refiners.values():
             refiner.fused_input = True
             refiner.enable_fused_heads()
+    if spec.fused_mx_blocks:
+        for module in model.modules():
+            if isinstance(module, FusedMXFP8RefinerBlock):
+                module.fuse_pointwise = True
     if spec.batched_directions:
         if not spec.fused_refiner_io:
             raise ValueError("batched_directions requires fused_refiner_io")

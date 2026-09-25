@@ -62,6 +62,8 @@ class Preset:
     fused_refiner_io: bool = False
     # Refine both match directions as one batch with one projection per feature map (bit-exact).
     batched_directions: bool = False
+    # Fuse each MXFP8 refiner block (depthwise + quantize + pointwise GEMM) into one kernel where supported.
+    fused_mx_blocks: bool = False
     description: str = ""
 
 
@@ -91,6 +93,7 @@ PRESETS: dict[str, Preset] = {
         fused_bf16_refiners=(1,),
         fused_refiner_io=True,
         batched_directions=True,
+        fused_mx_blocks=True,
         description="fp8 + FlashIM refiner kernels (fused BF16 stride-1 blocks, fused refiner input); "
         "not RoMaV2-exact",
     ),
