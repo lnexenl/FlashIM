@@ -114,6 +114,7 @@ dependencies = [
 
 [package.optional-dependencies]
 eval = [
+    { name = "hardmatch" },
     { name = "opencv-python" },
     { name = "tqdm" },
 ]
@@ -129,6 +130,7 @@ dev = [
 requires-dist = [
     { name = "einops", specifier = ">=0.8.1" },
     { name = "fused-local-corr", marker = "sys_platform == 'linux'", specifier = "==0.3.211" },
+    { name = "hardmatch", marker = "extra == 'eval'", specifier = ">=1.0.0" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "opencv-python", marker = "extra == 'eval'", specifier = ">=4.12.0.88" },
     { name = "pillow", specifier = ">=12.0.0" },
@@ -166,6 +168,24 @@ dependencies = [
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0c/82/547f2611af62694dd811c1a66dbbd4435ca83b037d144d4549b682b5392c/fused_local_corr-0.3.211-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:df40916b9628b8aa3ca8fbd731a4be32cf21a4fe4ea7d025171d5e7269389f73", size = 3297420, upload-time = "2026-04-04T20:12:15.174Z" },
     { url = "https://files.pythonhosted.org/packages/41/8a/78057d96c046c9e8fedec54ff540eed66a04c1eaad9abd00568b475b7c48/fused_local_corr-0.3.211-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9ce4a97d18c5e43f683dabd69ec503dd8d74ec8056b77c1a699fe5816a93f746", size = 3297576, upload-time = "2026-04-04T20:12:17.345Z" },
+]
+
+[[package]]
+name = "hardmatch"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "einops" },
+    { name = "numpy" },
+    { name = "opencv-python" },
+    { name = "pillow" },
+    { name = "torch" },
+    { name = "torchvision" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/25/32/cfac4f190ab5e1d430f0a65bc4b24024fb4b2c42e8910b16473d88e649b2/hardmatch-1.0.0.tar.gz", hash = "sha256:07712f537e23c262f219a246389c4111a46159f5bf674575cbeb79361676230b", size = 14474, upload-time = "2026-08-05T16:14:09.543Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/55/0b/af25af2161991600854bba1c242cef187d94ce3603bd28729fb4788523fa/hardmatch-1.0.0-py3-none-any.whl", hash = "sha256:92029d7452030848231659965bd34c65a737378f24bba45a4f57e0f8950f0013", size = 16981, upload-time = "2026-08-05T16:14:08.701Z" },
 ]
 
 [[package]]
