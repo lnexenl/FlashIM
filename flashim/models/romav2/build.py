@@ -84,6 +84,10 @@ def load_romav2(
         for refiner in model.refiners.values():
             refiner.fused_input = True
             refiner.enable_fused_heads()
+    if spec.batched_directions:
+        if not spec.fused_refiner_io:
+            raise ValueError("batched_directions requires fused_refiner_io")
+        model.batched_directions = True
     if engine == "compile":
         compile_regions(model, COMPILE_REGIONS, mode=compile_mode)
     elif engine == "compile-full":

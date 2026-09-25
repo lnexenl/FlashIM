@@ -20,6 +20,7 @@ from flashim.ops.mx import (
 )
 from flashim.ops.refiner_heads import refiner_heads
 from flashim.ops.refiner_input import refiner_input
+from flashim.ops.refiner_proj import refiner_proj
 from flashim.ops.rope import rope_qk
 
 __all__ = [
@@ -37,6 +38,7 @@ __all__ = [
     "mxfp8_scaled_mm",
     "refiner_heads",
     "refiner_input",
+    "refiner_proj",
     "reset_call_counts",
     "rope_qk",
     "set_strict",

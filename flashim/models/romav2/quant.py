@@ -9,7 +9,8 @@ Presets (all MXFP8, E4M3 values + E8M0 block-32 scales):
 - ``fp8``     : ``fp8-p8`` + stride-4 and stride-2 refiner blocks fused (default).
 - ``fp8-fast``: ``fp8`` + FlashIM refiner kernels: fused BF16 stride-1 conv blocks, a fused
   refiner input (warp sampling, displacement embedding, local correlation in one pass) and
-  fused output heads (FP32 warp/confidence convs + updates).
+  fused output heads (FP32 warp/confidence convs + updates), one projection per feature map
+  (RoMaV2 recomputes each for the second direction) and both directions refined as one batch.
   Numerics differ from RoMaV2 by reduction order / rounding points only; pending AUC.
 
 Accuracy evidence for these configurations (RoMaV2 P8 reports, RTX 5070 Ti,
@@ -59,6 +60,8 @@ class Preset:
     # Refiner glue as fused ops: block1 input (warp sampling, disp_emb, local corr) and
     # output heads (warp/confidence convs + updates).
     fused_refiner_io: bool = False
+    # Refine both match directions as one batch with one projection per feature map (bit-exact).
+    batched_directions: bool = False
     description: str = ""
 
 
@@ -87,6 +90,7 @@ PRESETS: dict[str, Preset] = {
         fold_refiners=True,
         fused_bf16_refiners=(1,),
         fused_refiner_io=True,
+        batched_directions=True,
         description="fp8 + FlashIM refiner kernels (fused BF16 stride-1 blocks, fused refiner input); "
         "not RoMaV2-exact",
     ),

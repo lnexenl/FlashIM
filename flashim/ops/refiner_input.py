@@ -27,10 +27,15 @@ def _refiner_input_reference(
     emb_bias: Tensor,
     scale_factor: Tensor,
     radius: int,
+    pair: int = 0,
 ) -> Tensor:
     """``f_a``/``f_b`` ``[B, h, w, P]`` FP32, ``warp`` ``[B, h, w, 2]``; ``emb_weight`` ``[E, 2(, 1, 1)]``;
-    ``radius < 0`` disables the correlation. Returns channels-last BF16 ``[B, C, h, w]``.
+    ``radius < 0`` disables the correlation. ``pair > 0``: ``f_a`` holds ``2*pair`` stacked images
+    (both directions) and image ``i`` is matched with image ``(i + pair) % (2*pair)`` of the same
+    tensor (``f_b`` is ignored). Returns channels-last BF16 ``[B, C, h, w]``.
     """
+    if pair > 0:
+        f_b = torch.roll(f_a, shifts=pair, dims=0)
     batch, h, w, _ = f_a.shape
     f_a_nchw = f_a.permute(0, 3, 1, 2)
     f_b_nchw = f_b.permute(0, 3, 1, 2)
@@ -49,7 +54,7 @@ def _refiner_input_reference(
 refiner_input = Op("refiner_input", _refiner_input_reference)
 
 
-def _eligible(f_a, f_b, warp, emb_weight, emb_bias, scale_factor, radius) -> bool:
+def _eligible(f_a, f_b, warp, emb_weight, emb_bias, scale_factor, radius, pair=0) -> bool:
     return (
         f_a.dtype == f_b.dtype == warp.dtype == torch.float32
         and f_a.is_contiguous()
@@ -64,7 +69,7 @@ def _eligible(f_a, f_b, warp, emb_weight, emb_bias, scale_factor, radius) -> boo
 
 
 @refiner_input.register("triton", device=DeviceSpec("cuda"), when=_eligible)
-def _refiner_input_triton(f_a, f_b, warp, emb_weight, emb_bias, scale_factor, radius):
+def _refiner_input_triton(f_a, f_b, warp, emb_weight, emb_bias, scale_factor, radius, pair=0):
     from flashim.ops._triton.refiner import refiner_input as kernel
 
-    return kernel(f_a, f_b, warp, emb_weight, emb_bias, scale_factor, radius)
+    return kernel(f_a, f_a if pair > 0 else f_b, warp, emb_weight, emb_bias, scale_factor, radius, pair)

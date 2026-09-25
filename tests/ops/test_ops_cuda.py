@@ -148,3 +148,34 @@ def test_refiner_heads(channels, hw, prev_c):
     assert w1.shape == w0.shape == (2, *hw, 2) and c1.shape == c0.shape == (2, *hw, 4)
     assert torch.allclose(w1, w0, atol=1e-6, rtol=1e-5)
     assert torch.allclose(c1, c0, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("proj,emb,radius,hw", [(192, 79, 3, (37, 45)), (12, 8, -1, (50, 70))])
+def test_refiner_input_stacked_directions(batch, proj, emb, radius, hw):
+    """pair=B: a stack [A-side; B-side] matches image i with image (i + B) % 2B, both directions at once."""
+    torch.manual_seed(5)
+    stack = torch.randn(2 * batch, *hw, proj, device=DEV)
+    warp = (torch.rand(2 * batch, *hw, 2, device=DEV) * 2.4 - 1.2).contiguous()
+    weight, bias = torch.randn(emb, 2, 1, 1, device=DEV), torch.randn(emb, device=DEV)
+    scale = torch.tensor([1.5625, 2.0], device=DEV)
+    fast = ops.refiner_input.get("triton")(stack, stack, warp, weight, bias, scale, radius, batch)
+    ref = ops.refiner_input.get("reference")(stack, stack, warp, weight, bias, scale, radius, batch)
+    # the stacked call must equal two separate one-direction calls
+    a, b = stack[:batch], stack[batch:]
+    ab = ops.refiner_input.get("triton")(a, b, warp[:batch], weight, bias, scale, radius)
+    ba = ops.refiner_input.get("triton")(b, a, warp[batch:], weight, bias, scale, radius)
+    assert torch.equal(fast[:batch], ab) and torch.equal(fast[batch:], ba)
+    assert torch.equal(fast[:, : 2 * proj], ref[:, : 2 * proj])
+    tail_fast, tail_ref = fast[:, 2 * proj :].float(), ref[:, 2 * proj :].float()
+    assert ((tail_fast - tail_ref).abs() <= tail_ref.abs().amax() * 2**-7).all()
+
+
+@pytest.mark.parametrize("k,p,rows", [(64, 12, 5000), (32, 8, 777), (128, 16, 4096)])
+def test_refiner_proj_small(k, p, rows):
+    x = torch.randn(2, rows // 2 + 1, k, device=DEV).to(torch.bfloat16)
+    weight, bias = torch.randn(p, k, device=DEV) * 0.1, torch.randn(p, device=DEV)
+    with torch.backends.cudnn.flags(allow_tf32=False):
+        fast, ref = _both(ops.refiner_proj, "triton", x, weight, bias)
+    assert fast.shape == ref.shape == (2, rows // 2 + 1, p) and fast.dtype == torch.float32
+    assert torch.allclose(fast, ref, atol=1e-5, rtol=1e-5)

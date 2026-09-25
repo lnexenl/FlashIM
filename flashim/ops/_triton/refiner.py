@@ -38,12 +38,17 @@ def _refiner_input_kernel(
     KK: tl.constexpr,
     HAS_CORR: tl.constexpr,
     C_TOTAL: tl.constexpr,
+    PAIR: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     valid = row < rows
     pix = row % (HEIGHT * WIDTH)
     img_base = row - pix  # first pixel of this image
+    if PAIR > 0:
+        # Stacked directions: image i of the 2*PAIR stack pairs with image (i + PAIR) % (2*PAIR).
+        img = row // (HEIGHT * WIDTH)
+        img_base = ((img + PAIR) % (2 * PAIR)) * (HEIGHT * WIDTH)  # first pixel of the partner
     y = pix // WIDTH
     x = pix - y * WIDTH
     ch = tl.arange(0, PP)
@@ -138,6 +143,7 @@ def refiner_input(
     emb_bias: Tensor,
     scale_factor: Tensor,
     radius: int,
+    pair: int = 0,
     *,
     block_m: int | None = None,
     num_warps: int = 4,
@@ -173,6 +179,7 @@ def refiner_input(
         KK=triton.next_power_of_2(max(k, 1)),
         HAS_CORR=has_corr,
         C_TOTAL=c_total,
+        PAIR=pair,
         BLOCK_M=block_m,
         num_warps=num_warps,
     )
@@ -273,3 +280,30 @@ def refiner_heads(
         num_warps=num_warps,
     )
     return warp, confidence
+
+
+@triton.jit
+def _proj_small_kernel(
+    x_ptr, w_ptr, b_ptr, out_ptr, rows, K: tl.constexpr, P: tl.constexpr, BM: tl.constexpr
+):
+    """``out = x @ w.T + b`` for small ``P``: BF16 ``x`` tile in registers, one exact-FP32
+    FMA reduction per output channel (cuBLAS's FP32 GEMM is inefficient for ``N ~ 12``)."""
+    row = tl.program_id(0) * BM + tl.arange(0, BM)
+    valid = row < rows
+    k = tl.arange(0, K)
+    x = tl.load(x_ptr + row[:, None] * K + k[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+    for p in tl.static_range(P):
+        out = tl.sum(x * tl.load(w_ptr + p * K + k)[None, :], axis=1) + tl.load(b_ptr + p)
+        tl.store(out_ptr + row * P + p, out, mask=valid)
+
+
+def refiner_proj(x: Tensor, weight: Tensor, bias: Tensor, *, block_m: int = 128, num_warps: int = 4) -> Tensor:
+    *lead, k = x.shape
+    p = weight.shape[0]
+    rows = x.numel() // k
+    out = torch.empty((*lead, p), device=x.device, dtype=torch.float32)
+    _proj_small_kernel[(triton.cdiv(rows, block_m),)](
+        x, weight.float().contiguous(), bias.float().contiguous(), out, rows, K=k, P=p, BM=block_m,
+        num_warps=num_warps,
+    )
+    return out

@@ -77,15 +77,38 @@ class ConvRefiner(nn.Module):
         )
         self.fused_heads = True
 
-    def forward(
-        self, f_a: Tensor, f_b: Tensor, prev_warp: Tensor, prev_confidence: Tensor, scale_factor: Tensor
-    ) -> tuple[Tensor, Tensor]:
-        cfg = self.cfg
-        batch, h, w, _ = f_a.shape
-        f_a = self.proj(f_a.reshape(batch, h * w, cfg.feat_dim).float()).reshape(batch, h, w, cfg.proj_dim)
-        f_b = self.proj(f_b.reshape(batch, h * w, cfg.feat_dim).float()).reshape(batch, h, w, cfg.proj_dim)
+    def project(self, f: Tensor) -> Tensor:
+        """FP32 projection of BF16 fine features ``[B, h, w, feat_dim]`` -> ``[B, h, w, proj_dim]``."""
         if self.fused_input:
-            radius = -1 if cfg.local_corr_radius is None else cfg.local_corr_radius
+            return ops.refiner_proj(f.contiguous(), self.proj.weight, self.proj.bias)
+        batch, h, w, _ = f.shape
+        return self.proj(f.reshape(batch, h * w, self.cfg.feat_dim).float()).reshape(batch, h, w, self.cfg.proj_dim)
+
+    def forward(
+        self,
+        f_a: Tensor,
+        f_b: Tensor,
+        prev_warp: Tensor,
+        prev_confidence: Tensor,
+        scale_factor: Tensor,
+        *,
+        pair: int = 0,
+    ) -> tuple[Tensor, Tensor]:
+        """Refine ``prev_warp``. ``pair > 0`` (fused input only): ``f_a`` is the *already projected*
+        stack of ``2*pair`` images, both match directions at once (image ``i`` with ``(i+pair) % 2*pair``)."""
+        cfg = self.cfg
+        radius = -1 if cfg.local_corr_radius is None else cfg.local_corr_radius
+        if pair:
+            if not self.fused_input:
+                raise ValueError("stacked directions require the fused refiner input")
+            d = ops.refiner_input(
+                f_a, f_a, prev_warp.contiguous(), self.disp_emb.weight, self.disp_emb.bias, scale_factor, radius, pair
+            )
+            return self._heads(self.hidden_blocks(self.block1(d)), prev_warp, prev_confidence)
+        batch, h, w, _ = f_a.shape
+        f_a = self.project(f_a)
+        f_b = self.project(f_b)
+        if self.fused_input:
             d = ops.refiner_input(
                 f_a, f_b, prev_warp.contiguous(), self.disp_emb.weight, self.disp_emb.bias, scale_factor, radius
             )

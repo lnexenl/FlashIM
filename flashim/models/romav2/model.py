@@ -105,6 +105,9 @@ class RoMaV2(nn.Module):
         self.matcher = Matcher()
         self.refiners = Refiners()
         self.refiner_features = VGG19BN()
+        # Refine both directions as one batch with projections computed once (set by presets;
+        # requires fused refiner input; not RoMaV2-bit-exact).
+        self.batched_directions = False
         self.apply_setting(self.config.setting)
 
     @classmethod
@@ -163,6 +166,11 @@ class RoMaV2(nn.Module):
             stages = [(img_a_lr, img_b_lr)]
             if img_a_hr is not None and img_b_hr is not None:
                 stages.append((img_a_hr, img_b_hr))
+            if self.batched_directions and bidirectional and all(a.shape == b.shape for a, b in stages):
+                warp_ab, conf_ab, warp_ba, conf_ba = self._refine_stacked(
+                    stages, warp_ab, conf_ab, warp_ba, conf_ba, preds
+                )
+                stages = []
             for stage, (img_a, img_b) in enumerate(stages):
                 _, _, height, width = img_a.shape
                 scale_factor = torch.empty(2, device=img_a.device, dtype=img_a.dtype)
@@ -184,6 +192,27 @@ class RoMaV2(nn.Module):
                         preds[f"refiner_{stride}_BA"] = None
         preds.update(warp_AB=warp_ab, confidence_AB=conf_ab, warp_BA=warp_ba, confidence_BA=conf_ba)
         return preds
+
+    def _refine_stacked(self, stages, warp_ab, conf_ab, warp_ba, conf_ba, preds):
+        """Both directions as one batch: ``[AB; BA]`` states, one projection per feature map."""
+        warp, conf = torch.cat((warp_ab, warp_ba)), torch.cat((conf_ab, conf_ba))
+        batch = warp_ab.shape[0]
+        for stage, (img_a, img_b) in enumerate(stages):
+            _, _, height, width = img_a.shape
+            scale_factor = torch.empty(2, device=img_a.device, dtype=img_a.dtype)
+            scale_factor[0].fill_(width / self.config.anchor_width)
+            scale_factor[1].fill_(height / self.config.anchor_height)
+            feats = self.refiner_features(torch.cat((img_a, img_b)))  # [A; B] stacked
+            for stride_key, refiner in self.refiners.items():
+                stride = int(stride_key)
+                zero_precision = len(stages) > 1 and stride == 4 and stage == 1
+                warp, conf = _resize_state(warp, conf, (height // stride, width // stride), zero_precision)
+                warp, conf = refiner(
+                    refiner.project(feats[stride]), None, warp, conf, scale_factor, pair=batch
+                )
+                preds[f"refiner_{stride}_AB"] = {"warp": warp[:batch], "confidence": conf[:batch]}
+                preds[f"refiner_{stride}_BA"] = {"warp": warp[batch:], "confidence": conf[batch:]}
+        return warp[:batch], conf[:batch], warp[batch:], conf[batch:]
 
     # -- image-level API -------------------------------------------------------------------
 
