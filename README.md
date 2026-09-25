@@ -15,12 +15,31 @@ kpts_a, kpts_b = model.to_pixel_coordinates(matches, h_a, w_a, h_b, w_b)
 
 | model | presets | notes |
 |---|---|---|
-| `romav2` | `bf16`, `fp8-p8`, `fp8-s4`, `fp8` (default) | native port of RoMa v2; BF16 and FP8 outputs are bit-identical to the RoMaV2 reference implementation |
+| `romav2` | `bf16`, `fp8-p8`, `fp8-s4`, `fp8` (default), `fp8-fast` | native port of RoMa v2; `bf16`/`fp8-*` outputs are bit-identical to the RoMaV2 reference implementation |
 
 RoMaV2 presets (MXFP8 = E4M3 values, E8M0 scale per 32 elements):
 
 - `fp8-p8` — every DINOv3 / matcher-ViT linear with *static* calibrated activation scales, fused LayerNorm→quant and GELU→quant producers, BF16 SDPA attention, BF16 refiners.
 - `fp8-s4` / `fp8` — additionally fuse stride-4 (and stride-2) refiner blocks: one Triton kernel for depthwise 5x5 + bias + ReLU + *dynamic* MXFP8 quantization, then a block-scaled MXFP8 pointwise GEMM.
+- `fp8-fast` — `fp8` plus FlashIM refiner kernels: fused BF16 stride-1 conv blocks, a fused refiner
+  input (warp sampling, displacement embedding and local correlation in one pass) and fused FP32
+  output heads. Not bit-identical to RoMaV2 (reduction order / rounding points); validated by pose AUC.
+
+Engines: `eager`; `compile` (DINOv3 + matcher ViT, RoMaV2's validated setting); `compile-full`
+(also VGG with folded BatchNorm, the DPT head and the refiner conv stacks).
+
+Measured on an RTX 5070 Ti (mega1500 setting, 800² LR + 1024² HR, bidirectional, B=1, preloaded forward):
+
+| configuration | forward | vs BF16 |
+|---|---|---|
+| `bf16` + `compile` | 344 ms | 1.0x |
+| RoMaV2 FastFP8 (s4+s2 fused) + compile | 210 ms | 1.64x |
+| `fp8` + `compile` | 204 ms | 1.69x |
+| `fp8` + `compile-full` | 165 ms | 2.09x |
+| `fp8-fast` + `compile-full` | 119 ms | 2.89x |
+
+Pose AUC@5 change vs `bf16` (3 seeds): `fp8`+`compile` Mega1500 -0.0042 / ScanNet1500 -0.0017;
+`fp8`+`compile-full` -0.0020 / -0.0026 (gate: >= -0.005). See `results/accuracy/`.
 
 Coordinate heads, the patch embedding, refiner projections and displacement
 embeddings are protected: a quantization config that targets them is rejected.
