@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor, nn
 
+from flashim import ops
 from flashim.models.romav2 import weights
 from flashim.models.romav2.config import SETTINGS, RoMaV2Config, Setting
 from flashim.models.romav2.dinov3 import DinoV3
@@ -108,6 +109,9 @@ class RoMaV2(nn.Module):
         # Refine both directions as one batch with projections computed once (set by presets;
         # requires fused refiner input; not RoMaV2-bit-exact).
         self.batched_directions = False
+        # sample(): fused FP32 KDE (no N x N matrix) and matches/precision built only for drawn
+        # candidates. Same RNG calls in the same order; densities differ from RoMaV2's FP16 KDE.
+        self.fast_sampling = False
         self.apply_setting(self.config.setting)
 
     @classmethod
@@ -241,17 +245,37 @@ class RoMaV2(nn.Module):
         return result
 
     @torch.inference_mode()
-    def match(self, img_a: ImageLike, img_b: ImageLike) -> DenseMatchResult:
-        return self.postprocess(self(*self.prepare(img_a, img_b)))
+    def match(
+        self,
+        img_a: ImageLike,
+        img_b: ImageLike,
+        *,
+        num_samples: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> DenseMatchResult:
+        """Dense matching. With ``num_samples``, also draw that many balanced matches (see
+        :meth:`sample`) and return them as pixel keypoints of the *original* images in
+        ``result.keypoints_A`` / ``keypoints_B`` (``[N, 2]``, x/y, pixel-center convention)."""
+        a, b = self.load_image(img_a), self.load_image(img_b)
+        result = self.postprocess(self(*prepare_pair(a, b, self.setting, self.device)))
+        if num_samples is not None:
+            matches, confidence, prec_a, prec_b = self.sample(result, num_samples, generator=generator)
+            (h_a, w_a), (h_b, w_b) = a.shape[-2:], b.shape[-2:]
+            result.keypoints_A, result.keypoints_B = self.to_pixel_coordinates(matches, h_a, w_a, h_b, w_b)
+            result.matches, result.match_confidence = matches, confidence
+            result.match_precision_A, result.match_precision_B = prec_a, prec_b
+        return result
 
     def sample(
-        self, result: DenseMatchResult, num: int
+        self, result: DenseMatchResult, num: int, *, generator: torch.Generator | None = None
     ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
         """Sample ``num`` KDE-balanced matches ``[N, 4]`` (xA, yA, xB, yB normalized) from batch item 0.
 
         Returns ``(matches, confidence, precision_A, precision_B)``; precisions are
         ``[N, 2, 2]`` (``None`` when unidirectional).
         """
+        if self.fast_sampling:
+            return self._sample_fast(result, num, generator)
         warp = result.warp_AB[0]
         h, w, _ = warp.shape
         grid = normalized_grid(1, h, w, warp.device)[0]
@@ -273,17 +297,70 @@ class RoMaV2(nn.Module):
             confidence = torch.cat((confidence, result.overlap_BA[0].reshape(-1)))
 
         confidence = confidence * matches.abs().amax(dim=-1).le(1 - 1 / h).float()
-        inds = torch.multinomial(confidence, 4 * num, replacement=False)
+        inds = torch.multinomial(confidence, 4 * num, replacement=False, generator=generator)
         matches, confidence = matches[inds], confidence[inds]
         if precision is not None:
             precision = precision[inds]
         density = _kde(matches)
         p = 1 / (density + 1)
         p[density < 10] = 1e-7  # need ~10 perfect neighbours to be trusted
-        balanced = torch.multinomial(p, num_samples=min(num, len(confidence)), replacement=False)
+        balanced = torch.multinomial(p, num_samples=min(num, len(confidence)), replacement=False, generator=generator)
         if precision is None:
             return matches[balanced], confidence[balanced], None, None
         return matches[balanced], confidence[balanced], precision[balanced][:, 0], precision[balanced][:, 1]
+
+    def _sample_fast(self, result: DenseMatchResult, num: int, generator: torch.Generator | None):
+        """Same draws as the reference path: confidences are computed for all candidates, but
+        matches and precisions only for the ``4 * num`` drawn ones; density by ``ops.kde_density``."""
+        warp = result.warp_AB[0]
+        h, w, _ = warp.shape
+        grid = normalized_grid(1, h, w, warp.device)[0].reshape(-1, 2)
+        warp = warp.reshape(-1, 2)
+        grid_max = grid.abs().amax(dim=-1)
+        limit = 1 - 1 / h
+
+        def in_frame(other: Tensor) -> Tensor:
+            return torch.maximum(grid_max, other.abs().amax(dim=-1)).le(limit).float()
+
+        confidence = result.overlap_AB[0].reshape(-1) * in_frame(warp)
+        if result.bidirectional:
+            warp_ba = result.warp_BA[0].reshape(-1, 2)
+            confidence = torch.cat((confidence, result.overlap_BA[0].reshape(-1) * in_frame(warp_ba)))
+        inds = torch.multinomial(confidence, 4 * num, replacement=False, generator=generator)
+        hw = h * w
+        is_ab = inds < hw
+        pix = torch.where(is_ab, inds, inds - hw)
+        if result.bidirectional:
+            other = torch.where(is_ab[:, None], warp[pix], warp_ba[pix])
+        else:
+            other = warp[pix]
+        matches = torch.where(is_ab[:, None], torch.cat((grid[pix], other), -1), torch.cat((other, grid[pix]), -1))
+        confidence = confidence[inds]
+        density = ops.kde_density(matches)
+        p = 1 / (density + 1)
+        p[density < 10] = 1e-7
+        balanced = torch.multinomial(p, num_samples=min(num, len(confidence)), replacement=False, generator=generator)
+        matches, confidence = matches[balanced], confidence[balanced]
+        if not result.bidirectional:
+            return matches, confidence, None, None
+        # Precision at the drawn matches only: the own-side matrix at the grid pixel and the
+        # other side's matrix bilinearly sampled at the warped point (as the reference does).
+        chosen_ab, chosen_pix, warped = is_ab[balanced], pix[balanced], other[balanced]
+        prec_ab = result.precision_AB[0].reshape(hw, 2, 2)
+        prec_ba = result.precision_BA[0].reshape(hw, 2, 2)
+
+        def sample_at(prec: Tensor, points: Tensor) -> Tensor:
+            grid_pts = points.reshape(1, 1, -1, 2)
+            out = F.grid_sample(prec.reshape(1, h, w, 4).permute(0, 3, 1, 2), grid_pts, mode="bilinear", align_corners=False)
+            return out[0, :, 0].t().reshape(-1, 2, 2)
+
+        own = torch.where(chosen_ab[:, None, None], prec_ab[chosen_pix], prec_ba[chosen_pix])
+        sampled_from_ba = sample_at(prec_ba, warped)
+        sampled_from_ab = sample_at(prec_ab, warped)
+        cross = torch.where(chosen_ab[:, None, None], sampled_from_ba, sampled_from_ab)
+        prec_a = torch.where(chosen_ab[:, None, None], cross, own)
+        prec_b = torch.where(chosen_ab[:, None, None], own, cross)
+        return matches, confidence, prec_a, prec_b
 
     @staticmethod
     def to_pixel_coordinates(matches: Tensor, h_a: int, w_a: int, h_b: int, w_b: int) -> tuple[Tensor, Tensor]:

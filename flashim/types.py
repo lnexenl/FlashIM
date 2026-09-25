@@ -25,6 +25,13 @@ class DenseMatchResult:
     confidence_BA: Tensor | None = None
     overlap_BA: Tensor | None = None
     precision_BA: Tensor | None = None
+    # Filled by ``match(..., num_samples=N)``: balanced sparse matches.
+    keypoints_A: Tensor | None = None  # [N, 2] pixels in the original image A
+    keypoints_B: Tensor | None = None  # [N, 2] pixels in the original image B
+    matches: Tensor | None = None  # [N, 4] normalized (xA, yA, xB, yB)
+    match_confidence: Tensor | None = None  # [N]
+    match_precision_A: Tensor | None = None  # [N, 2, 2]
+    match_precision_B: Tensor | None = None  # [N, 2, 2]
 
     @property
     def bidirectional(self) -> bool:

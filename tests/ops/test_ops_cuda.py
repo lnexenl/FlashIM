@@ -199,3 +199,15 @@ def test_mxfp8_refiner_block_fused(batch, hw):
     fast, ref = _both(ops.mxfp8_refiner_block, "triton_fused", *args)
     assert fast.shape == ref.shape and fast.dtype == torch.bfloat16
     assert ((fast.float() - ref.float()).abs() <= ref.float().abs() * 2**-7 + 1e-6).all()
+
+
+@pytest.mark.parametrize("n", [1, 777, 20000])
+def test_kde_density(n):
+    torch.manual_seed(7)
+    centers = torch.rand(20, 4, device=DEV) * 2 - 1
+    x = (centers[torch.randint(0, 20, (n,), device=DEV)] + torch.randn(n, 4, device=DEV) * 0.08).clamp(-1, 1)
+    fast = ops.kde_density.get("triton")(x)
+    exact = torch.exp(-torch.cdist(x.double(), x.double()) ** 2 / 0.02).sum(-1)
+    assert fast.dtype == torch.float16 and fast.shape == (n,)
+    # FP32 accumulation: only the FP16 output rounding remains (the reference FP16 matrix is ~1e-1 off)
+    assert ((fast.double() - exact).abs() / exact).max() < 1e-3

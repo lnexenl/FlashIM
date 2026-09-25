@@ -9,6 +9,7 @@ from flashim.ops._registry import (
     reset_call_counts,
     set_strict,
 )
+from flashim.ops.kde import kde_density
 from flashim.ops.local_corr import local_corr
 from flashim.ops.mx import (
     depthwise5x5_relu_mxfp8,
@@ -34,6 +35,7 @@ __all__ = [
     "depthwise5x5_relu_pointwise",
     "fp8_linear",
     "gelu_quantize",
+    "kde_density",
     "layernorm_quantize",
     "local_corr",
     "mxfp8_refiner_block",
