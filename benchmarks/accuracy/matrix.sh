@@ -8,7 +8,7 @@ engine="${ENGINE:-compile}"
 for ds in mega1500 scannet1500; do
   for seed in 17 29 42; do
     for preset in "$@"; do
-      tag="${ds}_${preset}_${engine}_seed${seed}"
+      tag="${ds}_${preset}_${engine}${TAG:+_$TAG}_seed${seed}"
       out="results/accuracy/${tag}.json"
       if [ -s "$out" ]; then echo "skip $tag"; continue; fi
       if .venv/bin/python benchmarks/accuracy/run.py --dataset "$ds" --preset "$preset" --engine "$engine" \

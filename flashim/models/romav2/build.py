@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -40,6 +41,7 @@ def load_romav2(
     strict: bool = False,
     config: RoMaV2Config | None = None,
     compile_mode: str | None = "max-autotune-no-cudagraphs",
+    fast_sampling: bool | None = None,
 ) -> RoMaV2:
     """Load RoMaV2 weights, apply a quantization preset and an execution engine.
 
@@ -51,6 +53,8 @@ def load_romav2(
         head and the refiner conv stacks (~20% faster; changes rounding vs ``compile``).
     On platforms without native MXFP8 GEMMs, FP8 presets run with emulation kernels
     (``strict=True`` raises instead).
+
+    ``fast_sampling``: fused-KDE ``sample()`` (default: env ``FLASHIM_FAST_SAMPLING``, off).
     """
     if preset not in PRESETS:
         raise ValueError(f"Unknown preset {preset!r}; choose from {sorted(PRESETS)}")
@@ -97,5 +101,8 @@ def load_romav2(
     elif engine == "compile-full":
         model.refiner_features.fold_batchnorm(channels_last=True)
         compile_regions(model, COMPILE_FULL_REGIONS, mode=compile_mode)
+    if fast_sampling is None:
+        fast_sampling = os.environ.get("FLASHIM_FAST_SAMPLING", "0") == "1"
+    model.fast_sampling = fast_sampling
     model.engine = engine
     return model
