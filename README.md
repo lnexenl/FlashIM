@@ -42,6 +42,11 @@ Pose AUC@5 change vs `bf16` (3 seeds): `fp8`+`compile` Mega1500 -0.0042 / ScanNe
 `fp8`+`compile-full` -0.0020 / -0.0026; `fp8-fast`+`compile-full` -0.0023 / +0.0007
 (gate: 3-seed mean >= -0.005; every `fp8-fast` seed is within -0.005).
 
+HardMatch (LoMa, ECCV 2026; 900 hand-labelled hard pairs, mAA@10px, 3 seeds, `wxbs` setting):
+`bf16` 0.4786, `fp8` 0.4707 (-0.0079), `fp8-fast` 0.4712 (-0.0074). FP8's cost is larger on these
+deliberately hard pairs than on MegaDepth/ScanNet; FlashIM's extra kernels add none of it.
+Run with `benchmarks/accuracy/run_hardmatch.py` (official `hardmatch` package protocol).
+
 `sample()` (KDE-balanced match sampling) takes 0.86 ms (RoMaV2: 16 ms, 1.5 GiB scratch); pose AUC
 vs RoMaV2's sampling +0.0012 / -0.0010 (3 seeds; `FLASHIM_FAST_SAMPLING=0` restores it); `match(..., num_samples=N)` returns pixel keypoints.
 
