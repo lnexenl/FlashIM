@@ -42,8 +42,8 @@ Pose AUC@5 change vs `bf16` (3 seeds): `fp8`+`compile` Mega1500 -0.0042 / ScanNe
 `fp8`+`compile-full` -0.0020 / -0.0026; `fp8-fast`+`compile-full` -0.0023 / +0.0007
 (gate: 3-seed mean >= -0.005; every `fp8-fast` seed is within -0.005).
 
-`sample()` (KDE-balanced match sampling) takes 0.86 ms with `fast_sampling=True`
-(RoMaV2: 16 ms, 1.5 GiB scratch); `match(..., num_samples=N)` returns pixel keypoints.
+`sample()` (KDE-balanced match sampling) takes 0.86 ms (RoMaV2: 16 ms, 1.5 GiB scratch); pose AUC
+vs RoMaV2's sampling +0.0012 / -0.0010 (3 seeds; `FLASHIM_FAST_SAMPLING=0` restores it); `match(..., num_samples=N)` returns pixel keypoints.
 
 Coordinate heads, the patch embedding, refiner projections and displacement
 embeddings are protected: a quantization config that targets them is rejected.

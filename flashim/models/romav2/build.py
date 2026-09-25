@@ -54,7 +54,7 @@ def load_romav2(
     On platforms without native MXFP8 GEMMs, FP8 presets run with emulation kernels
     (``strict=True`` raises instead).
 
-    ``fast_sampling``: fused-KDE ``sample()`` (default: env ``FLASHIM_FAST_SAMPLING``, off).
+    ``fast_sampling``: fused-KDE ``sample()`` (default on; ``FLASHIM_FAST_SAMPLING=0`` restores RoMaV2's).
     """
     if preset not in PRESETS:
         raise ValueError(f"Unknown preset {preset!r}; choose from {sorted(PRESETS)}")
@@ -102,7 +102,7 @@ def load_romav2(
         model.refiner_features.fold_batchnorm(channels_last=True)
         compile_regions(model, COMPILE_FULL_REGIONS, mode=compile_mode)
     if fast_sampling is None:
-        fast_sampling = os.environ.get("FLASHIM_FAST_SAMPLING", "0") == "1"
+        fast_sampling = os.environ.get("FLASHIM_FAST_SAMPLING", "1") != "0"
     model.fast_sampling = fast_sampling
     model.engine = engine
     return model

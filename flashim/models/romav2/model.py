@@ -111,7 +111,7 @@ class RoMaV2(nn.Module):
         self.batched_directions = False
         # sample(): fused FP32 KDE (no N x N matrix) and matches/precision built only for drawn
         # candidates. Same RNG calls in the same order; densities differ from RoMaV2's FP16 KDE.
-        self.fast_sampling = False
+        self.fast_sampling = True
         self.apply_setting(self.config.setting)
 
     @classmethod
