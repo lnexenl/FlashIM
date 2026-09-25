@@ -39,7 +39,8 @@ Measured on an RTX 5070 Ti (mega1500 setting, 800² LR + 1024² HR, bidirectiona
 | `fp8-fast` + `compile-full` | 119 ms | 2.89x |
 
 Pose AUC@5 change vs `bf16` (3 seeds): `fp8`+`compile` Mega1500 -0.0042 / ScanNet1500 -0.0017;
-`fp8`+`compile-full` -0.0020 / -0.0026 (gate: >= -0.005). See `results/accuracy/`.
+`fp8`+`compile-full` -0.0020 / -0.0026; `fp8-fast`+`compile-full` -0.0020 / -0.0005
+(gate: 3-seed mean >= -0.005; Mega1500 seed 17 is below -0.005 for every FP8 configuration).
 
 Coordinate heads, the patch embedding, refiner projections and displacement
 embeddings are protected: a quantization config that targets them is rejected.
