@@ -134,3 +134,17 @@ def test_refiner_input(proj, emb, radius, hw):
     assert torch.equal(fast[:, : 2 * proj], ref[:, : 2 * proj])
     tail_fast, tail_ref = fast[:, 2 * proj :].float(), ref[:, 2 * proj :].float()
     assert ((tail_fast - tail_ref).abs() <= tail_ref.abs().amax() * 2**-7).all()
+
+
+@pytest.mark.parametrize("channels,hw,prev_c", [(512, (40, 50), 4), (128, (64, 64), 4), (32, (70, 90), 1)])
+def test_refiner_heads(channels, hw, prev_c):
+    torch.manual_seed(4)
+    z = (torch.randn(2, channels, *hw, device=DEV) * 0.5).to(torch.bfloat16).contiguous(memory_format=torch.channels_last)
+    weight, bias = torch.randn(6, channels, device=DEV) * 0.05, torch.randn(6, device=DEV)
+    prev_warp = torch.rand(2, *hw, 2, device=DEV) * 2 - 1
+    prev_conf = torch.randn(2, *hw, prev_c, device=DEV)
+    with torch.backends.cudnn.flags(allow_tf32=False):  # compare against a true-FP32 reference
+        (w1, c1), (w0, c0) = _both(ops.refiner_heads, "triton", z, weight, bias, prev_warp, prev_conf, 4.0)
+    assert w1.shape == w0.shape == (2, *hw, 2) and c1.shape == c0.shape == (2, *hw, 4)
+    assert torch.allclose(w1, w0, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(c1, c0, atol=1e-4, rtol=1e-4)

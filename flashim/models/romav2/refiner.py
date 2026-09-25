@@ -65,6 +65,17 @@ class ConvRefiner(nn.Module):
         self.channels_last = False
         # Build block1's input with one fused op (BF16 output; not RoMaV2-bit-exact).
         self.fused_input = False
+        # Heads + warp/confidence update as one fused op (FP32; not RoMaV2-bit-exact).
+        self.fused_heads = False
+
+    def enable_fused_heads(self) -> None:
+        channels = self.cfg.channels
+        weight = torch.cat((self.warp_head.weight.reshape(2, channels), self.confidence_head.weight.reshape(-1, channels)))
+        self.register_buffer("head_weight", weight.detach().float().contiguous(), persistent=False)
+        self.register_buffer(
+            "head_bias", torch.cat((self.warp_head.bias, self.confidence_head.bias)).detach().float(), persistent=False
+        )
+        self.fused_heads = True
 
     def forward(
         self, f_a: Tensor, f_b: Tensor, prev_warp: Tensor, prev_confidence: Tensor, scale_factor: Tensor
@@ -92,6 +103,8 @@ class ConvRefiner(nn.Module):
 
     def _heads(self, z: Tensor, prev_warp: Tensor, prev_confidence: Tensor) -> tuple[Tensor, Tensor]:
         cfg = self.cfg
+        if self.fused_heads:
+            return ops.refiner_heads(z, self.head_weight, self.head_bias, prev_warp, prev_confidence, cfg.refine_init)
         batch, _, h, w = z.shape
         z = z.float()
         displacement_out = self.warp_head(z).permute(0, 2, 3, 1).reshape(batch, h, w, 2)

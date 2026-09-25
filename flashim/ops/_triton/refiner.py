@@ -177,3 +177,99 @@ def refiner_input(
         num_warps=num_warps,
     )
     return out.permute(0, 3, 1, 2)
+
+
+@triton.jit
+def _softplus(x):
+    # torch.nn.functional.softplus(beta=1, threshold=20)
+    return tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(tl.minimum(x, 20.0))))
+
+
+@triton.jit
+def _refiner_heads_kernel(
+    z_ptr,
+    w_ptr,
+    b_ptr,
+    prev_warp_ptr,
+    prev_conf_ptr,
+    warp_ptr,
+    conf_ptr,
+    rows,
+    inv_norm_x,
+    inv_norm_y,
+    C: tl.constexpr,
+    PREV_CONF_C: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    valid = row < rows
+    ch = tl.arange(0, C)
+    z = tl.load(z_ptr + row[:, None] * C + ch[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+    # Six FP32 dot products per pixel on CUDA cores: exact FP32 (the cuDNN 1x1 conv this
+    # replaces runs in TF32 under torch's default cudnn.allow_tf32) and cheaper than tl.dot
+    # padding 6 outputs to 16.
+    d0 = tl.sum(z * tl.load(w_ptr + 0 * C + ch)[None, :], axis=1) + tl.load(b_ptr + 0)
+    d1 = tl.sum(z * tl.load(w_ptr + 1 * C + ch)[None, :], axis=1) + tl.load(b_ptr + 1)
+    c0 = tl.sum(z * tl.load(w_ptr + 2 * C + ch)[None, :], axis=1) + tl.load(b_ptr + 2)
+    x1 = tl.sum(z * tl.load(w_ptr + 3 * C + ch)[None, :], axis=1) + tl.load(b_ptr + 3)
+    l10 = tl.sum(z * tl.load(w_ptr + 4 * C + ch)[None, :], axis=1) + tl.load(b_ptr + 4)
+    x3 = tl.sum(z * tl.load(w_ptr + 5 * C + ch)[None, :], axis=1) + tl.load(b_ptr + 5)
+    warp_x = tl.load(prev_warp_ptr + row * 2, mask=valid) + d0 * inv_norm_x
+    warp_y = tl.load(prev_warp_ptr + row * 2 + 1, mask=valid) + d1 * inv_norm_y
+    tl.store(warp_ptr + row * 2, warp_x, mask=valid)
+    tl.store(warp_ptr + row * 2 + 1, warp_y, mask=valid)
+
+    l00 = _softplus(x1) + 1e-6
+    l11 = _softplus(x3) + 1e-6
+    p0 = tl.load(prev_conf_ptr + row * PREV_CONF_C, mask=valid)
+    tl.store(conf_ptr + row * 4, p0 + c0, mask=valid)
+    if PREV_CONF_C == 4:
+        tl.store(conf_ptr + row * 4 + 1, tl.load(prev_conf_ptr + row * 4 + 1, mask=valid) + l00 * l00, mask=valid)
+        tl.store(conf_ptr + row * 4 + 2, tl.load(prev_conf_ptr + row * 4 + 2, mask=valid) + l00 * l10, mask=valid)
+        tl.store(
+            conf_ptr + row * 4 + 3,
+            tl.load(prev_conf_ptr + row * 4 + 3, mask=valid) + (l10 * l10 + l11 * l11),
+            mask=valid,
+        )
+    else:
+        tl.store(conf_ptr + row * 4 + 1, l00 * l00, mask=valid)
+        tl.store(conf_ptr + row * 4 + 2, l00 * l10, mask=valid)
+        tl.store(conf_ptr + row * 4 + 3, l10 * l10 + l11 * l11, mask=valid)
+
+
+def refiner_heads(
+    z: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    prev_warp: Tensor,
+    prev_confidence: Tensor,
+    refine_init: float,
+    *,
+    block_m: int | None = None,
+    num_warps: int = 4,
+) -> tuple[Tensor, Tensor]:
+    batch, channels, h, w = z.shape
+    rows = batch * h * w
+    if block_m is None:
+        block_m = max(16, min(128, 8192 // channels))
+    prev_warp = prev_warp.float().contiguous()
+    prev_confidence = prev_confidence.float().contiguous()
+    warp = torch.empty((batch, h, w, 2), device=z.device, dtype=torch.float32)
+    confidence = torch.empty((batch, h, w, 4), device=z.device, dtype=torch.float32)
+    _refiner_heads_kernel[(triton.cdiv(rows, block_m),)](
+        z,
+        weight.float().contiguous(),
+        bias.float().contiguous(),
+        prev_warp,
+        prev_confidence,
+        warp,
+        confidence,
+        rows,
+        1.0 / (refine_init * w),
+        1.0 / (refine_init * h),
+        C=channels,
+        PREV_CONF_C=prev_confidence.shape[-1],
+        BLOCK_M=block_m,
+        num_warps=num_warps,
+    )
+    return warp, confidence

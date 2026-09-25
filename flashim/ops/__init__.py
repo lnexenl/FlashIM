@@ -18,6 +18,7 @@ from flashim.ops.mx import (
     layernorm_quantize,
     mxfp8_scaled_mm,
 )
+from flashim.ops.refiner_heads import refiner_heads
 from flashim.ops.refiner_input import refiner_input
 from flashim.ops.rope import rope_qk
 
@@ -34,6 +35,7 @@ __all__ = [
     "layernorm_quantize",
     "local_corr",
     "mxfp8_scaled_mm",
+    "refiner_heads",
     "refiner_input",
     "reset_call_counts",
     "rope_qk",
