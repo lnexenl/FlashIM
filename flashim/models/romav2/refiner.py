@@ -9,22 +9,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from flashim import ops
+from flashim.layers import SeparableConvBlock
 from flashim.models.romav2.geometry import bhwc_grid_sample, normalized_grid
 
 
-class RefinerBlock(nn.Module):
-    """Depthwise 5x5 -> BatchNorm -> ReLU -> pointwise 1x1, under BF16 autocast. No residual."""
-
-    def __init__(self, channels: int, kernel_size: int = 5) -> None:
-        super().__init__()
-        self.conv_depthwise = nn.Conv2d(channels, channels, kernel_size, padding=kernel_size // 2, groups=channels)
-        self.norm: nn.Module = nn.BatchNorm2d(channels, momentum=0.01)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv_pointwise = nn.Conv2d(channels, channels, 1)
-
-    def forward(self, x: Tensor) -> Tensor:
-        with torch.autocast(x.device.type, torch.bfloat16):
-            return self.conv_pointwise(self.relu(self.norm(self.conv_depthwise(x))))
+def _refiner_block(channels: int) -> SeparableConvBlock:
+    """Depthwise 5x5 -> BatchNorm -> ReLU -> pointwise 1x1 under BF16 autocast, no residual."""
+    return SeparableConvBlock(channels, 5, autocast_dtype=torch.bfloat16, momentum=0.01)
 
 
 @dataclass(frozen=True)
@@ -56,8 +47,8 @@ class ConvRefiner(nn.Module):
         self.cfg = cfg
         channels = cfg.channels
         self.proj = nn.Linear(cfg.feat_dim, cfg.proj_dim)
-        self.block1 = RefinerBlock(channels)
-        self.hidden_blocks = nn.Sequential(*(RefinerBlock(channels) for _ in range(cfg.hidden_blocks)))
+        self.block1 = _refiner_block(channels)
+        self.hidden_blocks = nn.Sequential(*(_refiner_block(channels) for _ in range(cfg.hidden_blocks)))
         self.disp_emb = nn.Conv2d(2, cfg.disp_emb_dim, 1)
         self.warp_head = nn.Conv2d(channels, 2, 1)
         self.confidence_head = nn.Conv2d(channels, cfg.confidence_dim, 1)

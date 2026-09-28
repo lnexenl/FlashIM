@@ -8,10 +8,10 @@ from pathlib import Path
 import torch
 
 from flashim.engines.compile import compile_regions
+from flashim.layers import MSDeformAttn
 from flashim.models.rdd.config import RDDConfig
 from flashim.models.rdd.model import RDD
 from flashim.models.rdd.quant import PRESETS, PROTECTED
-from flashim.models.rdd.transformer import MSDeformAttn
 from flashim.platforms import Feature, platform_for
 from flashim.quant.apply import quantize_model
 from flashim.quant.calibration import CalibrationTable

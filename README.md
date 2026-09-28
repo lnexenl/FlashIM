@@ -293,6 +293,9 @@ flashim/
                triton/, tilelang/, cuda/ (JIT CUDA C++), torch_native/ (cuBLAS), external/ (sageattention,
                fused-local-corr); out-of-tree backends via the `flashim.backends` entry point
   log.py       logging (FLASHIM_LOG), dispatch tracing, profiler / NVTX ranges
+  layers/      building blocks the passes recognize by type (TransformerBlock, SeparableConvBlock,
+               DeformableEncoder, ...): a model built from them gets quantization + fused kernels without
+               model-specific code
   quant/       formats (MX), QuantizedTensor, schemes (compressed-tensors vocabulary), calibration,
                methods (StaticMXFP8Linear = ops.mxfp8_linear bound to its weight: cuBLAS MXFP8 > Triton FP8 >
                emulated reference, via normal op dispatch), fusion passes

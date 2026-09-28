@@ -16,12 +16,13 @@ import torch
 from torch import Tensor, nn
 
 from flashim import ops
+from flashim.layers import SeparableConvBlock
 from flashim.quant.formats import int8, mx
 from flashim.utils import set_submodule
 
 
 def is_separable_conv_block(module: nn.Module) -> bool:
-    return all(hasattr(module, attr) for attr in ("conv_depthwise", "norm", "relu", "conv_pointwise"))
+    return isinstance(module, SeparableConvBlock)
 
 
 def _check_block(block: nn.Module, channels_allowed: tuple[int, ...] | None = None) -> int:

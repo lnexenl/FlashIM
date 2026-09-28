@@ -12,8 +12,9 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
+from flashim.layers import TransformerBlock
 from flashim.models.romav2.geometry import imagenet_normalize
-from flashim.models.romav2.vit import Block, RopeEmbedding
+from flashim.models.romav2.vit import RopeEmbedding
 
 
 class PatchEmbed(nn.Module):
@@ -46,7 +47,7 @@ class DinoV3(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, dim))
         self.rope_embed = RopeEmbedding(dim // num_heads, base=100.0, compute_dtype=torch.float32)
         self.blocks = nn.ModuleList(
-            Block(dim, num_heads, eps=1e-5, layer_scale=True, mask_k_bias=True, rope_impl="reference")
+            TransformerBlock(dim, num_heads, eps=1e-5, layer_scale=True, mask_k_bias=True, rope_impl="reference")
             for _ in range(depth)
         )
         self.norm = nn.LayerNorm(dim, eps=1e-5)

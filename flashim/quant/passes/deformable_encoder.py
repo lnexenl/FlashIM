@@ -15,6 +15,7 @@ from __future__ import annotations
 from torch import Tensor, nn
 
 from flashim import ops
+from flashim.layers import DeformableEncoder
 from flashim.quant.methods.linear import StaticMXFP8Linear
 
 _MAIN_LINEARS = (("self_attn", "value_proj"), ("self_attn", "output_proj"), ("linear1",), ("linear2",))
@@ -29,19 +30,12 @@ def _resolve(layer: nn.Module, path: tuple[str, ...]):
 
 
 def is_deformable_encoder(module: nn.Module) -> bool:
-    """Structural match: ``layers`` of post-norm deformable encoder layers with packed value/output/FFN linears."""
-    layers = getattr(module, "layers", None)
-    if not isinstance(layers, nn.ModuleList) or len(layers) == 0:
+    """A :class:`~flashim.layers.DeformableEncoder` whose value / output / FFN linears are all static MXFP8."""
+    if not isinstance(module, DeformableEncoder) or len(module.layers) == 0:
         return False
-    for layer in layers:
-        attn = getattr(layer, "self_attn", None)
-        if attn is None or not all(hasattr(attn, n) for n in ("project_query", "n_heads", "n_levels", "n_points")):
-            return False
-        if not all(hasattr(layer, n) for n in ("norm1", "norm2")):
-            return False
-        if not all(isinstance(_resolve(layer, path), StaticMXFP8Linear) for path in _MAIN_LINEARS):
-            return False
-    return True
+    return all(
+        isinstance(_resolve(layer, path), StaticMXFP8Linear) for layer in module.layers for path in _MAIN_LINEARS
+    )
 
 
 class QuantizedDeformableEncoder(nn.Module):

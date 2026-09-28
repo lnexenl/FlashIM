@@ -17,10 +17,10 @@ to the unfused path, exactly as RoMaV2 does.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
 
 from flashim import ops
+from flashim.layers import TransformerBlock
 from flashim.quant.methods.int8_linear import StaticInt8Linear
 from flashim.quant.methods.linear import StaticMXFP8Linear
 
@@ -28,18 +28,7 @@ STATIC_LINEARS = (StaticMXFP8Linear, StaticInt8Linear)
 
 
 def is_transformer_block(module: nn.Module) -> bool:
-    attn = getattr(module, "attn", None)
-    return (
-        isinstance(getattr(module, "norm1", None), nn.LayerNorm)
-        and isinstance(getattr(module, "norm2", None), nn.LayerNorm)
-        and hasattr(module, "ls1")
-        and hasattr(module, "ls2")
-        and isinstance(getattr(module, "mlp", None), nn.Module)
-        and attn is not None
-        and hasattr(attn, "qkv")
-        and hasattr(attn, "proj")
-        and isinstance(getattr(attn, "num_heads", None), int)
-    )
+    return isinstance(module, TransformerBlock)
 
 
 class QuantizedAttention(nn.Module):
@@ -54,7 +43,7 @@ class QuantizedAttention(nn.Module):
             raise ValueError(f"head_dim must be a power of two divisible by 32, got {head_dim}")
         self.rope_impl = rope_impl
         # ``ops.sdpa`` implementation: "reference" (torch SDPA), "sage" (INT8 QK attention) or None = dispatch.
-        self.sdpa_impl: str | None = "reference"
+        self.sdpa_impl: str | None = getattr(attn, "sdpa_impl", "reference")
 
     def attend(self, qkv: Tensor, rope: tuple[Tensor, Tensor] | None) -> Tensor:
         batch, tokens, three_c = qkv.shape
@@ -74,7 +63,7 @@ class QuantizedTransformerBlock(nn.Module):
     def __init__(self, block: nn.Module, rope_impl: str | None = "reference") -> None:
         super().__init__()
         if not is_transformer_block(block):
-            raise TypeError(f"Not a structural transformer block: {type(block).__name__}")
+            raise TypeError(f"Not a flashim.layers.TransformerBlock: {type(block).__name__}")
         self.norm1, self.ls1 = block.norm1, block.ls1
         self.norm2, self.mlp, self.ls2 = block.norm2, block.mlp, block.ls2
         self.attn = QuantizedAttention(block.attn, rope_impl)

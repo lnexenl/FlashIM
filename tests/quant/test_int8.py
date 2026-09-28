@@ -109,12 +109,12 @@ def test_depthwise_int8_producer_matches_reference(channels, height, width):
 
 @pytest.mark.cuda
 def test_separable_block_and_conv1x1_wrappers():
-    from flashim.models.romav2.refiner import RefinerBlock
+    from flashim.layers import SeparableConvBlock
     from flashim.quant.methods.int8_linear import StaticInt8Conv1x1
     from flashim.quant.passes.separable_conv_block import Int8SeparableConvBlock, fold_block_batchnorm
 
     torch.manual_seed(0)
-    block = RefinerBlock(128).cuda().eval()
+    block = SeparableConvBlock(128, autocast_dtype=torch.bfloat16).cuda().eval()
     block.norm.running_mean.normal_(), block.norm.running_var.uniform_(0.5, 2)
     x = (
         (torch.randn(2, 128, 24, 24, device="cuda") * 2)

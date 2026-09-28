@@ -6,9 +6,10 @@ import torch
 from einops import rearrange
 from torch import Tensor, nn
 
+from flashim.layers import TransformerBlock
 from flashim.models.romav2.dpt import DPTHead
 from flashim.models.romav2.geometry import normalized_grid
-from flashim.models.romav2.vit import Block, RopeEmbedding
+from flashim.models.romav2.vit import RopeEmbedding
 
 
 class MatchTransformer(nn.Module):
@@ -26,7 +27,7 @@ class MatchTransformer(nn.Module):
         self.projector = nn.Linear(in_dim, dim)
         self.output_projector = nn.Linear(dim, out_dim)
         self.blocks = nn.ModuleList(
-            Block(dim, num_heads, eps=1e-6, layer_scale=False, mask_k_bias=False, rope_impl=None)
+            TransformerBlock(dim, num_heads, eps=1e-6, layer_scale=False, mask_k_bias=False, rope_impl=None)
             for _ in range(depth)
         )
         self.norm = nn.LayerNorm(dim, eps=1e-6)
