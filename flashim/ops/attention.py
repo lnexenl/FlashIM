@@ -5,8 +5,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from flashim.ops._registry import DeviceSpec, Op
-from flashim.platforms import Feature
+from flashim.ops._registry import Op
 
 
 def _rope_qk_reference(q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> tuple[Tensor, Tensor]:
@@ -32,30 +31,6 @@ def _rope_qk_reference(q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> tuple[
 
 rope_qk = Op("rope_qk", _rope_qk_reference)
 
-_FLOATS = (torch.float16, torch.bfloat16, torch.float32)
-
-
-def _triton_eligible(q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> bool:
-    if torch.is_grad_enabled() or q.ndim != 4 or k.shape != q.shape:
-        return False
-    if sin.ndim != 2 or sin.shape != cos.shape or sin.dtype != cos.dtype:
-        return False
-    if q.dtype not in _FLOATS or k.dtype not in _FLOATS or sin.dtype not in _FLOATS:
-        return False
-    # Low-precision tables require q/k already in the table dtype (no promotion).
-    if sin.dtype != torch.float32 and (q.dtype != sin.dtype or k.dtype != sin.dtype):
-        return False
-    head_dim = q.shape[-1]
-    return 0 < sin.shape[0] <= q.shape[2] and head_dim == sin.shape[1] and head_dim % 2 == 0
-
-
-@rope_qk.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_triton_eligible)
-def _rope_qk_triton(q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> tuple[Tensor, Tensor]:
-    from flashim.ops._triton.attention import rope_qk as kernel
-
-    return kernel(q, k, sin, cos)
-
-
 # -- scaled dot-product attention (non-causal, no mask) ------------------------------------------------
 
 
@@ -65,50 +40,6 @@ def _sdpa_reference(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
 
 
 sdpa = Op("sdpa", _sdpa_reference)
-
-
-def _sage_eligible(q: Tensor, k: Tensor, v: Tensor) -> bool:
-    import importlib.util
-
-    return (
-        importlib.util.find_spec("sageattention") is not None
-        and q.ndim == 4
-        and q.shape == k.shape == v.shape
-        and q.shape[-1] in (64, 128)
-        and q.dtype in (torch.float16, torch.bfloat16)
-        and q.dtype == k.dtype == v.dtype
-        and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
-    )
-
-
-# SageAttention (thu-ml; Q/K INT8 with K smoothing). Opt-in: pin with ``ops.sdpa.get("sage")`` (INT8 QK +
-# FP16 PV, FP32 accumulation) or ``"sage-fp8"`` (INT8 QK + FP8 PV).
-@sdpa.register("sage", device=DeviceSpec("cuda", min_capability=(8, 0)), priority=-1, when=_sage_eligible)
-def _sdpa_sage(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-    return _sage_sdpa(q, k, v, "fp16")
-
-
-@sdpa.register("sage-fp8", device=DeviceSpec("cuda", min_capability=(8, 9)), priority=-1, when=_sage_eligible)
-def _sdpa_sage_fp8(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-    return _sage_sdpa(q, k, v, "fp8")
-
-
-@torch.library.custom_op("flashim::sage_sdpa", mutates_args=())
-def _sage_sdpa(q: Tensor, k: Tensor, v: Tensor, variant: str) -> Tensor:
-    import sageattention
-
-    if variant == "fp8":
-        return sageattention.sageattn_qk_int8_pv_fp8_cuda(
-            q, k, v, tensor_layout="HND", is_causal=False, pv_accum_dtype="fp32+fp32"
-        )
-    return sageattention.sageattn_qk_int8_pv_fp16_cuda(
-        q, k, v, tensor_layout="HND", is_causal=False, pv_accum_dtype="fp32"
-    )
-
-
-@_sage_sdpa.register_fake
-def _(q: Tensor, k: Tensor, v: Tensor, variant: str) -> Tensor:
-    return torch.empty(q.shape, dtype=q.dtype, device=q.device)
 
 
 # -- multi-scale deformable attention (Deformable DETR core) --------------------------------------------
@@ -166,43 +97,3 @@ def _deformable_attention_reference(
 
 
 deformable_attention = Op("deformable_attention", _deformable_attention_reference)
-
-
-def _deformable_triton_eligible(value, offsets, weights, reference, spatial_shapes, softmax=False) -> bool:
-    if torch.is_grad_enabled() and any(t.requires_grad for t in (value, offsets, weights, reference)):
-        return False  # forward-only kernel
-    if value.ndim != 4 or offsets.ndim != 6 or weights.ndim != 5:
-        return False
-    return (
-        value.dtype in _FLOATS
-        and value.shape[-1] in (8, 16, 32, 64, 128)
-        and offsets.shape[3] == len(spatial_shapes)
-        and value.shape[1] == sum(h * w for h, w in spatial_shapes)
-        and offsets[0, 0].is_contiguous()
-        and weights[0, 0].is_contiguous()
-    )
-
-
-@deformable_attention.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_deformable_triton_eligible
-)
-def _deformable_attention_triton(value, offsets, weights, reference, spatial_shapes, softmax=False) -> Tensor:
-    flat = [size for shape in spatial_shapes for size in shape]
-    return _deformable_attention_kernel(value, offsets, weights, reference, flat, softmax)
-
-
-# Opaque to torch.compile (no tracing into the launcher; strided offset/weight views pass through as-is).
-@torch.library.custom_op("flashim::deformable_attention", mutates_args=())
-def _deformable_attention_kernel(
-    value: Tensor, offsets: Tensor, weights: Tensor, reference: Tensor, shapes: list[int], softmax: bool
-) -> Tensor:
-    from flashim.ops._triton.attention import deformable_attention as kernel
-
-    spatial_shapes = tuple((shapes[i], shapes[i + 1]) for i in range(0, len(shapes), 2))
-    return kernel(value, offsets, weights, reference, spatial_shapes, softmax)
-
-
-@_deformable_attention_kernel.register_fake
-def _(value, offsets, weights, reference, shapes, softmax):
-    n, queries, m, d = value.shape[0], offsets.shape[1], value.shape[2], value.shape[3]
-    return value.new_empty(n, queries, m * d)

@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from flashim.ops._registry import DeviceSpec, Op
+from flashim.ops._registry import Op
 from flashim.ops.correlation import local_corr
 
 # -- refiner input: [f_a, warp(f_b), disp_emb, local_corr] ---------------------------------------
@@ -67,27 +67,6 @@ def _refiner_input_reference(
 romav2_refiner_input = Op("romav2_refiner_input", _refiner_input_reference)
 
 
-def _refiner_input_eligible(f_a, f_b, warp, emb_weight, emb_bias, scale_factor, radius, pair=0) -> bool:
-    return (
-        f_a.dtype == f_b.dtype == warp.dtype == torch.float32
-        and f_a.is_contiguous()
-        and f_b.is_contiguous()
-        and warp.is_contiguous()
-        and f_a.shape == f_b.shape
-        and f_a.shape[-1] <= 256
-        and emb_weight.shape[0] <= 128
-        and radius <= 3
-        and f_a.numel() * 4 < 2**31
-    )
-
-
-@romav2_refiner_input.register("triton", device=DeviceSpec("cuda"), when=_refiner_input_eligible)
-def _refiner_input_triton(f_a, f_b, warp, emb_weight, emb_bias, scale_factor, radius, pair=0):
-    from flashim.ops._triton.romav2 import refiner_input as kernel
-
-    return kernel(f_a, f_a if pair > 0 else f_b, warp, emb_weight, emb_bias, scale_factor, radius, pair)
-
-
 # -- refiner heads: 1x1 warp/confidence convs + warp update + precision --------------------------
 
 
@@ -113,22 +92,3 @@ def _refiner_heads_reference(
 
 
 romav2_refiner_heads = Op("romav2_refiner_heads", _refiner_heads_reference)
-
-
-def _refiner_heads_eligible(z, weight, bias, prev_warp, prev_confidence, refine_init) -> bool:
-    return (
-        z.ndim == 4
-        and z.dtype == torch.bfloat16
-        and z.is_contiguous(memory_format=torch.channels_last)
-        and z.shape[1] in (32, 64, 128, 256, 512)
-        and tuple(weight.shape) == (6, z.shape[1])
-        and prev_confidence.shape[-1] in (1, 4)
-        and z.numel() < 2**31
-    )
-
-
-@romav2_refiner_heads.register("triton", device=DeviceSpec("cuda"), when=_refiner_heads_eligible)
-def _refiner_heads_triton(z, weight, bias, prev_warp, prev_confidence, refine_init):
-    from flashim.ops._triton.romav2 import refiner_heads as kernel
-
-    return kernel(z, weight, bias, prev_warp, prev_confidence, refine_init)

@@ -13,6 +13,9 @@ import triton.language as tl
 from torch import Tensor
 from triton.language.extra import libdevice
 
+from flashim import ops
+from flashim.ops._registry import DeviceSpec
+from flashim.platforms import Feature
 from flashim.quant.formats.mx import padded_channels
 from flashim.quant.tensor import Int8Tensor, QuantizedTensor
 
@@ -309,3 +312,44 @@ def gelu_quantize_int8(value: Tensor, scale: Tensor, approximate: str) -> Int8Te
         num_warps=4,
     )
     return Int8Tensor(out, scale)
+
+# -- registrations ---------------------------------------------------------------------------------------
+
+def _row_major(value: Tensor) -> bool:
+    return value.dtype in (torch.float16, torch.bfloat16, torch.float32) and value.is_contiguous() and value.numel() > 0
+
+
+def _layernorm_eligible(value, residual, weight, bias, eps, scale_exponent, **kwargs) -> bool:
+    return _row_major(value) and (residual is None or (residual.shape == value.shape and _row_major(residual)))
+
+
+@ops.layernorm_quantize.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_layernorm_eligible
+)
+def _layernorm_quantize_impl(value, residual, weight, bias, eps, scale_exponent, **kwargs):
+    return layernorm_quantize(value, residual, weight, bias, eps, scale_exponent.to(value.device, torch.int8), **kwargs)
+
+
+@ops.gelu_quantize.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=lambda value, *a, **k: _row_major(value)
+)
+def _gelu_quantize_impl(value: Tensor, scale_exponent: Tensor, approximate: str = "none", *, input_bias=None):
+    return gelu_quantize(value, scale_exponent.to(value.device, torch.int8), approximate, input_bias=input_bias)
+
+
+@ops.quantize_mxfp8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=lambda value, scale_exponent: _row_major(value)
+)
+def _quantize_mxfp8_impl(value: Tensor, scale_exponent: Tensor) -> QuantizedTensor:
+    return quantize_static(value, scale_exponent.to(value.device, torch.int8))
+
+
+ops.quantize_int8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=lambda value, scale: _row_major(value)
+)(quantize_int8)
+ops.layernorm_quantize_int8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_layernorm_eligible
+)(layernorm_quantize_int8)
+ops.gelu_quantize_int8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=lambda value, *a, **k: _row_major(value)
+)(gelu_quantize_int8)

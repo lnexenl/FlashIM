@@ -11,8 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from flashim.ops._registry import DeviceSpec, Op
-from flashim.platforms import Feature
+from flashim.ops._registry import Op
 from flashim.quant.tensor import QuantizedTensor, QuantizedWeight, quantize_static
 
 # -- block-scaled MXFP8 GEMM -----------------------------------------------------------------
@@ -52,29 +51,6 @@ def _mxfp8_scaled_mm_reference(
 mxfp8_scaled_mm = Op("mxfp8_scaled_mm", _mxfp8_scaled_mm_reference)
 
 
-@torch.compiler.allow_in_graph
-def _scaled_mm_cublas(a: Tensor, b_t: Tensor, a_scale: Tensor, b_scale: Tensor, bias: Tensor | None) -> Tensor:
-    # The ScalingType/SwizzleType pybind enums cannot be proxied by Dynamo, so they
-    # stay inside this allow_in_graph boundary.
-    return F.scaled_mm(
-        a,
-        b_t,
-        a_scale,
-        F.ScalingType.BlockWise1x32,
-        b_scale,
-        F.ScalingType.BlockWise1x32,
-        F.SwizzleType.SWIZZLE_32_4_4,
-        F.SwizzleType.SWIZZLE_32_4_4,
-        bias=bias,
-        output_dtype=torch.bfloat16,
-    )
-
-
-@mxfp8_scaled_mm.register("cublas", device=DeviceSpec("cuda"), requires=[Feature.MXFP8_SCALED_MM])
-def _mxfp8_scaled_mm_cublas(a, b_t, a_scale, b_scale, bias=None):
-    return _scaled_mm_cublas(a, b_t, a_scale, b_scale, bias)
-
-
 # -- static-activation FP8 GEMM for weights cuBLAS cannot take (K or N % 128 != 0) --------------
 
 
@@ -89,13 +65,6 @@ def _fp8_linear_reference(activation: QuantizedTensor, weight: QuantizedWeight, 
 
 
 fp8_linear = Op("fp8_linear", _fp8_linear_reference)
-
-
-@fp8_linear.register("triton", device=DeviceSpec("cuda", min_capability=(8, 9)), requires=[Feature.TRITON])
-def _fp8_linear_triton(activation: QuantizedTensor, weight: QuantizedWeight, bias: Tensor | None) -> Tensor:
-    from flashim.ops._triton.gemm import fp8_gemm_bf16
-
-    return fp8_gemm_bf16(activation, weight, None if bias is None else bias.float())
 
 
 # -- static INT8 GEMM (per-channel weights, per-tensor activations) ---------------------------------
@@ -113,29 +82,6 @@ def _int8_linear_reference(a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: 
 int8_linear = Op("int8_linear", _int8_linear_reference)
 
 
-def _int_mm_eligible(a, weight, a_scale, w_scale, bias) -> bool:
-    # torch._int_mm: M > 16, K and N multiples of 8 (cuBLASLt IMMA).
-    return a.shape[0] > 16 and a.shape[1] % 8 == 0 and weight.shape[0] % 8 == 0 and a.is_contiguous()
-
-
-@int8_linear.register("cublas", device=DeviceSpec("cuda", min_capability=(7, 5)), when=_int_mm_eligible)
-def _int8_linear_cublas(a, weight, a_scale, w_scale, bias):
-    out = torch._int_mm(a, weight.t()).float() * (a_scale * w_scale)
-    if bias is not None:
-        out = out + bias.float()
-    return out.to(torch.bfloat16)
-
-
-# The fused-epilogue Triton GEMM beats cuBLAS ``_int_mm`` + separate dequant passes at every shape.
-@int8_linear.register(
-    "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON], priority=1
-)
-def _int8_linear_triton(a, weight, a_scale, w_scale, bias):
-    from flashim.ops._triton.gemm import int8_gemm_bf16
-
-    return int8_gemm_bf16(a.contiguous(), weight, a_scale, w_scale, bias)
-
-
 # -- FP32 linear of a BF16 input ----------------------------------------------------------------
 
 
@@ -145,44 +91,6 @@ def _linear_fp32_reference(x: Tensor, weight: Tensor, bias: Tensor) -> Tensor:
 
 
 linear_fp32 = Op("linear_fp32", _linear_fp32_reference)
-
-
-def _linear_fp32_eligible(x: Tensor, weight: Tensor, bias: Tensor) -> bool:
-    k = x.shape[-1]
-    return (
-        x.dtype == torch.bfloat16
-        and x.is_contiguous()
-        and weight.shape[0] <= 16
-        and weight.shape[1] == k
-        and k in (16, 32, 64, 128)
-        and x.numel() < 2**31
-    )
-
-
-@linear_fp32.register("triton", device=DeviceSpec("cuda"), when=_linear_fp32_eligible)
-def _linear_fp32_triton(x: Tensor, weight: Tensor, bias: Tensor) -> Tensor:
-    from flashim.ops._triton.gemm import linear_fp32_small_n as kernel
-
-    return kernel(x, weight, bias)
-
-
-def _linear_fp32_split_eligible(x: Tensor, weight: Tensor, bias: Tensor) -> bool:
-    return (
-        x.dtype == torch.bfloat16
-        and x.is_contiguous()
-        and weight.shape[0] > 16
-        and weight.shape[1] == x.shape[-1]
-        and x.shape[-1] % 32 == 0
-        and x.numel() < 2**31
-    )
-
-
-@linear_fp32.register("triton_split", device=DeviceSpec("cuda", min_capability=(8, 0)), when=_linear_fp32_split_eligible)
-def _linear_fp32_triton_split(x: Tensor, weight: Tensor, bias: Tensor) -> Tensor:
-    """Tensor-core path: exact BF16 input, weight as two BF16 halves (~1e-5 relative error vs FP32)."""
-    from flashim.ops._triton.gemm import linear_fp32_split as kernel
-
-    return kernel(x, weight, bias)
 
 
 # -- fused MXFP8 GELU MLP -------------------------------------------------------------------------------
@@ -199,24 +107,4 @@ def _mxfp8_gelu_mlp_reference(
     return _fp8_linear_reference(quantize_static(activated, hidden_exponent), w2, None)
 
 
-mxfp8_gelu_mlp = Op("mxfp8_gelu_mlp", _mxfp8_gelu_mlp_reference, composite=True)
-
-
-def _mlp_eligible(x, w1, b1, hidden_exponent, w2) -> bool:
-    k1, hidden, n2 = x.channels, w1.out_features, w2.out_features
-    return (
-        w1.in_features == k1
-        and w2.in_features == hidden
-        and k1 in (32, 64, 128, 256)
-        and n2 in (32, 64, 128, 256)
-        and hidden % 64 == 0
-    )
-
-
-@mxfp8_gelu_mlp.register(
-    "triton", device=DeviceSpec("cuda", min_capability=(10, 0)), requires=[Feature.TRITON], when=_mlp_eligible
-)
-def _mxfp8_gelu_mlp_triton(x, w1, b1, hidden_exponent, w2):
-    from flashim.ops._triton.gemm import mxfp8_gelu_mlp as kernel
-
-    return kernel(x, w1, b1, hidden_exponent.to(x.device, torch.int8), w2)
+mxfp8_gelu_mlp = Op("mxfp8_gelu_mlp", _mxfp8_gelu_mlp_reference)

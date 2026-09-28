@@ -26,8 +26,8 @@ def _rel_rms(a, b):
 
 
 def _backend(name):
-    from flashim.ops._cuda import raco as cuda_kernel
-    from flashim.ops._triton import raco as triton_kernel
+    from flashim.backends.cuda import raco as cuda_kernel
+    from flashim.backends.triton import raco as triton_kernel
 
     if name == "cuda":
         if not cuda_kernel.available():
@@ -40,7 +40,7 @@ def _backend(name):
 @pytest.mark.parametrize("h,w", [(64, 64), (75, 101), (200, 232)])  # tile-aligned and ragged edges
 @pytest.mark.parametrize("first", [False, True])  # 12 -> 12 on a 16-wide buffer / 3 -> 12 on a 4-wide buffer
 def test_fused_resblock_matches_torch(backend, h, w, first):
-    from flashim.ops._triton import raco as fused
+    from flashim.backends.triton import raco as fused
 
     run, adapt = _backend(backend)
     model = _folded_raco()
@@ -59,8 +59,8 @@ def test_fused_resblock_matches_torch(backend, h, w, first):
 
 
 def test_cuda_and_triton_resblocks_agree():
-    from flashim.ops._cuda import raco as cuda_kernel
-    from flashim.ops._triton import raco as fused
+    from flashim.backends.cuda import raco as cuda_kernel
+    from flashim.backends.triton import raco as fused
 
     if not cuda_kernel.available():
         pytest.skip("needs nvcc")
@@ -75,7 +75,7 @@ def test_cuda_and_triton_resblocks_agree():
 
 
 def test_loader_falls_back_without_a_toolchain(monkeypatch):
-    from flashim.ops import _cuda
+    from flashim.backends import cuda as _cuda
 
     monkeypatch.setattr(_cuda, "nvcc_path", lambda: None)
     _cuda.load.cache_clear()
@@ -86,7 +86,7 @@ def test_loader_falls_back_without_a_toolchain(monkeypatch):
 
 
 def test_fused_head_matches_reflect_conv():
-    from flashim.ops._triton import raco as fused
+    from flashim.backends.triton import raco as fused
 
     model = _folded_raco()
     head = model.ranker_head[-1]

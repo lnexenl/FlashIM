@@ -8,6 +8,9 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from flashim import ops
+from flashim.ops._registry import DeviceSpec
+from flashim.platforms import Feature
 from flashim.quant.tensor import QuantizedTensor, QuantizedWeight
 
 
@@ -345,3 +348,70 @@ def mxfp8_gelu_mlp(
         num_stages=tile["num_stages"],
     )
     return out
+
+# -- registrations ---------------------------------------------------------------------------------------
+
+@ops.fp8_linear.register("triton", device=DeviceSpec("cuda", min_capability=(8, 9)), requires=[Feature.TRITON])
+def _fp8_linear_impl(activation: QuantizedTensor, weight: QuantizedWeight, bias: Tensor | None) -> Tensor:
+    return fp8_gemm_bf16(activation, weight, None if bias is None else bias.float())
+
+
+# The fused-epilogue Triton GEMM beats cuBLAS ``_int_mm`` + separate dequant passes at every shape.
+@ops.int8_linear.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON], priority=1
+)
+def _int8_linear_impl(a, weight, a_scale, w_scale, bias):
+    return int8_gemm_bf16(a.contiguous(), weight, a_scale, w_scale, bias)
+
+
+def _linear_fp32_small_n_eligible(x: Tensor, weight: Tensor, bias: Tensor) -> bool:
+    k = x.shape[-1]
+    return (
+        x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.shape[0] <= 16
+        and weight.shape[1] == k
+        and k in (16, 32, 64, 128)
+        and x.numel() < 2**31
+    )
+
+
+ops.linear_fp32.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_linear_fp32_small_n_eligible
+)(linear_fp32_small_n)
+
+
+def _linear_fp32_split_eligible(x: Tensor, weight: Tensor, bias: Tensor) -> bool:
+    return (
+        x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.shape[0] > 16
+        and weight.shape[1] == x.shape[-1]
+        and x.shape[-1] % 32 == 0
+        and x.numel() < 2**31
+    )
+
+
+# Tensor-core path: exact BF16 input, weight as two BF16 halves (~1e-5 relative error vs FP32).
+ops.linear_fp32.register(
+    "triton_split", device=DeviceSpec("cuda", min_capability=(8, 0)), requires=[Feature.TRITON],
+    when=_linear_fp32_split_eligible,
+)(linear_fp32_split)
+
+
+def _mlp_eligible(x, w1, b1, hidden_exponent, w2) -> bool:
+    k1, hidden, n2 = x.channels, w1.out_features, w2.out_features
+    return (
+        w1.in_features == k1
+        and w2.in_features == hidden
+        and k1 in (32, 64, 128, 256)
+        and n2 in (32, 64, 128, 256)
+        and hidden % 64 == 0
+    )
+
+
+@ops.mxfp8_gelu_mlp.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(10, 0)), requires=[Feature.TRITON], when=_mlp_eligible
+)
+def _mxfp8_gelu_mlp_impl(x, w1, b1, hidden_exponent, w2):
+    return mxfp8_gelu_mlp(x, w1, b1, hidden_exponent.to(x.device, torch.int8), w2)

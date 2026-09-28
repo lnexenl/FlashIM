@@ -15,6 +15,10 @@ import triton.language as tl
 from torch import Tensor
 from triton.language.extra import libdevice
 
+from flashim import ops
+from flashim.ops._registry import DeviceSpec
+from flashim.platforms import Feature
+
 
 @triton.jit
 def _load_tap_row(input_ptr, row_base, x, row_ok, x_ok, channel, CHANNELS: tl.constexpr, WIDTH: tl.constexpr,
@@ -450,3 +454,77 @@ def depthwise5x5_relu_pointwise_int8(
         num_warps=num_warps,
     )
     return out.permute(0, 3, 1, 2)
+
+# -- registrations ---------------------------------------------------------------------------------------
+
+def _depthwise_eligible(value: Tensor, weight: Tensor, bias: Tensor, *_) -> bool:
+    return (
+        value.ndim == 4
+        and value.shape[1] in (32, 128, 512)
+        and value.is_contiguous(memory_format=torch.channels_last)
+        and tuple(weight.shape) == (25, value.shape[1])
+    )
+
+
+ops.depthwise5x5_relu_mxfp8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_depthwise_eligible
+)(depthwise5x5_relu_mxfp8)
+ops.depthwise5x5_relu_int8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_depthwise_eligible
+)(depthwise5x5_relu_int8)
+
+
+def _dw_pw_eligible(value: Tensor, dw_weight: Tensor, dw_bias: Tensor, pw_weight: Tensor, pw_bias: Tensor) -> bool:
+    channels = value.shape[1] if value.ndim == 4 else 0
+    return (
+        channels in (16, 32, 64)
+        and value.is_contiguous(memory_format=torch.channels_last)
+        and tuple(dw_weight.shape) == (25, channels)
+        and tuple(pw_weight.shape) == (channels, channels)
+        and pw_weight.dtype == torch.bfloat16
+        and pw_weight.is_contiguous()
+        and (value.numel() + 128 * channels) < 2**31
+    )
+
+
+ops.depthwise5x5_relu_pointwise.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_dw_pw_eligible
+)(depthwise5x5_relu_pointwise)
+
+
+def _mxfp8_block_eligible(value, dw_weight, dw_bias, pw_weight, pw_scale_swizzled, pw_scale_u8, pw_bias) -> bool:
+    return (
+        value.ndim == 4
+        and value.shape[1] == 128
+        and value.is_contiguous(memory_format=torch.channels_last)
+        and tuple(dw_weight.shape) == (25, 128)
+        and tuple(pw_weight.shape) == (128, 128)
+        and pw_weight.dtype == torch.float8_e4m3fn
+        and pw_scale_u8.dtype == torch.uint8
+        and tuple(pw_scale_u8.shape) == (128, 4)
+    )
+
+
+@ops.depthwise5x5_relu_pointwise_mxfp8.register(
+    "triton_fused", device=DeviceSpec("cuda", min_capability=(10, 0)), requires=[Feature.TRITON],
+    when=_mxfp8_block_eligible,
+)
+def _depthwise5x5_relu_pointwise_mxfp8_impl(value, dw_weight, dw_bias, pw_weight, pw_scale_swizzled, pw_scale_u8, pw_bias):
+    return depthwise5x5_relu_pointwise_mxfp8(value, dw_weight, dw_bias, pw_weight, pw_scale_u8, pw_bias)
+
+
+def _int8_block_eligible(value, dw_weight, dw_bias, pw_weight, pw_wscale, pw_bias, scale) -> bool:
+    return (
+        value.ndim == 4
+        and value.shape[1] == 128
+        and value.is_contiguous(memory_format=torch.channels_last)
+        and tuple(dw_weight.shape) == (25, 128)
+        and tuple(pw_weight.shape) == (128, 128)
+        and pw_weight.dtype == torch.int8
+    )
+
+
+ops.depthwise5x5_relu_pointwise_int8.register(
+    "triton_fused", device=DeviceSpec("cuda", min_capability=(8, 0)), requires=[Feature.TRITON],
+    when=_int8_block_eligible,
+)(depthwise5x5_relu_pointwise_int8)

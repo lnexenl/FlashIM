@@ -7,8 +7,8 @@ The library only emits records; it installs no handler unless asked. Opt in with
     FLASHIM_LOG=info                 # everything at INFO
     FLASHIM_LOG=info,ops=debug       # plus op dispatch decisions (first use of each impl, rejection reasons)
 
-Subsystems: ``flashim.ops`` (dispatch), ``flashim.ops._cuda`` (JIT builds), ``flashim.platforms``,
-``flashim.quant``, ``flashim.models.<name>``.
+Subsystems: ``flashim.ops`` (dispatch), ``flashim.backends`` (backend loading, CUDA JIT builds),
+``flashim.platforms``, ``flashim.quant``, ``flashim.models.<name>``.
 
 Nothing here may run inside ``torch.compile`` tracing (a logger call there graph-breaks or is dropped): callers
 guard with ``torch.compiler.is_compiling()``, and :func:`warn_once` does so itself.

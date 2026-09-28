@@ -9,6 +9,10 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from flashim import ops
+from flashim.ops._registry import DeviceSpec
+from flashim.platforms import Feature
+
 
 @triton.jit
 def _kde_kernel(x_ptr, out_ptr, n, neg_scale_log2, D: tl.constexpr, DP: tl.constexpr,
@@ -41,3 +45,14 @@ def kde_density(x: Tensor, std: float = 0.1, *, block_m: int = 64, block_n: int 
         num_warps=num_warps,
     )
     return out
+
+# -- registrations ---------------------------------------------------------------------------------------
+
+def _eligible(x: Tensor, std: float = 0.1) -> bool:
+    return x.ndim == 2 and 1 <= x.shape[1] <= 8 and x.shape[0] > 0
+
+
+@ops.kde_density.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible)
+def _kde_density_impl(x: Tensor, std: float = 0.1) -> Tensor:
+    """Tiled FP32 evaluation with no ``N x N`` intermediate; returns FP16 like the reference."""
+    return kde_density(x, std).half()

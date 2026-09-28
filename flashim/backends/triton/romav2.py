@@ -18,6 +18,10 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from flashim import ops
+from flashim.ops._registry import DeviceSpec
+from flashim.platforms import Feature
+
 
 @triton.jit
 def _refiner_input_kernel(
@@ -282,3 +286,42 @@ def refiner_heads(
         num_warps=num_warps,
     )
     return warp, confidence
+
+# -- registrations ---------------------------------------------------------------------------------------
+
+def _refiner_input_eligible(f_a, f_b, warp, emb_weight, emb_bias, scale_factor, radius, pair=0) -> bool:
+    return (
+        f_a.dtype == f_b.dtype == warp.dtype == torch.float32
+        and f_a.is_contiguous()
+        and f_b.is_contiguous()
+        and warp.is_contiguous()
+        and f_a.shape == f_b.shape
+        and f_a.shape[-1] <= 256
+        and emb_weight.shape[0] <= 128
+        and radius <= 3
+        and f_a.numel() * 4 < 2**31
+    )
+
+
+@ops.romav2_refiner_input.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_refiner_input_eligible
+)
+def _refiner_input_impl(f_a, f_b, warp, emb_weight, emb_bias, scale_factor, radius, pair=0):
+    return refiner_input(f_a, f_a if pair > 0 else f_b, warp, emb_weight, emb_bias, scale_factor, radius, pair)
+
+
+def _refiner_heads_eligible(z, weight, bias, prev_warp, prev_confidence, refine_init) -> bool:
+    return (
+        z.ndim == 4
+        and z.dtype == torch.bfloat16
+        and z.is_contiguous(memory_format=torch.channels_last)
+        and z.shape[1] in (32, 64, 128, 256, 512)
+        and tuple(weight.shape) == (6, z.shape[1])
+        and prev_confidence.shape[-1] in (1, 4)
+        and z.numel() < 2**31
+    )
+
+
+ops.romav2_refiner_heads.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_refiner_heads_eligible
+)(refiner_heads)

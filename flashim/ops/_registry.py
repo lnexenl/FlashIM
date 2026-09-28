@@ -180,6 +180,13 @@ class Op:
         available = [impl for impl in self.impls if impl.available(platform)]
         return sorted(available, key=lambda i: (-i.priority, i.device.span, i.order))
 
+    def _unknown_impl(self, name: str) -> str:
+        from flashim.backends import BACKENDS, LOADED
+
+        missing = [f"{b.name} (needs {', '.join(b.packages)})" for b in BACKENDS if b.name not in LOADED]
+        hint = f"; backends not loaded: {', '.join(missing)}" if missing else ""
+        return f"Op {self.name!r} has no impl {name!r} (registered: {[i.name for i in self.impls]}){hint}"
+
     def _platform(self, args: tuple, kwargs: dict) -> Platform:
         return platform_for(_first_device(args) or _first_device(kwargs.values()) or torch.device("cpu"))
 
@@ -207,7 +214,7 @@ class Op:
             for impl in self.impls:
                 if impl.name == forced:
                     return impl.name, impl.fn
-            raise ValueError(f"Op {self.name!r} has no impl {forced!r}")
+            raise ValueError(self._unknown_impl(forced))
         for impl in self.candidates(platform):
             if impl.when is None or impl.when(*args, **kwargs):
                 return impl.name, impl.fn
@@ -261,7 +268,7 @@ class Op:
         else:
             impl = next((i for i in self.impls if i.name == name), None)
             if impl is None:
-                raise ValueError(f"Op {self.name!r} has no impl {name!r}")
+                raise ValueError(self._unknown_impl(name))
 
         def pinned(*args, **kwargs):
             if self.name in _CONFIG.forced or self.name in _CONFIG.disabled:

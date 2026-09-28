@@ -251,8 +251,8 @@ still has no like-for-like counterpart. The port started at 88.8 ms; what moved 
 - **BatchNorm folding** (exact) and a **bf16 detector trunk + ranker** under `compile`.
 - **Fused ranker blocks**: each residual block is one kernel (input read once, output written once, intermediate kept on
   chip) plus a fused 5x5 reflect head. Three implementations of the same block, all agreeing to ~1e-5 relative, per
-  12-channel block at 1024x1024: unfused torch/Inductor ~0.33 ms, Triton 0.237 ms (`ops/_triton/raco.py`; per-tile
-  L1/L2 scratch + barriers), **CUDA C++ 0.175 ms** (`ops/_cuda/raco_resblock.cu`, used by default). The CUDA kernel is
+  12-channel block at 1024x1024: unfused torch/Inductor ~0.33 ms, Triton 0.237 ms (`backends/triton/raco.py`; per-tile
+  L1/L2 scratch + barriers), **CUDA C++ 0.175 ms** (`backends/cuda/csrc/raco_resblock.cu`, used by default). The CUDA kernel is
   an implicit GEMM with `mma.sync.m16n8k16`: A-fragments are `ldmatrix`-ed straight from the NHWC input/intermediate
   tile in shared memory (no im2col), 28 KB of shared memory so several blocks fit per SM, shortcut as a tenth tap. It is
   JIT-built with `nvcc` on first use (cached in `~/.cache/flashim/cuda`, pure CUDA with no torch headers) and falls back
@@ -284,10 +284,15 @@ provider wants their pinned `libnvinfer.so.10`, so engines were built and valida
 
 ```
 flashim/
-  platforms/   device + feature detection (triton, fp8, mxfp8 scaled_mm, ...)
-  ops/         every op = torch reference + optional per-platform impls (Triton, cuBLAS, fused_local_corr)
+  platforms/   vendor-aware device detection: dispatch key, arch, ISA features (tma, wgmma, tcgen05, fp8,
+               mxfp8 scaled_mm, ...), toolchains (triton, tilelang, nvcc); pluggable per device type
+  ops/         op declarations: signature + torch reference (the correctness oracle and fallback);
                files by computation (attention, conv, correlation, density, gemm, quantize);
-               model-specific ops in a file named after the model (romav2.py); _triton/ mirrors it
+               model-specific ops in a file named after the model (romav2.py, aliked.py)
+  backends/    optimized impls, one package per kernel language / library, mirroring ops/ file names:
+               triton/, tilelang/, cuda/ (JIT CUDA C++), torch_native/ (cuBLAS), external/ (sageattention,
+               fused-local-corr); out-of-tree backends via the `flashim.backends` entry point
+  log.py       logging (FLASHIM_LOG), dispatch tracing, profiler / NVTX ranges
   quant/       formats (MX), QuantizedTensor, schemes (compressed-tensors vocabulary), calibration,
                methods (StaticMXFP8Linear), kernels (cuBLAS MXFP8 > Triton FP8 > emulation), fusion passes
   engines/     region torch.compile, experimental CUDA-graph runner

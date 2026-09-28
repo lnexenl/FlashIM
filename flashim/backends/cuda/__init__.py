@@ -1,6 +1,6 @@
 """CUDA C++ kernels, JIT-compiled with ``nvcc`` on first use.
 
-Sources live next to this file; each is built into a shared library cached under ``~/.cache/flashim/cuda`` (keyed by a
+Sources live in ``csrc/``; each is built into a shared library cached under ``~/.cache/flashim/cuda`` (keyed by a
 hash of the source, the target architecture and the compiler), and launched through ``ctypes`` on PyTorch's current
 stream — no torch C++ headers, so no dependence on the host compiler's compatibility with them. Every CUDA kernel has a
 Triton/torch fallback: :func:`load` returns ``None`` (with one logged warning) when there is no toolchain or the build
@@ -22,7 +22,7 @@ import torch
 from flashim.platforms.nvidia import nvcc_path
 
 logger = logging.getLogger(__name__)
-_SOURCE_DIR = Path(__file__).parent
+_SOURCE_DIR = Path(__file__).parent / "csrc"
 _FLAGS = ("-O3", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", "-allow-unsupported-compiler")
 
 

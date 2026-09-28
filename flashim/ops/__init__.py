@@ -1,8 +1,8 @@
-"""FlashIM ops: each has a torch reference plus optional per-platform implementations.
+"""FlashIM ops: declarations (signature + torch reference); optimized impls live in :mod:`flashim.backends`.
 
 Files group ops by what they compute (``attention``, ``conv``, ``correlation``, ``density``,
-``gemm``, ``quantize``); ops only one model uses live in a file named after it (``romav2``)
-and carry its name as a prefix. ``_triton/`` mirrors the same layout.
+``gemm``, ``quantize``); ops only one model uses live in a file named after it (``romav2``, ``aliked``)
+and carry its name as a prefix. Each backend package mirrors the same file names.
 """
 
 from flashim.ops._registry import (
@@ -70,3 +70,8 @@ __all__ = [
     "sdpa",
     "set_strict",
 ]
+
+# Last: backends register their impls into the ops above.
+from flashim import backends
+
+backends.load()

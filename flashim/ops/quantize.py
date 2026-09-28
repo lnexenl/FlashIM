@@ -3,20 +3,11 @@ linear writes its E4M3 input directly."""
 
 from __future__ import annotations
 
-import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from flashim.ops._registry import DeviceSpec, Op
-from flashim.platforms import Feature
+from flashim.ops._registry import Op
 from flashim.quant.tensor import Int8Tensor, QuantizedTensor, quantize_int8_static, quantize_static
-
-_TRITON_FLOATS = (torch.float16, torch.bfloat16, torch.float32)
-
-
-def _cuda_row_major(value: Tensor) -> bool:
-    return value.dtype in _TRITON_FLOATS and value.is_contiguous() and value.numel() > 0
-
 
 # -- LayerNorm (+ residual) -> static quantize ------------------------------------------
 
@@ -53,21 +44,6 @@ def _layernorm_quantize_reference(
 layernorm_quantize = Op("layernorm_quantize", _layernorm_quantize_reference)
 
 
-def _layernorm_quantize_eligible(value, residual, weight, bias, eps, scale_exponent, **kwargs) -> bool:
-    return _cuda_row_major(value) and (
-        residual is None or (residual.shape == value.shape and _cuda_row_major(residual))
-    )
-
-
-@layernorm_quantize.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_layernorm_quantize_eligible
-)
-def _layernorm_quantize_triton(value, residual, weight, bias, eps, scale_exponent, **kwargs):
-    from flashim.ops._triton.quantize import layernorm_quantize as kernel
-
-    return kernel(value, residual, weight, bias, eps, scale_exponent.to(value.device, torch.int8), **kwargs)
-
-
 # -- GELU -> static quantize ---------------------------------------------------------------
 
 
@@ -85,18 +61,6 @@ def _gelu_quantize_reference(
 gelu_quantize = Op("gelu_quantize", _gelu_quantize_reference)
 
 
-@gelu_quantize.register(
-    "triton",
-    device=DeviceSpec("cuda"),
-    requires=[Feature.TRITON],
-    when=lambda value, *args, **kwargs: _cuda_row_major(value),
-)
-def _gelu_quantize_triton(value: Tensor, scale_exponent: Tensor, approximate: str = "none", *, input_bias=None):
-    from flashim.ops._triton.quantize import gelu_quantize as kernel
-
-    return kernel(value, scale_exponent.to(value.device, torch.int8), approximate, input_bias=input_bias)
-
-
 # -- plain static quantize ---------------------------------------------------------------------------
 
 
@@ -108,18 +72,6 @@ def _quantize_static_reference(value: Tensor, scale_exponent: Tensor) -> Quantiz
 quantize_mxfp8 = Op("quantize_mxfp8", _quantize_static_reference)
 
 
-@quantize_mxfp8.register(
-    "triton",
-    device=DeviceSpec("cuda"),
-    requires=[Feature.TRITON],
-    when=lambda value, scale_exponent: _cuda_row_major(value),
-)
-def _quantize_static_triton(value: Tensor, scale_exponent: Tensor) -> QuantizedTensor:
-    from flashim.ops._triton.quantize import quantize_static as kernel
-
-    return kernel(value, scale_exponent.to(value.device, torch.int8))
-
-
 # -- INT8 producers: static per-tensor FP32 scale ---------------------------------------------------
 
 
@@ -129,15 +81,6 @@ def _quantize_int8_reference(value: Tensor, scale: Tensor) -> Int8Tensor:
 
 
 quantize_int8 = Op("quantize_int8", _quantize_int8_reference)
-
-
-@quantize_int8.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=lambda value, scale: _cuda_row_major(value)
-)
-def _quantize_int8_triton(value: Tensor, scale: Tensor) -> Int8Tensor:
-    from flashim.ops._triton.quantize import quantize_int8 as kernel
-
-    return kernel(value, scale)
 
 
 def _layernorm_quantize_int8_reference(
@@ -155,16 +98,7 @@ def _layernorm_quantize_int8_reference(
     return quantize_int8_static(normalized, scale)
 
 
-layernorm_quantize_int8 = Op("layernorm_quantize_int8", _layernorm_quantize_int8_reference, composite=True)
-
-
-@layernorm_quantize_int8.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_layernorm_quantize_eligible
-)
-def _layernorm_quantize_int8_triton(value, residual, weight, bias, eps, scale):
-    from flashim.ops._triton.quantize import layernorm_quantize_int8 as kernel
-
-    return kernel(value, residual, weight, bias, eps, scale)
+layernorm_quantize_int8 = Op("layernorm_quantize_int8", _layernorm_quantize_int8_reference)
 
 
 def _gelu_quantize_int8_reference(value: Tensor, scale: Tensor, approximate: str = "none") -> Int8Tensor:
@@ -172,16 +106,4 @@ def _gelu_quantize_int8_reference(value: Tensor, scale: Tensor, approximate: str
     return quantize_int8_static(F.gelu(value, approximate=approximate), scale)
 
 
-gelu_quantize_int8 = Op("gelu_quantize_int8", _gelu_quantize_int8_reference, composite=True)
-
-
-@gelu_quantize_int8.register(
-    "triton",
-    device=DeviceSpec("cuda"),
-    requires=[Feature.TRITON],
-    when=lambda value, *args, **kwargs: _cuda_row_major(value),
-)
-def _gelu_quantize_int8_triton(value: Tensor, scale: Tensor, approximate: str = "none"):
-    from flashim.ops._triton.quantize import gelu_quantize_int8 as kernel
-
-    return kernel(value, scale, approximate)
+gelu_quantize_int8 = Op("gelu_quantize_int8", _gelu_quantize_int8_reference)

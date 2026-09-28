@@ -8,8 +8,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from flashim.ops._registry import DeviceSpec, Op
-from flashim.platforms import Feature
+from flashim.ops._registry import Op
 
 
 def _kde_density_reference(x: Tensor, std: float = 0.1) -> Tensor:
@@ -19,15 +18,3 @@ def _kde_density_reference(x: Tensor, std: float = 0.1) -> Tensor:
 
 
 kde_density = Op("kde_density", _kde_density_reference)
-
-
-def _eligible(x: Tensor, std: float = 0.1) -> bool:
-    return x.ndim == 2 and 1 <= x.shape[1] <= 8 and x.shape[0] > 0
-
-
-@kde_density.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible)
-def _kde_density_triton(x: Tensor, std: float = 0.1) -> Tensor:
-    """Tiled FP32 evaluation with no ``N x N`` intermediate; returns FP16 like the reference."""
-    from flashim.ops._triton.density import kde_density as kernel
-
-    return kernel(x, std).half()

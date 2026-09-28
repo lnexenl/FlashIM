@@ -111,13 +111,13 @@ class RaCo(nn.Module):
 
     def use_fused_ranker(self, backend: str = "auto") -> None:
         """Run the ranker's residual blocks as fused kernels (one read + one write of the activation per block instead
-        of ~5 passes) on CUDA with batch size 1. ``backend``: ``"cuda"`` (CUDA C++, ``ops/_cuda/raco_resblock.cu``, JIT
-        built with nvcc), ``"triton"`` (``ops/_triton/raco.py``) or ``"auto"`` (CUDA when it builds, else Triton). Needs
+        of ~5 passes) on CUDA with batch size 1. ``backend``: ``"cuda"`` (CUDA C++, ``backends/cuda/csrc/raco_resblock.cu``, JIT
+        built with nvcc), ``"triton"`` (``backends/triton/raco.py``) or ``"auto"`` (CUDA when it builds, else Triton). Needs
         BatchNorm folded (:func:`~flashim.models.raco.fuse.fold_batchnorm`); the original ``ranker_head`` stays as the
         fallback. Faster than the compiled BF16 ranker and closer to FP32 (99.8% of the selected keypoints identical
         vs 99.6%)."""
-        from flashim.ops._cuda import raco as cuda_kernel
-        from flashim.ops._triton import raco as fused
+        from flashim.backends.cuda import raco as cuda_kernel
+        from flashim.backends.triton import raco as fused
 
         if backend not in ("auto", "cuda", "triton"):
             raise ValueError(f"Unknown backend {backend!r}")
@@ -137,7 +137,7 @@ class RaCo(nn.Module):
         self._fused_ranker = (packs, fused.pack_head(self.ranker_head[-1]), cuda_kernel.resblock if use_cuda else fused.resblock)
 
     def _fused_ranker_map(self, image: Tensor) -> Tensor:
-        from flashim.ops._triton import raco as fused
+        from flashim.backends.triton import raco as fused
 
         packs, head, resblock = self._fused_ranker
         h, w = image.shape[-2:]

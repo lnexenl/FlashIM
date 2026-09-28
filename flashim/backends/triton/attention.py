@@ -10,6 +10,10 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from flashim import ops
+from flashim.ops._registry import DeviceSpec
+from flashim.platforms import Feature
+
 
 @triton.jit
 def _rope_qk_kernel(
@@ -265,3 +269,62 @@ def deformable_attention(
         num_warps=DEFORMABLE_TILE["num_warps"],
     )
     return out
+
+# -- registrations ---------------------------------------------------------------------------------------
+
+_FLOATS = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _rope_eligible(q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> bool:
+    if torch.is_grad_enabled() or q.ndim != 4 or k.shape != q.shape:
+        return False
+    if sin.ndim != 2 or sin.shape != cos.shape or sin.dtype != cos.dtype:
+        return False
+    if q.dtype not in _FLOATS or k.dtype not in _FLOATS or sin.dtype not in _FLOATS:
+        return False
+    # Low-precision tables require q/k already in the table dtype (no promotion).
+    if sin.dtype != torch.float32 and (q.dtype != sin.dtype or k.dtype != sin.dtype):
+        return False
+    head_dim = q.shape[-1]
+    return 0 < sin.shape[0] <= q.shape[2] and head_dim == sin.shape[1] and head_dim % 2 == 0
+
+
+ops.rope_qk.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_rope_eligible)(rope_qk)
+
+
+def _deformable_eligible(value, offsets, weights, reference, spatial_shapes, softmax=False) -> bool:
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (value, offsets, weights, reference)):
+        return False  # forward-only kernel
+    if value.ndim != 4 or offsets.ndim != 6 or weights.ndim != 5:
+        return False
+    return (
+        value.dtype in _FLOATS
+        and value.shape[-1] in (8, 16, 32, 64, 128)
+        and offsets.shape[3] == len(spatial_shapes)
+        and value.shape[1] == sum(h * w for h, w in spatial_shapes)
+        and offsets[0, 0].is_contiguous()
+        and weights[0, 0].is_contiguous()
+    )
+
+
+@ops.deformable_attention.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_deformable_eligible
+)
+def _deformable_attention_impl(value, offsets, weights, reference, spatial_shapes, softmax=False) -> Tensor:
+    flat = [size for shape in spatial_shapes for size in shape]
+    return _deformable_attention_op(value, offsets, weights, reference, flat, softmax)
+
+
+# Opaque to torch.compile (no tracing into the launcher; strided offset/weight views pass through as-is).
+@torch.library.custom_op("flashim::deformable_attention", mutates_args=())
+def _deformable_attention_op(
+    value: Tensor, offsets: Tensor, weights: Tensor, reference: Tensor, shapes: list[int], softmax: bool
+) -> Tensor:
+    spatial_shapes = tuple((shapes[i], shapes[i + 1]) for i in range(0, len(shapes), 2))
+    return deformable_attention(value, offsets, weights, reference, spatial_shapes, softmax)
+
+
+@_deformable_attention_op.register_fake
+def _(value, offsets, weights, reference, shapes, softmax):
+    n, queries, m, d = value.shape[0], offsets.shape[1], value.shape[2], value.shape[3]
+    return value.new_empty(n, queries, m * d)

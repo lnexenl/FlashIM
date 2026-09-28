@@ -1,8 +1,8 @@
-"""RaCo's fused residual block as a CUDA C++ kernel (``raco_resblock.cu``).
+"""RaCo's fused residual block as a CUDA C++ kernel (``csrc/raco_resblock.cu``).
 
 Implicit GEMM with ``mma.sync.m16n8k16`` (bf16 -> fp32): the A-fragments are ``ldmatrix``-ed straight from the NHWC
 input / intermediate tile in shared memory (no im2col), the intermediate never leaves the SM, the 1x1 shortcut is a
-tenth tap. 0.175 ms per 12-channel block at 1024x1024 vs 0.237 ms for the Triton kernel (``_triton/raco.py``, same
+tenth tap. 0.175 ms per 12-channel block at 1024x1024 vs 0.237 ms for the Triton kernel (``backends/triton/raco.py``, same
 math and layout) and ~0.33 ms unfused; results agree with the Triton kernel to ~1e-5 relative.
 """
 
@@ -13,7 +13,7 @@ import ctypes
 import torch
 from torch import Tensor
 
-from flashim.ops._cuda import load
+from flashim.backends.cuda import load
 
 BLOCKS_PER_SM = 6
 

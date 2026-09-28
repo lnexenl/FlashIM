@@ -16,8 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from flashim.ops._registry import DeviceSpec, Op
-from flashim.platforms import Feature
+from flashim.ops._registry import Op
 from flashim.quant.tensor import Int8Tensor, quantize_int8_static
 
 
@@ -80,25 +79,13 @@ def _deform_patches_int8_reference(x: Tensor, offset: Tensor, kernel_size: int, 
 deform_patches_int8 = Op("deform_patches_int8", _deform_patches_int8_reference)
 
 
-def _dcn_eligible(x: Tensor, offset: Tensor, kernel_size: int, padding: int, scale: Tensor) -> bool:
-    # x's layout doesn't matter: the Triton impl converts to channels-last itself (coalesced channel gather).
-    return offset.is_contiguous() and x.dtype == offset.dtype == torch.float32
-
-
-@deform_patches_int8.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_dcn_eligible)
-def _deform_patches_int8_triton(x: Tensor, offset: Tensor, kernel_size: int, padding: int, scale: Tensor) -> Int8Tensor:
-    from flashim.ops._triton.aliked import deform_patches_int8 as kernel
-
-    return kernel(x, offset, kernel_size, padding, scale)
-
-
 def _multiscale_fuse_reference(
     f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, head_weight: Tensor | None = None, *, normalize: bool = True
 ) -> tuple[Tensor | None, Tensor | None]:
     """ALIKED's / RaCo's multi-scale feature fusion: ``fused = cat([f1, up(f2), up(f3), up(f4)])`` (bilinear,
     ``align_corners=True``, to ``f1``'s size), then ``head = selu(conv1x1(fused.float(), head_weight))`` (the score
     head's first layer, FP32; ``head_weight`` ``[8, 4C]``) and ``feature_map = F.normalize(fused, p=2, dim=1)`` in
-    ``f1``'s dtype. Either output can be skipped. See ``ops/_triton/aliked_fuse.py`` for the fused kernel."""
+    ``f1``'s dtype. Either output can be skipped. See ``backends/triton/aliked.py`` for the fused kernel."""
     size = f1.shape[-2:]
     upsampled = [F.interpolate(f.float(), size=size, mode="bilinear", align_corners=True) for f in (f2, f3, f4)]
     fused = torch.cat([f1.float(), *upsampled], dim=1)
@@ -107,19 +94,3 @@ def _multiscale_fuse_reference(
 
 
 multiscale_fuse = Op("multiscale_fuse", _multiscale_fuse_reference)
-
-
-def _multiscale_fuse_eligible(
-    f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, head_weight: Tensor | None = None, *, normalize: bool = True
-) -> bool:
-    ok = f1.shape[0] == 1 and f1.shape[1] <= 32  # batch size 1 (the sparse extract contract); dim // 4 <= 32
-    return ok and (head_weight is None or (head_weight.dtype == torch.float32 and head_weight.is_contiguous()))
-
-
-@multiscale_fuse.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_multiscale_fuse_eligible)
-def _multiscale_fuse_triton(
-    f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, head_weight: Tensor | None = None, *, normalize: bool = True
-) -> tuple[Tensor | None, Tensor | None]:
-    from flashim.ops._triton.aliked_fuse import multiscale_fuse as kernel
-
-    return kernel(f1, f2, f3, f4, head_weight, normalize=normalize)
