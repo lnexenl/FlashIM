@@ -26,6 +26,7 @@ from flashim.models.romav2.geometry import (
 )
 from flashim.models.romav2.matcher import Matcher
 from flashim.models.romav2.refiner import Refiners
+from flashim.platforms import default_device
 from flashim.types import DenseMatchResult
 
 ImageLike = str | Path | Image.Image | np.ndarray | Tensor
@@ -49,6 +50,11 @@ def _resize_state(warp: Tensor, confidence: Tensor, size: tuple[int, int], zero_
         confidence[..., 1:] = 0.0
     confidence = bhwc_interpolate(confidence, size=size, mode="bilinear", align_corners=False)
     return warp, confidence
+
+
+def _is_hr_entry(stages: list, stage: int, stride: int) -> bool:
+    """First refiner of the HR stage: its incoming precision deltas must be reset."""
+    return len(stages) > 1 and stage == 1 and stride == 4
 
 
 def load_image(img: ImageLike, device: torch.device) -> Tensor:
@@ -87,11 +93,6 @@ def prepare_pair(
     return (*lr, resize(a, setting.h_hr, setting.w_hr), resize(b, setting.h_hr, setting.w_hr))
 
 
-def _kde(x: Tensor, std: float = 0.1) -> Tensor:
-    x = x.half()
-    return (-(torch.cdist(x, x) ** 2) / (2 * std**2)).exp().sum(dim=-1)
-
-
 class RoMaV2(nn.Module):
     """``f`` (DINOv3) -> ``matcher`` (MV-ViT + DPT) -> ``refiners`` at strides 4/2/1.
 
@@ -112,6 +113,11 @@ class RoMaV2(nn.Module):
         # sample(): fused FP32 KDE (no N x N matrix) and matches/precision built only for drawn
         # candidates. Same RNG calls in the same order; densities differ from RoMaV2's FP16 KDE.
         self.fast_sampling = True
+        # Filled in by ``load_romav2``.
+        self.preset: str | None = None
+        self.engine: str | None = None
+        self.quant_report = None
+        self.calibration_metadata: dict[str, str] | None = None
         self.apply_setting(self.config.setting)
 
     @classmethod
@@ -122,7 +128,7 @@ class RoMaV2(nn.Module):
         device: torch.device | str | None = None,
         state_dict: dict[str, Tensor] | None = None,
     ) -> RoMaV2:
-        device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        device = torch.device(device or default_device())
         with torch.device("meta"):
             model = cls(config)
         state = state_dict if state_dict is not None else weights.load_state_dict("cpu")
@@ -142,6 +148,14 @@ class RoMaV2(nn.Module):
                 raise ValueError(f"Unknown setting {setting!r}; choose from {sorted(SETTINGS)}")
             setting = SETTINGS[setting]
         self.setting = setting
+
+    def _scale_factor(self, img: Tensor) -> Tensor:
+        """``(W / anchor_W, H / anchor_H)`` of a stage's images, for the displacement embedding."""
+        _, _, height, width = img.shape
+        scale_factor = torch.empty(2, device=img.device, dtype=img.dtype)
+        scale_factor[0].fill_(width / self.config.anchor_width)
+        scale_factor[1].fill_(height / self.config.anchor_height)
+        return scale_factor
 
     def _fine_features(self, img_a: Tensor, img_b: Tensor) -> tuple[dict[int, Tensor], dict[int, Tensor]]:
         if not self.config.batch_refiner_features or img_a.shape != img_b.shape:
@@ -177,14 +191,12 @@ class RoMaV2(nn.Module):
                 stages = []
             for stage, (img_a, img_b) in enumerate(stages):
                 _, _, height, width = img_a.shape
-                scale_factor = torch.empty(2, device=img_a.device, dtype=img_a.dtype)
-                scale_factor[0].fill_(width / self.config.anchor_width)
-                scale_factor[1].fill_(height / self.config.anchor_height)
+                scale_factor = self._scale_factor(img_a)
                 feats_a, feats_b = self._fine_features(img_a, img_b)
                 for stride_key, refiner in self.refiners.items():
                     stride = int(stride_key)
                     size = (height // stride, width // stride)
-                    zero_precision = len(stages) > 1 and stride == 4 and stage == 1
+                    zero_precision = _is_hr_entry(stages, stage, stride)
                     warp_ab, conf_ab = _resize_state(warp_ab, conf_ab, size, zero_precision)
                     warp_ab, conf_ab = refiner(feats_a[stride], feats_b[stride], warp_ab, conf_ab, scale_factor)
                     preds[f"refiner_{stride}_AB"] = {"warp": warp_ab, "confidence": conf_ab}
@@ -203,13 +215,11 @@ class RoMaV2(nn.Module):
         batch = warp_ab.shape[0]
         for stage, (img_a, img_b) in enumerate(stages):
             _, _, height, width = img_a.shape
-            scale_factor = torch.empty(2, device=img_a.device, dtype=img_a.dtype)
-            scale_factor[0].fill_(width / self.config.anchor_width)
-            scale_factor[1].fill_(height / self.config.anchor_height)
+            scale_factor = self._scale_factor(img_a)
             feats = self.refiner_features(torch.cat((img_a, img_b)))  # [A; B] stacked
             for stride_key, refiner in self.refiners.items():
                 stride = int(stride_key)
-                zero_precision = len(stages) > 1 and stride == 4 and stage == 1
+                zero_precision = _is_hr_entry(stages, stage, stride)
                 warp, conf = _resize_state(warp, conf, (height // stride, width // stride), zero_precision)
                 warp, conf = refiner(
                     refiner.project(feats[stride]), None, warp, conf, scale_factor, pair=batch
@@ -301,7 +311,7 @@ class RoMaV2(nn.Module):
         matches, confidence = matches[inds], confidence[inds]
         if precision is not None:
             precision = precision[inds]
-        density = _kde(matches)
+        density = ops.kde_density.get("reference")(matches)
         p = 1 / (density + 1)
         p[density < 10] = 1e-7  # need ~10 perfect neighbours to be trusted
         balanced = torch.multinomial(p, num_samples=min(num, len(confidence)), replacement=False, generator=generator)

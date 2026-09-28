@@ -15,7 +15,6 @@ import statistics
 from pathlib import Path
 
 import torch
-from torch import nn
 
 from flashim.engines.compile import compile_regions
 from flashim.models.romav2.build import load_romav2
@@ -23,21 +22,6 @@ from flashim.models.romav2.build import load_romav2
 ROMAV2_DATA = Path.home() / "work" / "RoMaV2" / "data"
 IMAGE_A = ROMAV2_DATA / "megadepth/Undistorted_SfM/0015/images/3383162411_67cc9af85e_o.jpg"
 IMAGE_B = ROMAV2_DATA / "megadepth/Undistorted_SfM/0015/images/299056923_ecd980298c_o.jpg"
-
-
-def fold_vgg(model) -> int:
-    layers = model.refiner_features.layers
-    folded = 0
-    for i in range(len(layers) - 1):
-        if isinstance(layers[i], nn.Conv2d) and isinstance(layers[i + 1], nn.BatchNorm2d):
-            layers[i] = nn.utils.fusion.fuse_conv_bn_eval(layers[i], layers[i + 1])
-            layers[i + 1] = nn.Identity()
-            folded += 1
-    model.refiner_features.channels_last = True
-    for layer in layers:
-        if isinstance(layer, nn.Conv2d):
-            layer.weight.data = layer.weight.data.to(memory_format=torch.channels_last)
-    return folded
 
 
 VARIANTS = {
@@ -68,7 +52,7 @@ def main() -> None:
     regions, fold = VARIANTS[args.variant]
     model = load_romav2(args.preset, setting="mega1500", engine="compile")
     if fold:
-        fold_vgg(model)
+        model.refiner_features.fold_batchnorm(channels_last=True)
     if regions:
         compile_regions(model, regions)
     inputs = model.prepare(IMAGE_A, IMAGE_B)

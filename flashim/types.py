@@ -39,3 +39,29 @@ class DenseMatchResult:
 
     def as_dict(self) -> dict[str, Tensor | None]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
+
+
+@dataclass
+class SparseFeatures:
+    """Keypoints and descriptors of one image batch.
+
+    ``keypoints`` ``[B, K, 2]``: ``(x, y)`` in pixel-index coordinates of the *original* image (integer =
+    pixel center); ``scores`` ``[B, K]``: detector score map value at each keypoint; ``descriptors``
+    ``[B, K, C]``: L2-normalized; ``image_size``: ``(H, W)`` of the original image.
+    """
+
+    keypoints: Tensor
+    scores: Tensor
+    descriptors: Tensor
+    image_size: tuple[int, int]
+
+
+@dataclass
+class SparseMatchResult:
+    """Mutual-nearest-neighbour matches between two images: ``[N, 2]`` pixel coordinates and ``[N]`` confidence."""
+
+    keypoints_A: Tensor
+    keypoints_B: Tensor
+    confidence: Tensor
+    indices_A: Tensor | None = None
+    indices_B: Tensor | None = None

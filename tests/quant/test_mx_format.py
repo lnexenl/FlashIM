@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch import nn
 
-from flashim.ops.mx import _dequantize_swizzled
+from flashim.ops.gemm import _dequantize_swizzled
 from flashim.quant.calibration import CalibrationTable, Calibrator, import_romav2_calibration
 from flashim.quant.formats import mx
 from flashim.quant.tensor import QuantizedWeight, quantize_static

@@ -61,7 +61,7 @@ class ConvRefiner(nn.Module):
         self.disp_emb = nn.Conv2d(2, cfg.disp_emb_dim, 1)
         self.warp_head = nn.Conv2d(channels, 2, 1)
         self.confidence_head = nn.Conv2d(channels, cfg.confidence_dim, 1)
-        # Set by the refiner optimization pass (BN fold + channels-last weights).
+        # Set by ``load_romav2`` with the BN fold (channels-last weights and block1 input).
         self.channels_last = False
         # Build block1's input with one fused op (BF16 output; not RoMaV2-bit-exact).
         self.fused_input = False
@@ -80,7 +80,7 @@ class ConvRefiner(nn.Module):
     def project(self, f: Tensor) -> Tensor:
         """FP32 projection of BF16 fine features ``[B, h, w, feat_dim]`` -> ``[B, h, w, proj_dim]``."""
         if self.fused_input:
-            return ops.refiner_proj(f.contiguous(), self.proj.weight, self.proj.bias)
+            return ops.linear_fp32(f.contiguous(), self.proj.weight, self.proj.bias)
         batch, h, w, _ = f.shape
         return self.proj(f.reshape(batch, h * w, self.cfg.feat_dim).float()).reshape(batch, h, w, self.cfg.proj_dim)
 
@@ -96,38 +96,41 @@ class ConvRefiner(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """Refine ``prev_warp``. ``pair > 0`` (fused input only): ``f_a`` is the *already projected*
         stack of ``2*pair`` images, both match directions at once (image ``i`` with ``(i+pair) % 2*pair``)."""
-        cfg = self.cfg
-        radius = -1 if cfg.local_corr_radius is None else cfg.local_corr_radius
+        radius = -1 if self.cfg.local_corr_radius is None else self.cfg.local_corr_radius
         if pair:
             if not self.fused_input:
                 raise ValueError("stacked directions require the fused refiner input")
-            d = ops.refiner_input(
+            d = ops.romav2_refiner_input(
                 f_a, f_a, prev_warp.contiguous(), self.disp_emb.weight, self.disp_emb.bias, scale_factor, radius, pair
             )
-            return self._heads(self.hidden_blocks(self.block1(d)), prev_warp, prev_confidence)
+        else:
+            f_a, f_b = self.project(f_a), self.project(f_b)
+            if self.fused_input:
+                d = ops.romav2_refiner_input(
+                    f_a, f_b, prev_warp.contiguous(), self.disp_emb.weight, self.disp_emb.bias, scale_factor, radius
+                )
+            else:
+                d = self._input(f_a, f_b, prev_warp, scale_factor)
+        return self._heads(self.hidden_blocks(self.block1(d)), prev_warp, prev_confidence)
+
+    def _input(self, f_a: Tensor, f_b: Tensor, prev_warp: Tensor, scale_factor: Tensor) -> Tensor:
+        """RoMaV2's unfused block1 input: ``[f_a, warp(f_b), disp_emb, local_corr]`` (NCHW)."""
         batch, h, w, _ = f_a.shape
-        f_a = self.project(f_a)
-        f_b = self.project(f_b)
-        if self.fused_input:
-            d = ops.refiner_input(
-                f_a, f_b, prev_warp.contiguous(), self.disp_emb.weight, self.disp_emb.bias, scale_factor, radius
-            )
-            return self._heads(self.hidden_blocks(self.block1(d)), prev_warp, prev_confidence)
         f_ba = bhwc_grid_sample(f_b, prev_warp, mode="bilinear", align_corners=False)
         displacement = (prev_warp - normalized_grid(batch, h, w, f_a.device)).permute(0, 3, 1, 2)
         emb = self.disp_emb(scale_factor[None, :, None, None] * displacement)
         parts = [f_a.permute(0, 3, 1, 2), f_ba.permute(0, 3, 1, 2), emb]
-        if cfg.local_corr_radius is not None:
-            parts.append(ops.local_corr(parts[0], f_b.permute(0, 3, 1, 2), prev_warp, cfg.local_corr_radius))
+        if self.cfg.local_corr_radius is not None:
+            parts.append(ops.local_corr(parts[0], f_b.permute(0, 3, 1, 2), prev_warp, self.cfg.local_corr_radius))
         d = torch.cat(parts, dim=1)
         if self.channels_last:
             d = d.to(memory_format=torch.channels_last)
-        return self._heads(self.hidden_blocks(self.block1(d)), prev_warp, prev_confidence)
+        return d
 
     def _heads(self, z: Tensor, prev_warp: Tensor, prev_confidence: Tensor) -> tuple[Tensor, Tensor]:
         cfg = self.cfg
         if self.fused_heads:
-            return ops.refiner_heads(z, self.head_weight, self.head_bias, prev_warp, prev_confidence, cfg.refine_init)
+            return ops.romav2_refiner_heads(z, self.head_weight, self.head_bias, prev_warp, prev_confidence, cfg.refine_init)
         batch, _, h, w = z.shape
         z = z.float()
         displacement_out = self.warp_head(z).permute(0, 2, 3, 1).reshape(batch, h, w, 2)

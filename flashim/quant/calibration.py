@@ -11,11 +11,13 @@ import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Self
 
 import torch
 from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 
+from flashim.quant.formats.int8 import INT8_MAX, safe_scale
 from flashim.quant.formats.mx import BLOCK, padded_channels, scale_exponent_from_amax
 
 FORMAT = "flashim.calibration.mx-block32"
@@ -127,7 +129,7 @@ class Calibrator:
         amax = self._block_amax(value)
         store[name] = amax if name not in store else torch.maximum(store[name], amax)
 
-    def __enter__(self) -> Calibrator:
+    def __enter__(self) -> Self:
         for name, module in self._targets.items():
 
             def hook(mod, args, output, name=name):
@@ -154,3 +156,88 @@ class Calibrator:
             for name in self._targets
         }
         return CalibrationTable(linear, {"observer": "amax", **(metadata or {})})
+
+
+# -- INT8: one static per-tensor activation scale per module ------------------------------------
+
+INT8_FORMAT = "flashim.calibration.int8-tensor"
+
+
+@dataclass
+class Int8CalibrationTable:
+    """Per-module FP32 input scale (``percentile / 127``) of statically quantized INT8 layers."""
+
+    input_scale: dict[str, Tensor]
+    metadata: dict[str, str] = field(default_factory=dict)
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.input_scale
+
+    def __getitem__(self, name: str) -> Tensor:
+        return self.input_scale[name]
+
+    def save(self, path: str | Path) -> None:
+        tensors = {name: scale.float().reshape(1).cpu().contiguous() for name, scale in self.input_scale.items()}
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        save_file(tensors, str(path), metadata={"format": INT8_FORMAT, "version": str(VERSION), **self.metadata})
+
+    @classmethod
+    def load(cls, path: str | Path) -> Int8CalibrationTable:
+        from safetensors import safe_open
+
+        with safe_open(str(path), framework="pt") as handle:
+            meta = dict(handle.metadata() or {})
+        if meta.get("format") != INT8_FORMAT or meta.get("version") != str(VERSION):
+            raise ValueError(f"Unsupported INT8 calibration file {path}: {meta.get('format')} v{meta.get('version')}")
+        meta.pop("format"), meta.pop("version")
+        return cls({name: value.reshape(()) for name, value in load_file(str(path)).items()}, meta)
+
+
+class Int8Calibrator:
+    """Record each targeted layer's input range (linears and 1x1 convs), RoMaV2 ``percentile`` observer.
+
+    Per forward call the ``percentile`` quantile of ``|x|`` is taken (on at most ``max_samples``
+    random elements); the scale is the mean over calls divided by 127.
+    """
+
+    def __init__(
+        self, model: nn.Module, names: Iterable[str], *, percentile: float = 0.9999, max_samples: int = 4_000_000
+    ) -> None:
+        modules = dict(model.named_modules())
+        self._targets = {}
+        for name in names:
+            module = modules.get(name)
+            if not isinstance(module, (nn.Linear, nn.Conv2d)):
+                raise TypeError(f"{name!r} is not an nn.Linear / nn.Conv2d")
+            self._targets[name] = module
+        self.percentile, self.max_samples = percentile, max_samples
+        self._calls: dict[str, list[float]] = {name: [] for name in self._targets}
+        self._handles: list = []
+
+    def __enter__(self) -> Self:
+        for name, module in self._targets.items():
+
+            def hook(mod, args, name=name):
+                flat = args[0].detach().float().abs().reshape(-1)
+                if flat.numel() > self.max_samples:
+                    flat = flat[torch.randperm(flat.numel(), device=flat.device)[: self.max_samples]]
+                k = max(1, int(flat.numel() * self.percentile))
+                self._calls[name].append(float(flat.kthvalue(k).values))
+
+            self._handles.append(module.register_forward_pre_hook(hook))
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def table(self, metadata: dict[str, str] | None = None) -> Int8CalibrationTable:
+        missing = sorted(name for name, calls in self._calls.items() if not calls)
+        if missing:
+            raise RuntimeError(f"No activations recorded for: {missing}")
+        scales = {
+            name: safe_scale(torch.tensor(sum(calls) / len(calls) / INT8_MAX))
+            for name, calls in self._calls.items()
+        }
+        return Int8CalibrationTable(scales, {"observer": f"percentile{self.percentile}", **(metadata or {})})

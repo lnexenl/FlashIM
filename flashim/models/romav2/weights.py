@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 
 CHECKPOINT_URL = "https://github.com/Parskatt/RoMaV2/releases/download/v2.0.1/romav2.0.1.pt"
-CHECKPOINT_SHA256_PREFIX = None  # the release does not publish a hash; torch.hub caches by filename
 
 LICENSES = {
     "code": "MIT (RoMaV2); FlashIM re-implementation",

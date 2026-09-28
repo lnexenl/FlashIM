@@ -7,15 +7,21 @@ import os
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from flashim.engines.compile import compile_regions
 from flashim.models.romav2.config import RoMaV2Config
 from flashim.models.romav2.model import RoMaV2
-from flashim.models.romav2.quant import DEFAULT_CALIBRATION, PRESETS, PROTECTED
+from flashim.models.romav2.quant import PRESETS, PROTECTED
 from flashim.platforms import Feature, platform_for
 from flashim.quant.apply import quantize_model
-from flashim.quant.calibration import CalibrationTable
-from flashim.quant.passes.refiner_block import FusedMXFP8RefinerBlock, fold_refiner_blocks, fuse_bf16_refiner_blocks
+from flashim.quant.calibration import CalibrationTable, Int8CalibrationTable
+from flashim.quant.passes.transformer_block import QuantizedAttention
+from flashim.quant.passes.separable_conv_block import (
+    MXFP8SeparableConvBlock,
+    fold_block_batchnorm,
+    fuse_bf16_blocks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +37,15 @@ COMPILE_FULL_REGIONS = (
 )
 
 
+def _refiners_channels_last(model: RoMaV2) -> None:
+    """Refiner conv weights to channels-last, and refiners build their inputs channels-last."""
+    for refiner in model.refiners.values():
+        refiner.channels_last = True
+        for child in refiner.modules():
+            if isinstance(child, nn.Conv2d):
+                child.weight.data = child.weight.data.to(memory_format=torch.channels_last)
+
+
 def load_romav2(
     preset: str = "fp8",
     *,
@@ -42,6 +57,7 @@ def load_romav2(
     config: RoMaV2Config | None = None,
     compile_mode: str | None = "max-autotune-no-cudagraphs",
     fast_sampling: bool | None = None,
+    attention: str = "sdpa",
 ) -> RoMaV2:
     """Load RoMaV2 weights, apply a quantization preset and an execution engine.
 
@@ -54,6 +70,9 @@ def load_romav2(
     On platforms without native MXFP8 GEMMs, FP8 presets run with emulation kernels
     (``strict=True`` raises instead).
 
+    ``attention``: ``"sdpa"`` (torch SDPA, default), ``"sage"`` or ``"sage-fp8"`` (SageAttention INT8-QK attention
+    in every quantized transformer block; needs the ``sageattention`` package; not RoMaV2-exact).
+
     ``fast_sampling``: fused-KDE ``sample()`` (default on; ``FLASHIM_FAST_SAMPLING=0`` restores RoMaV2's).
     """
     if preset not in PRESETS:
@@ -64,33 +83,41 @@ def load_romav2(
     model = RoMaV2.from_pretrained(cfg, device=device)
     platform = platform_for(model.device)
     spec = PRESETS[preset]
-    model.quant_report = None
     model.preset = preset
     if spec.config is not None:
-        if not platform.supports(Feature.MXFP8_SCALED_MM):
+        int8 = any(scheme.weights.type == "int" for scheme in spec.config.config_groups.values())
+        if not int8 and not platform.supports(Feature.MXFP8_SCALED_MM):
             message = f"Preset {preset!r}: no native MXFP8 GEMM on {platform.describe()}; using emulation"
             if strict:
                 raise RuntimeError(message)
             logger.warning(message)
         table = calibration
-        if not isinstance(table, CalibrationTable):
-            table = CalibrationTable.load(table or DEFAULT_CALIBRATION)
+        if not isinstance(table, (CalibrationTable, Int8CalibrationTable)):
+            table = (Int8CalibrationTable if int8 else CalibrationTable).load(table or spec.calibration)
         if spec.fold_refiners:
-            fold_refiner_blocks(model.refiners, channels_last=True)
+            _refiners_channels_last(model)
+            fold_block_batchnorm(model.refiners)
         model.quant_report = quantize_model(model, spec.config, table, protected=PROTECTED, platform=platform)
         model.calibration_metadata = dict(table.metadata)
+    if attention != "sdpa":
+        if spec.config is None:
+            raise ValueError(f"attention={attention!r} needs a quantized preset (fused transformer blocks)")
+        for module in model.modules():
+            if isinstance(module, QuantizedAttention):
+                module.sdpa_impl = attention
+        model.attention = attention
     if spec.fused_bf16_refiners:
         prefixes = tuple(f"refiners.{stride}." for stride in spec.fused_bf16_refiners)
-        fused = fuse_bf16_refiner_blocks(model, prefixes)
+        fused = fuse_bf16_blocks(model, prefixes)
         if model.quant_report is not None:
-            model.quant_report.fused_refiner_blocks.extend(fused)
+            model.quant_report.fused_conv_blocks.extend(fused)
     if spec.fused_refiner_io:
         for refiner in model.refiners.values():
             refiner.fused_input = True
             refiner.enable_fused_heads()
     if spec.fused_mx_blocks:
         for module in model.modules():
-            if isinstance(module, FusedMXFP8RefinerBlock):
+            if isinstance(module, MXFP8SeparableConvBlock):
                 module.fuse_pointwise = True
     if spec.batched_directions:
         if not spec.fused_refiner_io:

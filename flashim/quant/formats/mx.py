@@ -93,7 +93,3 @@ def static_input_scales(exponent: Tensor, rows: int) -> Tensor:
     if rows <= 0:
         raise ValueError(f"Expected a positive row count, got {rows}")
     return swizzle_scales(exponent.to(torch.int8).expand(rows, -1))
-
-
-def swizzled_scale_numel(rows: int, k: int) -> int:
-    return ((rows + 127) // 128) * 128 * (((k // BLOCK + 3) // 4) * 4)

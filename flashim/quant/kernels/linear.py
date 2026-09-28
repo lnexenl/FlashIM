@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+import torch
 from torch import Tensor
 
 from flashim import ops
@@ -32,8 +33,8 @@ class MXFP8LinearKernel(ABC):
         return {}
 
     @abstractmethod
-    def apply(self, layer, activation: QuantizedTensor) -> Tensor:
-        """Return the padded ``[rows, N]`` BF16 product (bias not added)."""
+    def apply(self, layer, activation: QuantizedTensor, bias: Tensor | None = None) -> Tensor:
+        """Return the padded ``[rows, N]`` BF16 product, plus ``bias`` (padded ``[N]``) in the epilogue if given."""
 
 
 class CublasMXFP8Kernel(MXFP8LinearKernel):
@@ -54,14 +55,14 @@ class CublasMXFP8Kernel(MXFP8LinearKernel):
     def prepare(self, weight):
         return {"weight_scale_swizzled": mx.swizzle_scales(weight.scale_exponent)}
 
-    def apply(self, layer, activation):
+    def apply(self, layer, activation, bias=None):
         matrix = activation.matrix()
         return ops.mxfp8_scaled_mm.get("cublas")(
             matrix,
             layer.weight_values.view(activation.values.dtype).t(),
             layer.input_scales(matrix.shape[0]),
             layer.weight_scale_swizzled,
-            None,
+            None if bias is None else bias.to(torch.bfloat16),
         )
 
 
@@ -75,8 +76,8 @@ class TritonFP8Kernel(MXFP8LinearKernel):
         ok = platform.supports(Feature.TRITON, Feature.FP8_E4M3)
         return ok, None if ok else "needs Triton + FP8 (sm_89+)"
 
-    def apply(self, layer, activation):
-        return ops.fp8_linear.get("triton")(activation, layer.packed_weight(), None)
+    def apply(self, layer, activation, bias=None):
+        return ops.fp8_linear.get("triton")(activation, layer.packed_weight(), bias)
 
 
 class EmulationKernel(MXFP8LinearKernel):
@@ -88,8 +89,8 @@ class EmulationKernel(MXFP8LinearKernel):
     def is_supported(cls, platform):
         return True, None
 
-    def apply(self, layer, activation):
-        return ops.fp8_linear.get("reference")(activation, layer.packed_weight(), None)
+    def apply(self, layer, activation, bias=None):
+        return ops.fp8_linear.get("reference")(activation, layer.packed_weight(), bias)
 
 
 KERNELS: tuple[type[MXFP8LinearKernel], ...] = (CublasMXFP8Kernel, TritonFP8Kernel, EmulationKernel)

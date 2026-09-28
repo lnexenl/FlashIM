@@ -7,34 +7,35 @@ from collections.abc import Iterable
 from torch import nn
 
 from flashim.platforms import Platform, platform_for
-from flashim.quant.calibration import CalibrationTable
+from flashim.quant.calibration import CalibrationTable, Int8CalibrationTable
+from flashim.quant.methods.int8_linear import StaticInt8Conv1x1, StaticInt8Linear
 from flashim.quant.methods.linear import StaticMXFP8Linear
-from flashim.quant.passes.refiner_block import FusedMXFP8RefinerBlock, is_refiner_block
-from flashim.quant.passes.transformer_block import FP8TransformerBlock, is_transformer_block
+from flashim.quant.passes.deformable_encoder import QuantizedDeformableEncoder, is_deformable_encoder
+from flashim.quant.passes.separable_conv_block import (
+    Int8SeparableConvBlock,
+    MXFP8SeparableConvBlock,
+    is_separable_conv_block,
+)
+from flashim.quant.passes.transformer_block import QuantizedTransformerBlock, is_transformer_block
 from flashim.quant.scheme import PackingReport, QuantConfig
-
-
-def _set_submodule(model: nn.Module, name: str, module: nn.Module) -> None:
-    parent, _, child = name.rpartition(".")
-    (model.get_submodule(parent) if parent else model)._modules[child] = module
-
-
-def _nbytes(module: nn.Module) -> int:
-    return sum(t.numel() * t.element_size() for t in [*module.parameters(), *module.buffers()])
+from flashim.utils import nbytes, set_submodule
 
 
 def quantize_model(
     model: nn.Module,
     config: QuantConfig,
-    calibration: CalibrationTable | None,
+    calibration: CalibrationTable | Int8CalibrationTable | None,
     *,
     protected: Iterable[str] = (),
     platform: Platform | None = None,
 ) -> PackingReport:
-    """In place. Linears targeted by a static scheme become :class:`StaticMXFP8Linear`;
+    """In place. Linears targeted by a static scheme become :class:`StaticMXFP8Linear`
+    (or :class:`StaticInt8Linear` for INT8 schemes, which need an :class:`Int8CalibrationTable`);
     transformer blocks whose attention projections were packed get fused boundaries;
-    refiner blocks whose ``conv_pointwise`` is targeted by a dynamic scheme become
-    :class:`FusedMXFP8RefinerBlock` (BatchNorm must already be folded).
+    separable conv blocks whose ``conv_pointwise`` is targeted by a dynamic MXFP8 scheme become
+    :class:`MXFP8SeparableConvBlock`, by a static INT8 scheme :class:`Int8SeparableConvBlock`
+    (BatchNorm must already be folded). Other 1x1 convolutions targeted by an INT8 scheme become
+    :class:`StaticInt8Conv1x1`.
     """
     platform = platform or platform_for(next(model.parameters()).device)
     names = [name for name, _ in model.named_modules()]
@@ -42,59 +43,74 @@ def quantize_model(
     report = PackingReport()
     modules = dict(model.named_modules())
 
-    # 1) Static-activation linears.
+    block_pointwise = {f"{n}.conv_pointwise" for n, m in modules.items() if is_separable_conv_block(m)}
+
+    # 1) Static-activation linears (and, for INT8, 1x1 convolutions outside separable blocks).
     for name, module in modules.items():
         match = config.scheme_for(name)
-        if match is None or not isinstance(module, nn.Linear):
+        if match is None:
             continue
         _, scheme = match
+        is_conv1x1 = (
+            isinstance(module, nn.Conv2d)
+            and module.kernel_size == (1, 1)
+            and module.groups == 1
+            and name not in block_pointwise
+        )
+        if not (isinstance(module, nn.Linear) or (is_conv1x1 and scheme.weights.type == "int")):
+            continue
         if scheme.input_activations is None or scheme.input_activations.dynamic:
             continue
         if calibration is None or name not in calibration:
             raise RuntimeError(f"No calibration for static-activation linear {name!r}")
-        packed = StaticMXFP8Linear.from_linear(module, calibration[name].input_exponent, platform)
-        report.bytes_before += _nbytes(module)
-        report.bytes_after += _nbytes(packed)
-        _set_submodule(model, name, packed)
-        report.linears[name] = packed.kernel.name
+        if scheme.weights.type == "int":
+            if not isinstance(calibration, Int8CalibrationTable):
+                raise TypeError(f"INT8 scheme for {name!r} needs an Int8CalibrationTable")
+            build = StaticInt8Conv1x1.from_conv if is_conv1x1 else StaticInt8Linear.from_linear
+            packed = build(module, calibration[name])
+        else:
+            if not isinstance(calibration, CalibrationTable):
+                raise TypeError(f"MXFP8 scheme for {name!r} needs a CalibrationTable")
+            packed = StaticMXFP8Linear.from_linear(module, calibration[name].input_exponent, platform)
+        report.bytes_before += nbytes(module)
+        report.bytes_after += nbytes(packed)
+        set_submodule(model, name, packed)
+        report.linears[name] = "int8_linear" if isinstance(packed, StaticInt8Linear) else packed.kernel.name
 
     # 2) Transformer-block boundary fusion (needs packed QKV).
     for name, module in list(model.named_modules()):
-        if is_transformer_block(module) and isinstance(module.attn.qkv, StaticMXFP8Linear):
-            _set_submodule(model, name, FP8TransformerBlock(module))
+        if is_transformer_block(module) and isinstance(module.attn.qkv, (StaticMXFP8Linear, StaticInt8Linear)):
+            set_submodule(model, name, QuantizedTransformerBlock(module))
             report.fused_blocks.append(name)
 
-    # 3) Refiner blocks with a dynamically quantized pointwise conv.
+    # 2b) Post-norm deformable-attention encoders with packed value/output/FFN linears.
     for name, module in list(model.named_modules()):
-        if not is_refiner_block(module):
+        if is_deformable_encoder(module):
+            set_submodule(model, name, QuantizedDeformableEncoder(module))
+            report.fused_blocks.append(name)
+
+    # 3) Separable conv blocks with a dynamically quantized pointwise conv.
+    for name, module in list(model.named_modules()):
+        if not is_separable_conv_block(module):
             continue
         match = config.scheme_for(f"{name}.conv_pointwise")
         if match is None:
             continue
         scheme = match[1]
-        if scheme.input_activations is None or not scheme.input_activations.dynamic:
-            raise ValueError(f"Refiner pointwise {name!r} requires a dynamic-activation scheme")
-        fused = FusedMXFP8RefinerBlock(module).to(next(module.parameters()).device)
-        report.bytes_before += _nbytes(module)
-        report.bytes_after += _nbytes(fused)
-        _set_submodule(model, name, fused)
-        report.fused_refiner_blocks.append(name)
+        if scheme.weights.type == "int":
+            pointwise = f"{name}.conv_pointwise"
+            if scheme.input_activations is None or scheme.input_activations.dynamic:
+                raise ValueError(f"INT8 pointwise conv {pointwise!r} requires a static-activation scheme")
+            if not isinstance(calibration, Int8CalibrationTable) or pointwise not in calibration:
+                raise RuntimeError(f"No INT8 calibration for {pointwise!r}")
+            fused = Int8SeparableConvBlock(module, calibration[pointwise]).to(next(module.parameters()).device)
+        elif scheme.input_activations is None or not scheme.input_activations.dynamic:
+            raise ValueError(f"Pointwise conv {name!r} requires a dynamic-activation scheme")
+        else:
+            fused = MXFP8SeparableConvBlock(module).to(next(module.parameters()).device)
+        report.bytes_before += nbytes(module)
+        report.bytes_after += nbytes(fused)
+        set_submodule(model, name, fused)
+        report.fused_conv_blocks.append(name)
     return report
 
-
-def reset_call_counts(model: nn.Module) -> None:
-    for module in model.modules():
-        if hasattr(module, "call_count"):
-            module.call_count = 0
-
-
-def dispatch_stats(model: nn.Module) -> dict[str, int]:
-    stats = {"fp8_linear_calls": 0, "fp8_transformer_block_calls": 0, "fused_refiner_block_calls": 0}
-    for module in model.modules():
-        if isinstance(module, StaticMXFP8Linear):
-            stats["fp8_linear_calls"] += module.call_count
-        elif isinstance(module, FP8TransformerBlock):
-            stats["fp8_transformer_block_calls"] += module.call_count
-        elif isinstance(module, FusedMXFP8RefinerBlock):
-            stats["fused_refiner_block_calls"] += module.call_count
-    return stats

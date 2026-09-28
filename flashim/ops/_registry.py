@@ -2,10 +2,15 @@
 
 Every op has a torch *reference* implementation (the correctness oracle and the
 universal fallback). Optimized implementations register for a
-:class:`DeviceSpec` (device type plus an optional compute-capability range) and
-may require platform :class:`~flashim.platforms.Feature` s and a per-call
-``when`` predicate. Selection order: highest ``priority`` first, then the
-narrowest capability range, then registration order.
+:class:`DeviceSpec` (a platform dispatch key -- ``"cuda"`` is NVIDIA only, ROCm is
+``"rocm"`` -- plus an optional NVIDIA compute-capability range) and may require
+platform :class:`~flashim.platforms.Feature` s and a per-call ``when`` predicate.
+Require a feature rather than a capability range when the hardware feature is not
+monotonic in the capability (``Feature.WGMMA``, ``Feature.TCGEN05``).
+Selection order: highest ``priority`` first, then the narrowest capability range,
+then registration order. :meth:`Op.explain` says why each impl was (not) chosen;
+``FLASHIM_LOG=ops=debug`` logs the first use of every impl and reference fallbacks
+on accelerators (see :mod:`flashim.log`).
 
 Runtime overrides (``FLASHIM_OPS`` env var or :func:`configure`), comma separated:
   ``-rope_qk``           disable optimized impls (use the reference)
@@ -20,10 +25,11 @@ import logging
 import os
 from collections import Counter
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 
 import torch
 
+from flashim.log import profiler_range, warn_once
 from flashim.platforms import Feature, Platform, platform_for
 
 logger = logging.getLogger(__name__)
@@ -46,9 +52,7 @@ class DeviceSpec:
             return False
         if self.min_capability is not None and platform.capability < self.min_capability:
             return False
-        if self.max_capability is not None and platform.capability > self.max_capability:
-            return False
-        return True
+        return self.max_capability is None or platform.capability <= self.max_capability
 
     @property
     def span(self) -> float:
@@ -75,6 +79,17 @@ class Impl:
 
     def available(self, platform: Platform) -> bool:
         return self.device.matches(platform) and platform.supports(*self.requires)
+
+    def rejection(self, platform: Platform, args: tuple, kwargs: dict) -> str | None:
+        """Why this impl does not apply to the call (``None`` if it does)."""
+        if not self.device.matches(platform):
+            return f"device {self.device} does not match {platform.device_type} {platform.arch}".rstrip()
+        missing = sorted(f.value for f in self.requires if not platform.supports(f))
+        if missing:
+            return "missing features " + ",".join(missing)
+        if self.when is not None and not self.when(*args, **kwargs):
+            return "when() rejected the arguments"
+        return None
 
 
 @dataclass
@@ -117,6 +132,8 @@ def _first_device(values: Iterable) -> torch.device | None:
     for value in values:
         if isinstance(value, torch.Tensor):
             return value.device
+        if is_dataclass(value) and not isinstance(value, type):  # QuantizedTensor / QuantizedWeight etc.
+            value = [getattr(value, f.name) for f in fields(value)]
         if isinstance(value, (list, tuple)):
             device = _first_device(value)
             if device is not None:
@@ -125,11 +142,15 @@ def _first_device(values: Iterable) -> torch.device | None:
 
 
 class Op:
-    def __init__(self, name: str, reference: Callable) -> None:
+    """A dispatched op. ``composite=True`` marks a reference built from other (dispatched) ops -- a fused op's
+    unfused pipeline -- so falling back to it is expected and not reported as a slow path."""
+
+    def __init__(self, name: str, reference: Callable, *, composite: bool = False) -> None:
         if name in OPS:
             raise ValueError(f"Duplicate op {name!r}")
         self.name = name
         self.reference = reference
+        self.composite = composite
         self.impls: list[Impl] = []
         self.calls: Counter[str] = Counter()
         self.__doc__ = reference.__doc__
@@ -159,9 +180,26 @@ class Op:
         available = [impl for impl in self.impls if impl.available(platform)]
         return sorted(available, key=lambda i: (-i.priority, i.device.span, i.order))
 
+    def _platform(self, args: tuple, kwargs: dict) -> Platform:
+        return platform_for(_first_device(args) or _first_device(kwargs.values()) or torch.device("cpu"))
+
+    def explain(self, *args, **kwargs) -> dict[str, str]:
+        """``{impl: "selected" | why not}`` for a call with these arguments, in selection order."""
+        platform = self._platform(args, kwargs)
+        chosen, _ = self.select(*args, **kwargs)
+        ranked = self.candidates(platform)
+        ranked += [impl for impl in self.impls if impl not in ranked]
+        report = {}
+        for impl in ranked:
+            if impl.name == chosen:
+                report[impl.name] = "selected"
+            else:
+                report[impl.name] = impl.rejection(platform, args, kwargs) or "lower priority"
+        report[REFERENCE] = "selected" if chosen == REFERENCE else "fallback"
+        return report
+
     def select(self, *args, **kwargs) -> tuple[str, Callable]:
-        device = _first_device(args) or _first_device(kwargs.values()) or torch.device("cpu")
-        platform = platform_for(device)
+        platform = self._platform(args, kwargs)
         forced = _CONFIG.forced.get(self.name)
         if forced == REFERENCE or self.name in _CONFIG.disabled:
             return REFERENCE, self.reference
@@ -179,15 +217,34 @@ class Op:
             )
         return REFERENCE, self.reference
 
-    def _count(self, name: str) -> None:
-        # Counting inside torch.compile would add guards on the counter values.
-        if not torch.compiler.is_compiling():
-            self.calls[name] += 1
+    def _run(self, name: str, fn: Callable, args: tuple, kwargs: dict, pinned: bool = False):
+        # Counting / logging inside torch.compile would add guards or graph breaks: eager only.
+        if torch.compiler.is_compiling():
+            return fn(*args, **kwargs)
+        if name not in self.calls:
+            self._log_first_use(name, args, kwargs, pinned)
+        self.calls[name] += 1
+        with profiler_range(f"flashim::{self.name}[{name}]"):
+            return fn(*args, **kwargs)
+
+    def _log_first_use(self, name: str, args: tuple, kwargs: dict, pinned: bool) -> None:
+        if pinned or self.composite or name != REFERENCE or not self.impls:
+            logger.debug("op %s -> %s%s", self.name, name, " (pinned)" if pinned else "")
+            return
+        platform = self._platform(args, kwargs)
+        if platform.device_type == "cpu" or not logger.isEnabledFor(logging.INFO):
+            return
+        reasons = "; ".join(
+            f"{impl.name}: {impl.rejection(platform, args, kwargs) or 'forced off'}" for impl in self.impls
+        )
+        warn_once(
+            logger, f"reference:{self.name}:{platform.device_type}", "op %s uses the reference on %s (%s)",
+            self.name, platform.describe(), reasons, level=logging.INFO,
+        )
 
     def __call__(self, *args, **kwargs):
         name, fn = self.select(*args, **kwargs)
-        self._count(name)
-        return fn(*args, **kwargs)
+        return self._run(name, fn, args, kwargs)
 
     def get(self, name: str | None) -> Callable:
         """Callable pinned to impl ``name`` (``None`` = normal dispatch).
@@ -209,14 +266,11 @@ class Op:
         def pinned(*args, **kwargs):
             if self.name in _CONFIG.forced or self.name in _CONFIG.disabled:
                 return self(*args, **kwargs)
-            device = _first_device(args) or _first_device(kwargs.values()) or torch.device("cpu")
-            if impl is not None and impl.available(platform_for(device)) and (
+            if impl is not None and impl.available(self._platform(args, kwargs)) and (
                 impl.when is None or impl.when(*args, **kwargs)
             ):
-                self._count(impl.name)
-                return impl.fn(*args, **kwargs)
-            self._count(REFERENCE)
-            return self.reference(*args, **kwargs)
+                return self._run(impl.name, impl.fn, args, kwargs, pinned=True)
+            return self._run(REFERENCE, self.reference, args, kwargs, pinned=impl is None)
 
         return pinned
 

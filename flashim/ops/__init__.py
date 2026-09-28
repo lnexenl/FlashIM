@@ -1,4 +1,9 @@
-"""FlashIM ops: each has a torch reference plus optional per-platform implementations."""
+"""FlashIM ops: each has a torch reference plus optional per-platform implementations.
+
+Files group ops by what they compute (``attention``, ``conv``, ``correlation``, ``density``,
+``gemm``, ``quantize``); ops only one model uses live in a file named after it (``romav2``)
+and carry its name as a prefix. ``_triton/`` mirrors the same layout.
+"""
 
 from flashim.ops._registry import (
     OPS,
@@ -9,21 +14,27 @@ from flashim.ops._registry import (
     reset_call_counts,
     set_strict,
 )
-from flashim.ops.kde import kde_density
-from flashim.ops.local_corr import local_corr
-from flashim.ops.mx import (
+from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
+from flashim.ops.attention import deformable_attention, rope_qk, sdpa
+from flashim.ops.conv import (
+    depthwise5x5_relu_int8,
     depthwise5x5_relu_mxfp8,
     depthwise5x5_relu_pointwise,
-    fp8_linear,
-    gelu_quantize,
-    layernorm_quantize,
-    mxfp8_refiner_block,
-    mxfp8_scaled_mm,
+    depthwise5x5_relu_pointwise_int8,
+    depthwise5x5_relu_pointwise_mxfp8,
 )
-from flashim.ops.refiner_heads import refiner_heads
-from flashim.ops.refiner_input import refiner_input
-from flashim.ops.refiner_proj import refiner_proj
-from flashim.ops.rope import rope_qk
+from flashim.ops.correlation import local_corr
+from flashim.ops.density import kde_density
+from flashim.ops.gemm import fp8_linear, int8_linear, linear_fp32, mxfp8_gelu_mlp, mxfp8_scaled_mm
+from flashim.ops.quantize import (
+    gelu_quantize,
+    gelu_quantize_int8,
+    layernorm_quantize,
+    layernorm_quantize_int8,
+    quantize_int8,
+    quantize_mxfp8,
+)
+from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 
 __all__ = [
     "OPS",
@@ -31,19 +42,31 @@ __all__ = [
     "Op",
     "call_counts",
     "configure",
+    "deform_patches_int8",
+    "deformable_attention",
+    "depthwise5x5_relu_int8",
     "depthwise5x5_relu_mxfp8",
     "depthwise5x5_relu_pointwise",
+    "depthwise5x5_relu_pointwise_int8",
+    "depthwise5x5_relu_pointwise_mxfp8",
     "fp8_linear",
     "gelu_quantize",
+    "gelu_quantize_int8",
+    "int8_linear",
     "kde_density",
     "layernorm_quantize",
+    "layernorm_quantize_int8",
+    "linear_fp32",
     "local_corr",
-    "mxfp8_refiner_block",
+    "multiscale_fuse",
+    "mxfp8_gelu_mlp",
     "mxfp8_scaled_mm",
-    "refiner_heads",
-    "refiner_input",
-    "refiner_proj",
+    "quantize_int8",
+    "quantize_mxfp8",
     "reset_call_counts",
+    "romav2_refiner_heads",
+    "romav2_refiner_input",
     "rope_qk",
+    "sdpa",
     "set_strict",
 ]

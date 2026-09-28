@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from flashim.quant.formats.int8 import quantize_symmetric
 from flashim.quant.formats.mx import BLOCK, padded_channels, quantize_blocks, scale_exponent_from_amax
 
 
@@ -110,3 +111,33 @@ def quantize_static(value: Tensor, scale_exponent: Tensor) -> QuantizedTensor:
         scale_exponent,
         tuple(value.shape),
     )
+
+
+@dataclass(frozen=True)
+class Int8Tensor:
+    """INT8 activations with one static per-tensor FP32 scale; ``values`` is ``[*leading, K]``."""
+
+    values: Tensor
+    scale: Tensor
+
+    def __post_init__(self) -> None:
+        if self.values.dtype != torch.int8:
+            raise ValueError(f"Expected int8 values, got {self.values.dtype}")
+        if self.scale.dtype != torch.float32 or self.scale.numel() != 1:
+            raise ValueError("scale must be a single FP32 value")
+
+    @property
+    def logical_shape(self) -> tuple[int, ...]:
+        return tuple(self.values.shape)
+
+    def matrix(self) -> Tensor:
+        return self.values.reshape(-1, self.values.shape[-1])
+
+    def dequantize(self, dtype: torch.dtype = torch.float32) -> Tensor:
+        return (self.values.float() * self.scale).to(dtype)
+
+
+def quantize_int8_static(value: Tensor, scale: Tensor) -> Int8Tensor:
+    """Reference static per-tensor INT8 quantization."""
+    scale = scale.to(device=value.device, dtype=torch.float32).reshape(())
+    return Int8Tensor(quantize_symmetric(value, scale), scale)

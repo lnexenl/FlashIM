@@ -27,7 +27,7 @@ _ROMAV2_VARIANTS = {"fp8-p8": "none", "fp8-s4": "s4_fused", "fp8": "s4_fused_s2_
 def _build_flashim(args):
     from flashim.models.romav2.build import load_romav2
 
-    model = load_romav2(args.preset, setting=args.setting, engine=args.engine)
+    model = load_romav2(args.preset, setting=args.setting, engine=args.engine, attention=args.attention)
     inputs = model.prepare(args.image_a, args.image_b)
     return model, inputs, (model.quant_report.summary() if model.quant_report else None)
 
@@ -71,13 +71,14 @@ def _build_romav2(args):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--impl", choices=("flashim", "romav2"), default="flashim")
-    parser.add_argument("--preset", default="fp8", choices=("bf16", "fp8-p8", "fp8-s4", "fp8", "fp8-fast"))
+    parser.add_argument("--preset", default="fp8", choices=("bf16", "int8", "int8-dpt", "int8-full", "int8-fast", "fp8-p8", "fp8-s4", "fp8", "fp8-fast"))
     parser.add_argument("--engine", default="compile", choices=("eager", "compile", "compile-full"))
     parser.add_argument("--setting", default="mega1500")
     parser.add_argument("--image-a", default=str(IMAGE_A))
     parser.add_argument("--image-b", default=str(IMAGE_B))
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--attention", default="sdpa", choices=("sdpa", "sage", "sage-fp8"))
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 

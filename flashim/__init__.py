@@ -6,6 +6,7 @@
     matches, conf, prec_a, prec_b = model.sample(result, 5000)
 """
 
+from flashim.log import set_verbosity
 from flashim.registry import MODELS
 from flashim.types import DenseMatchResult
 
@@ -24,4 +25,4 @@ def available_models() -> dict[str, str]:
     return {name: entry.description for name, entry in MODELS.items()}
 
 
-__all__ = ["DenseMatchResult", "available_models", "load"]
+__all__ = ["DenseMatchResult", "available_models", "load", "set_verbosity"]

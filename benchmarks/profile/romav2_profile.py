@@ -23,7 +23,6 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 from flashim import ops
 from flashim.models.romav2.build import load_romav2

@@ -56,3 +56,22 @@ def test_strict_mode_raises_off_cpu():
     if torch.cuda.is_available():
         with pytest.raises(RuntimeError):
             op(torch.zeros(1, device="cuda"))
+
+
+def test_dataclass_arguments_resolve_their_device():
+    from flashim.ops._registry import _first_device
+    from flashim.quant.tensor import QuantizedWeight
+
+    weight = QuantizedWeight.from_float(torch.randn(64, 64))
+    assert _first_device((weight, None)) == torch.device("cpu")
+
+
+@pytest.mark.cuda
+def test_platform_detected_inside_compile_has_features():
+    """The first ``platform_for`` call may happen while Dynamo traces; its probes must still run eagerly."""
+    from flashim.platforms import detect
+
+    detect._PLATFORMS.clear()
+    compiled = torch.compile(lambda x: (x + 1, detect.platform_for(x.device))[0], backend="eager")
+    compiled(torch.zeros(2, device="cuda"))
+    assert detect.platform_for("cuda").supports(Feature.TRITON)

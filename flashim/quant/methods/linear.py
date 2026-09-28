@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim import ops
 from flashim.platforms import Platform
 from flashim.quant.formats import mx
 from flashim.quant.kernels.linear import MXFP8LinearKernel, choose_kernel
@@ -43,7 +44,6 @@ class StaticMXFP8Linear(nn.Module):
         for name, value in kernel.prepare(weight).items():
             self.register_buffer(name, value)
         self._input_scales: dict[int, Tensor] = {}
-        self.call_count = 0
 
     @classmethod
     def from_linear(cls, linear: nn.Linear, input_exponent: Tensor, platform: Platform) -> StaticMXFP8Linear:
@@ -83,15 +83,25 @@ class StaticMXFP8Linear(nn.Module):
         return out[:, : self.out_features].reshape(*leading, self.out_features).to(dtype)
 
     def forward(self, x: Tensor) -> Tensor:
-        if not torch.compiler.is_compiling():
-            self.call_count += 1
         quantized = quantize_static(x, self.input_exponent)
         return self._finish(self.kernel.apply(self, quantized), tuple(x.shape[:-1]), x.dtype)
 
+    def quantize_layernorm(self, value: Tensor, residual: Tensor | None, norm: nn.LayerNorm) -> QuantizedTensor:
+        return ops.layernorm_quantize(value, residual, norm.weight, norm.bias, norm.eps, self.input_exponent)
+
+    def quantize_gelu(self, value: Tensor, approximate: str) -> QuantizedTensor:
+        return ops.gelu_quantize(value, self.input_exponent, approximate)
+
+    def matmul(self, quantized: QuantizedTensor, *, bias: bool = False) -> Tensor:
+        """BF16 product of an activation packed with this layer's input exponent: ``[*leading, out_features]``.
+
+        ``bias=False`` leaves the bias out (for consumers that fold it into their own kernel); ``bias=True`` adds
+        it in the GEMM epilogue (FP32 accumulator + bias, one rounding)."""
+        out = self.kernel.apply(self, quantized, self.bias if bias else None)
+        return out[:, : self.out_features].reshape(*quantized.logical_shape[:-1], self.out_features)
+
     def forward_prequantized(self, quantized: QuantizedTensor) -> Tensor:
         """Consume an activation already packed with this layer's input exponent; BF16 out."""
-        if not torch.compiler.is_compiling():
-            self.call_count += 1
         if quantized.scale_exponent is not self.input_exponent and not torch.equal(
             quantized.scale_exponent, self.input_exponent
         ):
