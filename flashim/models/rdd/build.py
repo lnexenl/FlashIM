@@ -68,7 +68,7 @@ def load_rdd(
         table = calibration
         if not isinstance(table, CalibrationTable):
             table = CalibrationTable.load(table or spec.calibration)
-        model.quant_report = quantize_model(model, spec.config, table, protected=PROTECTED, platform=platform)
+        model.quant_report = quantize_model(model, spec.config, table, protected=PROTECTED)
         model.calibration_metadata = dict(table.metadata)
     fused = [m.fuse_query_projections() for m in model.modules() if isinstance(m, MSDeformAttn)]
     model.fused_query_projections = sum(fused)

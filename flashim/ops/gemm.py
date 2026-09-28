@@ -1,4 +1,4 @@
-"""GEMMs: block-scaled MXFP8, static-activation FP8, and FP32 linear of low-precision inputs.
+"""GEMMs: block-scaled MXFP8, static MXFP8 / INT8 linears, and FP32 linear of low-precision inputs.
 
 ``linear_fp32``: the reference runs an FP32 GEMM; the ``triton`` path covers small outputs
 (``N <= 16``) exactly; ``triton_split`` covers larger ones on tensor cores with the FP32 weight split
@@ -51,11 +51,15 @@ def _mxfp8_scaled_mm_reference(
 mxfp8_scaled_mm = Op("mxfp8_scaled_mm", _mxfp8_scaled_mm_reference)
 
 
-# -- static-activation FP8 GEMM for weights cuBLAS cannot take (K or N % 128 != 0) --------------
+# -- static MXFP8 linear ---------------------------------------------------------------------
 
 
-def _fp8_linear_reference(activation: QuantizedTensor, weight: QuantizedWeight, bias: Tensor | None) -> Tensor:
-    """Dequantize both operands and matmul in FP32; padded ``[rows, N]`` BF16 output."""
+def _mxfp8_linear_reference(activation: QuantizedTensor, bias: Tensor | None, weight: QuantizedWeight) -> Tensor:
+    """Static MXFP8 linear, emulated: dequantize both operands and matmul in FP32; padded ``[rows, N]`` BF16 out.
+
+    ``activation`` block-32 E4M3 with its (static) E8M0 exponents; ``weight`` E4M3 ``[N, K]`` with one exponent per
+    (row, 32 inputs), both padded to multiples of 32; ``bias`` (padded ``[N]``, optional) is added in the FP32
+    epilogue. ``weight`` is the bound operand: impls repack it once (``Op.bind``)."""
     a = activation.matrix().float() * torch.exp2(activation.scale_exponent.float()).repeat_interleave(32)
     w = weight.values.float() * torch.exp2(weight.scale_exponent.float()).repeat_interleave(32, dim=1)
     out = a @ w.t()
@@ -64,7 +68,7 @@ def _fp8_linear_reference(activation: QuantizedTensor, weight: QuantizedWeight, 
     return out.to(torch.bfloat16)
 
 
-fp8_linear = Op("fp8_linear", _fp8_linear_reference)
+mxfp8_linear = Op("mxfp8_linear", _mxfp8_linear_reference, weights=1)
 
 
 # -- static INT8 GEMM (per-channel weights, per-tensor activations) ---------------------------------
@@ -102,9 +106,9 @@ def _mxfp8_gelu_mlp_reference(
     """``quantize_static(GELU(x W1^T [BF16] + b1) [BF16], hidden_exponent) W2^T`` -> BF16 ``[rows, N2]``
     (padded widths; W2's bias is not added). Same rounding points as two static MXFP8 linears around
     ``gelu_quantize(input_bias=b1)``."""
-    hidden = _fp8_linear_reference(x, w1, None)
+    hidden = _mxfp8_linear_reference(x, None, w1)
     activated = F.gelu(hidden.float() + b1.float()).to(torch.bfloat16)
-    return _fp8_linear_reference(quantize_static(activated, hidden_exponent), w2, None)
+    return _mxfp8_linear_reference(quantize_static(activated, hidden_exponent), None, w2)
 
 
 mxfp8_gelu_mlp = Op("mxfp8_gelu_mlp", _mxfp8_gelu_mlp_reference)

@@ -15,7 +15,7 @@ def test_fp8_emulation_on_cpu_tracks_bf16(fp32_highest):
     pair = (ASSETS / "toronto_A.jpg", ASSETS / "toronto_B.jpg")
     reset_call_counts()
     fp8 = load_romav2("fp8", setting="turbo", device="cpu")
-    assert set(fp8.quant_report.kernel_counts()) == {"emulation"}
+    assert set(fp8.quant_report.kernel_counts()) == {"reference"}
     bf16 = load_romav2("bf16", setting="turbo", device="cpu")
     with torch.inference_mode():
         a = fp8.match(*pair)

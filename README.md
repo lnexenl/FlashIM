@@ -294,7 +294,8 @@ flashim/
                fused-local-corr); out-of-tree backends via the `flashim.backends` entry point
   log.py       logging (FLASHIM_LOG), dispatch tracing, profiler / NVTX ranges
   quant/       formats (MX), QuantizedTensor, schemes (compressed-tensors vocabulary), calibration,
-               methods (StaticMXFP8Linear), kernels (cuBLAS MXFP8 > Triton FP8 > emulation), fusion passes
+               methods (StaticMXFP8Linear = ops.mxfp8_linear bound to its weight: cuBLAS MXFP8 > Triton FP8 >
+               emulated reference, via normal op dispatch), fusion passes
   engines/     region torch.compile, experimental CUDA-graph runner
   models/      romav2 (DINOv3 ViT-L/16, MV-ViT, DPT head, conv refiners, presets, calibration)
                rdd (ConvNeXt, deformable encoder, detector, sparse keypoints / matching, presets, calibration)

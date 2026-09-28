@@ -68,7 +68,7 @@ def test_fp8_bit_exact(preset, fp32_highest):
     model = load_romav2(preset, setting="mega1500")
     summary = model.quant_report.summary()
     # 146 RoMaV2 linears minus the 24 in DINOv3 blocks 18-23, which FlashIM truncates.
-    assert summary["linears"] == 122 and summary["linear_kernels"] == {"cublas_mxfp8": 122}
+    assert summary["linears"] == 122 and summary["linear_kernels"] == {"cublas": 122}
     inputs = model.prepare(*PAIR)
     with torch.inference_mode():
         ref = oracle(*inputs)

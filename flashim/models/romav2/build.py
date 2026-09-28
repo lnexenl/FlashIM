@@ -97,7 +97,7 @@ def load_romav2(
         if spec.fold_refiners:
             _refiners_channels_last(model)
             fold_block_batchnorm(model.refiners)
-        model.quant_report = quantize_model(model, spec.config, table, protected=PROTECTED, platform=platform)
+        model.quant_report = quantize_model(model, spec.config, table, protected=PROTECTED)
         model.calibration_metadata = dict(table.metadata)
     if attention != "sdpa":
         if spec.config is None:

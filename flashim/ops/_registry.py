@@ -78,8 +78,11 @@ class Impl:
     priority: int = 0
     when: Callable[..., bool] | None = None
     order: int = 0
+    weights: int = 0  # the op's trailing weight operand count
     # Raw weight operands -> this impl's layout (tuple), run once per BoundOp (per call when unbound).
     prepare: Callable[..., tuple] | None = None
+    # Weight-only eligibility (vLLM's ``can_implement``): checked once per BoundOp, per call when unbound.
+    accepts: Callable[..., bool] | None = None
 
     def available(self, platform: Platform) -> bool:
         return self.device.matches(platform) and platform.supports(*self.requires)
@@ -91,9 +94,15 @@ class Impl:
         missing = sorted(f.value for f in self.requires if not platform.supports(f))
         if missing:
             return "missing features " + ",".join(missing)
+        if self.accepts is not None and not self.accepts(*weights_of(self, args)):
+            return "accepts() rejected the weights"
         if self.when is not None and not self.when(*args, **kwargs):
             return "when() rejected the arguments"
         return None
+
+
+def weights_of(impl: Impl, args: tuple) -> tuple:
+    return args[len(args) - impl.weights:]
 
 
 @dataclass
@@ -175,15 +184,19 @@ class Op:
         priority: int = 0,
         when: Callable[..., bool] | None = None,
         prepare: Callable[..., tuple] | None = None,
+        accepts: Callable[..., bool] | None = None,
     ) -> Callable[[Callable], Callable]:
         if name == REFERENCE or any(impl.name == name for impl in self.impls):
             raise ValueError(f"Duplicate impl {name!r} for op {self.name!r}")
-        if prepare is not None and not self.weights:
-            raise ValueError(f"Op {self.name!r} declares no weight operands to prepare")
+        if (prepare is not None or accepts is not None) and not self.weights:
+            raise ValueError(f"Op {self.name!r} declares no weight operands to prepare or accept")
 
         def decorator(fn: Callable) -> Callable:
             self.impls.append(
-                Impl(name, fn, device, frozenset(requires), priority, when, len(self.impls), prepare)
+                Impl(
+                    name, fn, device, frozenset(requires), priority, when, len(self.impls), self.weights, prepare,
+                    accepts,
+                )
             )
             return fn
 
@@ -224,7 +237,9 @@ class Op:
             raise ValueError(self._unknown_impl(name))
         return impl
 
-    def _choose(self, args: tuple, kwargs: dict, pin: str | None = None) -> Impl | None:
+    def _choose(
+        self, args: tuple, kwargs: dict, pin: str | None = None, accepted: dict[str, bool] | None = None
+    ) -> Impl | None:
         """The impl to run (``None`` = the reference). Global overrides first; a pinned impl that does not apply
         falls back to the reference, not to other impls."""
         forced = _CONFIG.forced.get(self.name)
@@ -236,7 +251,17 @@ class Op:
             return None
         platform = self._platform(args, kwargs)
         for impl in [self._find(pin)] if pin is not None else self.candidates(platform):
-            if impl.available(platform) and (impl.when is None or impl.when(*args, **kwargs)):
+            if not impl.available(platform):
+                continue
+            if impl.accepts is not None:
+                ok = None if accepted is None else accepted.get(impl.name)
+                if ok is None:
+                    ok = bool(impl.accepts(*weights_of(impl, args)))
+                    if accepted is not None:
+                        accepted[impl.name] = ok
+                if not ok:
+                    continue
+            if impl.when is None or impl.when(*args, **kwargs):
                 return impl
         if pin is None and _CONFIG.strict and platform.device_type != "cpu":
             raise RuntimeError(f"Op {self.name!r} fell back to the reference on {platform.describe()}")
@@ -336,16 +361,30 @@ class BoundOp:
         self.weights = weights
         self.pin = pin
         self._prepared: dict[str, tuple] = {}
+        self._accepted: dict[str, bool] = {}
 
     @property
     def platform(self) -> Platform:
         return platform_for(_first_device(self.weights) or torch.device("cpu"))
 
+    def _usable(self) -> list[Impl]:
+        impls = [
+            impl for impl in self.op.candidates(self.platform)
+            if impl.accepts is None or impl.accepts(*self.weights)
+        ]
+        return impls if self.pin is None else [i for i in impls if i.name == self.pin]
+
     @property
     def available(self) -> list[str]:
-        """Impls that can run on the weights' device (before per-call ``when`` checks), best first."""
-        names = [impl.name for impl in self.op.candidates(self.platform)]
-        return names if self.pin is None else [n for n in names if n == self.pin]
+        """Impls that can run these weights on their device (before per-call ``when`` checks), best first."""
+        return [impl.name for impl in self._usable()]
+
+    def warmup(self) -> BoundOp:
+        """Prepare every usable impl now (eagerly: keeps ``prepare`` out of ``torch.compile`` traces)."""
+        for impl in self._usable():
+            if impl.prepare is not None and impl.name not in self._prepared:
+                self._prepared[impl.name] = tuple(impl.prepare(*self.weights))
+        return self
 
     @property
     def primary(self) -> str:
@@ -354,7 +393,7 @@ class BoundOp:
 
     def __call__(self, *args, **kwargs):
         full = args + self.weights
-        impl = self.op._choose(full, kwargs, pin=self.pin)
+        impl = self.op._choose(full, kwargs, pin=self.pin, accepted=self._accepted)
         prepared = None
         if impl is not None and impl.prepare is not None:
             prepared = self._prepared.get(impl.name)

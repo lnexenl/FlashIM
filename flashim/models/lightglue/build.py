@@ -78,7 +78,7 @@ def load_lightglue(
         table = calibration
         if not isinstance(table, (CalibrationTable, Int8CalibrationTable)):
             table = (Int8CalibrationTable if spec.int8 else CalibrationTable).load(table or spec.calibration)
-        model.quant_report = quantize_model(model, spec.config, table, protected=PROTECTED, platform=platform)
+        model.quant_report = quantize_model(model, spec.config, table, protected=PROTECTED)
         model.calibration_metadata = dict(table.metadata)
     if attention != "sdpa":
         for module in model.modules():

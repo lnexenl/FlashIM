@@ -26,7 +26,7 @@ from flashim.ops.conv import (
 )
 from flashim.ops.correlation import local_corr
 from flashim.ops.density import kde_density
-from flashim.ops.gemm import fp8_linear, int8_linear, linear_fp32, mxfp8_gelu_mlp, mxfp8_scaled_mm
+from flashim.ops.gemm import int8_linear, linear_fp32, mxfp8_gelu_mlp, mxfp8_linear, mxfp8_scaled_mm
 from flashim.ops.quantize import (
     gelu_quantize,
     gelu_quantize_int8,
@@ -52,7 +52,6 @@ __all__ = [
     "depthwise5x5_relu_pointwise",
     "depthwise5x5_relu_pointwise_int8",
     "depthwise5x5_relu_pointwise_mxfp8",
-    "fp8_linear",
     "gelu_quantize",
     "gelu_quantize_int8",
     "int8_linear",
@@ -63,6 +62,7 @@ __all__ = [
     "local_corr",
     "multiscale_fuse",
     "mxfp8_gelu_mlp",
+    "mxfp8_linear",
     "mxfp8_scaled_mm",
     "quantize_int8",
     "quantize_mxfp8",

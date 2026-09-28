@@ -6,7 +6,6 @@ from collections.abc import Iterable
 
 from torch import nn
 
-from flashim.platforms import Platform, platform_for
 from flashim.quant.calibration import CalibrationTable, Int8CalibrationTable
 from flashim.quant.methods.int8_linear import StaticInt8Conv1x1, StaticInt8Linear
 from flashim.quant.methods.linear import StaticMXFP8Linear
@@ -27,7 +26,6 @@ def quantize_model(
     calibration: CalibrationTable | Int8CalibrationTable | None,
     *,
     protected: Iterable[str] = (),
-    platform: Platform | None = None,
 ) -> PackingReport:
     """In place. Linears targeted by a static scheme become :class:`StaticMXFP8Linear`
     (or :class:`StaticInt8Linear` for INT8 schemes, which need an :class:`Int8CalibrationTable`);
@@ -35,9 +33,8 @@ def quantize_model(
     separable conv blocks whose ``conv_pointwise`` is targeted by a dynamic MXFP8 scheme become
     :class:`MXFP8SeparableConvBlock`, by a static INT8 scheme :class:`Int8SeparableConvBlock`
     (BatchNorm must already be folded). Other 1x1 convolutions targeted by an INT8 scheme become
-    :class:`StaticInt8Conv1x1`.
+    :class:`StaticInt8Conv1x1`. Kernels are chosen by op dispatch on the layers' device.
     """
-    platform = platform or platform_for(next(model.parameters()).device)
     names = [name for name, _ in model.named_modules()]
     config.check_protected(names, protected)
     report = PackingReport()
@@ -71,11 +68,11 @@ def quantize_model(
         else:
             if not isinstance(calibration, CalibrationTable):
                 raise TypeError(f"MXFP8 scheme for {name!r} needs a CalibrationTable")
-            packed = StaticMXFP8Linear.from_linear(module, calibration[name].input_exponent, platform)
+            packed = StaticMXFP8Linear.from_linear(module, calibration[name].input_exponent)
         report.bytes_before += nbytes(module)
         report.bytes_after += nbytes(packed)
         set_submodule(model, name, packed)
-        report.linears[name] = "int8_linear" if isinstance(packed, StaticInt8Linear) else packed.kernel.name
+        report.linears[name] = "int8_linear" if isinstance(packed, StaticInt8Linear) else packed.kernel_name
 
     # 2) Transformer-block boundary fusion (needs packed QKV).
     for name, module in list(model.named_modules()):

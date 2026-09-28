@@ -7,9 +7,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from flashim import ops
-from flashim.platforms import Platform
+from flashim.ops import BoundOp
 from flashim.quant.formats import mx
-from flashim.quant.kernels.linear import MXFP8LinearKernel, choose_kernel
 from flashim.quant.tensor import QuantizedTensor, QuantizedWeight, quantize_static
 
 
@@ -20,6 +19,10 @@ class StaticMXFP8Linear(nn.Module):
     multiples of 32. Inputs: quantized with a *static* calibrated exponent per
     32-channel block (values beyond the calibrated range saturate). Output: BF16
     GEMM result plus BF16 bias, cast to the input dtype (RoMaV2 FastFP8 contract).
+
+    The GEMM is ``ops.mxfp8_linear`` bound to this layer's packed weight: cuBLAS block-scaled MXFP8 where it
+    applies (Blackwell, N and K multiples of 128), else the Triton FP8 GEMM, else the emulated reference. ``impl``
+    pins one (e.g. ``"reference"``). Moving the layer (``.to()``) rebinds it.
     """
 
     def __init__(
@@ -28,11 +31,11 @@ class StaticMXFP8Linear(nn.Module):
         bias: Tensor | None,
         input_exponent: Tensor,
         *,
-        kernel: MXFP8LinearKernel,
+        impl: str | None = None,
     ) -> None:
         super().__init__()
         self.in_features, self.out_features = weight.logical_shape[1], weight.logical_shape[0]
-        self.kernel = kernel
+        self.impl = impl
         device = weight.values.device
         self.register_buffer("weight_values", weight.values.view(torch.uint8))
         self.register_buffer("weight_exponent", weight.scale_exponent)
@@ -41,12 +44,23 @@ class StaticMXFP8Linear(nn.Module):
             "bias", None if bias is None else F.pad(bias.float(), (0, weight.out_features - bias.shape[0]))
         )
         self.register_buffer("bias_bf16", None if self.bias is None else self.bias.to(torch.bfloat16))
-        for name, value in kernel.prepare(weight).items():
-            self.register_buffer(name, value)
-        self._input_scales: dict[int, Tensor] = {}
+        self._bind()
+
+    def _bind(self) -> None:
+        self.gemm: BoundOp = ops.mxfp8_linear.bind(self.packed_weight(), impl=self.impl).warmup()
+
+    def _apply(self, fn, recurse: bool = True):
+        result = super()._apply(fn, recurse)
+        self._bind()  # the bound weights (and their packed forms) must follow the buffers
+        return result
+
+    @property
+    def kernel_name(self) -> str:
+        """The GEMM impl calls will use (``"cublas"``, ``"triton"`` or ``"reference"``)."""
+        return self.gemm.primary
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, input_exponent: Tensor, platform: Platform) -> StaticMXFP8Linear:
+    def from_linear(cls, linear: nn.Linear, input_exponent: Tensor, *, impl: str | None = None) -> StaticMXFP8Linear:
         weight = QuantizedWeight.from_float(linear.weight.detach())
         bias = None
         if linear.bias is not None:
@@ -59,8 +73,7 @@ class StaticMXFP8Linear(nn.Module):
         expected = (weight.in_features // mx.BLOCK,)
         if tuple(input_exponent.shape) != expected:
             raise ValueError(f"Input exponent shape {tuple(input_exponent.shape)} != {expected}")
-        kernel = choose_kernel(platform, weight.out_features, weight.in_features)
-        return cls(weight, bias, input_exponent, kernel=kernel)
+        return cls(weight, bias, input_exponent, impl=impl)
 
     def packed_weight(self) -> QuantizedWeight:
         return QuantizedWeight(
@@ -69,14 +82,6 @@ class StaticMXFP8Linear(nn.Module):
             (self.out_features, self.in_features),
         )
 
-    def input_scales(self, rows: int) -> Tensor:
-        """Swizzled static input scales for ``rows`` rows (cached per row count)."""
-        scales = self._input_scales.get(rows)
-        if scales is None:
-            scales = mx.static_input_scales(self.input_exponent, rows)
-            self._input_scales[rows] = scales
-        return scales
-
     def _finish(self, out: Tensor, leading: tuple[int, ...], dtype: torch.dtype) -> Tensor:
         if self.bias_bf16 is not None:
             out = out + self.bias_bf16
@@ -84,7 +89,7 @@ class StaticMXFP8Linear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         quantized = quantize_static(x, self.input_exponent)
-        return self._finish(self.kernel.apply(self, quantized), tuple(x.shape[:-1]), x.dtype)
+        return self._finish(self.gemm(quantized, None), tuple(x.shape[:-1]), x.dtype)
 
     def quantize_layernorm(self, value: Tensor, residual: Tensor | None, norm: nn.LayerNorm) -> QuantizedTensor:
         return ops.layernorm_quantize(value, residual, norm.weight, norm.bias, norm.eps, self.input_exponent)
@@ -97,7 +102,7 @@ class StaticMXFP8Linear(nn.Module):
 
         ``bias=False`` leaves the bias out (for consumers that fold it into their own kernel); ``bias=True`` adds
         it in the GEMM epilogue (FP32 accumulator + bias, one rounding)."""
-        out = self.kernel.apply(self, quantized, self.bias if bias else None)
+        out = self.gemm(quantized, self.bias if bias else None)
         return out[:, : self.out_features].reshape(*quantized.logical_shape[:-1], self.out_features)
 
     def forward_prequantized(self, quantized: QuantizedTensor) -> Tensor:
@@ -106,8 +111,8 @@ class StaticMXFP8Linear(nn.Module):
             quantized.scale_exponent, self.input_exponent
         ):
             raise ValueError("Prequantized activation uses a different static scale")
-        out = self.kernel.apply(self, quantized)
+        out = self.gemm(quantized, None)
         return self._finish(out, quantized.logical_shape[:-1], torch.bfloat16)
 
     def extra_repr(self) -> str:
-        return f"in={self.in_features}, out={self.out_features}, kernel={self.kernel.name}"
+        return f"in={self.in_features}, out={self.out_features}, kernel={self.kernel_name}"

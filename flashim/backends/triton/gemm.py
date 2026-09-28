@@ -351,8 +351,9 @@ def mxfp8_gelu_mlp(
 
 # -- registrations ---------------------------------------------------------------------------------------
 
-@ops.fp8_linear.register("triton", device=DeviceSpec("cuda", min_capability=(8, 9)), requires=[Feature.TRITON])
-def _fp8_linear_impl(activation: QuantizedTensor, weight: QuantizedWeight, bias: Tensor | None) -> Tensor:
+# Static MXFP8 linear for shapes cuBLAS block-scaled MXFP8 cannot take (and pre-Blackwell FP8 GPUs).
+@ops.mxfp8_linear.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3])
+def _mxfp8_linear_impl(activation: QuantizedTensor, bias: Tensor | None, weight: QuantizedWeight) -> Tensor:
     return fp8_gemm_bf16(activation, weight, None if bias is None else bias.float())
 
 

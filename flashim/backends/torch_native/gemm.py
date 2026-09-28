@@ -9,6 +9,8 @@ from torch import Tensor
 from flashim import ops
 from flashim.ops._registry import DeviceSpec
 from flashim.platforms import Feature
+from flashim.quant.formats import mx
+from flashim.quant.tensor import QuantizedTensor, QuantizedWeight
 
 
 @torch.compiler.allow_in_graph
@@ -32,6 +34,48 @@ def _scaled_mm_cublas(a: Tensor, b_t: Tensor, a_scale: Tensor, b_scale: Tensor, 
 @ops.mxfp8_scaled_mm.register("cublas", device=DeviceSpec("cuda"), requires=[Feature.MXFP8_SCALED_MM])
 def _mxfp8_scaled_mm_cublas(a, b_t, a_scale, b_scale, bias=None):
     return _scaled_mm_cublas(a, b_t, a_scale, b_scale, bias)
+
+
+class _InputScales:
+    """Swizzled static input scales per row count for one layer's calibrated input exponent (the first one seen;
+    another exponent object is converted per call, uncached)."""
+
+    def __init__(self) -> None:
+        self.exponent: Tensor | None = None
+        self.by_rows: dict[int, Tensor] = {}
+
+    def get(self, exponent: Tensor, rows: int) -> Tensor:
+        if self.exponent is None:
+            self.exponent = exponent
+        if exponent is not self.exponent:
+            return mx.static_input_scales(exponent, rows)
+        scales = self.by_rows.get(rows)
+        if scales is None:
+            scales = self.by_rows[rows] = mx.static_input_scales(exponent, rows)
+        return scales
+
+
+def _prepare_mxfp8(weight: QuantizedWeight) -> tuple[Tensor, Tensor, _InputScales]:
+    return weight.values.t(), mx.swizzle_scales(weight.scale_exponent), _InputScales()
+
+
+def _cublas_shapes(weight: QuantizedWeight) -> bool:
+    # cuBLAS block-scaled MXFP8: padded N and K multiples of 128.
+    return weight.out_features % 128 == 0 and weight.in_features % 128 == 0
+
+
+@ops.mxfp8_linear.register(
+    "cublas", device=DeviceSpec("cuda"), requires=[Feature.MXFP8_SCALED_MM], priority=1,
+    prepare=_prepare_mxfp8, accepts=_cublas_shapes,
+)
+def _mxfp8_linear_cublas(
+    activation: QuantizedTensor, bias: Tensor | None, weight_t: Tensor, weight_scale: Tensor, input_scales: _InputScales
+) -> Tensor:
+    matrix = activation.matrix()
+    a_scale = input_scales.get(activation.scale_exponent, matrix.shape[0])
+    return _scaled_mm_cublas(
+        matrix, weight_t, a_scale, weight_scale, None if bias is None else bias.to(torch.bfloat16)
+    )
 
 
 def _int_mm_eligible(a, weight, a_scale, w_scale, bias) -> bool:

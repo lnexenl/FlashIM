@@ -99,15 +99,15 @@ def test_mxfp8_scaled_mm_matches_emulation(rows):
     assert rel < 1e-4
 
 
-def test_fp8_linear_triton_matches_reference():
+def test_mxfp8_linear_triton_matches_reference():
     w = QuantizedWeight.from_float(torch.randn(96, 160, device=DEV))  # not a multiple of 128
     x = torch.randn(77, 160, device=DEV)
     q = quantize_static(x, mx.calibrate_block32_exponent(x))
     bias = torch.randn(96, device=DEV)
     ops.reset_call_counts()
-    fast, ref = _both(ops.fp8_linear, "triton", q, w, bias)
+    fast, ref = _both(ops.mxfp8_linear, "triton", q, bias, w)
     # Dataclass arguments must resolve to their CUDA device (a pinned impl used to fall back silently).
-    assert ops.call_counts()["fp8_linear"] == {"triton": 1, "reference": 1}
+    assert ops.call_counts()["mxfp8_linear"] == {"triton": 1, "reference": 1}
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
 
 
