@@ -12,11 +12,13 @@ from flashim.types import SparseFeatures, SparseMatchResult
 
 class SparsePipeline(nn.Module):
     """``extractor`` (e.g. RDD: ``extract(image, resize=, top_k=) -> SparseFeatures``) followed by ``matcher``
-    (:class:`LightGlue`). ``match`` accepts the extractor's ``resize`` / ``top_k`` and the matcher's ``threshold``."""
+    (:class:`LightGlue`). ``match`` accepts the extractor's ``resize`` / ``top_k`` and the matcher's ``threshold``;
+    ``defaults`` (a run config's ``inference`` section) fills the ones a call leaves ``None``."""
 
     def __init__(self, extractor: nn.Module, matcher: LightGlue) -> None:
         super().__init__()
         self.extractor, self.matcher = extractor, matcher
+        self.defaults: dict = {}
 
     @property
     def device(self) -> torch.device:
@@ -54,6 +56,9 @@ class SparsePipeline(nn.Module):
         top_k: int | None = None,
         threshold: float | None = None,
     ) -> SparseMatchResult:
+        resize = resize if resize is not None else self.defaults.get("resize")
+        top_k = top_k if top_k is not None else self.defaults.get("top_k")
+        threshold = threshold if threshold is not None else self.defaults.get("threshold")
         a = self.extract(img_a, resize=resize, top_k=top_k)
         b = self.extract(img_b, resize=resize, top_k=top_k)
         return self.match_features(a, b, threshold)

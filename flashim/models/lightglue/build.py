@@ -1,27 +1,17 @@
-"""Build a ready-to-run LightGlue (and the RDD + LightGlue pipeline) from a preset and an engine."""
+"""Build LightGlue and the sparse pipelines around it (the keyword API over :mod:`flashim.build`)."""
 
 from __future__ import annotations
 
-import dataclasses
-import logging
 from pathlib import Path
 
 import torch
 
-from flashim.engines.compile import compile_regions
-from flashim.models.lightglue import weights
-from flashim.models.lightglue.config import ALIKED_CONFIG, LightGlueConfig
-from flashim.models.lightglue.model import CrossBlock, LightGlue, SelfBlock
+from flashim.build import build
+from flashim.models.lightglue.config import LightGlueConfig
+from flashim.models.lightglue.model import LightGlue
 from flashim.models.lightglue.pipeline import SparsePipeline
-from flashim.models.lightglue.quant import PRESETS, PROTECTED
-from flashim.platforms import Feature, platform_for
-from flashim.quant.apply import quantize_model
+from flashim.models.lightglue.spec import legacy_overrides
 from flashim.quant.calibration import CalibrationTable, Int8CalibrationTable
-
-logger = logging.getLogger(__name__)
-
-ENGINES = ("eager", "compile")
-RECOMPILE_LIMIT = 64
 
 
 def load_lightglue(
@@ -49,54 +39,25 @@ def load_lightglue(
     kernels (``strict=True`` raises instead). ``depth_confidence`` in (0, 1) enables early stopping
     (LightGlue recommends 0.95): layers stop once that fraction of keypoints is confident, so with
     ``engine="compile"`` each executed depth reuses the per-layer graphs (one host sync per layer).
+    Equivalent to ``flashim.build("lightglue", preset, config=...)``.
     """
-    if preset not in PRESETS:
-        raise ValueError(f"Unknown preset {preset!r}; choose from {sorted(PRESETS)}")
-    if engine not in ENGINES:
-        raise ValueError(f"Unknown engine {engine!r}; choose from {ENGINES}")
-    if variant not in ("rdd", "aliked"):
-        raise ValueError(f"Unknown variant {variant!r}; choose from ('rdd', 'aliked')")
-    spec = PRESETS[preset]
-    config = config or (ALIKED_CONFIG if variant == "aliked" else LightGlueConfig())
-    if depth_confidence is not None:
-        config = dataclasses.replace(config, depth_confidence=depth_confidence)
-    if variant == "aliked":
-        state = weights.load_aliked_state_dict(config.num_heads, config.num_layers, checkpoint)
-        model = LightGlue.from_pretrained(config, state_dict=state, device=device)
-    else:
-        model = LightGlue.from_pretrained(config, checkpoint=checkpoint, device=device)
-    model.preset = preset
-    if spec.compute_dtype != torch.float32:
-        model.set_compute_dtype(spec.compute_dtype)
-    if spec.config is not None:
-        platform = platform_for(model.device)
-        if not spec.int8 and not platform.supports(Feature.MXFP8_SCALED_MM):
-            message = f"Preset {preset!r}: no native MXFP8 GEMM on {platform.describe()}; using emulation"
-            if strict:
-                raise RuntimeError(message)
-            logger.warning(message)
-        table = calibration
-        if not isinstance(table, (CalibrationTable, Int8CalibrationTable)):
-            table = (Int8CalibrationTable if spec.int8 else CalibrationTable).load(table or spec.calibration)
-        model.quant_report = quantize_model(model, spec.config, table, protected=PROTECTED)
-        model.calibration_metadata = dict(table.metadata)
-    if attention != "sdpa":
-        for module in model.modules():
-            if isinstance(module, (SelfBlock, CrossBlock)):
-                module.sdpa_impl = attention
-        model.attention = attention
-    if engine == "compile":
-        import torch._dynamo.config as dynamo_config
+    return build(
+        "lightglue",
+        preset,
+        config=legacy_overrides(
+            variant=variant, engine=engine, device=device, checkpoint=checkpoint, calibration=calibration,
+            strict=strict, config=config, compile_mode=compile_mode, attention=attention,
+            depth_confidence=depth_confidence,
+        ),
+    )
 
-        dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, RECOMPILE_LIMIT)
-        regions = (
-            "posenc",
-            *(f"transformers.{i}" for i in range(len(model.transformers))),
-            *(f"log_assignment.{i}" for i in range(len(model.log_assignment))),
-        )
-        compile_regions(model, regions, mode=compile_mode)
-    model.engine = engine
-    return model
+
+def _pipeline(name: str, preset: str, extractor: dict, engine: str, device, kwargs: dict, variant: str) -> SparsePipeline:
+    matcher = {"model": "lightglue", "preset": preset, **legacy_overrides(variant=variant, engine=engine, **kwargs)}
+    overlay: dict = {"engine": {"kind": engine}, "components": {"extractor": extractor, "matcher": matcher}}
+    if device is not None:
+        overlay["device"] = str(device)
+    return build(name, preset, config=overlay)
 
 
 def load_rdd_lightglue(
@@ -110,11 +71,10 @@ def load_rdd_lightglue(
 ) -> SparsePipeline:
     """RDD keypoints/descriptors (``rdd_preset``) matched by LightGlue (``preset``); ``kwargs`` go to
     :func:`load_lightglue` and ``rdd_kwargs`` to :func:`flashim.models.rdd.build.load_rdd`."""
-    from flashim.models.rdd.build import load_rdd
+    from flashim.models.rdd.spec import legacy_overrides as rdd_overrides
 
-    extractor = load_rdd(rdd_preset, engine=engine, device=device, **(rdd_kwargs or {}))
-    matcher = load_lightglue(preset, engine=engine, device=device, **kwargs)
-    return SparsePipeline(extractor, matcher)
+    extractor = {"model": "rdd", "preset": rdd_preset, **rdd_overrides(engine=engine, **(rdd_kwargs or {}))}
+    return _pipeline("rdd-lightglue", preset, extractor, engine, device, kwargs, "rdd")
 
 
 def load_aliked_lightglue(
@@ -129,11 +89,10 @@ def load_aliked_lightglue(
     """ALIKED keypoints/descriptors (``aliked_preset``) matched by cvg/LightGlue's ALIKED-trained weights
     (``preset``); ``kwargs`` go to :func:`load_lightglue` (``variant="aliked"`` is set automatically) and
     ``aliked_kwargs`` to :func:`flashim.models.aliked.build.load_aliked`."""
-    from flashim.models.aliked.build import load_aliked
+    from flashim.models.aliked.spec import legacy_overrides as aliked_overrides
 
-    extractor = load_aliked(aliked_preset, engine=engine, device=device, **(aliked_kwargs or {}))
-    matcher = load_lightglue(preset, variant="aliked", engine=engine, device=device, **kwargs)
-    return SparsePipeline(extractor, matcher)
+    extractor = {"model": "aliked", "preset": aliked_preset, **aliked_overrides(engine=engine, **(aliked_kwargs or {}))}
+    return _pipeline("aliked-lightglue", preset, extractor, engine, device, kwargs, "aliked")
 
 
 def load_raco_aliked_lightglue(
@@ -147,9 +106,10 @@ def load_raco_aliked_lightglue(
 ) -> SparsePipeline:
     """RaCo keypoints + ALIKED descriptors (``extractor_preset``) matched by cvg/LightGlue's ALIKED-trained
     weights (``preset``): the pipeline of `fabio-sim/LightGlue-ONNX`'s ``raco_aliked``. ``kwargs`` go to
-    :func:`load_lightglue`, ``extractor_kwargs`` to :func:`flashim.models.raco.build.load_raco_aliked`."""
-    from flashim.models.raco.build import load_raco_aliked
+    :func:`load_lightglue`, ``extractor_kwargs`` (``raco_checkpoint``, ``raco_config``, ``aliked_kwargs``,
+    ``fused_ranker``) to :func:`flashim.models.raco.build.load_raco_aliked`."""
+    from flashim.models.raco.build import raco_aliked_overlay
 
-    extractor = load_raco_aliked(extractor_preset, engine=engine, device=device, **(extractor_kwargs or {}))
-    matcher = load_lightglue(preset, variant="aliked", engine=engine, device=device, **kwargs)
-    return SparsePipeline(extractor, matcher)
+    overlay = raco_aliked_overlay(extractor_preset, engine=engine, **(extractor_kwargs or {}))
+    extractor = {"model": "raco-aliked", "preset": extractor_preset, **overlay}
+    return _pipeline("raco-aliked-lightglue", preset, extractor, engine, device, kwargs, "aliked")

@@ -11,6 +11,36 @@ matches, conf, prec_a, prec_b = model.sample(result, 5000)
 kpts_a, kpts_b = model.to_pixel_coordinates(matches, h_a, w_a, h_b, w_b)
 ```
 
+## Configuring a run
+
+Every model is built by one generic builder from a `RunConfig` (`flashim/config.py`): `arch`, `precision`
+(dtype, quantization, calibration), `optimize` (named passes, attention impl, strict), `engine`, `inference`
+(per-call defaults) and, for pipelines, `components`. A preset is a named partial config; files, dicts and dotted
+overrides layer on top (later wins). The keyword API above is a thin layer over the same builder.
+
+```python
+model = flashim.load("romav2", "fp8-fast", overrides=["engine.kind=compile-full", "arch.setting=mega1500"])
+model = flashim.load("raco-aliked-lightglue", "int8", config="run.toml")   # .toml / .json (.yaml with PyYAML)
+flashim.resolve("rdd-lightglue", "fp8").to_dict()      # the config a build would use, without building
+model.run_config.digest(), model.build_report          # what was asked for / what was actually applied
+```
+
+```toml
+# run.toml: RaCo+ALIKED in BF16, LightGlue INT8, everything compiled
+device = "cuda"
+[engine]
+kind = "compile"
+[components.extractor]
+preset = "bf16"
+[inference]
+resize = 1024
+top_k = 1024
+```
+
+Overrides: `optimize.passes+=x` appends a pass, `components.matcher.optimize.attention=sage` reaches into a
+pipeline component. Unknown keys, passes, quant configs and engines are errors; a pass the platform cannot run is
+skipped with a warning (`optimize.strict=true` raises).
+
 ## Models
 
 | model | presets | notes |
@@ -293,6 +323,8 @@ flashim/
                triton/, tilelang/, cuda/ (JIT CUDA C++), torch_native/ (cuBLAS), external/ (sageattention,
                fused-local-corr); out-of-tree backends via the `flashim.backends` entry point
   log.py       logging (FLASHIM_LOG), dispatch tracing, profiler / NVTX ranges
+  config.py    RunConfig: typed, layered (preset < file < overrides), serializable run configuration
+  build.py     ModelSpec (presets, passes, engines) + the generic builder all models go through
   layers/      building blocks the passes recognize by type (TransformerBlock, SeparableConvBlock,
                DeformableEncoder, ...): a model built from them gets quantization + fused kernels without
                model-specific code
