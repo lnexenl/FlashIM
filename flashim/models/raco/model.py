@@ -105,51 +105,46 @@ class RaCo(nn.Module):
 
     def ranker_map(self, image: Tensor) -> Tensor:
         """Ranker score map ``[B, 1, H, W]`` (FP32) for a normalized image."""
-        if self._fused_ranker is not None and image.is_cuda and image.shape[0] == 1:
+        if self._fused_ranker is not None and image.shape[0] == 1:
             return self._fused_ranker_map(image)
         return self.ranker_head(image.to(self.compute_dtype)).float()
 
     def use_fused_ranker(self, backend: str = "auto") -> None:
-        """Run the ranker's residual blocks as fused kernels (one read + one write of the activation per block instead
-        of ~5 passes) on CUDA with batch size 1. ``backend``: ``"cuda"`` (CUDA C++, ``backends/cuda/csrc/raco_resblock.cu``, JIT
-        built with nvcc), ``"triton"`` (``backends/triton/raco.py``) or ``"auto"`` (CUDA when it builds, else Triton). Needs
-        BatchNorm folded (:func:`~flashim.models.raco.fuse.fold_batchnorm`); the original ``ranker_head`` stays as the
-        fallback. Faster than the compiled BF16 ranker and closer to FP32 (99.8% of the selected keypoints identical
-        vs 99.6%)."""
-        from flashim.backends.cuda import raco as cuda_kernel
-        from flashim.backends.triton import raco as fused
-
-        if backend not in ("auto", "cuda", "triton"):
-            raise ValueError(f"Unknown backend {backend!r}")
-        use_cuda = backend == "cuda" or (backend == "auto" and cuda_kernel.available(self.device))
-        if backend == "cuda" and not cuda_kernel.available(self.device):
-            raise RuntimeError("the CUDA C++ ranker kernel is unavailable (needs nvcc and compute capability >= 8.0)")
-
+        """Run the ranker's residual blocks and 5x5 head through the fused ops (``ops.raco_resblock`` /
+        ``ops.raco_head5x5``: one read + one write of the activation per block instead of ~5 passes) at batch
+        size 1. ``backend``: ``"auto"`` (normal dispatch: the CUDA C++ kernel when nvcc builds it, else Triton, else
+        the torch reference) or an impl name to pin (``"cuda"``, ``"triton"``). Needs BatchNorm folded
+        (:func:`~flashim.models.raco.fuse.fold_batchnorm`); ``ranker_head`` stays for batched inputs. Faster than
+        the compiled BF16 ranker and closer to FP32 (99.8% of the selected keypoints identical vs 99.6%)."""
         blocks = [m for m in self.ranker_head if isinstance(m, ResBlock)]
         if any(isinstance(b.bn1, nn.BatchNorm2d) for b in blocks):
             raise RuntimeError("use_fused_ranker needs BatchNorm folded first")
-        packs = []
-        for b in blocks:
-            w1, w2, wm = fused.pack_block(b.conv1.weight, b.conv2.weight, b.match_dims.weight)
-            pack = (w1, fused.pad_bias(b.conv1.bias), w2, fused.pad_bias(b.conv2.bias), wm, fused.pad_bias(b.match_dims.bias))
-            packs.append(cuda_kernel.pack_block(pack) if use_cuda else pack)
-        self.ranker_backend = "cuda" if use_cuda else "triton"
-        self._fused_ranker = (packs, fused.pack_head(self.ranker_head[-1]), cuda_kernel.resblock if use_cuda else fused.resblock)
+        pin = None if backend == "auto" else backend
+        resblocks = [
+            ops.raco_resblock.bind(
+                b.conv1.weight, b.conv1.bias, b.conv2.weight, b.conv2.bias, b.match_dims.weight, b.match_dims.bias,
+                impl=pin,
+            )
+            for b in blocks
+        ]
+        head = self.ranker_head[-1]
+        if pin is not None and pin not in resblocks[0].available:
+            raise RuntimeError(f"raco_resblock impl {pin!r} cannot run on {resblocks[0].platform.describe()}")
+        self.ranker_backend = resblocks[0].primary
+        self._fused_ranker = (resblocks, ops.raco_head5x5.bind(head.weight, head.bias))
 
     def _fused_ranker_map(self, image: Tensor) -> Tensor:
-        from flashim.backends.triton import raco as fused
-
-        packs, head, resblock = self._fused_ranker
+        resblocks, head = self._fused_ranker
         h, w = image.shape[-2:]
         buffer = self._ranker_buffers.get((h, w))
         if buffer is None:  # 4 channels per pixel (3 valid): the input's zero padding is written once
             buffer = self._ranker_buffers[(h, w)] = torch.zeros(h, w, 4, device=image.device, dtype=torch.bfloat16)
         buffer[..., :3] = image[0].permute(1, 2, 0)
-        current, scratch, cin = buffer, None, 3
-        for pack in packs:
-            current, scratch = resblock(current, cin, pack, scratch)
+        current, cin = buffer, 3
+        for block in resblocks:
+            current = block(current, cin)
             cin = self.config.ranker_width
-        return fused.head5x5(current, head)
+        return head(current)
 
     def set_compute_dtype(self, dtype: torch.dtype) -> None:
         """Run the detector trunk and the ranker in ``dtype``; the detector's score head, NMS / soft-argmax and the

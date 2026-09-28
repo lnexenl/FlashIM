@@ -14,6 +14,10 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from flashim import ops
+from flashim.ops._registry import DeviceSpec
+from flashim.platforms import Feature
+
 TH, TW = 14, 14  # output tile (rows x cols); its conv1 region (+1px halo) is 16x16 = 256 lanes (tl.dot M)
 CP = 16  # channel padding (tl.dot's minimum K/N)
 NUM_WARPS = 8
@@ -156,13 +160,6 @@ def _head5x5_kernel(x_ptr, w_ptr, out_ptr, bias, H, W, BLOCK: tl.constexpr, CP: 
     tl.store(out_ptr + pix, acc + bias, mask=live)
 
 
-def pack_head(conv: Tensor) -> tuple[Tensor, float]:
-    """``conv``: ``Conv2d(C<=16, 1, 5)`` -> tap-major ``[25, CP]`` FP32 weights and the bias."""
-    weight = torch.zeros(25, CP, device=conv.weight.device, dtype=torch.float32)
-    weight[:, : conv.in_channels] = conv.weight.detach()[0].permute(1, 2, 0).reshape(25, conv.in_channels).float()
-    return weight, float(conv.bias.detach().item())
-
-
 def head5x5(x: Tensor, packed: tuple[Tensor, float]) -> Tensor:
     """``x``: NHWC bf16 ``[H, W, 16]`` -> FP32 ``[1, 1, H, W]``."""
     h, w, _ = x.shape
@@ -170,3 +167,37 @@ def head5x5(x: Tensor, packed: tuple[Tensor, float]) -> Tensor:
     out = torch.empty(h * w, device=x.device, dtype=torch.float32)
     _head5x5_kernel[(triton.cdiv(h * w, 256),)](x, weight, out, bias, h, w, BLOCK=256, CP=CP, num_warps=4)
     return out.view(1, 1, h, w)
+
+
+# -- registrations ---------------------------------------------------------------------------------------
+
+
+def _prepare_block(w1: Tensor, b1: Tensor, w2: Tensor, b2: Tensor, wm: Tensor, bm: Tensor) -> tuple[Tensor, ...]:
+    t1, t2, shortcut = pack_block(w1, w2, wm)
+    return t1, pad_bias(b1), t2, pad_bias(b2), shortcut, pad_bias(bm)
+
+
+def _resblock_eligible(x: Tensor, cin: int, w1: Tensor, *_) -> bool:
+    return x.ndim == 3 and x.dtype == torch.bfloat16 and x.is_contiguous() and x.shape[-1] in (4, CP) and w1.shape[0] <= CP
+
+
+@ops.raco_resblock.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_resblock_eligible, prepare=_prepare_block
+)
+def _resblock_impl(x: Tensor, cin: int, *packed: Tensor) -> Tensor:
+    return resblock(x, cin, packed)[0]
+
+
+def _prepare_head(weight: Tensor, bias: Tensor) -> tuple[Tensor, float]:
+    packed = torch.zeros(25, CP, device=weight.device, dtype=torch.float32)
+    packed[:, : weight.shape[1]] = weight.detach()[0].permute(1, 2, 0).reshape(25, weight.shape[1]).float()
+    return packed, float(bias.detach().item())
+
+
+def _head_eligible(x: Tensor, weight: Tensor, bias: Tensor) -> bool:
+    return x.ndim == 3 and x.dtype == torch.bfloat16 and x.is_contiguous() and x.shape[-1] == CP and min(x.shape[:2]) > 2
+
+
+ops.raco_head5x5.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_head_eligible, prepare=_prepare_head
+)(lambda x, weight, bias: head5x5(x, (weight, bias)))

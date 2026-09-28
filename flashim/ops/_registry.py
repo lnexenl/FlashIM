@@ -9,6 +9,8 @@ Require a feature rather than a capability range when the hardware feature is no
 monotonic in the capability (``Feature.WGMMA``, ``Feature.TCGEN05``).
 Selection order: highest ``priority`` first, then the narrowest capability range,
 then registration order. :meth:`Op.explain` says why each impl was (not) chosen;
+ops with constant weight operands (``Op(..., weights=n)``) let each impl repack them
+once, at load time, through :meth:`Op.bind` (``register(..., prepare=...)``);
 ``FLASHIM_LOG=ops=debug`` logs the first use of every impl and reference fallbacks
 on accelerators (see :mod:`flashim.log`).
 
@@ -76,6 +78,8 @@ class Impl:
     priority: int = 0
     when: Callable[..., bool] | None = None
     order: int = 0
+    # Raw weight operands -> this impl's layout (tuple), run once per BoundOp (per call when unbound).
+    prepare: Callable[..., tuple] | None = None
 
     def available(self, platform: Platform) -> bool:
         return self.device.matches(platform) and platform.supports(*self.requires)
@@ -143,14 +147,20 @@ def _first_device(values: Iterable) -> torch.device | None:
 
 class Op:
     """A dispatched op. ``composite=True`` marks a reference built from other (dispatched) ops -- a fused op's
-    unfused pipeline -- so falling back to it is expected and not reported as a slow path."""
+    unfused pipeline -- so falling back to it is expected and not reported as a slow path.
 
-    def __init__(self, name: str, reference: Callable, *, composite: bool = False) -> None:
+    ``weights=n``: the last ``n`` positional arguments are constant weights (raw module parameters). ``when``
+    predicates and the reference see the raw weights; an impl registered with ``prepare`` receives
+    ``prepare(*weights)`` in their place. Use :meth:`bind` to prepare once; a plain call prepares every time.
+    """
+
+    def __init__(self, name: str, reference: Callable, *, composite: bool = False, weights: int = 0) -> None:
         if name in OPS:
             raise ValueError(f"Duplicate op {name!r}")
         self.name = name
         self.reference = reference
         self.composite = composite
+        self.weights = weights
         self.impls: list[Impl] = []
         self.calls: Counter[str] = Counter()
         self.__doc__ = reference.__doc__
@@ -164,13 +174,16 @@ class Op:
         requires: Iterable[Feature] = (),
         priority: int = 0,
         when: Callable[..., bool] | None = None,
+        prepare: Callable[..., tuple] | None = None,
     ) -> Callable[[Callable], Callable]:
         if name == REFERENCE or any(impl.name == name for impl in self.impls):
             raise ValueError(f"Duplicate impl {name!r} for op {self.name!r}")
+        if prepare is not None and not self.weights:
+            raise ValueError(f"Op {self.name!r} declares no weight operands to prepare")
 
         def decorator(fn: Callable) -> Callable:
             self.impls.append(
-                Impl(name, fn, device, frozenset(requires), priority, when, len(self.impls))
+                Impl(name, fn, device, frozenset(requires), priority, when, len(self.impls), prepare)
             )
             return fn
 
@@ -205,34 +218,60 @@ class Op:
         report[REFERENCE] = "selected" if chosen == REFERENCE else "fallback"
         return report
 
-    def select(self, *args, **kwargs) -> tuple[str, Callable]:
-        platform = self._platform(args, kwargs)
+    def _find(self, name: str) -> Impl:
+        impl = next((i for i in self.impls if i.name == name), None)
+        if impl is None:
+            raise ValueError(self._unknown_impl(name))
+        return impl
+
+    def _choose(self, args: tuple, kwargs: dict, pin: str | None = None) -> Impl | None:
+        """The impl to run (``None`` = the reference). Global overrides first; a pinned impl that does not apply
+        falls back to the reference, not to other impls."""
         forced = _CONFIG.forced.get(self.name)
         if forced == REFERENCE or self.name in _CONFIG.disabled:
-            return REFERENCE, self.reference
+            return None
         if forced is not None:
-            for impl in self.impls:
-                if impl.name == forced:
-                    return impl.name, impl.fn
-            raise ValueError(self._unknown_impl(forced))
-        for impl in self.candidates(platform):
-            if impl.when is None or impl.when(*args, **kwargs):
-                return impl.name, impl.fn
-        if _CONFIG.strict and platform.device_type != "cpu":
-            raise RuntimeError(
-                f"Op {self.name!r} fell back to the reference on {platform.describe()}"
-            )
-        return REFERENCE, self.reference
+            return self._find(forced)
+        if pin == REFERENCE:
+            return None
+        platform = self._platform(args, kwargs)
+        for impl in [self._find(pin)] if pin is not None else self.candidates(platform):
+            if impl.available(platform) and (impl.when is None or impl.when(*args, **kwargs)):
+                return impl
+        if pin is None and _CONFIG.strict and platform.device_type != "cpu":
+            raise RuntimeError(f"Op {self.name!r} fell back to the reference on {platform.describe()}")
+        return None
 
-    def _run(self, name: str, fn: Callable, args: tuple, kwargs: dict, pinned: bool = False):
+    def select(self, *args, **kwargs) -> tuple[str, Callable]:
+        impl = self._choose(args, kwargs)
+        return (REFERENCE, self.reference) if impl is None else (impl.name, impl.fn)
+
+    def _invoke(
+        self, impl: Impl | None, args: tuple, kwargs: dict, pin: str | None = None, prepared: tuple | None = None
+    ):
+        pinned = pin is not None and (impl is not None or pin == REFERENCE)
+        if impl is None:
+            return self._run(REFERENCE, self.reference, args, kwargs, pinned)
+        call_args = args
+        if impl.prepare is not None:
+            split = len(args) - self.weights
+            if prepared is None:
+                prepared = tuple(impl.prepare(*args[split:]))
+            call_args = args[:split] + prepared
+        return self._run(impl.name, impl.fn, args, kwargs, pinned, call_args)
+
+    def _run(
+        self, name: str, fn: Callable, args: tuple, kwargs: dict, pinned: bool = False, call_args: tuple | None = None
+    ):
+        call_args = args if call_args is None else call_args
         # Counting / logging inside torch.compile would add guards or graph breaks: eager only.
         if torch.compiler.is_compiling():
-            return fn(*args, **kwargs)
+            return fn(*call_args, **kwargs)
         if name not in self.calls:
             self._log_first_use(name, args, kwargs, pinned)
         self.calls[name] += 1
         with profiler_range(f"flashim::{self.name}[{name}]"):
-            return fn(*args, **kwargs)
+            return fn(*call_args, **kwargs)
 
     def _log_first_use(self, name: str, args: tuple, kwargs: dict, pinned: bool) -> None:
         if pinned or self.composite or name != REFERENCE or not self.impls:
@@ -250,8 +289,16 @@ class Op:
         )
 
     def __call__(self, *args, **kwargs):
-        name, fn = self.select(*args, **kwargs)
-        return self._run(name, fn, args, kwargs)
+        return self._invoke(self._choose(args, kwargs), args, kwargs)
+
+    def bind(self, *weights, impl: str | None = None) -> BoundOp:
+        """This op with its ``weights`` trailing operands fixed (see :class:`BoundOp`); ``impl`` pins an impl
+        like :meth:`get`."""
+        if len(weights) != self.weights:
+            raise ValueError(f"Op {self.name!r} takes {self.weights} weight operands, got {len(weights)}")
+        if impl is not None and impl != REFERENCE:
+            self._find(impl)
+        return BoundOp(self, weights, impl)
 
     def get(self, name: str | None) -> Callable:
         """Callable pinned to impl ``name`` (``None`` = normal dispatch).
@@ -263,27 +310,60 @@ class Op:
         """
         if name is None:
             return self
-        if name == REFERENCE:
-            impl = None
-        else:
-            impl = next((i for i in self.impls if i.name == name), None)
-            if impl is None:
-                raise ValueError(self._unknown_impl(name))
+        if name != REFERENCE:
+            self._find(name)
 
         def pinned(*args, **kwargs):
-            if self.name in _CONFIG.forced or self.name in _CONFIG.disabled:
-                return self(*args, **kwargs)
-            if impl is not None and impl.available(self._platform(args, kwargs)) and (
-                impl.when is None or impl.when(*args, **kwargs)
-            ):
-                return self._run(impl.name, impl.fn, args, kwargs, pinned=True)
-            return self._run(REFERENCE, self.reference, args, kwargs, pinned=impl is None)
+            return self._invoke(self._choose(args, kwargs, pin=name), args, kwargs, pin=name)
 
         return pinned
 
     def __repr__(self) -> str:
         impls = ", ".join(i.name for i in self.impls)
         return f"Op({self.name}: reference, {impls})"
+
+
+class BoundOp:
+    """An op whose trailing weight operands are fixed (a layer's parameters, bound once at load time).
+
+    Calls pass only the leading (activation) operands. Dispatch is unchanged -- priority, ``when`` on the full
+    arguments, overrides, pinning -- but each impl's ``prepare`` runs once, the first time that impl is chosen, and
+    its packed weights are reused. Rebind after changing the weights in place.
+    """
+
+    def __init__(self, op: Op, weights: tuple, pin: str | None = None) -> None:
+        self.op = op
+        self.weights = weights
+        self.pin = pin
+        self._prepared: dict[str, tuple] = {}
+
+    @property
+    def platform(self) -> Platform:
+        return platform_for(_first_device(self.weights) or torch.device("cpu"))
+
+    @property
+    def available(self) -> list[str]:
+        """Impls that can run on the weights' device (before per-call ``when`` checks), best first."""
+        names = [impl.name for impl in self.op.candidates(self.platform)]
+        return names if self.pin is None else [n for n in names if n == self.pin]
+
+    @property
+    def primary(self) -> str:
+        """The impl calls will use when their arguments qualify."""
+        return next(iter(self.available), REFERENCE)
+
+    def __call__(self, *args, **kwargs):
+        full = args + self.weights
+        impl = self.op._choose(full, kwargs, pin=self.pin)
+        prepared = None
+        if impl is not None and impl.prepare is not None:
+            prepared = self._prepared.get(impl.name)
+            if prepared is None:
+                prepared = self._prepared[impl.name] = tuple(impl.prepare(*self.weights))
+        return self.op._invoke(impl, full, kwargs, pin=self.pin, prepared=prepared)
+
+    def __repr__(self) -> str:
+        return f"BoundOp({self.op.name} -> {self.primary})"
 
 
 def reset_call_counts() -> None:

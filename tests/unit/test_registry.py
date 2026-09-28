@@ -75,3 +75,48 @@ def test_platform_detected_inside_compile_has_features():
     compiled = torch.compile(lambda x: (x + 1, detect.platform_for(x.device))[0], backend="eager")
     compiled(torch.zeros(2, device="cuda"))
     assert detect.platform_for("cuda").supports(Feature.TRITON)
+
+
+def _weighted_op(name):
+    OPS.pop(name, None)
+    op = Op(name, lambda x, w: ("reference", x, w), weights=1)
+    prepared = []
+
+    def prepare(w):
+        prepared.append(w)
+        return (w * 10,)
+
+    op.register("packed", device=DeviceSpec("cpu"), when=lambda x, w: x > 0, prepare=prepare)(
+        lambda x, packed: ("packed", x, packed)
+    )
+    return op, prepared
+
+
+def test_bind_prepares_once_and_keeps_dispatch():
+    op, prepared = _weighted_op("t_bind")
+    bound = op.bind(torch.tensor(2))
+    assert bound.primary == "packed"
+    assert bound(torch.tensor(1))[0] == "packed" and bound(torch.tensor(3))[2] == 20
+    assert len(prepared) == 1  # prepared once, reused
+    # ``when`` sees the raw weight and falls back to the reference, which also gets the raw weight
+    name, _, weight = bound(torch.tensor(-1))
+    assert name == "reference" and weight == 2
+    assert op.calls == {"packed": 2, "reference": 1}
+
+
+def test_unbound_call_prepares_every_time_and_pinning_works():
+    op, prepared = _weighted_op("t_unbound")
+    assert op(torch.tensor(1), torch.tensor(2))[2] == 20
+    assert op(torch.tensor(1), torch.tensor(2))[0] == "packed"
+    assert len(prepared) == 2
+    assert op.bind(torch.tensor(2), impl="reference")(torch.tensor(1))[0] == "reference"
+    with pytest.raises(ValueError, match="weight operands"):
+        op.bind()
+    with pytest.raises(ValueError, match="no impl 'nope'"):
+        op.bind(torch.tensor(2), impl="nope")
+
+
+def test_prepare_needs_weight_operands():
+    op = _op("t_noweights")
+    with pytest.raises(ValueError, match="no weight operands"):
+        op.register("x", device=DeviceSpec("cpu"), prepare=lambda: ())

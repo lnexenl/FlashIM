@@ -7,6 +7,7 @@ and carry its name as a prefix. Each backend package mirrors the same file names
 
 from flashim.ops._registry import (
     OPS,
+    BoundOp,
     DeviceSpec,
     Op,
     call_counts,
@@ -34,10 +35,12 @@ from flashim.ops.quantize import (
     quantize_int8,
     quantize_mxfp8,
 )
+from flashim.ops.raco import raco_head5x5, raco_resblock
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 
 __all__ = [
     "OPS",
+    "BoundOp",
     "DeviceSpec",
     "Op",
     "call_counts",
@@ -63,6 +66,8 @@ __all__ = [
     "mxfp8_scaled_mm",
     "quantize_int8",
     "quantize_mxfp8",
+    "raco_head5x5",
+    "raco_resblock",
     "reset_call_counts",
     "romav2_refiner_heads",
     "romav2_refiner_input",

@@ -13,8 +13,6 @@ Rules:
     ``torch.library.custom_op`` with a fake; Triton kernels stay visible to Inductor;
   - hardware requirements go on the impl (``device=`` / ``requires=`` features), Python-package requirements on
     the :class:`~flashim.backends._loader.Backend` entry.
-
-``cuda/`` (JIT-built CUDA C++) currently holds only RaCo's fused residual block, used directly by the model.
 """
 
 from flashim.backends._loader import BACKENDS, LOADED, Backend, load
