@@ -1,0 +1,94 @@
+# NVIDIA architectures, Ampere to Blackwell: what a FlashIM kernel can rely on
+
+Companion to `optimize-kernel`. `kernelwiki` and `ncu-report-skill` cover sm_90 / sm_100 only; this file supplies the
+rest so a kernel is designed for the hardware it will run on. Items marked **(verify)** are from memory of NVIDIA /
+CUTLASS documentation and were not checked on hardware here. Check them (`nvcc -arch=... `, `ncu --query-metrics`,
+`torch.cuda.get_device_properties`) before building a design on them. The only GPU available locally is **sm_120**
+(RTX 5070 Ti); everything else can be compile-checked (nvcc 13.4: sm_75 ... sm_121) but not run.
+
+## Feature matrix
+
+FlashIM `Feature` flags come from `flashim/platforms/nvidia.py::isa_features`. Add a new flag only for an instruction
+family a kernel here has actually run on.
+
+| Arch (cc) | Parts | MMA path | Async copy | Low precision | FlashIM features today |
+|---|---|---|---|---|---|
+| Ampere sm_80 | A100, A30 | `mma.sync` m16n8k16 (fp16/bf16), m16n8k8 (tf32), m16n8k32 (int8) | `cp.async` (LDGSTS), no TMA | fp16/bf16/tf32/int8; **no FP8** | `MMA_SYNC` |
+| Ampere sm_86 / sm_87 | RTX 30xx, A10/A40, Orin | same as sm_80 | `cp.async` | same; **no FP8** | `MMA_SYNC` |
+| Ada sm_89 | RTX 40xx, L4/L40 | same `mma.sync` + FP8 (E4M3/E5M2) `mma.sync` | `cp.async` | FP8 via `mma.sync`, `torch._scaled_mm` (rowwise) | `MMA_SYNC`, `FP8_E4M3`, `FP8_ROWWISE_SCALED_MM` |
+| Hopper sm_90a | H100/H200 | `wgmma` (warpgroup, async, smem operands) + legacy `mma.sync` | TMA (+ multicast), mbarrier, clusters/DSMEM | FP8 wgmma | + `TMA`, `WGMMA` |
+| Datacenter Blackwell sm_100a / sm_103a / sm_110 | B200, B300 (GB300), Thor | `tcgen05.mma` (accumulator in TMEM, single-thread issue, 2-CTA pairs); legacy `mma.sync` kept | TMA, CLC (cluster launch control) | MXFP8 / MXFP6 / MXFP4 / NVFP4 block-scaled | + `TCGEN05`, `MXFP8_SCALED_MM` |
+| Consumer Blackwell sm_120a / sm_121 | RTX 50xx, RTX PRO Blackwell, GB10 (Spark) | `mma.sync` only, incl. block-scaled variants (`kind::mxf8f6f4`, nvf4) **(verify)**; **no wgmma, no tcgen05/TMEM** | TMA + mbarrier | FP8, MXFP8 via cuBLAS `scaled_mm`; FP4 **(verify)** | `MMA_SYNC`, `TMA`, `FP8_*`, `MXFP8_SCALED_MM` (no WGMMA, no TCGEN05) |
+
+sm_120 is **not** "small Blackwell datacenter": kernels written for tcgen05/TMEM (kernelwiki's Blackwell pages,
+FlashAttention-4, DeepGEMM sm_100 paths) do not port. Its design space is Ampere/Ada-style `mma.sync` register-fragment
+kernels + TMA/mbarrier pipelines.
+
+## Resources per SM (order of magnitude, **(verify)** against `cudaGetDeviceProperties` for the exact part)
+
+| Arch | Max smem/block | Smem+L1 per SM | Regs/SM | Notes |
+|---|---|---|---|---|
+| sm_80 | ~163 KB (opt-in) | 192 KB | 64K x 32-bit | 40 MB L2 (A100); HBM2e |
+| sm_86 / 87 | ~99 KB | 128 KB | 64K | doubled FP32 units; GDDR6/X |
+| sm_89 | ~99 KB | 128 KB | 64K | large L2 (up to 72 MB): fits many working sets |
+| sm_90 | ~227 KB | 256 KB | 64K | clusters up to 8 (16 opt-in), `setmaxnreg` for warp specialization |
+| sm_100 / 103 | ~227 KB | 256 KB + 256 KB TMEM | 64K | clusters, 2-SM MMA |
+| sm_120 / 121 | ~99 KB **(verify)** | 128 KB | 64K | cluster size 1 in CUTLASS SM120 kernels **(verify)**; GDDR7 |
+
+Query the real value: `torch.cuda.get_device_properties(0).shared_memory_per_block_optin`. Set
+`cudaFuncAttributeMaxDynamicSharedMemorySize` for CUDA C++; Triton `num_stages` x tile bytes must fit it, otherwise the
+autotuner silently drops configs (an out-of-resources config is not a slow config).
+
+## Design guidance by tier
+
+**Ampere / Ada (sm_80-89).** Memory-latency hiding is done with `cp.async` multi-stage pipelines (2-4 stages) and
+`ldmatrix`; there is no producer/consumer warp specialization with TMA. Triton `num_stages` maps to this. Keep occupancy
+in mind: 2-3 CTAs/SM is normal. sm_86/89 have ~100 KB smem, so tiles tuned on A100 (163 KB) often do not fit: parametrize
+stages by the measured `shared_memory_per_block_optin`. FP8 only from sm_89 (`Feature.FP8_E4M3`); on sm_80/86 an FP8
+storage format must be dequantized to bf16 before `mma.sync` (a memory-bandwidth win only). INT8 `mma` exists from
+Turing on and runs at 2x fp16 rate; Triton int8 dot is `DeviceSpec(min_capability=(7, 5))` here.
+
+**Hopper (sm_90a).** Build with `-arch=sm_90a` (the `a` is required for wgmma / setmaxnreg; PTX for `sm_90` will not
+contain them). Use TMA descriptors + mbarrier, warp-specialized producer (`setmaxnreg.dec`) and consumer warpgroups
+(`setmaxnreg.inc`), wgmma with accumulators in registers. Triton 3.x emits wgmma/TMA on sm_90 for `tl.dot` (tensor
+descriptors via `tl.make_tensor_descriptor`). kernelwiki's Hopper pages apply directly.
+
+**Datacenter Blackwell (sm_100a / 103a / 110).** `-arch=sm_100a` (`sm_103a`, `sm_110a`): tcgen05 is arch-specific and
+not forward-compatible between the 10x and 12x families. Accumulators live in TMEM, one thread issues the MMA,
+2-CTA pairs share B. NVFP4 / MXFP block-scaled MMAs take scale factors in TMEM. This is where kernelwiki and
+ncu-report-skill are written for. Local hardware cannot run it: compile-check only.
+
+**Consumer Blackwell (sm_120a / 121).** `-arch=sm_120a` (`sm_121a` for GB10). Design like Ada with extras: TMA +
+mbarrier pipelines (this is why `TILELANG` kernels here require `Feature.TMA`), FP8 and block-scaled MXFP8 through
+cuBLAS (`Feature.MXFP8_SCALED_MM`), no TMEM, no wgmma. Measured on this repo's RTX 5070 Ti: see docstrings in
+`flashim/backends/{triton,tilelang}/gemm.py`, and the note in `AGENTS.md` that quantized im2col conv is slower than BF16
+on the small nets. TileLang gotchas (width <= 16 miscompiles, fence.proxy.async before TMA refill) are in `AGENTS.md`.
+
+## Registering per architecture
+
+- Prefer `requires=[Feature.X]` over `min_capability` whenever the feature is not monotonic. Example: `WGMMA` is
+  sm_90 only, `TMA` is sm_90 and sm_120 but not sm_100-with-tcgen05-only designs. A Hopper wgmma kernel must
+  `requires=[Feature.WGMMA]`, never `min_capability=(9, 0)`, or it will be selected on sm_100/sm_120 where it does not run.
+- One impl per architecture family is normal (`triton` generic + `tilelang_hopper` + ...). Give the specialized impl
+  a higher `priority=` and keep the generic one as its fallback; `op.explain(*args)` shows which one is chosen.
+- CUDA C++ arch flag from `platform.capability`: `sm_80`, `sm_86`, `sm_89`, `sm_90a`, `sm_100a`, `sm_103a`, `sm_110a`,
+  `sm_120a`, `sm_121a`. Include the arch in the JIT cache key (`~/.cache/flashim/cuda`) so a cubin for one arch is never
+  loaded on another.
+- Triton autotune configs must be filtered by the smem budget above; key tuning caches by arch.
+- Compile-check without hardware: `nvcc -arch=sm_90a -cubin -o /dev/null k.cu` (repeat per arch); for Triton,
+  `triton.compile(src, target=triton.backends.compiler.GPUTarget("cuda", 90, 32))`. A successful compile proves only
+  that the arch accepts the instructions.
+
+## Profiling on non-sm_100 GPUs (overrides for ncu-report-skill)
+
+- `ncu-report-skill/reference/08-b200-metric-names.md` lists sm_100 names. Other archs differ (notably tensor-pipe and
+  L1TEX names). Enumerate first: `ncu --query-metrics --chip <ga100|ga102|ad102|gh100|gb100|gb202>` (chip names checked
+  against `ncu --list-chips` here), or `action.metric_names()` in the python API. Treat every metric named in the
+  skill as a hint, not a fact, until it returns non-`None` on the local GPU.
+- The tensor-pipe utilization metric family depends on the MMA type in use (legacy `mma.sync` vs wgmma vs tcgen05): if a
+  tensor metric reads 0 while the kernel is a GEMM, look at the other family before concluding the tensor cores are idle.
+- Rooflines are per part: read peak bandwidth / FLOPs from `nvidia-smi -q -d CLOCK`, the datasheet and ncu's
+  `sm__throughput` / `gpu__compute_memory_throughput` percent-of-peak, not from the B200 numbers in the skill.
+- Permissions: ncu needs `NVreg_RestrictProfilingToAdminUsers=0` or root; the skill's `09-common-issues.md` covers this.
+- Consumer GPUs boost and throttle: lock clocks only if run-to-run jitter is large (`ncu --clock-control base` is the
+  default and is the more reproducible choice).

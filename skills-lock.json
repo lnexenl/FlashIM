@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "KernelWiki": {
+      "source": "mit-han-lab/kernelwiki",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "0552102287997a18d1b598611b449a48fe119a68bbd4e2edf0a51f6ad3556ccc"
+    },
+    "ncu-report-skill": {
+      "source": "mit-han-lab/ncu-report-skill",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "9f69d2df4e09b143dcd749aba8157a2391f5cfd18514cca025375c51aa62d29a"
+    }
+  }
+}
