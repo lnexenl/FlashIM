@@ -19,6 +19,7 @@ dependencies = [
 eval = [
     "hardmatch>=1.0.0",
     "opencv-python>=4.12.0.88",
+    "poselib>=2.0.4",  # LO-RANSAC of the unified pose-accuracy protocol (benchmarks/accuracy/run_sparse.py)
     "tqdm>=4.67.1",
 ]
 tilelang = [
@@ -29,7 +30,9 @@ tilelang = [
 dev = [
     "pytest>=8.4.2",
     "ruff>=0.14.5",
+    "kornia>=0.8",  # oracle of the DISK / LoFTR parity tests
     "romav2",
+    "matplotlib>=3.11.2",
 ]
 
 [tool.uv.sources]
