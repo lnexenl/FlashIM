@@ -1,4 +1,4 @@
-"""Local correlation between a feature map and a warped window of another."""
+"""Local correlation between a feature map and a warped window of another; mutual matches of a similarity matrix."""
 
 from __future__ import annotations
 
@@ -39,3 +39,28 @@ def _local_corr_reference(feature0: Tensor, feature1: Tensor, warp: Tensor, radi
 
 
 local_corr = Op("local_corr", _local_corr_reference)
+
+
+def _dual_softmax_mutual_reference(
+    sim: Tensor, row_bias: Tensor | None = None, col_bias: Tensor | None = None
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Mutual best matches of a dual-softmax assignment over a similarity matrix ``sim [L, S]`` (FP32).
+
+    ``score[i, j] = log_softmax(sim, 1)[i, j] + log_softmax(sim, 0)[i, j] + row_bias[i] + col_bias[j]`` (the log of
+    ``softmax(sim, 1) * softmax(sim, 0)``, the biases are e.g. LightGlue's log matchabilities). Returns, per row
+    ``i``: ``log_conf [L]`` (FP32, the row maximum of ``score``), ``index [L]`` (int64, its column) and
+    ``mutual [L]`` (bool: row ``i`` is also the best row of column ``index[i]``). Exact ties are broken arbitrarily.
+    """
+    score = F.log_softmax(sim, 1)
+    score += F.log_softmax(sim, 0)
+    if row_bias is not None:
+        score += row_bias[:, None]
+    if col_bias is not None:
+        score += col_bias[None, :]
+    best = score.max(1)
+    best_row = score.max(0).indices
+    mutual = best_row[best.indices] == torch.arange(sim.shape[0], device=sim.device)
+    return best.values, best.indices, mutual
+
+
+dual_softmax_mutual = Op("dual_softmax_mutual", _dual_softmax_mutual_reference)

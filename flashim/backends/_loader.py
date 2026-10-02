@@ -28,7 +28,7 @@ BACKENDS: tuple[Backend, ...] = (
     Backend("torch_native", ("torch_native.gemm",)),
     Backend(
         "triton",
-        tuple(f"triton.{m}" for m in ("aliked", "attention", "conv", "density", "gemm", "quantize", "raco", "romav2")),
+        tuple(f"triton.{m}" for m in ("aliked", "attention", "conv", "correlation", "density", "gemm", "quantize", "raco", "romav2")),
         packages=("triton",),
     ),
     Backend("tilelang", ("tilelang.conv", "tilelang.gemm"), packages=("tilelang",)),

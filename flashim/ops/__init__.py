@@ -27,7 +27,7 @@ from flashim.ops.conv import (
     int8_conv2d,
     mxfp8_conv2d,
 )
-from flashim.ops.correlation import local_corr
+from flashim.ops.correlation import dual_softmax_mutual, local_corr
 from flashim.ops.density import kde_density
 from flashim.ops.gemm import int8_linear, linear_fp32, mxfp8_gelu_mlp, mxfp8_linear, mxfp8_scaled_mm
 from flashim.ops.quantize import (
@@ -55,6 +55,7 @@ __all__ = [
     "depthwise5x5_relu_pointwise",
     "depthwise5x5_relu_pointwise_int8",
     "depthwise5x5_relu_pointwise_mxfp8",
+    "dual_softmax_mutual",
     "gelu_quantize",
     "gelu_quantize_int8",
     "im2col_gather",

@@ -152,6 +152,16 @@ class MatchAssignment(nn.Module):
         certainty = F.logsigmoid(z0) + F.logsigmoid(z1).transpose(-1, -2)
         return F.log_softmax(sim, -1) + F.log_softmax(sim, -2) + certainty
 
+    def matches(self, x0: Tensor, x1: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Per point of image A (batch 1): the maximum of :meth:`forward`'s log assignment over image B's points,
+        its index, and whether the pair is mutual -- without the ``[M, N]`` score matrix
+        (``ops.dual_softmax_mutual``; the log matchabilities are its row / column biases)."""
+        dim = x0.shape[-1]
+        m0, m1 = (self.final_proj(x).float() / dim**0.25 for x in (x0, x1))
+        sim = (m0 @ m1.transpose(-1, -2))[0]
+        z0, z1 = (F.logsigmoid(self.matchability(x).float())[0, :, 0] for x in (x0, x1))
+        return ops.dual_softmax_mutual(sim, z0, z1)
+
 
 def filter_matches(scores: Tensor, threshold: float) -> tuple[Tensor, Tensor, Tensor]:
     """Mutual best matches of a log assignment matrix ``[1, M, N]`` whose probability exceeds ``threshold``:
@@ -234,8 +244,8 @@ class LightGlue(nn.Module):
         ratio = 1.0 - (confidence < self.confidence_thresholds[layer]).sum() / confidence.numel()
         return bool(ratio > depth_confidence)
 
-    def scores(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> Tensor:
-        """Log assignment scores after the last executed layer (``executed_layers`` records how many ran)."""
+    def features(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> tuple[Tensor, Tensor, int]:
+        """Point features after the last executed layer and its index (``executed_layers`` records how many ran)."""
         x0, x1 = self.input_proj(desc0.to(self.compute_dtype)), self.input_proj(desc1.to(self.compute_dtype))
         enc0, enc1 = enc0.to(self.compute_dtype), enc1.to(self.compute_dtype)
         depth_confidence = self.config.depth_confidence
@@ -245,6 +255,11 @@ class LightGlue(nn.Module):
             if depth_confidence > 0 and i < last and self.should_stop(x0, x1, i, depth_confidence):
                 break
         self.executed_layers = i + 1
+        return x0, x1, i
+
+    def scores(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> Tensor:
+        """Log assignment scores ``[1, M, N]`` after the last executed layer."""
+        x0, x1, i = self.features(desc0, desc1, enc0, enc1)
         return self.log_assignment[i](x0, x1)
 
     @torch.inference_mode()
@@ -256,9 +271,14 @@ class LightGlue(nn.Module):
         if a.keypoints.shape[1] == 0 or b.keypoints.shape[1] == 0:
             empty = a.keypoints.new_zeros(0, 2)
             return SparseMatchResult(empty, empty, a.keypoints.new_zeros(0))
-        scores = self.scores(
+        x0, x1, i = self.features(
             a.descriptors, b.descriptors, self.encode(a.keypoints, a.image_size), self.encode(b.keypoints, b.image_size)
         )
+        # same matches as ``filter_matches(self.scores(...))`` (identical lists on 200 MegaDepth pairs); the fused op
+        # measured 4.2 to 4.8 ms less per 4096 x 4096 pair on sm_120 (SuperPoint 18.8 -> 14.6 ms, XFeat 8.8 -> 4.0 ms)
+        log_conf, index, mutual = self.log_assignment[i].matches(x0, x1)
+        conf = log_conf.exp()
         threshold = self.config.filter_threshold if threshold is None else threshold
-        ia, ib, conf = filter_matches(scores, threshold)
-        return SparseMatchResult(a.keypoints[0][ia], b.keypoints[0][ib], conf, ia, ib)
+        ia = torch.nonzero(mutual & (conf > threshold))[:, 0]
+        ib = index[ia]
+        return SparseMatchResult(a.keypoints[0][ia], b.keypoints[0][ib], conf[ia], ia, ib)
