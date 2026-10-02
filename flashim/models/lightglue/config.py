@@ -25,3 +25,10 @@ class LightGlueConfig:
 # descriptor dim is 128, but this LightGlue was trained with a 256-wide transformer), the correct (x, y)
 # keypoint-normalization order, and the upstream default match threshold.
 ALIKED_CONFIG = LightGlueConfig(input_dim=128, dim=256, filter_threshold=0.1, reference_size_order=False)
+
+# cvg/LightGlue's SuperPoint and DISK variants (``superpoint_lightglue.pth`` / ``disk_lightglue.pth``): same
+# transformer and keypoint normalization as the ALIKED one, input widths 256 / 128.
+SUPERPOINT_CONFIG = LightGlueConfig(input_dim=256, dim=256, filter_threshold=0.1, reference_size_order=False)
+DISK_CONFIG = ALIKED_CONFIG
+# XFeat's "LighterGlue" (``xfeat-lighterglue.pt``): 64 -> 96 input projection, one head, six layers.
+XFEAT_CONFIG = LightGlueConfig(input_dim=64, dim=96, num_heads=1, num_layers=6, filter_threshold=0.1, reference_size_order=False)

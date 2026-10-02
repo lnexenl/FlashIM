@@ -9,10 +9,16 @@ from torch import nn
 from flashim.build import EngineSpec, ModelSpec, dtype
 from flashim.config import RunConfig
 from flashim.models.lightglue import quant, weights
-from flashim.models.lightglue.config import ALIKED_CONFIG, LightGlueConfig
+from flashim.models.lightglue.config import (
+    ALIKED_CONFIG,
+    DISK_CONFIG,
+    SUPERPOINT_CONFIG,
+    XFEAT_CONFIG,
+    LightGlueConfig,
+)
 from flashim.models.lightglue.model import CrossBlock, LightGlue, SelfBlock
 
-VARIANTS = {"rdd": LightGlueConfig(), "aliked": ALIKED_CONFIG}
+VARIANTS = {"rdd": LightGlueConfig(), "aliked": ALIKED_CONFIG, "superpoint": SUPERPOINT_CONFIG, "disk": DISK_CONFIG, "xfeat": XFEAT_CONFIG}
 
 
 def _load(config: RunConfig) -> LightGlue:
@@ -22,6 +28,14 @@ def _load(config: RunConfig) -> LightGlue:
     arch = dataclasses.replace(VARIANTS[variant], **config.arch)
     if variant == "aliked":
         state = weights.load_aliked_state_dict(arch.num_heads, arch.num_layers, config.checkpoint)
+        return LightGlue.from_pretrained(arch, state_dict=state, device=config.device)
+    if variant == "xfeat":
+        from flashim.models.xfeat.weights import load_lighterglue_state_dict
+
+        state = load_lighterglue_state_dict(arch.num_heads, arch.num_layers, config.checkpoint)
+        return LightGlue.from_pretrained(arch, state_dict=state, device=config.device)
+    if variant in weights.CVG_FILES:
+        state = weights.load_cvg_state_dict(variant, arch.num_heads, arch.num_layers, config.checkpoint)
         return LightGlue.from_pretrained(arch, state_dict=state, device=config.device)
     return LightGlue.from_pretrained(arch, checkpoint=config.checkpoint, device=config.device)
 
@@ -80,6 +94,12 @@ def _apply_inference(model: nn.Module, inference: dict) -> None:
     model.defaults = {**model.defaults, **inference}
 
 
+def _matcher_precision(variant: str, preset: str) -> dict:
+    """Quantized presets use the variant's own calibration table when one ships next to the default (RDD's) one."""
+    table = quant.CALIBRATION_DIR / f"lightglue_{variant}_{preset}_mega.safetensors"
+    return {"precision": {"calibration": str(table)}} if preset in _QUANTIZED and table.exists() else {}
+
+
 def _pipeline(name: str, extractor: str, extractor_preset: str, variant: str, default: str, description: str):
     return ModelSpec(
         name=name,
@@ -90,7 +110,7 @@ def _pipeline(name: str, extractor: str, extractor_preset: str, variant: str, de
             preset: {
                 "components": {
                     "extractor": {"model": extractor, "preset": extractor_preset},
-                    "matcher": {"model": "lightglue", "preset": preset, "variant": variant},
+                    "matcher": {"model": "lightglue", "preset": preset, "variant": variant, **_matcher_precision(variant, preset)},
                 }
             }
             for preset in ("fp32", "bf16", *_QUANTIZED)
@@ -112,6 +132,18 @@ ALIKED_LIGHTGLUE = _pipeline(
 RACO_ALIKED_LIGHTGLUE = _pipeline(
     "raco-aliked-lightglue", "raco-aliked", "fp32", "aliked", "fp32",
     "RaCo keypoints + ALIKED descriptors + LightGlue; components.extractor.preset = RaCo/ALIKED's (default fp32)",
+)
+SUPERPOINT_LIGHTGLUE = _pipeline(
+    "superpoint-lightglue", "superpoint", "fp32", "superpoint", "fp32",
+    "SuperPoint + LightGlue (cvg weights); components.extractor.preset = SuperPoint's (default fp32)",
+)
+DISK_LIGHTGLUE = _pipeline(
+    "disk-lightglue", "disk", "fp32", "disk", "fp32",
+    "DISK + LightGlue (cvg weights); components.extractor.preset = DISK's (default fp32)",
+)
+XFEAT_LIGHTGLUE = _pipeline(
+    "xfeat-lightglue", "xfeat", "fp32", "xfeat", "fp32",
+    "XFeat + LighterGlue (verlab weights); components.extractor.preset = XFeat's (default fp32)",
 )
 
 

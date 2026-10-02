@@ -18,7 +18,6 @@ from pathlib import Path
 import torch
 
 import flashim
-from flashim.models.lightglue import LightGlue
 from flashim.models.lightglue.quant import PRESETS
 from flashim.quant.calibration import Calibrator, Int8Calibrator
 
@@ -31,7 +30,8 @@ def main() -> None:
     parser.add_argument("--max-pairs", type=int, default=32)
     parser.add_argument("--resize", type=int, default=1600)
     parser.add_argument("--top-k", type=int, default=4096)
-    parser.add_argument("--rdd-preset", default="fp8")
+    parser.add_argument("--rdd-preset", default=None, help="extractor preset (default: fp8 for rdd, fp32 otherwise)")
+    parser.add_argument("--extractor", default="rdd", help="rdd | aliked | superpoint | disk (LightGlue variant = extractor)")
     parser.add_argument("--percentile", type=float, default=0.9999, help="INT8 observer quantile of |x|")
     parser.add_argument("--checkpoint")
     parser.add_argument("--out", required=True)
@@ -47,9 +47,8 @@ def main() -> None:
     if not pairs:
         raise ValueError("empty calibration manifest")
 
-    rdd = flashim.load("rdd", preset=args.rdd_preset)
-    model = LightGlue.from_pretrained(checkpoint=args.checkpoint, device=rdd.device)
-    model.set_compute_dtype(torch.bfloat16)
+    rdd = flashim.load(args.extractor, preset=args.rdd_preset or ("fp8" if args.extractor == "rdd" else "fp32"))
+    model = flashim.build("lightglue", "bf16", config={"variant": args.extractor, "checkpoint": args.checkpoint})
     config = PRESETS[args.format].config
     targets = [
         name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear) and config.scheme_for(name)
@@ -64,7 +63,8 @@ def main() -> None:
     table = observer.table(
         {
             "model": "lightglue",
-            "rdd_preset": args.rdd_preset,
+            "extractor": args.extractor,
+            "rdd_preset": str(args.rdd_preset),
             "resize": str(args.resize),
             "pairs": str(len(pairs)),
             "manifest": Path(args.manifest).name,

@@ -27,14 +27,16 @@ LICENSES = {
     "raco_aliked_lightglue.pth (LightGlue trained on ALIKED descriptors, 128 -> 256 input projection)",
 }
 
-_UNUSED = re.compile(r"^confidence_thresholds")
+_UNUSED = re.compile(r"^confidence_thresholds|^log_assignment\.\d+\.r$")
+_OLD_LAYOUT = re.compile(r"^(self_attn|cross_attn)\.(\d+)\.")  # cvg releases before ``transformers.N.*``
 
 
 def convert_state_dict(state: dict[str, torch.Tensor], num_heads: int, num_layers: int) -> dict[str, torch.Tensor]:
     """Upstream layout -> FlashIM layout.
 
-    - The ``confidence_thresholds`` buffer is dropped (recomputed); token confidences and per-layer assignments
-      are kept for early stopping.
+    - The ``confidence_thresholds`` buffer (and the stray ``log_assignment.N.r`` of the cvg releases) is dropped
+      (recomputed); token confidences and per-layer assignments are kept for early stopping. Pre-``transformers.N``
+      key layouts (``self_attn.N.*``, ``cross_attn.N.*``) are renamed.
     - ``Wqkv`` output channels are reordered from upstream's interleaved ``[head, dim, (q, k, v)]`` to
       ``[(q, k, v), head, dim]`` so q, k and v are contiguous slices.
     """
@@ -42,6 +44,7 @@ def convert_state_dict(state: dict[str, torch.Tensor], num_heads: int, num_layer
     for key, value in state.items():
         if _UNUSED.match(key):
             continue
+        key = _OLD_LAYOUT.sub(r"transformers.\2.\1.", key)
         if ".Wqkv." in key:
             rows = value.shape[0]
             head_dim = rows // (3 * num_heads)
@@ -84,3 +87,19 @@ def load_aliked_state_dict(
 ) -> dict[str, torch.Tensor]:
     state = torch.load(find_aliked_checkpoint(path), map_location=map_location, weights_only=True)
     return convert_state_dict(state, num_heads, num_layers)
+
+
+CVG_FILES = {"superpoint": "superpoint_lightglue.pth", "disk": "disk_lightglue.pth", "sift": "sift_lightglue.pth"}
+
+
+def load_cvg_state_dict(
+    variant: str, num_heads: int, num_layers: int, path: str | Path | None = None, map_location="cpu"
+) -> dict[str, torch.Tensor]:
+    """cvg/LightGlue's per-extractor release (``<extractor>_lightglue.pth``)."""
+    from flashim.models.weights_util import find_weights
+
+    file = find_weights(
+        CVG_FILES[variant], path=path, env=f"FLASHIM_{variant.upper()}_LIGHTGLUE_CHECKPOINT",
+        help=f"Download https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/{CVG_FILES[variant]}",
+    )
+    return convert_state_dict(torch.load(file, map_location=map_location, weights_only=True), num_heads, num_layers)

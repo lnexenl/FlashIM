@@ -48,6 +48,9 @@ skipped with a warning (`optimize.strict=true` raises).
 | `romav2` | `bf16`, `fp8-p8`, `fp8-s4`, `fp8` (default), `fp8-fast`, `int8`, `int8-dpt`, `int8-full`, `int8-fast` | native port of RoMa v2; `bf16`/`fp8-*` outputs are bit-identical to the RoMaV2 reference implementation |
 | `rdd` | `fp32`, `bf16`, `fp8` (default), `fp8-full`, `fp8-backbone` | native port of [RDD](https://github.com/xtcpete/rdd) (CVPR'25, sparse detector + descriptor); `fp32` matches the reference to 1e-5 (see [RDD](#rdd)) |
 | `aliked` | `fp32` (default), `bf16` | native port of [ALIKED](https://github.com/Shiaoming/ALIKED) (TIM'23, sparse detector + descriptor); `fp32` matches the reference bit-exactly (see [ALIKED](#aliked)) |
+| `superpoint`, `alike`, `disk`, `xfeat`, `ripe`, `dedode`, `dedode-g`, `dad`, `loftr` | `fp32`, `bf16` (default), `int8`, `fp8` | native ports, each verified against its upstream implementation (see [More sparse and semi-dense models](#more-sparse-and-semi-dense-models)) |
+| `superpoint-lightglue`, `disk-lightglue`, `xfeat-lightglue` | `fp32`, `bf16`, `int8`, `fp8` | extractor + LightGlue (cvg weights; XFeat's LighterGlue), matcher preset selects the pair, `components.extractor.preset` the extractor |
+| `sift`, `orb` | `fp32` | OpenCV baselines (no weights: nothing to quantize) |
 
 RoMaV2 presets (MXFP8 = E4M3 values, E8M0 scale per 32 elements):
 
@@ -310,6 +313,141 @@ TensorRT 11's stricter parser rejects) and, for FP16, exporting with `--fp16` de
 (TensorRT >= 10 is strongly typed: precision comes from the graph's dtypes). ONNX Runtime's TensorRT execution
 provider wants their pinned `libnvinfer.so.10`, so engines were built and validated with `trtexec` directly.
 
+## More sparse and semi-dense models
+
+```python
+model = flashim.load("superpoint-lightglue", "bf16", overrides=["components.extractor.preset=bf16"])
+m = model.match("a.jpg", "b.jpg", resize=1600, top_k=4096)      # SparseMatchResult
+model = flashim.load("dedode-g", "int8"); model.extract("a.jpg", resize=1024, top_k=8192)   # SparseFeatures
+model = flashim.load("loftr", "bf16"); model.match("a.jpg", "b.jpg", resize=840)            # pair-level: no extract()
+```
+
+Ten models were added, all as native PyTorch ports that load the released checkpoints with `strict=True` and have a parity
+test against the upstream code (`tests/parity/<model>`; upstream checkouts and weights in `~/work/oracles`, DISK / LoFTR also
+against kornia). Detector, descriptor and matching follow each method's own protocol:
+
+| model | what it is | matching | working resolution |
+|---|---|---|---|
+| `superpoint` | VGG encoder, cell-softmax heatmap, 256-d | mutual NN, or LightGlue (`superpoint-lightglue`) | 1600 px |
+| `disk` | U-Net of 5x5 convs (InstanceNorm + PReLU), 128-d | mutual NN, or LightGlue (`disk-lightglue`) | 1600 px |
+| `alike` | ALIKED's plain-conv predecessor, variants `alike-t/s/n/l` | mutual NN | 1600 px |
+| `xfeat` | 0.7M-parameter net, 64-d | mutual NN (0.82), or LighterGlue (`xfeat-lightglue`) | 1600 px |
+| `dedode` / `dedode-g` | DeDoDe v2 detector L + descriptor B / G (VGG19 + DINOv2 ViT-L/14) | dual softmax | 1024 px |
+| `dad` | DaD detector (VGG11) + DeDoDe-G descriptors | dual softmax | 1024 px |
+| `ripe` | DeDoDe-style heatmap + hypercolumn 256-d descriptors | mutual NN | 1024 px |
+| `loftr` | detector-free: ResNetFPN, linear-attention transformer, coarse + fine matching | built in | 840 px |
+| `sift`, `orb` | OpenCV, CPU detection, GPU ratio-test matching; fp32 only | mutual NN + ratio 0.8 | 1600 px |
+
+Presets: `fp32` (checkpoint precision, exact BatchNorm fold), `bf16` (trunk and heads in BF16; keypoint selection, softmaxes,
+sampling, the LoFTR attention core and coarse similarity stay FP32), `int8` (static symmetric per-channel weights, one
+calibrated per-tensor activation scale) and `fp8` (static MXFP8) on the convolutions and linears listed in each
+`spec.py`. Convolutions run as im2col + GEMM (`quant/methods/conv2d.py`: quantize on NHWC, gather the *quantized bytes*
+with `ops.im2col_gather` — one Triton kernel per conv call, see below — into the existing INT8 / MXFP8 GEMM; any kernel /
+stride / padding, `groups == 1`). Calibration: `scripts/calibrate_extractor.py` (24 to 32 pairs of the MegaDepth
+calibration split, disjoint from MegaDepth-1500) and, for the LightGlue pairings, `scripts/calibrate_lightglue.py
+--extractor <model>`; tables ship next to each model.
+
+`extract()` latency, RTX 5070 Ti, eager, one MegaDepth image at the protocol resolution above with 4096 keypoints (8192 for
+DeDoDe / DaD; LoFTR: `match` of a pair). Ratios are over the model's own `bf16` row (`benchmarks/speed/sparse_matrix.sh`):
+
+| model | fp32 | bf16 | int8 | fp8 | int8 / bf16 | fp8 / bf16 |
+|---|---|---|---|---|---|---|
+| superpoint | 25.4 | 14.1 | 18.2 | 20.0 | 0.77x | 0.70x |
+| disk | 69.6 | 64.5 | 91.2 | 80.8 | 0.71x | 0.80x |
+| alike | 14.4 | 11.9 | 18.8 | 24.4 | 0.63x | 0.49x |
+| xfeat | 3.6 | 3.5 | 4.0 | 5.5 | 0.89x | 0.63x |
+| dedode | 132.2 | 90.3 | 67.0 | 91.6 | **1.35x** | 0.99x |
+| dedode-g | 361.6 | 130.8 | 107.0 | 117.3 | **1.22x** | **1.12x** |
+| dad | 288.9 | 96.9 | 87.1 | 88.6 | **1.11x** | **1.09x** |
+| ripe | 78.5 | 53.7 | 35.8 | 51.2 | **1.50x** | **1.05x** |
+| loftr | 71.2 | 46.9 | 44.7 | 52.0 | **1.05x** | 0.90x |
+| sift / orb | 34.6 / 13.5 | | | | | |
+
+BF16 is the biggest win: 1.0x to 1.6x over fp32 for the CNNs and 2.6x for the DeDoDe-G / DaD stack (DINOv2 ViT-L + refiners).
+
+**Two bugs made INT8/FP8 slower than BF16 on most models; both are fixed, and FP8 now matches or beats BF16 on four of
+nine.**
+
+1. **The im2col gather, not the GEMM, was the first bottleneck.** Profiling (`benchmarks/profile/extractor_profile.py`,
+   SuperPoint `int8`, 1600 px) showed the INT8 GEMMs taking 3.05 ms for the nine quantized convolutions (about what
+   BF16's cuDNN convolutions take for the same layers), but the `F.pad` + `torch.cat` that built the im2col matrix
+   taking 14.5 ms — 47% of all kernel time, more than the GEMM plus the convolutions it replaced. `F.pad` materialized
+   a whole padded copy of the activation, and `torch.cat` then copied each of the `kh*kw` strided taps into the
+   im2col buffer separately: `kh*kw + 1` extra full passes over the data for a memory-bound 1-byte gather. Fixed with
+   `ops.im2col_gather`, one Triton kernel (`backends/triton/conv.py`) that computes the padding bounds inline and
+   writes every tap of an output row in one program, no padded intermediate or per-tap launches: SuperPoint's im2col
+   dropped from 14.5 ms to 6.65 ms (bit-identical — `tests/quant/test_conv2d.py::test_im2col_matches_unfold` checks it
+   against `F.unfold`).
+2. **MXFP8's own activation quantization was calling the wrong function.** `StaticMXFP8Linear.forward` (and the new
+   `StaticMXFP8Conv2d`, which copied it) imported `quantize_static` straight from `flashim.quant.tensor` — the plain
+   torch reference (pad to a multiple of 32, reshape into blocks, divide by the exponent, clamp, cast: five separate
+   kernel launches) — instead of calling through `ops.quantize_mxfp8`, the dispatched op whose Triton backend
+   (`backends/triton/quantize.py`) already does the same thing in one fused kernel. That backend exists and is tested
+   (`tests/ops/test_ops_cuda.py::test_quantize_mxfp8`) but nothing on this call path used it. Fixed by calling
+   `ops.quantize_mxfp8` in both classes; this also speeds up any other model's plain (non-fused-producer) MXFP8
+   linears, not just the new conv layers. Effect (fp8, on top of fix 1): 15% to 39% faster; `dedode-g`, `dad` and
+   `ripe` now beat `bf16`, and `dedode` is within 1%.
+
+**What's left, and why it's not worth chasing further:** cuBLAS's block-scaled MXFP8 GEMM needs both the padded `N`
+and `K` (`kh*kw*C_in`, rounded up to 32) divisible by 128 (`backends/torch_native/gemm.py:_cublas_shapes`); anything
+else falls back to a Triton FP8 GEMM that is 7x to 9x slower per call (0.08 ms vs 0.73 ms in the SuperPoint profile).
+`model.quant_report.summary()["linear_kernels"]` shows the split per model: DeDoDe / DaD / RIPE / LoFTR are already
+80-90%+ cuBLAS (their linears and 1x1 refiner convs sit at 256+ channels), which is why fixes 1 and 2 alone got them
+to parity or a win. DISK, ALIKE and XFeat are the opposite — 0/7, 1/14 and 2/19 cuBLAS — because their conv channel
+counts (16 to 64) never reach 128; that's architectural, not a bug, and padding those channels up to 128 to buy
+cuBLAS eligibility would multiply their real FLOPs and gather bytes by 2x to 8x for a GEMM that's already cheap
+relative to the gather, a bad trade. Not attempted for those. A true implicit-GEMM kernel (taps gathered inside
+the GEMM's shared-memory load, no im2col buffer, bias/ReLU/requantize in the epilogue) would help every model and
+was not attempted either — the biggest remaining project here.
+
+**A custom Triton/TileLang GEMM to remove the 128-alignment need directly, for DISK and LoFTR (the two models with
+some genuinely large `K`, up to 3200): tried, and it helps a little, once the design landed on the right shape.**
+MXFP8's own scale-block size (32) equals the K-width of this GPU's FP8 tensor-core instruction (`mma.sync.m16n8k32`
+— available here: `Feature.MMA_SYNC` + `Feature.FP8_E4M3`, confirmed no `Feature.TCGEN05` needed, since cuBLAS's own
+kernel doesn't have it either on this consumer-Blackwell card), so a kernel can rescale-and-accumulate per 32-wide
+block with no alignment requirement at all. Two false starts before it worked:
+- *v1* (one small MMA + one global-memory round trip per 32-wide block): 3x to 16x **slower** than the Triton
+  fallback at every shape tried — reverted immediately, nothing shipped.
+- *v2* (load the entire `K` into shared memory once per tile, to remove those round trips): correct and fast in
+  isolation, but this GPU's opt-in shared memory per block is only ~99KB (`shared_memory_per_block_optin`) — far
+  short of datacenter Blackwell's ~227KB — so it doesn't fit for the actual `K` values here (1152-3200) at a useful
+  tile size.
+- *v3* (shipped, `backends/tilelang/{gemm.py,_gemm_kernels.py}`): batch `K` in chunks (a divisor of `K`, sized to
+  fit the shared-memory budget) instead of the full width or single 32-wide blocks — one shared-memory load per
+  chunk, several MMAs + a batched rescale-accumulate from data already resident. Registered as `ops.mxfp8_linear`'s
+  `"tilelang"` impl, gated to `K >= 2000` and cuBLAS-ineligible (`backends/tilelang/gemm.py:MIN_K`): below that,
+  measured roughly break-even with Triton (0.94x-1.01x) or worse; above it, 1.1x-2.5x faster **in isolation**.
+  End-to-end, after also fixing a real bug the integration surfaced (padding the activation's row count up to the
+  tile size with `F.pad` looked free — at most 63 extra rows — but pad allocates and copies the *whole* tensor, an
+  `O(M*K)` pass that was as expensive as the GEMM itself for LoFTR's ~130k-row activations; fixed by splitting into
+  a zero-copy "bulk" launch on the exact multiple of the tile size plus one small launch for the remainder): DISK's
+  `extract()` is a real, repeatable ~4% faster (best-of-3: 80.8 -> 77.4-77.6 ms); LoFTR is neutral (best-of-3:
+  52.3-52.8 ms, matching its pre-tilelang 52.0 ms). The isolated GEMM win doesn't show up end-to-end because the
+  im2col gather, activation quantization and everything else each layer still needs dominate the total. Verified
+  bit-identical (`tests/ops/test_ops_cuda.py`, `tests/parity/{disk,loftr}`); every other model's quantized layers
+  have `K <= 576` and are untouched (still Triton/cuBLAS as before).
+
+Fidelity to each model's own fp32 output on 20 held-out MegaDepth-1500 pairs (`benchmarks/accuracy/fidelity.py`, full table
+in `results/sparse_models.md`): `bf16` keeps 92 to 99% of the keypoints (within 1.5 px) and descriptor cosine >= 0.994; `int8`
+keeps cosine >= 0.99 on every model and 87 to 97% of the keypoints; `fp8` is clearly the least faithful on the small nets
+(SuperPoint: 70% of the keypoints, descriptor cosine 0.953, 18% fewer matches; XFeat: 73% of the keypoints), fine on
+DISK / DeDoDe / RIPE (cosine >= 0.986). **INT8 on DINOv2 is broken**: quantizing the ViT-L linears of DeDoDe-G / DaD with one
+per-tensor scale gives a dense-descriptor cosine of 0.79 (min 0.01); attention and the MLP down-projection each break it
+(DINOv2's outlier activations). The `int8` presets of `dedode-g` and `dad` therefore leave the ViT in BF16 (cosine 0.997);
+their `fp8` presets keep it in MXFP8 (per-32-block scales: cosine 0.994).
+
+Task-level accuracy (MegaDepth-1500 AUC, RDD's protocol) of the quantized presets is **not measured yet**: it is a 3 to 5
+hour GPU job (`benchmarks/accuracy/sparse_matrix.sh`, resumable, then `benchmarks/report_sparse.py`). Until then only the
+fidelity proxy above backs the `int8` / `fp8` presets. Sanity runs (fp32, first 100 pairs, AUC@5): LoFTR 0.52, DeDoDe-G 0.51
+(0.55 at 1024 px), SuperPoint+LightGlue 0.50 (full 1500 pairs 0.503), DeDoDe 0.50, DaD 0.46 (0.48 at 1024 px), DISK+LightGlue
+0.45, XFeat+LighterGlue 0.46, ALIKE 0.45, SIFT 0.33, RIPE 0.37, SuperPoint with plain mutual NN 0.28, ORB 0.14.
+
+Not done: SIFT + LightGlue (needs the scale / orientation position encoding), an ALIKE + LightGlue pairing (no released
+weights), compiled engines (`engine.kind=compile` is wired up for every model but not benchmarked), and BF16 refiner-block
+fusion for DeDoDe / DaD / RIPE (their depthwise 5x5 + ReLU + 1x1 blocks are exactly RoMaV2's `SeparableConvBlock` pattern:
+the fused `depthwise5x5_relu_pointwise` kernels would apply after the BatchNorm fold; the depthwise convs are 36% of DeDoDe's
+BF16 kernel time).
+
 ## Layout
 
 ```
@@ -335,6 +473,8 @@ flashim/
   models/      romav2 (DINOv3 ViT-L/16, MV-ViT, DPT head, conv refiners, presets, calibration)
                rdd (ConvNeXt, deformable encoder, detector, sparse keypoints / matching, presets, calibration)
                aliked (deformable-conv encoder, SDDH descriptor head, DKD keypoints / matching, presets)
+               superpoint, alike, disk, xfeat, dedode (+ dad, ripe share its blocks), loftr, sift, orb (see above);
+               sparse.py / sparse_spec.py: base class + spec factory shared by the sparse extractors
   geometry/    pose estimation + AUC metrics
 benchmarks/    speed/forward.py, accuracy/run.py (MegaDepth-1500, ScanNet-1500), accuracy/run_sparse.py (RDD)
 scripts/       calibrate_romav2.py, calibrate_rdd.py

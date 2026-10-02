@@ -22,6 +22,20 @@ SPECS = {
     "rdd-lightglue": "flashim.models.lightglue.spec:RDD_LIGHTGLUE",
     "aliked-lightglue": "flashim.models.lightglue.spec:ALIKED_LIGHTGLUE",
     "raco-aliked-lightglue": "flashim.models.lightglue.spec:RACO_ALIKED_LIGHTGLUE",
+    "superpoint": "flashim.models.superpoint.spec:SPEC",
+    "alike": "flashim.models.alike.spec:SPEC",
+    "disk": "flashim.models.disk.spec:SPEC",
+    "xfeat": "flashim.models.xfeat.spec:SPEC",
+    "dedode": "flashim.models.dedode.spec:SPEC",
+    "dedode-g": "flashim.models.dedode.spec:SPEC_G",
+    "dad": "flashim.models.dad.spec:SPEC",
+    "ripe": "flashim.models.ripe.spec:SPEC",
+    "loftr": "flashim.models.loftr.spec:SPEC",
+    "sift": "flashim.models.sift.spec:SPEC",
+    "orb": "flashim.models.orb.spec:SPEC",
+    "xfeat-lightglue": "flashim.models.lightglue.spec:XFEAT_LIGHTGLUE",
+    "superpoint-lightglue": "flashim.models.lightglue.spec:SUPERPOINT_LIGHTGLUE",
+    "disk-lightglue": "flashim.models.lightglue.spec:DISK_LIGHTGLUE",
 }
 
 # Keyword-API loaders (``module:function``).
