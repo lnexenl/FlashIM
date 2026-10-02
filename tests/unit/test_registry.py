@@ -23,6 +23,18 @@ def test_priority_then_narrowest_range():
     assert op.candidates(Platform("cpu")) == []
 
 
+def test_negative_priority_is_opt_in():
+    op = _op("t_opt_in")
+    op.register("extra", device=DeviceSpec("*"), priority=-1)(lambda x: "extra")
+    x = torch.zeros(1)
+    assert op(x) == "reference"  # dispatch never picks an opt-in impl, even when it is the only one
+    assert op.explain(x)["extra"].startswith("opt-in")
+    assert op.get("extra")(x) == "extra"
+    ops.configure("t_opt_in:extra")
+    assert op(x) == "extra"
+    ops.configure(None)
+
+
 def test_required_features_filter():
     op = _op("t_features")
     op.register("mx", device=DeviceSpec("cuda"), requires=[Feature.MXFP8_SCALED_MM])(lambda x: "mx")

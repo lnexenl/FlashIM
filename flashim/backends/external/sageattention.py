@@ -1,7 +1,8 @@
 """SageAttention (thu-ml; Q/K INT8 with K smoothing) as ``sdpa`` impls; loaded only when the package is installed.
 
 Opt-in (priority -1): pin with ``ops.sdpa.get("sage")`` (INT8 QK + FP16 PV, FP32 accumulation) or ``"sage-fp8"``
-(INT8 QK + FP8 PV).
+(INT8 QK + FP8 PV). Head dims 64 to 128 are accepted: SageAttention's CUDA entry points zero-pad dims between
+64 and 128 to 128 themselves (e.g. 96 for XFeat's LighterGlue) and default the softmax scale to the original dim's.
 """
 
 from __future__ import annotations
@@ -13,12 +14,14 @@ from torch import Tensor
 from flashim import ops
 from flashim.ops._registry import DeviceSpec
 
+_HEAD_DIMS = (64, 96, 128)
+
 
 def _eligible(q: Tensor, k: Tensor, v: Tensor) -> bool:
     return (
         q.ndim == 4
         and q.shape == k.shape == v.shape
-        and q.shape[-1] in (64, 128)
+        and q.shape[-1] in _HEAD_DIMS
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.dtype == k.dtype == v.dtype
         and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1

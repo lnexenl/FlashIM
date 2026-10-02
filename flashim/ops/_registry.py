@@ -8,7 +8,9 @@ platform :class:`~flashim.platforms.Feature` s and a per-call ``when`` predicate
 Require a feature rather than a capability range when the hardware feature is not
 monotonic in the capability (``Feature.WGMMA``, ``Feature.TCGEN05``).
 Selection order: highest ``priority`` first, then the narrowest capability range,
-then registration order. :meth:`Op.explain` says why each impl was (not) chosen;
+then registration order. A negative ``priority`` makes an impl opt-in: dispatch never
+picks it, only a pin (:meth:`Op.get`, :meth:`Op.bind`) or a ``FLASHIM_OPS`` override
+does. :meth:`Op.explain` says why each impl was (not) chosen;
 ops with constant weight operands (``Op(..., weights=n)``) let each impl repack them
 once, at load time, through :meth:`Op.bind` (``register(..., prepare=...)``);
 ``FLASHIM_LOG=ops=debug`` logs the first use of every impl and reference fallbacks
@@ -83,6 +85,11 @@ class Impl:
     prepare: Callable[..., tuple] | None = None
     # Weight-only eligibility (vLLM's ``can_implement``): checked once per BoundOp, per call when unbound.
     accepts: Callable[..., bool] | None = None
+
+    @property
+    def opt_in(self) -> bool:
+        """Negative priority: never selected by dispatch, only when pinned or forced."""
+        return self.priority < 0
 
     def available(self, platform: Platform) -> bool:
         return self.device.matches(platform) and platform.supports(*self.requires)
@@ -227,7 +234,8 @@ class Op:
             if impl.name == chosen:
                 report[impl.name] = "selected"
             else:
-                report[impl.name] = impl.rejection(platform, args, kwargs) or "lower priority"
+                reason = "opt-in (negative priority): pin it" if impl.opt_in else "lower priority"
+                report[impl.name] = impl.rejection(platform, args, kwargs) or reason
         report[REFERENCE] = "selected" if chosen == REFERENCE else "fallback"
         return report
 
@@ -251,7 +259,7 @@ class Op:
             return None
         platform = self._platform(args, kwargs)
         for impl in [self._find(pin)] if pin is not None else self.candidates(platform):
-            if not impl.available(platform):
+            if not impl.available(platform) or (pin is None and impl.opt_in):
                 continue
             if impl.accepts is not None:
                 ok = None if accepted is None else accepted.get(impl.name)
