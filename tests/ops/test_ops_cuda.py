@@ -111,6 +111,37 @@ def test_mxfp8_linear_triton_matches_reference():
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
 
 
+@pytest.mark.parametrize("n,k", [(64, 3200), (196, 2016), (196, 2304), (128, 2016)])  # real DISK / LoFTR shapes
+@pytest.mark.parametrize("bias", [False, True])
+def test_mxfp8_linear_tilelang_matches_reference(n, k, bias):
+    """The batched-chunk K-loop kernel (``backends/tilelang/_gemm_kernels.py``) against the dequantize-then-matmul
+    reference, at the large-K shapes it targets (cuBLAS rejects them; below K=2000 this backend declines and
+    Triton handles them, see ``backends/tilelang/gemm.py:MIN_K``)."""
+    w = QuantizedWeight.from_float(torch.randn(n, k, device=DEV) * 0.3)
+    x = torch.randn(4000, k, device=DEV) * 0.3
+    q = quantize_static(x, mx.calibrate_block32_exponent(x))
+    # bias is padded to the physical (32-padded) out_features before it reaches the op, same as StaticMXFP8Linear
+    # pads it once at construction (__init__); an unpadded bias is a caller bug, not something the op handles.
+    b = F.pad(torch.randn(n, device=DEV), (0, w.out_features - n)) if bias else None
+    ops.reset_call_counts()
+    fast, ref = _both(ops.mxfp8_linear, "tilelang", q, b, w)
+    assert ops.call_counts()["mxfp8_linear"] == {"tilelang": 1, "reference": 1}
+    assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
+
+
+def test_mxfp8_linear_dispatch_prefers_tilelang_above_k_threshold():
+    """Large-K, cuBLAS-ineligible shapes reach the new kernel through normal dispatch; smaller ones stay on Triton."""
+    big = QuantizedWeight.from_float(torch.randn(64, 3200, device=DEV))
+    small = QuantizedWeight.from_float(torch.randn(64, 576, device=DEV))
+    x_big, x_small = torch.randn(500, 3200, device=DEV), torch.randn(500, 576, device=DEV)
+    q_big = quantize_static(x_big, mx.calibrate_block32_exponent(x_big))
+    q_small = quantize_static(x_small, mx.calibrate_block32_exponent(x_small))
+    ops.reset_call_counts()
+    ops.mxfp8_linear(q_big, None, big)
+    ops.mxfp8_linear(q_small, None, small)
+    assert ops.call_counts()["mxfp8_linear"] == {"tilelang": 1, "triton": 1}
+
+
 @pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float32])
 def test_rope_qk(table_dtype):
     q = torch.randn(2, 12, 505, 64, device=DEV, dtype=torch.bfloat16)
@@ -349,6 +380,33 @@ def test_gelu_quantize_input_bias():
     exponent = mx.calibrate_block32_exponent(F.gelu(x.float() + bias.float())).to(DEV)
     fast, ref = _both(ops.gelu_quantize, "triton", x, exponent, "none", input_bias=bias)
     assert _mismatch(fast.values, ref.values) < 1e-4
+
+
+@pytest.mark.parametrize(
+    "cin,cout,kh,kw,sh,sw,ph,pw,dh,dw",
+    [
+        (64, 64, 3, 3, 1, 1, 1, 1, 1, 1),
+        (48, 40, 3, 3, 1, 1, 1, 1, 1, 1),  # Cin not a multiple of 32
+        (16, 24, 3, 3, 1, 1, 1, 1, 1, 1),  # Cin < 32 (tl.dot's K minimum)
+        (64, 64, 1, 1, 1, 1, 0, 0, 1, 1),  # 1x1
+        (32, 32, 3, 3, 2, 2, 1, 1, 1, 1),  # stride 2
+        (32, 32, 3, 3, 1, 1, 2, 2, 2, 2),  # dilation 2
+        (8, 16, 7, 7, 2, 2, 3, 3, 1, 1),  # 7x7 stride 2 (loftr-like stem), Cin < 32
+    ],
+)
+@pytest.mark.parametrize("has_bias", [True, False])
+def test_int8_conv2d(cin, cout, kh, kw, sh, sw, ph, pw, dh, dw, has_bias):
+    torch.manual_seed(0)
+    x = torch.randint(-127, 127, (2, 17, 19, cin), dtype=torch.int8, device=DEV)
+    weight = torch.randint(-127, 127, (cout, kh * kw * cin), dtype=torch.int8, device=DEV)
+    a_scale = torch.tensor(0.017, device=DEV)
+    w_scale = torch.rand(cout, device=DEV) * 0.01 + 0.001
+    bias = torch.randn(cout, device=DEV, dtype=torch.bfloat16) if has_bias else None
+    fast, ref = _both(
+        ops.int8_conv2d, "triton", x, weight, a_scale, w_scale, bias, kh, kw, sh, sw, ph, pw, dh, dw
+    )
+    assert fast.shape == ref.shape
+    torch.testing.assert_close(fast, ref)
 
 
 @pytest.mark.sm120

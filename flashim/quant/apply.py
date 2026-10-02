@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from torch import nn
 
 from flashim.quant.calibration import CalibrationTable, Int8CalibrationTable
+from flashim.quant.methods.conv2d import StaticInt8Conv2d, StaticMXFP8Conv2d
 from flashim.quant.methods.int8_linear import StaticInt8Conv1x1, StaticInt8Linear
 from flashim.quant.methods.linear import StaticMXFP8Linear
 from flashim.quant.passes.deformable_encoder import QuantizedDeformableEncoder, is_deformable_encoder
@@ -52,9 +53,12 @@ def quantize_model(
             isinstance(module, nn.Conv2d)
             and module.kernel_size == (1, 1)
             and module.groups == 1
+            and module.stride == (1, 1)  # strided 1x1s take the generic im2col path below
+            and module.padding == (0, 0)
             and name not in block_pointwise
         )
-        if not (isinstance(module, nn.Linear) or (is_conv1x1 and scheme.weights.type == "int")):
+        is_conv = isinstance(module, nn.Conv2d) and module.groups == 1 and name not in block_pointwise
+        if not (isinstance(module, nn.Linear) or is_conv1x1 and scheme.weights.type == "int" or is_conv):
             continue
         if scheme.input_activations is None or scheme.input_activations.dynamic:
             continue
@@ -63,16 +67,24 @@ def quantize_model(
         if scheme.weights.type == "int":
             if not isinstance(calibration, Int8CalibrationTable):
                 raise TypeError(f"INT8 scheme for {name!r} needs an Int8CalibrationTable")
-            build = StaticInt8Conv1x1.from_conv if is_conv1x1 else StaticInt8Linear.from_linear
+            if is_conv1x1:
+                build = StaticInt8Conv1x1.from_conv
+            elif is_conv:
+                build = StaticInt8Conv2d.from_conv
+            else:
+                build = StaticInt8Linear.from_linear
             packed = build(module, calibration[name])
         else:
             if not isinstance(calibration, CalibrationTable):
                 raise TypeError(f"MXFP8 scheme for {name!r} needs a CalibrationTable")
-            packed = StaticMXFP8Linear.from_linear(module, calibration[name].input_exponent)
+            build = StaticMXFP8Conv2d.from_conv if is_conv else StaticMXFP8Linear.from_linear
+            packed = build(module, calibration[name].input_exponent)
         report.bytes_before += nbytes(module)
         report.bytes_after += nbytes(packed)
         set_submodule(model, name, packed)
         report.linears[name] = "int8_linear" if isinstance(packed, StaticInt8Linear) else packed.kernel_name
+        if is_conv:
+            report.convs.append(name)
 
     # 2) Transformer-block boundary fusion (needs packed QKV).
     for name, module in list(model.named_modules()):

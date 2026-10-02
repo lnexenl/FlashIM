@@ -1,10 +1,13 @@
-"""Depthwise 5x5 conv-block kernels (ported from RoMaV2 ``refiner_fused_mxfp8.py``).
+"""Depthwise 5x5 conv-block kernels (ported from RoMaV2 ``refiner_fused_mxfp8.py``), and fused implicit-GEMM
+convolutions for a full ``groups == 1`` ``nn.Conv2d``.
 
 - ``depthwise5x5_relu_mxfp8``: depthwise + bias + ReLU -> dynamic per-(row, 32-channel)
   MXFP8, scales written directly in the ``SWIZZLE_32_4_4`` layout ``F.scaled_mm`` expects;
 - ``depthwise5x5_relu_int8``: the same producer with a static per-tensor INT8 output;
 - ``depthwise5x5_relu_pointwise``: BF16 depthwise + ReLU + pointwise 1x1 in one pass;
-- ``depthwise5x5_relu_pointwise_mxfp8``: the MXFP8 variant with the pointwise GEMM fused.
+- ``depthwise5x5_relu_pointwise_mxfp8``: the MXFP8 variant with the pointwise GEMM fused;
+- ``int8_conv2d`` / ``mxfp8_conv2d``: one tap per ``tl.dot`` (INT8) or per-32-channel-block ``tl.dot`` (MXFP8),
+  gathered straight from the activation; no materialized im2col buffer.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from triton.language.extra import libdevice
 
 from flashim import ops
 from flashim.ops._registry import DeviceSpec
+from flashim.ops.conv import fused_mxfp8_conv2d_worthwhile
 from flashim.platforms import Feature
 
 
@@ -528,3 +532,275 @@ ops.depthwise5x5_relu_pointwise_int8.register(
     "triton_fused", device=DeviceSpec("cuda", min_capability=(8, 0)), requires=[Feature.TRITON],
     when=_int8_block_eligible,
 )(depthwise5x5_relu_pointwise_int8)
+
+
+# -- im2col gather ------------------------------------------------------------------------------------
+
+
+@triton.jit
+def _im2col_gather_kernel(
+    x_ptr, out_ptr,
+    H, W, HO, WO,
+    KH: tl.constexpr, KW: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
+    PH: tl.constexpr, PW: tl.constexpr, DH: tl.constexpr, DW: tl.constexpr,
+    C: tl.constexpr, BLOCK_C: tl.constexpr,
+):
+    """One program per output row: gathers every tap's ``C`` channels straight from ``x`` (zero-padded on read,
+    no materialized padding) and writes them contiguously — the whole im2col row in one kernel, one read of each
+    input byte per tap, no intermediate tensors. ``BLOCK_C`` is ``C`` rounded up to a power of 2 (``tl.arange``
+    needs one); the channel mask covers both the padding taps and this rounding."""
+    row = tl.program_id(0).to(tl.int64)
+    b = row // (HO * WO)
+    rem = row % (HO * WO)
+    oy = rem // WO
+    ox = rem % WO
+    c = tl.arange(0, BLOCK_C).to(tl.int64)
+    c_ok = c < C
+    out_base = row * (KH * KW * C)
+    for ky in tl.static_range(KH):
+        iy = oy * SH + ky * DH - PH
+        y_ok = (iy >= 0) & (iy < H)
+        for kx in tl.static_range(KW):
+            ix = ox * SW + kx * DW - PW
+            ok = c_ok & y_ok & (ix >= 0) & (ix < W)
+            x_off = ((b * H + iy) * W + ix) * C
+            vals = tl.load(x_ptr + x_off + c, mask=ok, other=0)
+            tap = ky * KW + kx
+            tl.store(out_ptr + out_base + tap * C + c, vals, mask=c_ok)
+
+
+def _im2col_gather_triton(x: Tensor, kh: int, kw: int, sh: int, sw: int, ph: int, pw: int, dh: int, dw: int) -> Tensor:
+    b, h, w, c = x.shape
+    ho = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+    wo = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+    raw = x.view(torch.uint8).contiguous()
+    out = torch.empty(b * ho * wo, kh * kw * c, dtype=torch.uint8, device=x.device)
+    _im2col_gather_kernel[(b * ho * wo,)](
+        raw, out, h, w, ho, wo, KH=kh, KW=kw, SH=sh, SW=sw, PH=ph, PW=pw, DH=dh, DW=dw,
+        C=c, BLOCK_C=triton.next_power_of_2(c),
+    )
+    return out.view(x.dtype)
+
+
+def _im2col_eligible(x: Tensor, kh: int, kw: int, sh: int, sw: int, ph: int, pw: int, dh: int, dw: int) -> bool:
+    return x.ndim == 4 and x.dtype.itemsize == 1 and x.shape[-1] <= 1024
+
+
+ops.im2col_gather.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_im2col_eligible
+)(_im2col_gather_triton)
+
+
+# -- fused INT8 conv2d (implicit GEMM) ----------------------------------------------------------
+
+_INT8_CONV2D_CONFIGS = [
+    triton.Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_warps=nw, num_stages=ns)
+    for bm, bn, nw, ns in [
+        (32, 32, 4, 3), (32, 64, 4, 3), (64, 32, 4, 3),
+        (64, 64, 4, 3), (64, 64, 8, 3), (64, 128, 4, 3),
+        (128, 64, 4, 3), (128, 128, 4, 3), (128, 128, 8, 2),
+        (256, 64, 8, 2), (256, 128, 8, 2),
+    ]
+]
+
+
+@triton.autotune(configs=_INT8_CONV2D_CONFIGS, key=["rows", "COUT", "CIN", "TAPS"])
+@triton.jit
+def _int8_conv2d_kernel(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    a_scale_ptr, w_scale_ptr,
+    B, H, W, HO, WO, rows,
+    CIN: tl.constexpr, COUT: tl.constexpr, TAPS: tl.constexpr,
+    KH: tl.constexpr, KW: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
+    PH: tl.constexpr, PW: tl.constexpr, DH: tl.constexpr, DW: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """Implicit-GEMM INT8 ``nn.Conv2d`` (``groups == 1``): one full-``BLOCK_K`` INT32 ``tl.dot`` per filter
+    tap, gathered straight from ``x_ptr`` ``[B, H, W, CIN]`` with the tap's spatial offset folded into the
+    address (padding masked to zero) instead of materializing ``im2col_gather``'s buffer and running a
+    separate GEMM on it. ``BLOCK_K`` is ``CIN`` rounded up to a power of 2 (>= 32, ``tl.dot``'s minimum);
+    the channel mask covers padding and this rounding, so ``CIN`` need not itself be a power of 2 (same
+    convention as ``_im2col_gather_kernel``'s ``BLOCK_C``). Epilogue matches ``_int8_gemm_kernel``.
+    """
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(COUT, BLOCK_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < rows
+    b = offs_m // (HO * WO)
+    rem = offs_m % (HO * WO)
+    oh = rem // WO
+    ow = rem % WO
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < COUT
+    offs_c = tl.arange(0, BLOCK_K)
+    c_ok = offs_c < CIN
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for ky in tl.static_range(KH):
+        ih = oh * SH + ky * DH - PH
+        ih_ok = (ih >= 0) & (ih < H)
+        for kx in tl.static_range(KW):
+            iw = ow * SW + kx * DW - PW
+            iw_ok = (iw >= 0) & (iw < W)
+            row_ok = mask_m & ih_ok & iw_ok
+            a_ptrs = x_ptr + ((b * H + ih) * W + iw)[:, None].to(tl.int64) * CIN + offs_c[None, :]
+            a = tl.load(a_ptrs, mask=row_ok[:, None] & c_ok[None, :], other=0)
+            tap = ky * KW + kx
+            b_ptrs = w_ptr + offs_n[None, :].to(tl.int64) * (TAPS * CIN) + tap * CIN + offs_c[:, None]
+            wt = tl.load(b_ptrs, mask=mask_n[None, :] & c_ok[:, None], other=0)
+            accumulator = tl.dot(a, wt, accumulator, out_dtype=tl.int32)
+
+    scale = tl.load(a_scale_ptr) * tl.load(w_scale_ptr + offs_n, mask=mask_n, other=0.0)
+    out = accumulator.to(tl.float32) * scale[None, :]
+    if HAS_BIAS:
+        out += tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)[None, :]
+    out_ptrs = out_ptr + offs_m[:, None].to(tl.int64) * COUT + offs_n[None, :]
+    tl.store(out_ptrs, out.to(tl.bfloat16), mask=mask_m[:, None] & mask_n[None, :])
+
+
+def _int8_conv2d_triton(x, weight, a_scale, w_scale, bias, kh, kw, sh, sw, ph, pw, dh, dw) -> Tensor:
+    b, h, w, cin = x.shape
+    cout = weight.shape[0]
+    ho = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+    wo = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+    out = torch.empty(b, ho, wo, cout, device=x.device, dtype=torch.bfloat16)
+    rows = b * ho * wo
+    block_k = max(32, triton.next_power_of_2(cin))
+    grid = lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]) * triton.cdiv(cout, meta["BLOCK_N"]),)
+    _int8_conv2d_kernel[grid](
+        x, weight, bias, out, a_scale, w_scale, b, h, w, ho, wo, rows,
+        CIN=cin, COUT=cout, TAPS=kh * kw, KH=kh, KW=kw, SH=sh, SW=sw, PH=ph, PW=pw, DH=dh, DW=dw,
+        HAS_BIAS=bias is not None, BLOCK_K=block_k,
+    )
+    return out
+
+
+def _int8_conv2d_eligible(x, weight, a_scale, w_scale, bias, kh, kw, sh, sw, ph, pw, dh, dw) -> bool:
+    return (
+        x.ndim == 4
+        and x.dtype == torch.int8
+        and x.is_contiguous()
+        and weight.shape == (weight.shape[0], kh * kw * x.shape[-1])
+        and kh * kw <= 49  # keeps the unrolled tap loop's compile time reasonable
+    )
+
+
+ops.int8_conv2d.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON],
+    when=_int8_conv2d_eligible,
+)(_int8_conv2d_triton)
+
+
+# -- fused static MXFP8 conv2d (implicit GEMM) --------------------------------------------------
+
+_MXFP8_CONV2D_CONFIGS = [
+    triton.Config({"BLOCK_M": bm, "BLOCK_N": bn}, num_warps=nw, num_stages=ns)
+    for bm, bn, nw, ns in [
+        (32, 32, 4, 3), (32, 64, 4, 3), (64, 32, 4, 3),
+        (64, 64, 4, 3), (64, 64, 8, 3), (64, 128, 4, 3),
+        (128, 64, 4, 3), (128, 128, 4, 3), (128, 128, 8, 2),
+    ]
+]
+
+
+@triton.autotune(configs=_MXFP8_CONV2D_CONFIGS, key=["rows", "COUT", "CIN", "TAPS"])
+@triton.jit
+def _mxfp8_conv2d_kernel(
+    x_ptr, w_ptr, wexp_ptr, cexp_ptr, bias_ptr, out_ptr,
+    B, H, W, HO, WO, rows,
+    CIN: tl.constexpr, COUT: tl.constexpr, TAPS: tl.constexpr, CIN_BLOCKS: tl.constexpr,
+    KH: tl.constexpr, KW: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
+    PH: tl.constexpr, PW: tl.constexpr, DH: tl.constexpr, DW: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """Implicit-GEMM static MXFP8 ``nn.Conv2d`` (``groups == 1``): one 32-channel-block E4M3 ``tl.dot`` per
+    (tap, channel block), gathered straight from ``x_ptr`` ``[B, H, W, CIN]`` (``CIN`` already a multiple of 32),
+    instead of materializing ``im2col_gather``'s buffer and running ``mxfp8_linear`` on it. The activation's
+    per-channel-block exponent (``cexp_ptr``, ``[CIN / 32]``) is the *same* for every tap -- a tap only changes
+    which weight reads a pixel, not the pixel's own scale -- so it's read once per (tap, block) instead of the
+    unfused path's tap-duplicated copy; the weight's own exponent (``wexp_ptr``, ``[COUT, TAPS * CIN / 32]``) does
+    vary per tap (it's a different weight tap, not a different view of the same activation). FP32 accumulation,
+    scaled per block as ``sum(a_bits * b_bits) * 2**a_exp * 2**b_exp`` (matches ``_fp8_gemm_kernel``'s epilogue).
+    """
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(COUT, BLOCK_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < rows
+    b = offs_m // (HO * WO)
+    rem = offs_m % (HO * WO)
+    oh = rem // WO
+    ow = rem % WO
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < COUT
+    offs_block = tl.arange(0, 32)
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for ky in tl.static_range(KH):
+        ih = oh * SH + ky * DH - PH
+        ih_ok = (ih >= 0) & (ih < H)
+        for kx in tl.static_range(KW):
+            iw = ow * SW + kx * DW - PW
+            iw_ok = (iw >= 0) & (iw < W)
+            row_ok = mask_m & ih_ok & iw_ok
+            tap = ky * KW + kx
+            for kt in tl.static_range(CIN_BLOCKS):
+                offs_c = kt * 32 + offs_block
+                a_ptrs = x_ptr + ((b * H + ih) * W + iw)[:, None].to(tl.int64) * CIN + offs_c[None, :]
+                a = tl.load(a_ptrs, mask=row_ok[:, None], other=0.0)
+                a_scale = tl.exp2(tl.load(cexp_ptr + kt).to(tl.float32))
+
+                kb = tap * CIN_BLOCKS + kt
+                w_ptrs = w_ptr + offs_n[:, None].to(tl.int64) * (TAPS * CIN) + kb * 32 + offs_block[None, :]
+                wt = tl.load(w_ptrs, mask=mask_n[:, None], other=0.0)
+                w_scale = tl.exp2(tl.load(wexp_ptr + offs_n * (TAPS * CIN_BLOCKS) + kb, mask=mask_n, other=-127.0).to(tl.float32))
+
+                accumulator += tl.dot(a, tl.trans(wt)) * (a_scale * w_scale[None, :])
+
+    out = accumulator
+    if HAS_BIAS:
+        out += tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)[None, :]
+    out_ptrs = out_ptr + offs_m[:, None].to(tl.int64) * COUT + offs_n[None, :]
+    tl.store(out_ptrs, out.to(tl.bfloat16), mask=mask_m[:, None] & mask_n[None, :])
+
+
+def _mxfp8_conv2d_triton(x, channel_exponent, weight, weight_exponent, bias, kh, kw, sh, sw, ph, pw, dh, dw) -> Tensor:
+    b, h, w, cin = x.shape
+    cout = weight.shape[0]
+    ho = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+    wo = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+    out = torch.empty(b, ho, wo, cout, device=x.device, dtype=torch.bfloat16)
+    rows = b * ho * wo
+    grid = lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]) * triton.cdiv(cout, meta["BLOCK_N"]),)
+    _mxfp8_conv2d_kernel[grid](
+        x, weight, weight_exponent, channel_exponent, bias, out, b, h, w, ho, wo, rows,
+        CIN=cin, COUT=cout, TAPS=kh * kw, CIN_BLOCKS=cin // 32, KH=kh, KW=kw, SH=sh, SW=sw, PH=ph, PW=pw, DH=dh, DW=dw,
+        HAS_BIAS=bias is not None,
+    )
+    return out
+
+
+def _mxfp8_conv2d_eligible(x, channel_exponent, weight, weight_exponent, bias, kh, kw, sh, sw, ph, pw, dh, dw) -> bool:
+    return (
+        x.ndim == 4
+        and x.dtype == torch.float8_e4m3fn
+        and x.is_contiguous()
+        and x.shape[-1] % 32 == 0
+        and weight.shape == (weight.shape[0], kh * kw * x.shape[-1])
+        and fused_mxfp8_conv2d_worthwhile(kh * kw, x.shape[-1] // 32)
+    )
+
+
+ops.mxfp8_conv2d.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3],
+    when=_mxfp8_conv2d_eligible,
+)(_mxfp8_conv2d_triton)

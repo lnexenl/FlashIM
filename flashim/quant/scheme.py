@@ -90,6 +90,7 @@ class PackingReport:
     linears: dict[str, str] = field(default_factory=dict)  # module name -> kernel name
     fused_blocks: list[str] = field(default_factory=list)
     fused_conv_blocks: list[str] = field(default_factory=list)
+    convs: list[str] = field(default_factory=list)  # convolutions packed as im2col + GEMM
     bytes_before: int = 0
     bytes_after: int = 0
 
@@ -105,6 +106,7 @@ class PackingReport:
             "linear_kernels": self.kernel_counts(),
             "fused_transformer_blocks": len(self.fused_blocks),
             "fused_conv_blocks": len(self.fused_conv_blocks),
+            "im2col_convs": len(self.convs),
             "weight_bytes_before": self.bytes_before,
             "weight_bytes_after": self.bytes_after,
         }

@@ -111,8 +111,8 @@ class Calibrator:
         self._targets = {}
         for name in names:
             module = modules.get(name)
-            if not isinstance(module, nn.Linear):
-                raise TypeError(f"{name!r} is not an nn.Linear")
+            if not isinstance(module, (nn.Linear, nn.Conv2d)):
+                raise TypeError(f"{name!r} is not an nn.Linear / nn.Conv2d")
             self._targets[name] = module
         self._handles: list = []
 
@@ -133,6 +133,10 @@ class Calibrator:
         for name, module in self._targets.items():
 
             def hook(mod, args, output, name=name):
+                if isinstance(mod, nn.Conv2d):  # channels-last view: per channel-block amax over N, H, W (all taps)
+                    self._merge(self._amax_in, name, args[0].permute(0, 2, 3, 1))
+                    self._merge(self._amax_out, name, output.permute(0, 2, 3, 1))
+                    return
                 self._merge(self._amax_in, name, args[0])
                 self._merge(self._amax_out, name, output)
 

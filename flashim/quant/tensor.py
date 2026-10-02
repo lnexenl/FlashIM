@@ -95,14 +95,22 @@ class QuantizedWeight:
 
 
 def quantize_static(value: Tensor, scale_exponent: Tensor) -> QuantizedTensor:
-    """Reference static block-32 quantization (pads channels to a multiple of 32)."""
+    """Reference static block-32 quantization (pads channels to a multiple of 32).
+
+    ``value`` is made contiguous first: a non-contiguous input (e.g. the transposed view
+    ``sample_descriptors`` produces) otherwise survives the ``.float()``/``.reshape()`` below as an
+    equally non-contiguous, oddly-strided ``QuantizedTensor.values`` whenever the reshape happens to
+    need no copy -- cuBLAS's block-scaled MXFP8 GEMM then rejects that layout with
+    ``CUBLAS_STATUS_NOT_SUPPORTED`` instead of a shape error, only on the (non-Triton-eligible) reference
+    path, so it was rare and looked data-dependent.
+    """
     if value.ndim < 2:
         raise ValueError(f"Expected a channelized tensor, got {tuple(value.shape)}")
     padded = padded_channels(value.shape[-1])
     scale_exponent = scale_exponent.to(device=value.device, dtype=torch.int8)
     if tuple(scale_exponent.shape) != (padded // BLOCK,):
         raise ValueError(f"Expected scale shape {(padded // BLOCK,)}, got {tuple(scale_exponent.shape)}")
-    dense = value.float()
+    dense = value.contiguous().float()
     if padded != value.shape[-1]:
         dense = F.pad(dense, (0, padded - value.shape[-1]))
     quantized = quantize_blocks(dense.reshape(-1, padded // BLOCK, BLOCK), scale_exponent)

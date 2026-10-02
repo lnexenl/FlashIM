@@ -9,7 +9,7 @@ from torch import Tensor, nn
 from flashim import ops
 from flashim.ops import BoundOp
 from flashim.quant.formats import mx
-from flashim.quant.tensor import QuantizedTensor, QuantizedWeight, quantize_static
+from flashim.quant.tensor import QuantizedTensor, QuantizedWeight
 
 
 class StaticMXFP8Linear(nn.Module):
@@ -88,7 +88,7 @@ class StaticMXFP8Linear(nn.Module):
         return out[:, : self.out_features].reshape(*leading, self.out_features).to(dtype)
 
     def forward(self, x: Tensor) -> Tensor:
-        quantized = quantize_static(x, self.input_exponent)
+        quantized = ops.quantize_mxfp8(x, self.input_exponent)  # dispatched: one Triton kernel on CUDA
         return self._finish(self.gemm(quantized, None), tuple(x.shape[:-1]), x.dtype)
 
     def quantize_layernorm(self, value: Tensor, residual: Tensor | None, norm: nn.LayerNorm) -> QuantizedTensor:
