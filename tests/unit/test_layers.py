@@ -80,3 +80,67 @@ def test_new_conv_model_gets_separable_block_passes():
         out = model(x)
     assert ops.call_counts()["depthwise5x5_relu_pointwise"] == {"reference": 2}  # CPU: the op's reference
     assert ((out.float() - ref).norm() / ref.norm()) < 0.02
+
+
+def test_indexed_separable_block_keeps_sequential_names_and_gets_the_passes():
+    """DeDoDe / RIPE style ``nn.Sequential(conv, bn, relu, conv)`` blocks: upstream state-dict keys, same layer type."""
+    torch.manual_seed(0)
+    channels = 32
+    upstream = nn.Sequential(
+        nn.Conv2d(channels, channels, 5, 1, 2, groups=channels), nn.BatchNorm2d(channels), nn.ReLU(inplace=True),
+        nn.Conv2d(channels, channels, 1),
+    ).eval()
+    upstream[1].running_var.uniform_(0.5, 1.5)
+    block = layers.IndexedSeparableConvBlock(channels).eval()
+    assert list(block.state_dict()) == list(upstream.state_dict())
+    block.load_state_dict(upstream.state_dict(), strict=True)
+    assert block.conv_depthwise is block.get_submodule("0") and block.conv_pointwise is block.get_submodule("3")
+    assert block.pointwise_name == "3" and not block.fuse_quantized
+    x = torch.randn(1, channels, 20, 28)
+    with torch.inference_mode():
+        ref = upstream(x.clone())
+        assert torch.equal(block(x.clone()), ref)
+        model = nn.Sequential(block, layers.IndexedSeparableConvBlock(48).eval())  # 48: no fused kernel
+        assert fold_block_batchnorm(model) == ["0", "1"]
+        assert isinstance(block.norm, nn.Identity) and "1" in dict(block.named_children())
+        assert fuse_bf16_blocks(model, ("",), channels=(16, 32, 64, 128)) == ["0"]  # only the supported channel count
+    assert isinstance(model[1], layers.IndexedSeparableConvBlock)
+
+
+def test_indexed_separable_block_pointwise_is_quantized_like_a_plain_conv():
+    """``fuse_quantized`` off: an INT8 scheme on ``<block>.3`` packs that conv; the block itself is not replaced."""
+    from flashim.quant.methods.int8_linear import StaticInt8Conv1x1
+
+    torch.manual_seed(0)
+    model = nn.Sequential(layers.IndexedSeparableConvBlock(32)).eval()
+    fold_block_batchnorm(model)
+    config = QuantConfig({"conv": QuantScheme(("0.3",), INT8_WEIGHTS, INT8_ACTIVATIONS)}, name="int8")
+    x = torch.randn(1, 32, 12, 12)
+    with torch.inference_mode(), Int8Calibrator(model, ["0.3"]) as calibrator:
+        model(x)
+    report = quantize_model(model, config, calibrator.table())
+    assert isinstance(model[0], layers.IndexedSeparableConvBlock) and isinstance(model[0].conv_pointwise, StaticInt8Conv1x1)
+    assert report.fused_conv_blocks == []
+
+
+def test_blocks_fused_before_quantization_leave_the_quantized_set():
+    """A separable block replaced by the BF16 fused block before ``quantize_model`` no longer has its pointwise conv:
+    the scheme's target stops matching (unused calibration entries are fine), other targets are still packed."""
+    from flashim.quant.methods.int8_linear import StaticInt8Conv1x1
+    from flashim.quant.passes.separable_conv_block import BF16SeparableConvBlock
+
+    torch.manual_seed(0)
+    model = nn.Sequential(layers.IndexedSeparableConvBlock(32), layers.IndexedSeparableConvBlock(48)).eval()
+    model[1] = nn.Sequential(nn.Conv2d(32, 48, 1), model[1])  # 48 channels: no fused kernel, stays a plain block
+    fold_block_batchnorm(model)
+    targets = ["0.3", "1.1.3"]
+    x = torch.randn(1, 32, 12, 12)
+    with torch.inference_mode(), Int8Calibrator(model, targets) as calibrator:
+        model(x)
+    table = calibrator.table()
+    assert fuse_bf16_blocks(model, ("",), channels=(16, 32, 64, 128)) == ["0"]
+    config = QuantConfig({"conv": QuantScheme(("0.3", "1.1.3"), INT8_WEIGHTS, INT8_ACTIVATIONS)}, name="int8")
+    quantize_model(model, config, table)
+    assert isinstance(model[0], BF16SeparableConvBlock)
+    assert isinstance(model[1][1], layers.IndexedSeparableConvBlock)
+    assert isinstance(model[1][1].conv_pointwise, StaticInt8Conv1x1)

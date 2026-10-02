@@ -7,7 +7,7 @@ names follow the common upstream conventions (timm / Deformable DETR) so checkpo
 on the layer types, never on attribute-name guessing.
 """
 
-from flashim.layers.conv import SeparableConvBlock
+from flashim.layers.conv import IndexedSeparableConvBlock, SeparableConvBlock
 from flashim.layers.deformable import DeformableEncoder, DeformableEncoderLayer, MSDeformAttn
 from flashim.layers.transformer import Attention, LayerScale, LinearKMaskedBias, Mlp, TransformerBlock
 
@@ -15,6 +15,7 @@ __all__ = [
     "Attention",
     "DeformableEncoder",
     "DeformableEncoderLayer",
+    "IndexedSeparableConvBlock",
     "LayerScale",
     "LinearKMaskedBias",
     "MSDeformAttn",

@@ -167,7 +167,9 @@ def test_local_corr(radius):
     assert torch.allclose(fast, ref, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.parametrize("channels,hw", [(32, (37, 53)), (32, (256, 256)), (64, (40, 48))])
+@pytest.mark.parametrize(
+    "channels,hw", [(16, (33, 70)), (32, (37, 53)), (32, (256, 256)), (64, (40, 48)), (64, (130, 97)), (128, (45, 67))]
+)
 def test_depthwise_relu_pointwise_bf16(channels, hw):
     torch.manual_seed(2)
     x = torch.randn(2, channels, *hw, device=DEV).to(memory_format=torch.channels_last)

@@ -41,7 +41,10 @@ def quantize_model(
     report = PackingReport()
     modules = dict(model.named_modules())
 
-    block_pointwise = {f"{n}.conv_pointwise" for n, m in modules.items() if is_separable_conv_block(m)}
+    # Separable blocks that are fused as a whole (step 3); a block with ``fuse_quantized`` off keeps its pointwise conv
+    # in step 1, like any other 1x1.
+    fused_blocks = {n for n, m in modules.items() if is_separable_conv_block(m) and m.fuse_quantized}
+    block_pointwise = {f"{n}.{modules[n].pointwise_name}" for n in fused_blocks}
 
     # 1) Static-activation linears (and, for INT8, 1x1 convolutions outside separable blocks).
     for name, module in modules.items():
@@ -100,14 +103,14 @@ def quantize_model(
 
     # 3) Separable conv blocks with a dynamically quantized pointwise conv.
     for name, module in list(model.named_modules()):
-        if not is_separable_conv_block(module):
+        if name not in fused_blocks:
             continue
-        match = config.scheme_for(f"{name}.conv_pointwise")
+        match = config.scheme_for(f"{name}.{module.pointwise_name}")
         if match is None:
             continue
         scheme = match[1]
         if scheme.weights.type == "int":
-            pointwise = f"{name}.conv_pointwise"
+            pointwise = f"{name}.{module.pointwise_name}"
             if scheme.input_activations is None or scheme.input_activations.dynamic:
                 raise ValueError(f"INT8 pointwise conv {pointwise!r} requires a static-activation scheme")
             if not isinstance(calibration, Int8CalibrationTable) or pointwise not in calibration:

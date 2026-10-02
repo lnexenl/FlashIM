@@ -20,7 +20,7 @@ from triton.language.extra import libdevice
 
 from flashim import ops
 from flashim.ops._registry import DeviceSpec
-from flashim.ops.conv import fused_mxfp8_conv2d_worthwhile
+from flashim.ops.conv import DEPTHWISE5X5_RELU_POINTWISE_CHANNELS, fused_mxfp8_conv2d_worthwhile
 from flashim.platforms import Feature
 
 
@@ -235,12 +235,18 @@ def depthwise5x5_relu_pointwise(
     *,
     bw: int = 32,
     tile_h: int | None = None,
-    num_warps: int = 2,
+    num_warps: int | None = None,
 ) -> Tensor:
+    """``num_warps`` defaults to one warp per 16 channels: the five ``[BW, C]`` FP32 row accumulators must stay in
+    registers. Measured on sm_120 (BF16 channels-last, vs cuDNN depthwise + ReLU + cuDNN 1x1): 64 ch at 896x1200
+    0.47 ms with 4 warps (35.7 ms with 2: spills) vs 2.06 ms; 128 ch at 448x600 0.32 ms with 8 warps vs 1.04 ms;
+    32 ch at 896x1200 0.23 ms with 2 warps vs 1.03 ms; 16 ch 0.115 ms with 1 warp vs 0.44 ms. 256 ch only reaches
+    0.36 vs 0.44 ms (bw=16, 16 warps) and 512 ch loses, so those stay on cuDNN (see ``_dw_pw_eligible``)."""
     batch, channels, height, width = value.shape
     if (batch * height * width + bw) * channels >= 2**31:
         raise ValueError("depthwise5x5_relu_pointwise: tensor too large for int32 offsets")
     tile_h = tile_h or (32 if height > 64 else 16)
+    num_warps = num_warps or max(1, channels // 16)
     out = torch.empty((batch, height, width, channels), device=value.device, dtype=torch.bfloat16)
     _depthwise5x5_relu_pointwise_kernel[(triton.cdiv(width, bw), triton.cdiv(height, tile_h), batch)](
         value,
@@ -481,7 +487,7 @@ ops.depthwise5x5_relu_int8.register(
 def _dw_pw_eligible(value: Tensor, dw_weight: Tensor, dw_bias: Tensor, pw_weight: Tensor, pw_bias: Tensor) -> bool:
     channels = value.shape[1] if value.ndim == 4 else 0
     return (
-        channels in (16, 32, 64)
+        channels in DEPTHWISE5X5_RELU_POINTWISE_CHANNELS
         and value.is_contiguous(memory_format=torch.channels_last)
         and tuple(dw_weight.shape) == (25, channels)
         and tuple(pw_weight.shape) == (channels, channels)

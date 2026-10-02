@@ -167,11 +167,17 @@ class BF16SeparableConvBlock(nn.Module):
         return f"channels={self.channels}, bf16 dwconv5x5+relu+pointwise fused"
 
 
-def fuse_bf16_blocks(model: nn.Module, prefixes: tuple[str, ...]) -> list[str]:
-    """Replace folded separable conv blocks under ``prefixes`` with :class:`BF16SeparableConvBlock`."""
+def fuse_bf16_blocks(
+    model: nn.Module, prefixes: tuple[str, ...], channels: tuple[int, ...] | None = None
+) -> list[str]:
+    """Replace folded separable conv blocks under ``prefixes`` with :class:`BF16SeparableConvBlock`. ``channels``
+    restricts the replacement to those channel counts (a block the fused op has no kernel for would otherwise run
+    the op's torch reference)."""
     replaced = []
     for name, module in list(model.named_modules()):
-        if is_separable_conv_block(module) and any(name.startswith(p) for p in prefixes):
+        if not is_separable_conv_block(module) or not any(name.startswith(p) for p in prefixes):
+            continue
+        if channels is None or module.conv_depthwise.in_channels in channels:
             set_submodule(model, name, BF16SeparableConvBlock(module).to(module.conv_depthwise.weight.device))
             replaced.append(name)
     return replaced

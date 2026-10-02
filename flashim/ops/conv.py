@@ -74,6 +74,9 @@ def _depthwise5x5_relu_pointwise_reference(
 
 
 depthwise5x5_relu_pointwise = Op("depthwise5x5_relu_pointwise", _depthwise5x5_relu_pointwise_reference)
+# Channel counts with a fused kernel that beats cuDNN's depthwise + ReLU + 1x1 (backends/triton/conv.py has the
+# measurements): what the BF16 block-fusion passes may replace. Other counts would run the reference above.
+DEPTHWISE5X5_RELU_POINTWISE_CHANNELS = (16, 32, 64, 128)
 
 
 # -- MXFP8 depthwise-separable block: depthwise 5x5 + ReLU -> dynamic MXFP8 -> pointwise GEMM -----------
