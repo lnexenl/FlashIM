@@ -22,12 +22,20 @@ def _layernorm_quantize_reference(
     *,
     input_bias: Tensor | None = None,
     return_dense: bool = False,
+    return_sum: bool = False,
+    activation: str | None = None,
 ) -> QuantizedTensor | tuple[QuantizedTensor, Tensor]:
-    """``quantize_static(LayerNorm(value [+ input_bias] [+ residual]))`` with FP32 statistics.
+    """``quantize_static(LayerNorm(value [+ input_bias] [+ residual]))`` with FP32 statistics; ``activation``
+    (``"none"`` / ``"tanh"``: the GELU approximation) applies GELU to the rounded normalized tensor and rounds again,
+    the rounding points of ``nn.LayerNorm`` -> ``nn.GELU`` in ``value.dtype``.
 
     The normalized tensor is rounded to ``value.dtype`` before quantization. ``return_dense`` also returns
-    that rounded tensor: ``(quantized, dense)``.
+    that rounded tensor: ``(quantized, dense)``; ``return_sum`` instead returns the LayerNorm input rounded to
+    ``value.dtype`` (``value + residual`` exactly as a BF16 ``torch.add``): ``(quantized, sum)``, the residual stream
+    a transformer block keeps (no separate add pass).
     """
+    if return_dense and return_sum:
+        raise ValueError("return_dense and return_sum are exclusive")
     dense = value.float() if input_bias is None else value.float() + input_bias.float()
     dense = dense if residual is None else dense + residual.float()
     normalized = F.layer_norm(
@@ -37,7 +45,11 @@ def _layernorm_quantize_reference(
         bias.float() if bias is not None else None,
         eps,
     ).to(value.dtype)
+    if activation is not None:
+        normalized = F.gelu(normalized.float(), approximate=activation).to(value.dtype)
     quantized = quantize_static(normalized, scale_exponent)
+    if return_sum:
+        return quantized, dense.to(value.dtype)
     return (quantized, normalized) if return_dense else quantized
 
 
@@ -84,9 +96,11 @@ quantize_int8 = Op("quantize_int8", _quantize_int8_reference)
 
 
 def _layernorm_quantize_int8_reference(
-    value: Tensor, residual: Tensor | None, weight: Tensor | None, bias: Tensor | None, eps: float, scale: Tensor
-) -> Int8Tensor:
-    """``quantize_int8(LayerNorm(value [+ residual]))`` with FP32 statistics, rounded to ``value.dtype`` first."""
+    value: Tensor, residual: Tensor | None, weight: Tensor | None, bias: Tensor | None, eps: float, scale: Tensor,
+    *, return_sum: bool = False, activation: str | None = None,
+) -> Int8Tensor | tuple[Int8Tensor, Tensor]:
+    """``quantize_int8(LayerNorm(value [+ residual]))`` with FP32 statistics, rounded to ``value.dtype`` first;
+    ``return_sum`` also returns ``value + residual`` in ``value.dtype`` (see :func:`layernorm_quantize`)."""
     dense = value.float() if residual is None else value.float() + residual.float()
     normalized = F.layer_norm(
         dense,
@@ -95,7 +109,10 @@ def _layernorm_quantize_int8_reference(
         bias.float() if bias is not None else None,
         eps,
     ).to(value.dtype)
-    return quantize_int8_static(normalized, scale)
+    if activation is not None:  # see layernorm_quantize
+        normalized = F.gelu(normalized.float(), approximate=activation).to(value.dtype)
+    quantized = quantize_int8_static(normalized, scale)
+    return (quantized, dense.to(value.dtype)) if return_sum else quantized
 
 
 layernorm_quantize_int8 = Op("layernorm_quantize_int8", _layernorm_quantize_int8_reference)

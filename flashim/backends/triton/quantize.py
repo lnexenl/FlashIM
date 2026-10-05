@@ -46,6 +46,14 @@ def _store_quantized(out_ptr, row, cols, activated, scale_ptr, padded_channels, 
 
 
 @triton.jit
+def _gelu(value, TANH: tl.constexpr):
+    if TANH:
+        inner = 0.7978845608028654 * (value + 0.044715 * value * value * value)
+        return 0.5 * value * (1.0 + (1.0 - 2.0 / (tl.exp(2.0 * inner) + 1.0)))
+    return 0.5 * value * (1.0 + tl.math.erf(value * 0.7071067811865476))
+
+
+@triton.jit
 def _gelu_quantize_kernel(
     value_ptr,
     scale_ptr,
@@ -89,6 +97,7 @@ def _layernorm_quantize_kernel(
     out_ptr,
     input_bias_ptr,
     dense_ptr,
+    sum_ptr,
     channels,
     padded_channels,
     eps,
@@ -100,6 +109,9 @@ def _layernorm_quantize_kernel(
     INT8: tl.constexpr,
     HAS_INPUT_BIAS: tl.constexpr,
     DENSE_OUT: tl.constexpr,
+    SUM_OUT: tl.constexpr,
+    GELU: tl.constexpr,
+    TANH: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     value_base = row * channels
@@ -128,6 +140,8 @@ def _layernorm_quantize_kernel(
         if HAS_RESIDUAL:
             residual = tl.load(residual_ptr + value_base + cols, mask=valid, other=0.0).to(tl.float32)
             value = value + residual
+        if SUM_OUT:  # the FP32 sum rounded once, as a BF16 torch.add would
+            tl.store(sum_ptr + value_base + cols, value.to(sum_ptr.dtype.element_ty), mask=valid)
         out = (value - mean) * rstd
         if HAS_WEIGHT:
             weight = tl.load(weight_ptr + cols, mask=valid, other=0.0).to(tl.float32)
@@ -137,6 +151,8 @@ def _layernorm_quantize_kernel(
             out = out + bias
         out = tl.where(valid, out, 0.0)
         out = _round_to_dense(out, ROUND)
+        if GELU:  # on the rounded normalized value, rounded again (nn.LayerNorm -> nn.GELU in the dense dtype)
+            out = _round_to_dense(_gelu(out, TANH), ROUND)
         if DENSE_OUT:
             tl.store(dense_ptr + value_base + cols, out.to(dense_ptr.dtype.element_ty), mask=valid)
         _store_quantized(out_ptr, row, cols, out, scale_ptr, padded_channels, True, INT8)
@@ -160,6 +176,47 @@ def _quantize_static_kernel(
     _store_quantized(out_ptr, row, cols, value, scale_ptr, padded_channels, valid, False)
 
 
+@triton.jit
+def _quantize_channels_first_kernel(
+    value_ptr,
+    scale_ptr,
+    out_ptr,
+    channels,
+    padded_channels,
+    pixels,
+    BLOCK_P: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    INT8: tl.constexpr,
+):
+    """Static quantize of the ``[B, H, W, C]`` channels-last *view* of an NCHW-contiguous tensor
+    (``x.permute(0, 2, 3, 1)``) into the packed ``[B, H, W, Cpad]`` layout. A tile is loaded along pixels (contiguous in
+    NCHW) and stored along channels (contiguous in the output), so the layout change costs no separate copy pass; the
+    per-element math is the row-major kernels' (bit-identical)."""
+    p = tl.program_id(0).to(tl.int64) * BLOCK_P + tl.arange(0, BLOCK_P)
+    c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    b = tl.program_id(2).to(tl.int64)
+    p_ok = p < pixels
+    load_ok = p_ok[:, None] & (c[None, :] < channels)
+    value = tl.load(value_ptr + (b * channels + c[None, :]) * pixels + p[:, None], mask=load_ok, other=0.0)
+    row = (b * pixels + p)[:, None]
+    _store_quantized(out_ptr, row, c[None, :], value.to(tl.float32), scale_ptr, padded_channels, p_ok[:, None], INT8)
+
+
+def _channels_first_view(value: Tensor) -> bool:
+    """``value`` is ``x.permute(0, 2, 3, 1)`` of an NCHW-contiguous ``x`` (and not itself row-major)."""
+    return value.ndim == 4 and not value.is_contiguous() and value.permute(0, 3, 1, 2).is_contiguous()
+
+
+def _quantize_channels_first(value: Tensor, scale: Tensor, out: Tensor, padded: int, int8: bool) -> None:
+    batch, height, width, channels = value.shape
+    pixels = height * width
+    block_p, block_c = 64, 64
+    grid = (triton.cdiv(pixels, block_p), triton.cdiv(padded, block_c), batch)
+    _quantize_channels_first_kernel[grid](
+        value, scale, out, channels, padded, pixels, BLOCK_P=block_p, BLOCK_C=block_c, INT8=int8, num_warps=4
+    )
+
+
 def _empty_quantized(value: Tensor, padded: int) -> Tensor:
     return torch.empty((*value.shape[:-1], padded), device=value.device, dtype=torch.float8_e4m3fn)
 
@@ -174,11 +231,16 @@ def layernorm_quantize(
     *,
     input_bias: Tensor | None = None,
     return_dense: bool = False,
+    return_sum: bool = False,
+    activation: str | None = None,
 ) -> QuantizedTensor | tuple[QuantizedTensor, Tensor]:
+    if return_dense and return_sum:
+        raise ValueError("return_dense and return_sum are exclusive")
     channels = value.shape[-1]
     padded = padded_channels(channels)
     out = _empty_quantized(value, padded)
     dense = torch.empty_like(value) if return_dense else value
+    summed = torch.empty_like(value) if return_sum else value
     rows = value.numel() // channels
     block_c = min(1024, triton.next_power_of_2(channels))
     _layernorm_quantize_kernel[(rows,)](
@@ -190,6 +252,7 @@ def layernorm_quantize(
         out,
         input_bias if input_bias is not None else value,
         dense,
+        summed,
         channels,
         padded,
         float(eps),
@@ -201,9 +264,14 @@ def layernorm_quantize(
         INT8=False,
         HAS_INPUT_BIAS=input_bias is not None,
         DENSE_OUT=return_dense,
+        SUM_OUT=return_sum,
+        GELU=activation is not None,
+        TANH=activation == "tanh",
         num_warps=4 if block_c >= 128 else 1,
     )
     quantized = QuantizedTensor(out, scale_exponent, tuple(value.shape))
+    if return_sum:
+        return quantized, summed
     return (quantized, dense) if return_dense else quantized
 
 
@@ -237,6 +305,9 @@ def quantize_static(value: Tensor, scale_exponent: Tensor) -> QuantizedTensor:
     channels = value.shape[-1]
     padded = padded_channels(channels)
     out = _empty_quantized(value, padded)
+    if _channels_first_view(value):
+        _quantize_channels_first(value, scale_exponent, out, padded, int8=False)
+        return QuantizedTensor(out, scale_exponent, tuple(value.shape))
     rows = value.numel() // channels
     block = 1024
     _quantize_static_kernel[(triton.cdiv(rows * padded, block),)](
@@ -258,15 +329,20 @@ def _quantize_int8_kernel(value_ptr, scale_ptr, out_ptr, elements, BLOCK: tl.con
 
 def quantize_int8(value: Tensor, scale: Tensor) -> Int8Tensor:
     out = torch.empty(value.shape, device=value.device, dtype=torch.int8)
+    if _channels_first_view(value):
+        _quantize_channels_first(value, scale, out, value.shape[-1], int8=True)
+        return Int8Tensor(out, scale)
     _quantize_int8_kernel[(triton.cdiv(value.numel(), 4096),)](value, scale, out, value.numel(), BLOCK=4096, num_warps=4)
     return Int8Tensor(out, scale)
 
 
 def layernorm_quantize_int8(
-    value: Tensor, residual: Tensor | None, weight: Tensor | None, bias: Tensor | None, eps: float, scale: Tensor
-) -> Int8Tensor:
+    value: Tensor, residual: Tensor | None, weight: Tensor | None, bias: Tensor | None, eps: float, scale: Tensor,
+    *, return_sum: bool = False, activation: str | None = None,
+) -> Int8Tensor | tuple[Int8Tensor, Tensor]:
     channels = value.shape[-1]
     out = torch.empty(value.shape, device=value.device, dtype=torch.int8)
+    summed = torch.empty_like(value) if return_sum else value
     block_c = min(1024, triton.next_power_of_2(channels))
     _layernorm_quantize_kernel[(value.numel() // channels,)](
         value,
@@ -277,6 +353,7 @@ def layernorm_quantize_int8(
         out,
         value,
         value,
+        summed,
         channels,
         channels,
         float(eps),
@@ -288,9 +365,12 @@ def layernorm_quantize_int8(
         INT8=True,
         HAS_INPUT_BIAS=False,
         DENSE_OUT=False,
+        SUM_OUT=return_sum,
+        GELU=activation is not None,
+        TANH=activation == "tanh",
         num_warps=4 if block_c >= 128 else 1,
     )
-    return Int8Tensor(out, scale)
+    return (Int8Tensor(out, scale), summed) if return_sum else Int8Tensor(out, scale)
 
 
 def gelu_quantize_int8(value: Tensor, scale: Tensor, approximate: str) -> Int8Tensor:
@@ -319,6 +399,12 @@ def _row_major(value: Tensor) -> bool:
     return value.dtype in (torch.float16, torch.bfloat16, torch.float32) and value.is_contiguous() and value.numel() > 0
 
 
+def _quantize_eligible(value: Tensor, *_) -> bool:
+    """Row-major, or the channels-last view of NCHW memory (quantized convolutions' input: no copy first)."""
+    floating = value.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    return _row_major(value) or (floating and value.numel() > 0 and _channels_first_view(value))
+
+
 def _layernorm_eligible(value, residual, weight, bias, eps, scale_exponent, **kwargs) -> bool:
     return _row_major(value) and (residual is None or (residual.shape == value.shape and _row_major(residual)))
 
@@ -337,15 +423,13 @@ def _gelu_quantize_impl(value: Tensor, scale_exponent: Tensor, approximate: str 
     return gelu_quantize(value, scale_exponent.to(value.device, torch.int8), approximate, input_bias=input_bias)
 
 
-@ops.quantize_mxfp8.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=lambda value, scale_exponent: _row_major(value)
-)
+@ops.quantize_mxfp8.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_quantize_eligible)
 def _quantize_mxfp8_impl(value: Tensor, scale_exponent: Tensor) -> QuantizedTensor:
     return quantize_static(value, scale_exponent.to(value.device, torch.int8))
 
 
 ops.quantize_int8.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=lambda value, scale: _row_major(value)
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_quantize_eligible
 )(quantize_int8)
 ops.layernorm_quantize_int8.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_layernorm_eligible

@@ -11,11 +11,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from flashim import ops
+from flashim.layers.conv import conv_relu
 from flashim.models import sparse
 from flashim.models.loftr import weights
 from flashim.models.romav2.model import ImageLike, load_image
 from flashim.platforms import default_device
 from flashim.types import SparseMatchResult
+from flashim.utils import device_constant
 
 
 def conv1x1(cin: int, cout: int, stride: int = 1) -> nn.Conv2d:
@@ -35,8 +37,12 @@ class BasicBlock(nn.Module):
         self.downsample = None if stride == 1 else nn.Sequential(conv1x1(cin, cout, stride), nn.BatchNorm2d(cout))
 
     def forward(self, x: Tensor) -> Tensor:
-        y = self.bn2(self.conv2(self.relu(self.bn1(self.conv1(x)))))
-        return self.relu((x if self.downsample is None else self.downsample(x)) + y)
+        y = conv_relu(self.conv1, x, self.bn1)
+        identity = x if self.downsample is None else self.downsample(x)
+        if getattr(self.conv2, "fuses_relu", False) and isinstance(self.bn2, nn.Identity):
+            # the residual add and ReLU in the quantized conv's epilogue (one BF16 rounding instead of two)
+            return self.conv2(y, relu=True, residual=identity)
+        return self.relu(identity + self.bn2(self.conv2(y)))
 
 
 class ResNetFPN_8_2(nn.Module):
@@ -148,6 +154,7 @@ class LoFTR(nn.Module):
     similarity / dual softmax (temperature 0.1) and the fine expectation stay FP32."""
 
     div_by = 8
+    fold_temperature = False  # see spec.py's fold_similarity_temperature pass
     preset: str | None = None
     engine: str | None = None
     quant_report = None
@@ -219,7 +226,10 @@ class LoFTR(nn.Module):
         # ``[L, S]`` probabilities are never formed (``ops.dual_softmax_mutual``): measured 35 -> 4 ms and 2.1 GB less
         # peak memory at 1200 px (16.8k x 16.5k tokens) with identical matches.
         a, b = (t.float() / t.shape[-1] ** 0.5 for t in (tokens0, tokens1))
-        sim = torch.einsum("nlc,nsc->nls", a, b) / 0.1
+        if self.fold_temperature:  # 1 / temperature on the [L, C] operand, not a pass over the [L, S] FP32 matrix
+            sim = torch.einsum("nlc,nsc->nls", a / 0.1, b)
+        else:
+            sim = torch.einsum("nlc,nsc->nls", a, b) / 0.1
         log_conf, all_j, mutual = ops.dual_softmax_mutual(sim[0])
         del sim
         conf = log_conf.exp()
@@ -280,6 +290,6 @@ class LoFTR(nn.Module):
         if top_k is not None and 0 < top_k < len(conf):
             conf, index = conf.topk(top_k)
             k0, k1 = k0[index], k1[index]
-        k0 = k0 * k0.new_tensor([sizes[0][1], sizes[0][0]])
-        k1 = k1 * k1.new_tensor([sizes[1][1], sizes[1][0]])
+        k0 = k0 * device_constant([sizes[0][1], sizes[0][0]], k0)
+        k1 = k1 * device_constant([sizes[1][1], sizes[1][0]], k1)
         return SparseMatchResult(k0, k1, conf)

@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim import ops
 from flashim.models import sparse
 from flashim.models.disk import weights
 from flashim.platforms import default_device
@@ -25,8 +26,12 @@ class Conv(nn.Sequential):
         gate = nn.Sequential() if skip_norm_and_gate else nn.PReLU(cin)
         super().__init__(norm, gate, nn.Sequential(), nn.Conv2d(cin, cout, size, padding="same", bias=True))
 
+    def prologue(self, x: Tensor) -> Tensor:
+        """``gate(norm(x))``: the convolution's input."""
+        return self[2](self[1](self[0](x)))
+
     def forward(self, x: Tensor) -> Tensor:
-        x = self[2](self[1](self[0](x)))
+        x = self.prologue(x)
         conv = self[3]
         return conv(x.to(conv.weight.dtype) if hasattr(conv, "weight") else x)
 
@@ -41,9 +46,14 @@ class UpBlock(nn.Module):
         super().__init__()
         self.conv = Conv(bottom + horizontal, cout, size)
 
+    def conv_input(self, bottom: Tensor, horizontal: Tensor) -> Tensor:
+        # A quantized conv leaves `bottom` channels-last; the skip input is NCHW. Mixed layouts send the concat to its
+        # slow generic kernel and the upsample to the NHWC one, so the small (low-resolution) input goes NCHW first.
+        big = F.interpolate(bottom.contiguous(), scale_factor=2, mode="bilinear", align_corners=False)
+        return torch.cat([big, horizontal.to(big.dtype)], dim=1)
+
     def forward(self, bottom: Tensor, horizontal: Tensor) -> Tensor:
-        big = F.interpolate(bottom, scale_factor=2, mode="bilinear", align_corners=False)
-        return self.conv(torch.cat([big, horizontal.to(big.dtype)], dim=1))
+        return self.conv(self.conv_input(bottom, horizontal))
 
 
 class SplitHeadConv(nn.Module):
@@ -86,12 +96,16 @@ class Unet(nn.Module):
         self.path_up = nn.ModuleList(UpBlock(a, b, c, size) for a, b, c in zip(bottom, horizontal, up))
         self.divisor = 2 ** len(up)
 
-    def forward(self, image: Tensor) -> Tensor:
+    def forward(self, image: Tensor, head_input: bool = False) -> Tensor:
+        """The output map; with ``head_input`` the input of the last convolution instead (normalized and gated)."""
         features = [image]
         for layer in self.path_down:
             features.append(layer(features[-1]))
         x = features[-1]
-        for layer, horizontal in zip(self.path_up, features[-2::-1]):
+        last = len(self.path_up) - 1
+        for i, (layer, horizontal) in enumerate(zip(self.path_up, features[-2::-1])):
+            if head_input and i == last:
+                return layer.conv.prologue(layer.conv_input(x, horizontal))
             x = layer(x, horizontal)
         return x
 
@@ -151,10 +165,21 @@ class DISK(sparse.SparseExtractor):
         return mask
 
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
-        heatmap, descriptor_map = self.dense(image)
+        head = self.unet.path_up[-1].conv[3]
+        if isinstance(head, SplitHeadConv):  # the descriptor half of the head only at the selected keypoints
+            features = self.unet(image.to(self.compute_dtype), head_input=True)
+            # FP32 heatmap straight from the compute-dtype features (no FP32 copy of them): full FP32 accumulation in
+            # the Triton impl, more exact than the cuDNN TF32 the dense head used (max rel 2e-6 vs 2e-4 of float64)
+            heatmap = ops.conv2d_single_output(features, head.heat.weight, head.heat.bias)
+        else:
+            heatmap, descriptor_map = self.dense(image)
         selected = self.nms_mask(heatmap)[0, 0] & (heatmap[0, 0] > self.score_threshold)
         ys, xs = selected.nonzero(as_tuple=True)
         keypoints, scores, _ = sparse.select_top_k(torch.stack((xs, ys), -1), heatmap[0, 0, ys, xs], top_k)
-        xs, ys = keypoints[:, 0], keypoints[:, 1]
-        descriptors = F.normalize(descriptor_map[0][:, ys, xs].t(), dim=-1)
-        return keypoints.float(), scores, descriptors
+        if isinstance(head, SplitHeadConv):
+            # same FP32 weights as the dense head; measured 13.9 ms (dense, cuDNN TF32) -> 0.36 ms at 4096 keypoints
+            # on sm_120, plus the 129-channel FP32 concat (3.3 ms) the dense output needed; full FP32 (not TF32) here
+            descriptors = ops.conv2d_at_points(features, head.desc.weight, head.desc.bias, keypoints).float()
+        else:
+            descriptors = descriptor_map[0][:, keypoints[:, 1], keypoints[:, 0]].t()
+        return keypoints.float(), scores, F.normalize(descriptors, dim=-1)

@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+from triton.language.extra import libdevice
 
 from flashim import ops
 from flashim.ops._registry import DeviceSpec
@@ -270,6 +271,57 @@ def deformable_attention(
     )
     return out
 
+# -- interleaved-pair RoPE with per-batch tables (LightGlue) ---------------------------------------------
+
+
+@triton.jit
+def _rope_pairs_rows(src, s_b, s_h, s_n, dst, b, h, n, d, partner, sign, cos, sin, ok, out_off):
+    row = src + b * s_b + h * s_h + n[:, None] * s_n
+    value = tl.load(row + d[None, :], mask=ok, other=0.0).to(tl.float32)
+    rotated = tl.load(row + partner[None, :], mask=ok, other=0.0).to(tl.float32) * sign[None, :]
+    out = libdevice.add_rn(libdevice.mul_rn(value, cos), libdevice.mul_rn(rotated, sin))
+    tl.store(dst + out_off, out.to(dst.dtype.element_ty), mask=ok)
+
+
+@triton.jit
+def _rope_qk_interleaved_kernel(
+    q_ptr, k_ptr, cos_ptr, sin_ptr, q_out_ptr, k_out_ptr,
+    qs_b, qs_h, qs_n, ks_b, ks_h, ks_n, ts_b, ts_n,
+    H, N,
+    D: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    """q and k of one (batch, head, token block) in one program: ``t * cos + rotate_pairs(t) * sin`` in FP32 with
+    rounded (non-contracted) products and sum, the operation order of the torch reference, so the result is
+    bit-identical to it; the pair partner is the same row's ``d ^ 1`` element (last dim contiguous)."""
+    bh = tl.program_id(1)
+    b = (bh // H).to(tl.int64)
+    h = (bh % H).to(tl.int64)
+    n = (tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+    d = tl.arange(0, BLOCK_D)  # D even: a pair partner d ^ 1 of a valid d is valid
+    partner = d ^ 1
+    sign = tl.where((d & 1) == 0, -1.0, 1.0)
+    ok = (n < N)[:, None] & (d < D)[None, :]
+    t_off = b * ts_b + n[:, None] * ts_n + d[None, :]
+    cos = tl.load(cos_ptr + t_off, mask=ok, other=0.0).to(tl.float32)  # the reference promotes them to FP32 too
+    sin = tl.load(sin_ptr + t_off, mask=ok, other=0.0).to(tl.float32)
+    out_off = ((b * H + h) * N + n[:, None]) * D + d[None, :]
+    _rope_pairs_rows(q_ptr, qs_b, qs_h, qs_n, q_out_ptr, b, h, n, d, partner, sign, cos, sin, ok, out_off)
+    _rope_pairs_rows(k_ptr, ks_b, ks_h, ks_n, k_out_ptr, b, h, n, d, partner, sign, cos, sin, ok, out_off)
+
+
+def rope_qk_interleaved(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor]:
+    batch, heads, tokens, dim = q.shape
+    q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    k_out = torch.empty(k.shape, device=k.device, dtype=k.dtype)
+    block_n = 64
+    _rope_qk_interleaved_kernel[(triton.cdiv(tokens, block_n), batch * heads)](
+        q, k, cos, sin, q_out, k_out,
+        q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), cos.stride(0), cos.stride(2),
+        heads, tokens, D=dim, BLOCK_D=triton.next_power_of_2(dim), BLOCK_N=block_n, num_warps=4,
+    )
+    return q_out, k_out
+
+
 # -- registrations ---------------------------------------------------------------------------------------
 
 _FLOATS = (torch.float16, torch.bfloat16, torch.float32)
@@ -290,6 +342,30 @@ def _rope_eligible(q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> bool:
 
 
 ops.rope_qk.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_rope_eligible)(rope_qk)
+
+
+def _rope_interleaved_eligible(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> bool:
+    return (
+        not torch.is_grad_enabled()
+        and q.ndim == 4
+        and k.shape == q.shape
+        and q.dtype in _FLOATS
+        and k.dtype in _FLOATS
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and cos.dtype == sin.dtype
+        and cos.dtype in _FLOATS
+        and cos.shape == sin.shape == (q.shape[0], 1, q.shape[2], q.shape[3])
+        and cos.stride() == sin.stride()
+        and cos.stride(-1) == 1
+        and q.shape[-1] % 2 == 0
+        and q.shape[-1] <= 256
+    )
+
+
+ops.rope_qk_interleaved.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_rope_interleaved_eligible
+)(rope_qk_interleaved)
 
 
 def _deformable_eligible(value, offsets, weights, reference, spatial_shapes, softmax=False) -> bool:

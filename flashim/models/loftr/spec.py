@@ -52,6 +52,16 @@ def _bf16_linear_attention(model: nn.Module, ctx: BuildContext) -> int | str:
     return len(layers)
 
 
+def _fold_similarity_temperature(model: nn.Module, ctx: BuildContext) -> str:
+    """Coarse similarity ``(a / 0.1) b^T`` instead of ``(a b^T) / 0.1``: the division was an elementwise pass over the
+    16.8k x 16.5k FP32 matrix at 1200 px (2.9 ms per pair on sm_120, benchmarks/profile/timeline_audit.py). Same math,
+    different rounding of the logits; skipped for ``fp32`` (the reference numerics)."""
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    model.fold_temperature = True
+    return "coarse matching"
+
+
 SPEC = extractor_spec(
     name="loftr",
     description="LoFTR detector-free matcher (variant outdoor | indoor); match(a, b) only",
@@ -66,6 +76,9 @@ SPEC = extractor_spec(
         "bf16_linear_attention": Pass(
             _bf16_linear_attention, description="linear-attention GEMMs on BF16 tensor cores (not fp32)", exact=False
         ),
+        "fold_similarity_temperature": Pass(
+            _fold_similarity_temperature, description="coarse-similarity temperature folded into an operand", exact=False
+        ),
     },
-    structural_passes=("channels_last", "bf16_linear_attention"),
+    structural_passes=("channels_last", "bf16_linear_attention", "fold_similarity_temperature"),
 )

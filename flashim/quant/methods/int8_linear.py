@@ -58,20 +58,26 @@ class StaticInt8Linear(nn.Module):
     def quantize(self, x: Tensor) -> Int8Tensor:
         return ops.quantize_int8(x, self.input_scale)
 
-    def quantize_layernorm(self, value: Tensor, residual: Tensor | None, norm: nn.LayerNorm) -> Int8Tensor:
+    def quantize_layernorm(
+        self, value: Tensor, residual: Tensor | None, norm: nn.LayerNorm, *, return_sum: bool = False,
+        activation: str | None = None,
+    ) -> Int8Tensor | tuple[Int8Tensor, Tensor]:
+        """``norm(value + residual)`` packed for this layer (``activation``: then GELU); ``return_sum`` also returns
+        ``value + residual``."""
         return ops.layernorm_quantize_int8(
-            value, residual, norm.weight, norm.bias, norm.eps, self.input_scale
+            value, residual, norm.weight, norm.bias, norm.eps, self.input_scale, return_sum=return_sum,
+            activation=activation,
         )
 
     def quantize_gelu(self, value: Tensor, approximate: str) -> Int8Tensor:
         return ops.gelu_quantize_int8(value, self.input_scale, approximate)
 
-    def forward_prequantized(self, quantized: Int8Tensor) -> Tensor:
-        """Consume an activation packed with this layer's input scale; BF16 out."""
+    def forward_prequantized(self, quantized: Int8Tensor, relu: bool = False) -> Tensor:
+        """Consume an activation packed with this layer's input scale; BF16 out (``relu``: ReLU in the epilogue)."""
         if quantized.scale is not self.input_scale and not torch.equal(quantized.scale, self.input_scale):
             raise ValueError("Prequantized activation uses a different static scale")
         out = ops.int8_linear(
-            quantized.matrix(), self.weight_int8, self.input_scale, self.weight_scale, self.bias
+            quantized.matrix(), self.weight_int8, self.input_scale, self.weight_scale, self.bias, relu=relu
         )
         return out.reshape(*quantized.logical_shape[:-1], self.out_features)
 
@@ -83,16 +89,19 @@ class StaticInt8Linear(nn.Module):
 
 
 class StaticInt8Conv1x1(StaticInt8Linear):
-    """A 1x1 convolution on ``[B, C, H, W]`` as an INT8 GEMM over the ``B*H*W`` pixels (BF16 out)."""
+    """A 1x1 convolution on ``[B, C, H, W]`` as an INT8 GEMM over the ``B*H*W`` pixels (BF16 out); ``forward(x,
+    relu=True)`` applies a following ReLU in the GEMM epilogue (:func:`flashim.layers.conv.conv_relu`)."""
+
+    fuses_relu = True
 
     @classmethod
     def from_conv(cls, conv: nn.Conv2d, input_scale: Tensor) -> StaticInt8Conv1x1:
         inner = StaticInt8Linear.from_conv1x1(conv, input_scale)
         return cls(inner.weight_int8, inner.weight_scale, inner.bias, inner.input_scale)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, relu: bool = False) -> Tensor:
         pixels = x.permute(0, 2, 3, 1)  # channels-last view: contiguous when x is channels-last
-        if not pixels.is_contiguous():
+        if not (pixels.is_contiguous() or x.is_contiguous()):  # NCHW memory is read in place by the quantize kernel
             pixels = pixels.contiguous()
-        out = self.forward_prequantized(self.quantize(pixels)).permute(0, 3, 1, 2)
+        out = self.forward_prequantized(self.quantize(pixels), relu=relu).permute(0, 3, 1, 2)
         return out.to(x.dtype)

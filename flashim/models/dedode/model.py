@@ -14,6 +14,7 @@ from flashim.models import sparse
 from flashim.models.dedode import blocks
 from flashim.platforms import default_device
 from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.utils import device_constant
 
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
@@ -65,7 +66,7 @@ def sample_keypoints(logits: Tensor, top_k: int, cfg: SamplerConfig) -> tuple[Te
 def bilinear_at(feature_map: Tensor, keypoints: Tensor) -> Tensor:
     """``[1, C, H, W]`` map sampled at pixel-index ``keypoints`` ``[K, 2]`` (``align_corners=False``) -> ``[K, C]``."""
     h, w = feature_map.shape[-2:]
-    grid = ((keypoints + 0.5) * 2 / keypoints.new_tensor([w, h]) - 1).view(1, 1, -1, 2)
+    grid = ((keypoints + 0.5) * 2 / device_constant([w, h], keypoints) - 1).view(1, 1, -1, 2)
     return F.grid_sample(feature_map.float(), grid, mode="bilinear", align_corners=False)[0, :, 0].t()
 
 
@@ -110,7 +111,8 @@ class DeDoDe(sparse.SparseExtractor):
         x = self.normalize(image)
         logits = self.detector(x)[0]  # [1, H, W]
         keypoints, probs = sample_keypoints(logits, top_k or self.default_top_k, self.sampler)
-        descriptors = F.normalize(bilinear_at(self.descriptor(x), keypoints), dim=-1)
+        # = bilinear_at(self.descriptor(x), keypoints), without forming the last scale's dense map
+        descriptors = F.normalize(self.descriptor(x, points=keypoints), dim=-1)
         return keypoints, probs, descriptors
 
     @torch.inference_mode()

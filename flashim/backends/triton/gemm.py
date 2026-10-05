@@ -144,12 +144,14 @@ def _int8_gemm_kernel(
     N,
     K: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    RELU: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
-    """``int8[M,K] x int8[N,K]^T`` with INT32 accumulation; epilogue ``acc * (a_scale * w_scale[n]) + bias``."""
+    """``int8[M,K] x int8[N,K]^T`` with INT32 accumulation; epilogue ``acc * (a_scale * w_scale[n]) + bias`` (then ReLU
+    with ``RELU``: it commutes with the BF16 rounding, so it equals a separate ReLU pass bit for bit)."""
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(rows, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -174,9 +176,14 @@ def _int8_gemm_kernel(
         a_ptrs += BLOCK_K
         b_ptrs += BLOCK_K
     scale = tl.load(a_scale_ptr) * tl.load(w_scale_ptr + offs_n, mask=mask_n, other=0.0)
-    out = accumulator.to(tl.float32) * scale[None, :]
-    if HAS_BIAS:
-        out += tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)[None, :]
+    if HAS_BIAS:  # explicit FMA: the compiler contracted `acc * scale + bias` for most tile configs but not all,
+        # so the output bits depended on which config autotuning picked; one rounding for every config instead
+        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        out = tl.fma(accumulator.to(tl.float32), scale[None, :], bias[None, :])
+    else:
+        out = accumulator.to(tl.float32) * scale[None, :]
+    if RELU:
+        out = tl.maximum(out, 0.0)
     tl.store(
         out_ptr + offs_m[:, None].to(tl.int64) * N + offs_n[None, :],
         out.to(tl.bfloat16),
@@ -194,7 +201,7 @@ def _int8_gemm_config(rows: int, n: int) -> tuple[int, int, int, int, int]:
 
 
 def int8_gemm_bf16(
-    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, config=None
+    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, config=None, *, relu: bool = False
 ) -> Tensor:
     """``[rows, K] int8 x [N, K] int8^T`` -> BF16 ``[rows, N]`` with the dequantizing epilogue fused."""
     rows, k = a.shape
@@ -212,6 +219,7 @@ def int8_gemm_bf16(
         n,
         K=k,
         HAS_BIAS=bias is not None,
+        RELU=relu,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -361,8 +369,8 @@ def _mxfp8_linear_impl(activation: QuantizedTensor, bias: Tensor | None, weight:
 @ops.int8_linear.register(
     "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON], priority=1
 )
-def _int8_linear_impl(a, weight, a_scale, w_scale, bias):
-    return int8_gemm_bf16(a.contiguous(), weight, a_scale, w_scale, bias)
+def _int8_linear_impl(a, weight, a_scale, w_scale, bias, *, relu: bool = False):
+    return int8_gemm_bf16(a.contiguous(), weight, a_scale, w_scale, bias, relu=relu)
 
 
 def _linear_fp32_small_n_eligible(x: Tensor, weight: Tensor, bias: Tensor) -> bool:

@@ -18,6 +18,7 @@ from flashim.models.aliked.descriptor import SDDH
 from flashim.models.romav2.model import ImageLike, load_image
 from flashim.platforms import default_device
 from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.utils import device_constant
 
 
 def _pad_to(image: Tensor, div_by: int) -> tuple[Tensor, tuple[int, int, int, int]]:
@@ -163,7 +164,7 @@ class ALIKED(nn.Module):
         """Descriptors ``[1, N, dim]`` sampled from ``feature_map`` (:meth:`encode`) at ``keypoints`` ``[1, N, 2]``,
         ``(x, y)`` in the map's pixel coordinates."""
         h, w = feature_map.shape[-2:]
-        normalized = 2 * keypoints[0] / keypoints.new_tensor([w - 1, h - 1]) - 1
+        normalized = 2 * keypoints[0] / device_constant([w - 1, h - 1], keypoints) - 1
         return self.desc_head(feature_map[0], normalized)[None]
 
     def describe(self, image: Tensor, keypoints: Tensor) -> Tensor:
@@ -193,8 +194,8 @@ class ALIKED(nn.Module):
             score_map, cfg.dkd_radius, cfg.dkd_temperature, cfg.top_k if top_k is None else top_k, cfg.scores_th, cfg.n_limit
         )
         descriptors = self.desc_head(feature_map[0], keypoints[0])
-        pixel_kpts = (keypoints[0] + 1) / 2 * keypoints[0].new_tensor([new_w - 1, new_h - 1])
-        pixel_kpts = pixel_kpts * pixel_kpts.new_tensor([width / new_w, height / new_h])
+        pixel_kpts = (keypoints[0] + 1) / 2 * device_constant([new_w - 1, new_h - 1], keypoints[0])
+        pixel_kpts = pixel_kpts * device_constant([width / new_w, height / new_h], pixel_kpts)
         return SparseFeatures(pixel_kpts[None], scores[0][None], descriptors[None], (height, width))
 
     @torch.inference_mode()

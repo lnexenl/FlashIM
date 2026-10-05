@@ -78,14 +78,16 @@ def _mxfp8_linear_cublas(
     )
 
 
-def _int_mm_eligible(a, weight, a_scale, w_scale, bias) -> bool:
+def _int_mm_eligible(a, weight, a_scale, w_scale, bias, **_) -> bool:
     # torch._int_mm: M > 16, K and N multiples of 8 (cuBLASLt IMMA).
     return a.shape[0] > 16 and a.shape[1] % 8 == 0 and weight.shape[0] % 8 == 0 and a.is_contiguous()
 
 
 @ops.int8_linear.register("cublas", device=DeviceSpec("cuda", min_capability=(7, 5)), when=_int_mm_eligible)
-def _int8_linear_cublas(a, weight, a_scale, w_scale, bias):
+def _int8_linear_cublas(a, weight, a_scale, w_scale, bias, *, relu: bool = False):
     out = torch._int_mm(a, weight.t()).float() * (a_scale * w_scale)
     if bias is not None:
         out = out + bias.float()
+    if relu:
+        out = out.relu()
     return out.to(torch.bfloat16)

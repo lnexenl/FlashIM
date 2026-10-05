@@ -1,9 +1,10 @@
 """Static INT8 / MXFP8 ``nn.Conv2d`` (any kernel, stride, padding, dilation; ``groups == 1``).
 
-The activation is quantized once with its static scale(s) on ``[B, H, W, C]``. Both dispatch to a fused
-implicit-GEMM (``ops.int8_conv2d`` / ``ops.mxfp8_conv2d``: one tap per full-``Cin`` ``tl.dot`` (INT8) or one
-per-32-channel-block ``tl.dot`` (MXFP8), gathered straight from the activation; no materialized im2col buffer —
-see ``backends/triton/conv.py``); their reference implementations go through the unfused pipeline instead: the
+The activation is quantized once with its static scale(s) on ``[B, H, W, C]`` (an NCHW input is read in place by the
+quantize kernel). Both dispatch to a fused implicit-GEMM (``ops.int8_conv2d`` / ``ops.mxfp8_conv2d``: per tap,
+``tl.dot`` (INT8) or block-scaled ``tl.dot_scaled`` (MXFP8) over channel chunks gathered straight from the
+activation; no materialized im2col buffer; ReLU and a residual add optionally in the epilogue — see
+``backends/triton/conv.py``); their reference implementations go through the unfused pipeline instead: the
 *quantized bytes* gathered into the ``[B*Ho*Wo, kh*kw*C]`` im2col matrix (``ops.im2col_gather``; zero padding is
 exactly zero in both formats), so the k*k-fold expansion moves 1-byte elements, not BF16, then the layer's
 existing static linear (``ops.int8_linear`` / ``ops.mxfp8_linear``); the weight is laid out ``(ky, kx, c)`` to
@@ -23,6 +24,7 @@ from torch import Tensor, nn
 
 from flashim import ops
 from flashim.ops.conv import fused_mxfp8_conv2d_worthwhile
+from flashim.platforms import platform_for
 from flashim.quant.formats import mx
 from flashim.quant.formats.int8 import quantize_symmetric, weight_scales
 from flashim.quant.methods.int8_linear import StaticInt8Linear
@@ -44,6 +46,13 @@ def im2col_bytes(x: Tensor, kernel, stride, padding, dilation) -> tuple[Tensor, 
     return cols, (ho, wo)
 
 
+def _pixels(x: Tensor) -> Tensor:
+    """``[B, C, H, W]`` -> its ``[B, H, W, C]`` view for the quantize op. Channels-last memory is already packed and
+    NCHW-contiguous memory is read in place by the quantize kernels (no copy pass); other layouts are copied."""
+    pixels = x.permute(0, 2, 3, 1)
+    return pixels if pixels.is_contiguous() or x.is_contiguous() else pixels.contiguous()
+
+
 def _geometry(conv: nn.Conv2d) -> dict:
     if conv.groups != 1:
         raise ValueError("quantized convolutions must have groups == 1")
@@ -60,7 +69,10 @@ def _geometry(conv: nn.Conv2d) -> dict:
 
 
 class StaticInt8Conv2d(StaticInt8Linear):
-    """``nn.Conv2d`` as an INT8 GEMM (per-output-channel weights, one static activation scale); BF16 out."""
+    """``nn.Conv2d`` as an INT8 GEMM (per-output-channel weights, one static activation scale); BF16 out.
+    ``forward(x, relu=True)`` applies a following ReLU in the GEMM epilogue (:func:`flashim.layers.conv.conv_relu`)."""
+
+    fuses_relu = True
 
     def __init__(self, weight_int8, weight_scale, bias, input_scale, *, in_channels: int, **geometry) -> None:
         super().__init__(weight_int8, weight_scale, bias, input_scale)
@@ -77,15 +89,15 @@ class StaticInt8Conv2d(StaticInt8Linear):
             in_channels=conv.in_channels, **geometry,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        pixels = x.permute(0, 2, 3, 1)
-        q = ops.quantize_int8(pixels if pixels.is_contiguous() else pixels.contiguous(), self.input_scale)
+    def forward(self, x: Tensor, relu: bool = False, residual: Tensor | None = None) -> Tensor:
+        """``relu(conv(x) [+ residual])`` with the ReLU and the residual (``[B, Cout, Ho, Wo]``) in the epilogue."""
+        q = ops.quantize_int8(_pixels(x), self.input_scale)
         (kh, kw), (sh, sw), (ph, pw), (dh, dw) = (
             self.geometry["kernel"], self.geometry["stride"], self.geometry["padding"], self.geometry["dilation"],
         )
         out = ops.int8_conv2d(
             q.values, self.weight_int8, self.input_scale, self.weight_scale, self.bias,
-            kh, kw, sh, sw, ph, pw, dh, dw,
+            kh, kw, sh, sw, ph, pw, dh, dw, relu=relu, residual=None if residual is None else residual.permute(0, 2, 3, 1),
         )
         return out.permute(0, 3, 1, 2).to(x.dtype)
 
@@ -105,14 +117,16 @@ class StaticMXFP8Conv2d(StaticMXFP8Linear):
     that redoes the weight transpose + swizzle every forward call instead of once (measured: LoFTR fp8 semi-dense
     match 46.7ms bf16 -> 222.7ms with the op's reference on an ineligible large-channel conv, vs 41.3ms int8).
     Always taking this layer's own bound path for the unfused case avoids that trap regardless of future
-    eligibility-gate tuning.
+    eligibility-gate tuning. ``forward(x, relu=True)`` applies a following ReLU (in the fused kernel's epilogue).
     """
+
+    fuses_relu = True
 
     def __init__(self, weight: QuantizedWeight, bias, input_exponent, *, in_channels: int, taps: int, **geometry):
         super().__init__(weight, bias, input_exponent.repeat(taps))
         self.in_channels, self.taps, self.geometry = in_channels, taps, geometry
         self.register_buffer("channel_exponent", input_exponent.to(device=weight.values.device, dtype=torch.int8))
-        self.use_fused = fused_mxfp8_conv2d_worthwhile(taps, input_exponent.shape[0])
+        self.use_fused = fused_mxfp8_conv2d_worthwhile(taps, input_exponent.shape[0], platform_for(weight.values.device))
 
     @classmethod
     def from_conv(cls, conv: nn.Conv2d, input_exponent: Tensor) -> StaticMXFP8Conv2d:
@@ -128,9 +142,9 @@ class StaticMXFP8Conv2d(StaticMXFP8Linear):
             in_channels=conv.in_channels, taps=taps, **geometry,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        pixels = x.permute(0, 2, 3, 1)
-        q = ops.quantize_mxfp8(pixels if pixels.is_contiguous() else pixels.contiguous(), self.channel_exponent)
+    def forward(self, x: Tensor, relu: bool = False, residual: Tensor | None = None) -> Tensor:
+        """``relu(conv(x) [+ residual])``; ReLU and the residual (``[B, Cout, Ho, Wo]``) in the fused kernel's epilogue."""
+        q = ops.quantize_mxfp8(_pixels(x), self.channel_exponent)
         (kh, kw), (sh, sw), (ph, pw), (dh, dw) = (
             self.geometry["kernel"], self.geometry["stride"], self.geometry["padding"], self.geometry["dilation"],
         )
@@ -138,13 +152,17 @@ class StaticMXFP8Conv2d(StaticMXFP8Linear):
             weight = self.weight_values.view(torch.float8_e4m3fn)
             out = ops.mxfp8_conv2d(
                 q.values, self.channel_exponent, weight, self.weight_exponent, self.bias_bf16,
-                kh, kw, sh, sw, ph, pw, dh, dw,
+                kh, kw, sh, sw, ph, pw, dh, dw, relu=relu,
+                residual=None if residual is None else residual.permute(0, 2, 3, 1),
             )
             return out[..., : self.out_features].to(x.dtype).permute(0, 3, 1, 2)
         cols, (ho, wo) = im2col_bytes(q.values, (kh, kw), (sh, sw), (ph, pw), (dh, dw))
         act = QuantizedTensor(cols, self.input_exponent, (cols.shape[0], cols.shape[1]))
         out = self._finish(self.gemm(act, None), (cols.shape[0],), x.dtype)
-        return out.reshape(x.shape[0], ho, wo, -1).permute(0, 3, 1, 2)
+        out = out.reshape(x.shape[0], ho, wo, -1).permute(0, 3, 1, 2)
+        if residual is not None:
+            out = out + residual
+        return F.relu(out, inplace=True) if relu else out
 
     def extra_repr(self) -> str:
         return f"{self.in_channels}->{self.out_features}, {self.geometry['kernel']}, kernel={self.kernel_name}"

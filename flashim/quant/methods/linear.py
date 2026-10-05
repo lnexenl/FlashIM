@@ -91,11 +91,23 @@ class StaticMXFP8Linear(nn.Module):
         quantized = ops.quantize_mxfp8(x, self.input_exponent)  # dispatched: one Triton kernel on CUDA
         return self._finish(self.gemm(quantized, None), tuple(x.shape[:-1]), x.dtype)
 
-    def quantize_layernorm(self, value: Tensor, residual: Tensor | None, norm: nn.LayerNorm) -> QuantizedTensor:
-        return ops.layernorm_quantize(value, residual, norm.weight, norm.bias, norm.eps, self.input_exponent)
+    def quantize_layernorm(
+        self, value: Tensor, residual: Tensor | None, norm: nn.LayerNorm, *, return_sum: bool = False,
+        input_bias: Tensor | None = None, activation: str | None = None,
+    ) -> QuantizedTensor | tuple[QuantizedTensor, Tensor]:
+        """``norm(value [+ input_bias] + residual)`` packed for this layer (``activation``: then GELU, see
+        ``ops.layernorm_quantize``); ``return_sum`` also returns the sum."""
+        return ops.layernorm_quantize(
+            value, residual, norm.weight, norm.bias, norm.eps, self.input_exponent, input_bias=input_bias,
+            return_sum=return_sum, activation=activation,
+        )
 
-    def quantize_gelu(self, value: Tensor, approximate: str) -> QuantizedTensor:
-        return ops.gelu_quantize(value, self.input_exponent, approximate)
+    def quantize(self, value: Tensor) -> QuantizedTensor:
+        return ops.quantize_mxfp8(value, self.input_exponent)
+
+    def quantize_gelu(self, value: Tensor, approximate: str, input_bias: Tensor | None = None) -> QuantizedTensor:
+        """``GELU(value [+ input_bias])`` packed for this layer (a preceding linear's bias fused here)."""
+        return ops.gelu_quantize(value, self.input_exponent, approximate, input_bias=input_bias)
 
     def matmul(self, quantized: QuantizedTensor, *, bias: bool = False) -> Tensor:
         """BF16 product of an activation packed with this layer's input exponent: ``[*leading, out_features]``.

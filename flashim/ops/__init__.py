@@ -16,8 +16,10 @@ from flashim.ops._registry import (
     set_strict,
 )
 from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
-from flashim.ops.attention import deformable_attention, rope_qk, sdpa
+from flashim.ops.attention import deformable_attention, rope_qk, rope_qk_interleaved, sdpa
 from flashim.ops.conv import (
+    conv2d_at_points,
+    conv2d_single_output,
     depthwise5x5_relu_int8,
     depthwise5x5_relu_mxfp8,
     depthwise5x5_relu_pointwise,
@@ -39,6 +41,7 @@ from flashim.ops.quantize import (
     quantize_mxfp8,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
+from flashim.ops.resample import upsample_add, upsample_concat
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 
 __all__ = [
@@ -48,6 +51,8 @@ __all__ = [
     "Op",
     "call_counts",
     "configure",
+    "conv2d_at_points",
+    "conv2d_single_output",
     "deform_patches_int8",
     "deformable_attention",
     "depthwise5x5_relu_int8",
@@ -79,8 +84,11 @@ __all__ = [
     "romav2_refiner_heads",
     "romav2_refiner_input",
     "rope_qk",
+    "rope_qk_interleaved",
     "sdpa",
     "set_strict",
+    "upsample_add",
+    "upsample_concat",
 ]
 
 # Last: backends register their impls into the ops above.

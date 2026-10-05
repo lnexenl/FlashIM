@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim.utils import device_constant
+
 
 def sample_patches(features: Tensor, corners: Tensor, size: int) -> Tensor:
     """``size x size`` integer-pixel patches of ``features`` ``[C, H, W]`` centered near ``corners`` ``[N, 2]``
@@ -49,7 +51,7 @@ class SDDH(nn.Module):
         Returns L2-normalized descriptors ``[N, C]``."""
         c, h, w = features.shape
         keypoints = keypoints.to(features.dtype)  # keeps the sampling grid in `features`' dtype for grid_sample
-        wh = features.new_tensor([w - 1, h - 1])
+        wh = device_constant([w - 1, h - 1], features)
         max_offset = max(h, w) / 4.0
         num_kpts = keypoints.shape[0]
 

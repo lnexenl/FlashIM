@@ -14,7 +14,8 @@ import torch.nn.functional as F
 import torchvision.models as tvm
 from torch import Tensor, nn
 
-from flashim.layers import IndexedSeparableConvBlock
+from flashim import ops
+from flashim.layers import IndexedSeparableConvBlock, fused_relu_end, sequential_forward
 from flashim.layers.transformer import TransformerBlock
 
 VGG_CUT = {"11": (tvm.vgg11_bn, 22), "13": (tvm.vgg13_bn, 28), "19": (tvm.vgg19_bn, 40)}
@@ -30,11 +31,15 @@ class VGG(nn.Module):
 
     def forward(self, x: Tensor) -> tuple[list[Tensor], list[tuple[int, int]]]:
         feats, sizes = [], []
-        for layer in self.layers:
+        layers, i = self.layers, 0
+        while i < len(layers):
+            layer = layers[i]
             if isinstance(layer, nn.MaxPool2d):
                 feats.append(x)
                 sizes.append(x.shape[-2:])
-            x = layer(x)
+            end = fused_relu_end(layers, i)  # conv -> folded BN -> ReLU as one quantized conv with a ReLU epilogue
+            x = layer(x) if end is None else layer(x, relu=True)
+            i = i + 1 if end is None else end + 1
         return feats, sizes
 
     def batchnorm_pairs(self, prefix: str) -> list[tuple[str, str]]:
@@ -127,12 +132,14 @@ class ConvRefiner(nn.Module):
         conv1 = nn.Conv2d(cin, cout, kernel_size, 1, kernel_size // 2, bias=True)
         return nn.Sequential(conv1, nn.BatchNorm2d(cout), nn.ReLU(inplace=True), nn.Conv2d(cout, cout, 1, 1, 0))
 
-    def forward(self, x: Tensor) -> Tensor:
-        x0 = self.block1(x)
+    def hidden(self, x: Tensor) -> Tensor:
+        """Everything before ``out_conv``."""
+        x0 = sequential_forward(self.block1, x)
         x = self.hidden_blocks(x0)
-        if self.residual:
-            x = (x + x0) / 1.4
-        return self.out_conv(x)
+        return (x + x0) / 1.4 if self.residual else x
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.out_conv(self.hidden(x))
 
 
 class Decoder(nn.Module):
@@ -141,10 +148,17 @@ class Decoder(nn.Module):
         self.layers = layers
         self.num_prototypes = num_prototypes
 
+    @staticmethod
+    def refiner_input(features: Tensor, context: Tensor | None) -> Tensor:
+        """``cat(features, context)``; a coarser ``context`` is upsampled (bilinear, FP32) in the same pass."""
+        if context is None:
+            return features
+        if context.shape[-2:] != features.shape[-2:]:
+            return ops.upsample_concat(features, context)
+        return torch.cat((features, context.to(features.dtype)), dim=1)
+
     def forward(self, features: Tensor, context: Tensor | None, scale: str) -> tuple[Tensor, Tensor]:
-        if context is not None:
-            features = torch.cat((features, context.to(features.dtype)), dim=1)
-        out = self.layers[scale](features)
+        out = self.layers[scale](self.refiner_input(features, context))
         return out[:, : self.num_prototypes], out[:, self.num_prototypes :]
 
 
@@ -168,6 +182,8 @@ class DeDoDeNet(nn.Module):
     (``num_prototypes`` channels) and the context passed to the next scale; the map / context are upsampled to the
     next encoder feature size in between. The sum is kept in FP32."""
 
+    fused_upsample = False  # see forward
+
     def __init__(self, config: NetConfig) -> None:
         super().__init__()
         self.config = config
@@ -177,20 +193,63 @@ class DeDoDeNet(nn.Module):
             config.num_prototypes,
         )
 
-    def forward(self, x: Tensor, return_features: bool = False):
-        """The summed output map; with ``return_features`` also the encoder's feature maps (RIPE's hypercolumns)."""
+    def forward(self, x: Tensor, return_features: bool = False, points: Tensor | None = None):
+        """The summed output map; with ``return_features`` also the encoder's feature maps (RIPE's hypercolumns). With
+        ``points`` ``[K, 2]`` (pixel-index ``(x, y)`` at the input resolution) the output is only read there: ``[K,
+        num_prototypes]`` FP32, the bilinear samples (``align_corners=False``) of the map, which is then never formed
+        at the last scale (:meth:`_read_last_scale`)."""
         cfg = self.config
         features, sizes = self.encoder(x)
-        out, context = 0, None
+        # With ``fused_upsample`` (spec pass ``fused_decoder_upsample``) the context and (bilinear) output maps stay
+        # coarse between scales: their upsampling runs inside the next scale's consumer (ops.upsample_concat building
+        # the refiner input, ops.upsample_add adding the next delta) instead of writing upsampled FP32 maps and reading
+        # them back for a cast / concat / add. Measured extract at 1200 px on sm_120, off -> on: DeDoDe int8 47.3 ->
+        # 39.7 ms, bf16 64.5 -> 56.9, DaD fp8 82.2 -> 74.8, RIPE int8 27.6 -> 24.4 (keypoints unchanged).
+        fused = self.fused_upsample
+        out, context, coarse = 0, None, False
+        last = len(cfg.scales) - 1
         for idx, (feature_map, scale) in enumerate(zip(reversed(features), cfg.scales)):
+            if points is not None and idx == last:
+                hidden = self.decoder.layers[scale].hidden(self.decoder.refiner_input(feature_map, context))
+                return self._read_last_scale(self.decoder.layers[scale].out_conv, hidden, out, points)
             delta, context = self.decoder(feature_map, context, scale)
-            out = out + delta.float()
-            if idx < len(cfg.scales) - 1:
+            out = ops.upsample_add(out, delta) if coarse else out + delta.float()
+            coarse = False
+            if idx < last:
                 size = sizes[-(idx + 2)]
-                kwargs = {"align_corners": False}
-                out = F.interpolate(out, size=size, mode=cfg.interpolation, **kwargs)
-                context = F.interpolate(context.float(), size=size, mode="bilinear", **kwargs)
+                if fused and cfg.interpolation == "bilinear":
+                    coarse = True  # upsampled with the next delta, or read at the points
+                elif points is None or idx < last - 1:  # with points, the last upsample happens at the read pixels
+                    out = F.interpolate(out, size=size, mode=cfg.interpolation, align_corners=False)
+                if not fused:
+                    context = F.interpolate(context.float(), size=size, mode="bilinear", align_corners=False)
         return (out, features) if return_features else out
+
+    def _read_last_scale(self, out_conv: nn.Module, hidden: Tensor, previous: Tensor, points: Tensor) -> Tensor:
+        """``bilinear_at(upsample(previous) + out_conv(hidden)[:, :P], points)`` evaluated at the 4 neighbouring pixels
+        of each point only: ``out_conv`` (a 1x1 convolution, called as the module so quantized / protected variants
+        keep their own math) on the gathered hidden pixels, the previous scale's output upsampled at those pixel
+        centres (``grid_sample`` with border clamping = ``F.interpolate``'s source-index clamp), then the bilinear
+        weights. Same math as the dense map, FP32 rounding in another order. Measured on DeDoDe int8 at 1200 px: the
+        dense last scale (out_conv, FP32 upsample of 256 channels to 896x1200, cast, add, bias) was 13.6 of 66 ms."""
+        _, _, height, width = hidden.shape
+        x0, y0 = points[:, 0].floor(), points[:, 1].floor()
+        fx, fy = points[:, 0] - x0, points[:, 1] - y0
+        xs = torch.stack((x0, x0 + 1, x0, x0 + 1), 1)  # [K, 4] neighbours: (x0, y0), (x1, y0), (x0, y1), (x1, y1)
+        ys = torch.stack((y0, y0, y0 + 1, y0 + 1), 1)
+        weights = torch.stack(((1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy), 1)
+        weights = weights * ((xs >= 0) & (xs < width) & (ys >= 0) & (ys < height))  # zero padding, as grid_sample
+        xi, yi = xs.clamp(0, width - 1).long(), ys.clamp(0, height - 1).long()
+        pixels = hidden.flatten(2)[:, :, (yi * width + xi).reshape(-1)]  # [1, C, 4K]
+        prototypes = self.decoder.num_prototypes
+        delta = out_conv(pixels[..., None])[0, :prototypes, :, 0].float()  # [P, 4K]
+        grid = torch.stack(((xi + 0.5) * 2 / width - 1, (yi + 0.5) * 2 / height - 1), -1).reshape(1, 1, -1, 2)
+        mode = self.config.interpolation
+        previous = F.grid_sample(
+            previous, grid.to(previous.dtype), mode=mode, padding_mode="border", align_corners=False
+        )[0, :, 0]  # [P, 4K]
+        values = (previous + delta).reshape(prototypes, -1, 4)
+        return (values * weights[None]).sum(-1).t()
 
     def batchnorm_pairs(self, prefix: str = "") -> list[tuple[str, str]]:
         pairs = self.encoder.batchnorm_pairs(f"{prefix}encoder.")

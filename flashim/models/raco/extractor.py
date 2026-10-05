@@ -10,6 +10,7 @@ from flashim.models.aliked.model import ALIKED
 from flashim.models.raco.model import RaCo
 from flashim.models.romav2.model import ImageLike, load_image
 from flashim.types import SparseFeatures
+from flashim.utils import device_constant
 
 
 class RaCoALIKED(nn.Module):
@@ -82,5 +83,5 @@ class RaCoALIKED(nn.Module):
         if (new_h, new_w) != (height, width):
             image = F.interpolate(image, size=(new_h, new_w), mode="bilinear", align_corners=False, antialias=True)
         keypoints, scores, descriptors = self._run(image, top_k)
-        keypoints = keypoints * keypoints.new_tensor([width / new_w, height / new_h])
+        keypoints = keypoints * device_constant([width / new_w, height / new_h], keypoints)
         return SparseFeatures(keypoints, scores, descriptors, (height, width))

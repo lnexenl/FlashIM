@@ -9,9 +9,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim.layers.conv import sequential_forward
 from flashim.models import sparse
 from flashim.models.xfeat import weights
 from flashim.platforms import default_device
+from flashim.utils import device_constant
 
 
 class BasicLayer(nn.Module):
@@ -26,7 +28,7 @@ class BasicLayer(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.layer(x)
+        return sequential_forward(self.layer, x)  # the ReLU in a quantized conv's epilogue once BatchNorm is folded
 
 
 def _bn_pairs(model: nn.Module) -> list[tuple[str, str]]:
@@ -36,7 +38,7 @@ def _bn_pairs(model: nn.Module) -> list[tuple[str, str]]:
 def _sample(x: Tensor, pos: Tensor, h: int, w: int, mode: str) -> Tensor:
     """Upstream ``InterpolateSparse2d``: sample ``x`` ``[1, C, ., .]`` at ``pos`` ``[N, 2]`` given in the ``h x w`` full
     resolution's pixel indices (normalized by ``size - 1``, ``align_corners=False``) -> ``[N, C]``."""
-    grid = (2.0 * pos.float() / pos.new_tensor([w - 1, h - 1], dtype=torch.float32) - 1.0).view(1, -1, 1, 2)
+    grid = (2.0 * pos.float() / device_constant([w - 1, h - 1], pos, torch.float32) - 1.0).view(1, -1, 1, 2)
     return F.grid_sample(x.float(), grid, mode=mode, align_corners=False)[0, :, :, 0].t()
 
 

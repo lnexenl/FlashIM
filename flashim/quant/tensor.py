@@ -148,4 +148,4 @@ class Int8Tensor:
 def quantize_int8_static(value: Tensor, scale: Tensor) -> Int8Tensor:
     """Reference static per-tensor INT8 quantization."""
     scale = scale.to(device=value.device, dtype=torch.float32).reshape(())
-    return Int8Tensor(quantize_symmetric(value, scale), scale)
+    return Int8Tensor(quantize_symmetric(value, scale).contiguous(), scale)  # packed, whatever the input layout

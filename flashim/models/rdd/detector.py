@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim.utils import device_constant
+
 MEAN = (0.430, 0.411, 0.296)
 STD = (0.213, 0.156, 0.143)
 
@@ -57,7 +59,7 @@ class Detector(nn.Module):
         self.convhead2.float()
 
     def forward(self, image: Tensor) -> Tensor:
-        mean, std = (image.new_tensor(v).view(1, 3, 1, 1) for v in (MEAN, STD))
+        mean, std = (device_constant(v, image).view(1, 3, 1, 1) for v in (MEAN, STD))
         x = ((image - mean) / std).to(self.block1.conv1.weight.dtype)
         x1 = self.block1(x)
         x2 = self.block2(F.max_pool2d(x1, 2))

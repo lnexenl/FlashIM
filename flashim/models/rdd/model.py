@@ -15,6 +15,7 @@ from flashim.models.rdd.transformer import DeformableTransformer
 from flashim.models.romav2.model import ImageLike, load_image
 from flashim.platforms import default_device
 from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.utils import device_constant
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -108,7 +109,7 @@ class RDD(nn.Module):
 
     def describe(self, image: Tensor) -> Tensor:
         """Descriptor map ``[B, d_model, H/4, W/4]`` for an image ``[B, 3, H, W]`` in ``[0, 1]`` (H, W % 32 == 0)."""
-        mean, std = (image.new_tensor(v).view(1, 3, 1, 1) for v in (IMAGENET_MEAN, IMAGENET_STD))
+        mean, std = (device_constant(v, image).view(1, 3, 1, 1) for v in (IMAGENET_MEAN, IMAGENET_STD))
         x = ((image - mean) / std).to(self.compute_dtype)
         features = self.backbone(x)
         sources = [proj(feat) for proj, feat in zip(self.input_proj, features)]
@@ -162,7 +163,7 @@ class RDD(nn.Module):
             score_map, top_k or cfg.top_k, cfg.nms_radius, cfg.softargmax_temperature
         )
         descriptors = kp.sample_descriptors(F.normalize(descriptor_map.float(), dim=1), keypoints, new_h, new_w)
-        keypoints = keypoints * keypoints.new_tensor([width / new_w, height / new_h])
+        keypoints = keypoints * device_constant([width / new_w, height / new_h], keypoints)
         return SparseFeatures(keypoints, scores, descriptors, (height, width))
 
     @torch.inference_mode()

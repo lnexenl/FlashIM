@@ -30,7 +30,7 @@ def _dcn_gather_quantize_kernel(
     x_ptr,
     offset_ptr,
     out_ptr,
-    inv_scale,
+    inv_scale_ptr,
     C,
     H,
     W,
@@ -59,6 +59,7 @@ def _dcn_gather_quantize_kernel(
     c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     c_mask = c < C
 
+    inv_scale = tl.load(inv_scale_ptr)  # a device scalar: no host sync to read the scale
     x_base = x_ptr + b * stride_xb
     off_base = offset_ptr + b * stride_ob
 
@@ -112,7 +113,7 @@ def deform_patches_int8(x: Tensor, offset: Tensor, kernel_size: int, padding: in
     oh, ow = offset.shape[-2:]
     out = torch.empty(b * oh * ow, c * kernel_size * kernel_size, device=x.device, dtype=torch.int8)
     scale = scale.reshape(())
-    inv_scale = float((1.0 / scale.clamp_min(torch.finfo(torch.float32).eps)).item())
+    inv_scale = (1.0 / scale.float().clamp_min(torch.finfo(torch.float32).eps)).reshape(1)
     block_pix, block_c = 32, min(32, triton.next_power_of_2(c))
     grid = (triton.cdiv(oh * ow, block_pix), triton.cdiv(c, block_c), b)
     _dcn_gather_quantize_kernel[grid](

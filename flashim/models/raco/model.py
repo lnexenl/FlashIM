@@ -20,6 +20,7 @@ from flashim.models.raco import weights
 from flashim.models.raco.blocks import ConvBlock, ResBlock
 from flashim.models.raco.config import RaCoConfig
 from flashim.platforms import default_device
+from flashim.utils import device_constant
 
 
 class RaCo(nn.Module):
@@ -81,7 +82,7 @@ class RaCo(nn.Module):
         return self.block1.conv1.weight.device
 
     def normalize(self, image: Tensor) -> Tensor:
-        mean, std = (image.new_tensor(v).view(1, 3, 1, 1) for v in (self.config.mean, self.config.std))
+        mean, std = (device_constant(v, image).view(1, 3, 1, 1) for v in (self.config.mean, self.config.std))
         return (image - mean) / std
 
     def detector_logits(self, image: Tensor) -> Tensor:

@@ -31,6 +31,25 @@ def _rope_qk_reference(q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> tuple[
 
 rope_qk = Op("rope_qk", _rope_qk_reference)
 
+
+def _rotate_pairs(x: Tensor) -> Tensor:
+    """``(x0, x1, x2, x3, ...) -> (-x1, x0, -x3, x2, ...)``."""
+    return torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).flatten(-2)
+
+
+def _rope_qk_interleaved_reference(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor]:
+    """Interleaved-pair RoPE (LightGlue's convention) in FP32 on ``[B, H, N, D]`` q / k with per-batch tables
+    ``[B, 1, N, D]`` (each frequency repeated for its pair): ``t * cos + rotate_pairs(t) * sin``, cast back."""
+
+    def apply(t: Tensor) -> Tensor:
+        t32 = t.float()
+        return (t32 * cos + _rotate_pairs(t32) * sin).to(t.dtype)
+
+    return apply(q), apply(k)
+
+
+rope_qk_interleaved = Op("rope_qk_interleaved", _rope_qk_interleaved_reference)
+
 # -- scaled dot-product attention (non-causal, no mask) ------------------------------------------------
 
 

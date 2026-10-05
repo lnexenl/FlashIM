@@ -7,10 +7,48 @@ and MXFP8 / INT8 pointwise quantization with the depthwise conv as the quantizin
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import ClassVar
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
+
+
+def conv_relu(conv: nn.Module, x: Tensor, norm: nn.Module | None = None) -> Tensor:
+    """``relu(norm(conv(x)))``, with the ReLU in the convolution's epilogue when the module supports it (quantized
+    convolutions set ``fuses_relu``) and ``norm`` is folded away (``None`` / :class:`nn.Identity`); otherwise the plain
+    in-place ReLU. Same bits either way: ReLU commutes with the epilogue's BF16 rounding."""
+    if getattr(conv, "fuses_relu", False) and (norm is None or isinstance(norm, nn.Identity)):
+        return conv(x, relu=True)
+    return F.relu(conv(x) if norm is None else norm(conv(x)), inplace=True)
+
+
+def fused_relu_end(layers: Sequence[nn.Module], i: int) -> int | None:
+    """Index of the :class:`nn.ReLU` that ``layers[i]`` can apply in its epilogue (``layers[i]`` fuses ReLU and only
+    folded norms, :class:`nn.Identity`, sit in between), else ``None``."""
+    if not getattr(layers[i], "fuses_relu", False):
+        return None
+    j = i + 1
+    while j < len(layers) and isinstance(layers[j], nn.Identity):
+        j += 1
+    return j if j < len(layers) and isinstance(layers[j], nn.ReLU) else None
+
+
+def sequential_forward(layers: Sequence[nn.Module], x: Tensor) -> Tensor:
+    """``nn.Sequential`` semantics over ``layers``, running each ``conv -> Identity* -> ReLU`` as ``conv(x, relu=True)``
+    (:func:`fused_relu_end`): measured as a separate elementwise pass per quantized conv (DeDoDe int8: 3.6 ms of ReLU
+    kernels per extract, ``benchmarks/profile/timeline_audit.py``)."""
+    i = 0
+    while i < len(layers):
+        end = fused_relu_end(layers, i)
+        if end is None:
+            x = layers[i](x)
+            i += 1
+        else:
+            x = layers[i](x, relu=True)
+            i = end + 1
+    return x
 
 
 class SeparableConvBlock(nn.Module):

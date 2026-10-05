@@ -14,7 +14,7 @@ from torch import Tensor, nn
 
 from flashim.models.romav2.model import ImageLike, load_image
 from flashim.types import SparseFeatures, SparseMatchResult
-from flashim.utils import set_submodule
+from flashim.utils import device_constant, set_submodule
 
 
 def target_size(height: int, width: int, long_side: int | None, div_by: int = 8) -> tuple[int, int]:
@@ -58,8 +58,8 @@ def sample_descriptors(keypoints: Tensor, descriptors: Tensor, stride: int) -> T
     """Bilinear descriptors ``[K, C]`` (L2-normalized) from a ``[1, C, h, w]`` map at ``keypoints`` ``[K, 2]`` given in
     pixel indices of the image the map was computed from (``stride`` = the map's downsampling factor)."""
     _, _, h, w = descriptors.shape
-    kpts = (keypoints.float() - stride / 2 + 0.5) / keypoints.new_tensor(
-        [w * stride - stride / 2 - 0.5, h * stride - stride / 2 - 0.5]
+    kpts = (keypoints.float() - stride / 2 + 0.5) / device_constant(
+        [w * stride - stride / 2 - 0.5, h * stride - stride / 2 - 0.5], keypoints
     )
     grid = (kpts * 2 - 1).view(1, 1, -1, 2)
     out = F.grid_sample(descriptors.float(), grid, mode="bilinear", align_corners=True)[0, :, 0].t()
@@ -73,10 +73,10 @@ def mutual_nn_match(desc0: Tensor, desc1: Tensor, threshold: float) -> tuple[Ten
         return empty, empty, desc0.new_zeros(0)
     sim = desc0.float() @ desc1.float().t()
     nn01, nn10 = sim.argmax(dim=1), sim.argmax(dim=0)
+    best = sim.gather(1, nn01[:, None])[:, 0]
     ids0 = torch.arange(sim.shape[0], device=sim.device)
-    valid = (ids0 == nn10[nn01]) & (sim[ids0, nn01] >= threshold)
-    idx0 = ids0[valid]
-    return idx0, nn01[valid], sim[idx0, nn01[valid]]
+    idx0 = ((ids0 == nn10[nn01]) & (best >= threshold)).nonzero()[:, 0]  # the only host sync (match count)
+    return idx0, nn01[idx0], best[idx0]
 
 
 class SparseExtractor(nn.Module):
@@ -137,7 +137,7 @@ class SparseExtractor(nn.Module):
         if (new_h, new_w) != (height, width):
             image = F.interpolate(image, size=(new_h, new_w), mode="bilinear", align_corners=False, antialias=True)
         keypoints, scores, descriptors = self.detect(image, self.default_top_k if top_k is None else top_k)
-        scale = keypoints.new_tensor([width / new_w, height / new_h])
+        scale = device_constant([width / new_w, height / new_h], keypoints)
         keypoints = (keypoints.float() + 0.5) * scale - 0.5
         return SparseFeatures(keypoints[None], scores.float()[None], descriptors[None], (height, width))
 

@@ -12,7 +12,9 @@ from flashim import ops
 from flashim.models.lightglue import weights
 from flashim.models.lightglue.config import LightGlueConfig
 from flashim.platforms import default_device
+from flashim.quant.methods.linear import StaticMXFP8Linear
 from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.utils import device_constant
 
 
 def normalize_keypoints(keypoints: Tensor, image_size: Tensor) -> Tensor:
@@ -51,6 +53,22 @@ def apply_batched(fn, xs: list[Tensor]) -> list[Tensor]:
     return [fn(x) for x in xs]
 
 
+def ffn_forward(ffn: nn.Sequential, x: Tensor) -> Tensor:
+    """``ffn(x)`` (``Linear -> LayerNorm -> GELU -> Linear``); with MXFP8 linears, LayerNorm, GELU and the last linear's
+    input quantization run as one kernel with the first linear's bias in it, instead of four passes. INT8 keeps the
+    unfused path: there the fused statistics' one-ulp BF16 differences moved the matches of the RDD pair in
+    tests/parity/test_lightglue_parity.py below its 90 % threshold (106 / 118 vs 107+), in either variance form tried."""
+    first, norm, act, last = ffn
+    fusable = isinstance(first, StaticMXFP8Linear) and isinstance(last, StaticMXFP8Linear) and first.bias is not None
+    if not (fusable and isinstance(norm, nn.LayerNorm) and isinstance(act, nn.GELU)):
+        return ffn(x)
+    hidden = first.matmul(first.quantize(x))
+    packed = last.quantize_layernorm(
+        hidden, None, norm, input_bias=first.bias[: first.out_features], activation=act.approximate
+    )
+    return last.forward_prequantized(packed).to(x.dtype)
+
+
 def make_ffn(dim: int) -> nn.Sequential:
     return nn.Sequential(nn.Linear(2 * dim, 2 * dim), nn.LayerNorm(2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
 
@@ -67,7 +85,7 @@ class SelfBlock(nn.Module):
     def attend(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         batch, tokens, _ = x.shape
         q, k, v = self.Wqkv(x).view(batch, tokens, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
+        q, k = ops.rope_qk_interleaved(q, k, cos, sin)  # = apply_rotary on each: one kernel for both instead of ~10
         out = ops.sdpa.get(self.sdpa_impl)(q, k, v)
         return self.out_proj(out.transpose(1, 2).reshape(batch, tokens, -1))
 
@@ -76,9 +94,11 @@ class SelfBlock(nn.Module):
         if len({x.shape for x in xs}) == 1:
             x = torch.cat(xs)
             enc = torch.cat(encodings, dim=1)
-            x = x + self.ffn(torch.cat((x, self.attend(x, enc[0], enc[1])), -1))
+            x = x + ffn_forward(self.ffn, torch.cat((x, self.attend(x, enc[0], enc[1])), -1))
             return list(x.chunk(len(xs)))
-        return [x + self.ffn(torch.cat((x, self.attend(x, e[0], e[1])), -1)) for x, e in zip(xs, encodings)]
+        return [
+            x + ffn_forward(self.ffn, torch.cat((x, self.attend(x, e[0], e[1])), -1)) for x, e in zip(xs, encodings)
+        ]
 
 
 class CrossBlock(nn.Module):
@@ -108,8 +128,8 @@ class CrossBlock(nn.Module):
             m0 = sdpa(qk0, qk1, v1).transpose(1, 2).reshape(x0.shape)
             m1 = sdpa(qk1, qk0, v0).transpose(1, 2).reshape(x1.shape)
         m0, m1 = apply_batched(self.to_out, [m0, m1])
-        x0 = x0 + self.ffn(torch.cat((x0, m0), -1))
-        x1 = x1 + self.ffn(torch.cat((x1, m1), -1))
+        x0 = x0 + ffn_forward(self.ffn, torch.cat((x0, m0), -1))
+        x1 = x1 + ffn_forward(self.ffn, torch.cat((x1, m1), -1))
         return x0, x1
 
 
@@ -233,7 +253,7 @@ class LightGlue(nn.Module):
     def normalized(self, keypoints: Tensor, image_size: tuple[int, int]) -> Tensor:
         height, width = image_size
         size = (height, width) if self.config.reference_size_order else (width, height)
-        return normalize_keypoints(keypoints, torch.tensor(size, device=keypoints.device)[None])
+        return normalize_keypoints(keypoints, device_constant(size, keypoints, torch.int64)[None])
 
     def encode(self, keypoints: Tensor, image_size: tuple[int, int]) -> Tensor:
         return self.posenc(self.normalized(keypoints, image_size))
@@ -246,7 +266,11 @@ class LightGlue(nn.Module):
 
     def features(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> tuple[Tensor, Tensor, int]:
         """Point features after the last executed layer and its index (``executed_layers`` records how many ran)."""
-        x0, x1 = self.input_proj(desc0.to(self.compute_dtype)), self.input_proj(desc1.to(self.compute_dtype))
+        # contiguous: SuperPoint's descriptors are a transposed view, and `.to` keeps that layout for the whole residual
+        # stream, so every quantized linear reading it fell back to the torch quantize (54 calls / match, 1.8-3.2 ms)
+        x0, x1 = (
+            self.input_proj(d.to(self.compute_dtype, memory_format=torch.contiguous_format)) for d in (desc0, desc1)
+        )
         enc0, enc1 = enc0.to(self.compute_dtype), enc1.to(self.compute_dtype)
         depth_confidence = self.config.depth_confidence
         last = len(self.transformers) - 1

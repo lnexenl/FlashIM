@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from flashim.utils import device_constant
+
 
 def simple_nms(scores: Tensor, radius: int) -> Tensor:
     """Two-round soft non-maximum suppression with a ``(2 * radius + 1)`` window."""
@@ -65,7 +67,7 @@ def detect_keypoints(
     nms_scores[:, :, :, w - radius :] = 0
     indices = _select_indices(nms_scores, score_map.detach(), top_k, scores_th, n_limit)
 
-    wh = score_map.new_tensor([w - 1, h - 1])
+    wh = device_constant([w - 1, h - 1], score_map)
     kernel = 2 * radius + 1
     offsets = torch.linspace(-radius, radius, kernel, device=score_map.device)
     grid = torch.stack(torch.meshgrid(offsets, offsets, indexing="ij")).view(2, -1).t()[:, [1, 0]]  # (kernel**2, 2) (x, y)

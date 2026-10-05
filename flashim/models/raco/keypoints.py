@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from flashim.utils import device_constant
+
 
 def detect_candidates(logits: Tensor, count: int, radius: int, temperature: float) -> Tensor:
     """Top-``count`` local maxima of ``logits`` ``[B, 1, H, W]`` (window ``radius``), refined by a softmax-weighted
@@ -32,7 +34,7 @@ def sample(feature_map: Tensor, keypoints: Tensor) -> Tensor:
     """Bilinear samples (border-clamped, ``align_corners=True``) of a single-channel ``[B, 1, H, W]`` map at
     pixel-index ``keypoints`` ``[B, N, 2]`` -> ``[B, N]``."""
     h, w = feature_map.shape[-2:]
-    scale = keypoints.new_tensor([w - 1, h - 1])
+    scale = device_constant([w - 1, h - 1], keypoints)
     grid = (2 * keypoints / scale - 1).unsqueeze(2)
     sampled = F.grid_sample(feature_map, grid, mode="bilinear", padding_mode="border", align_corners=True)
     return sampled[:, 0, :, 0]

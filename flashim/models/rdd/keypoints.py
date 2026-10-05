@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from flashim.utils import device_constant
+
 
 def simple_nms(scores: Tensor, radius: int) -> Tensor:
     """Non-maximum suppression with a ``(2 * radius + 1)`` window (SuperPoint-style, two suppression rounds)."""
@@ -52,7 +54,7 @@ def detect_keypoints(
     residual = torch.stack((weights @ grid_x, weights @ grid_y), dim=-1) / weights.sum(-1, keepdim=True)
     keypoints = torch.stack((xs, ys), dim=-1).float() + residual
 
-    norm = keypoints / keypoints.new_tensor([w - 1, h - 1]) * 2 - 1
+    norm = keypoints / device_constant([w - 1, h - 1], keypoints) * 2 - 1
     scores = F.grid_sample(score_map, norm[:, None], mode="bilinear", align_corners=True)[:, 0, 0]
     return keypoints, scores
 
@@ -60,7 +62,7 @@ def detect_keypoints(
 def sample_descriptors(features: Tensor, keypoints: Tensor, height: int, width: int) -> Tensor:
     """Bicubic samples of ``features`` ``[B, C, h, w]`` at pixel-index ``keypoints`` of a ``height x width``
     image, L2-normalized: ``[B, K, C]``."""
-    scale = torch.tensor([width, height], device=keypoints.device, dtype=keypoints.dtype)
+    scale = device_constant([width, height], keypoints)
     grid = ((2.0 * keypoints + 1.0) / scale - 1.0)[:, :, None].to(features.dtype)
     sampled = F.grid_sample(features, grid, mode="bicubic", align_corners=False)
     return F.normalize(sampled.permute(0, 2, 3, 1).squeeze(-2), dim=-1)

@@ -13,6 +13,7 @@ from flashim.models import sparse
 from flashim.models.dedode import blocks
 from flashim.models.ripe import weights
 from flashim.platforms import default_device
+from flashim.utils import device_constant
 
 
 class RIPE(sparse.SparseExtractor):
@@ -58,7 +59,7 @@ class RIPE(sparse.SparseExtractor):
         scores = heat[0, 0, ys, xs]
         order = torch.argsort(-scores)[: top_k if top_k else None]
         keypoints, scores = keypoints[order], scores[order]
-        grid = (2.0 * keypoints.float() / keypoints.new_tensor([w - 1, h - 1], dtype=torch.float32) - 1.0).view(1, 1, -1, 2)
+        grid = (2.0 * keypoints.float() / device_constant([w - 1, h - 1], keypoints, torch.float32) - 1.0).view(1, 1, -1, 2)
         hyper = torch.cat(
             [F.grid_sample(f.float(), grid, mode="bilinear", align_corners=True)[0, :, 0] for f in features], dim=0
         )  # [960, K]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from collections import OrderedDict
 from pathlib import Path
 
@@ -57,8 +58,28 @@ def _is_hr_entry(stages: list, stage: int, stride: int) -> bool:
     return len(stages) > 1 and stage == 1 and stride == 4
 
 
-def load_image(img: ImageLike, device: torch.device) -> Tensor:
-    """Path / PIL / HWC numpy / ``[B,3,H,W]`` tensor -> float ``[B,3,H,W]`` in [0, 1] on ``device``."""
+# Decoder for image *paths*: "pil" (libjpeg on the CPU, then a host -> device copy) or "nvjpeg" (JPEG files decoded on
+# the GPU, torchvision.io.decode_jpeg). Measured for a 1600x1199 MegaDepth JPEG on sm_120: 15.7 ms -> 2.2 ms (+ the file
+# read); the decoded pixels differ from libjpeg's (max 15 levels, mean 0.19), so "pil" stays the default and the
+# benchmarks use it. Override per call (``decoder=``) or with FLASHIM_IMAGE_DECODER.
+IMAGE_DECODER = os.environ.get("FLASHIM_IMAGE_DECODER", "pil")
+
+
+def load_image(img: ImageLike, device: torch.device, decoder: str | None = None) -> Tensor:
+    """Path / PIL / HWC numpy / ``[B,3,H,W]`` tensor -> float ``[B,3,H,W]`` in [0, 1] on ``device`` (``decoder``: see
+    ``IMAGE_DECODER``)."""
+    decoder = decoder or IMAGE_DECODER
+    if decoder not in ("pil", "nvjpeg"):
+        raise ValueError(f"Unknown image decoder {decoder!r}: 'pil' or 'nvjpeg'")
+    if (
+        decoder == "nvjpeg"
+        and isinstance(img, (str, Path))
+        and Path(img).suffix.lower() in (".jpg", ".jpeg")
+        and torch.device(device).type == "cuda"
+    ):
+        from torchvision.io import ImageReadMode, decode_jpeg, read_file
+
+        return decode_jpeg(read_file(str(img)), mode=ImageReadMode.RGB, device=device)[None].float() / 255.0
     if isinstance(img, (str, Path)):
         pil = Image.open(img)
         if pil.mode == "I;16":

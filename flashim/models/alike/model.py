@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torchvision.models import resnet
 
+from flashim import ops
+from flashim.layers.conv import conv_relu
 from flashim.models import sparse
 from flashim.models.alike import weights
 from flashim.models.alike.config import VARIANTS, ALIKEConfig
@@ -24,6 +26,8 @@ class ConvBlock(nn.Module):
         self.conv2, self.bn2 = resnet.conv3x3(cout, cout), nn.BatchNorm2d(cout)
 
     def forward(self, x: Tensor) -> Tensor:
+        if isinstance(self.gate, nn.ReLU):  # ReLU in the (quantized) convolutions' epilogue when they support it
+            return conv_relu(self.conv2, conv_relu(self.conv1, x, self.bn1), self.bn2)
         return self.gate(self.bn2(self.conv2(self.gate(self.bn1(self.conv1(x))))))
 
 
@@ -36,8 +40,11 @@ class ResBlock(nn.Module):
         self.downsample = nn.Conv2d(cin, cout, 1)
 
     def forward(self, x: Tensor) -> Tensor:
-        out = self.bn2(self.conv2(self.gate(self.bn1(self.conv1(x)))))
-        return self.gate(out + self.downsample(x))
+        if isinstance(self.gate, nn.ReLU):
+            hidden = conv_relu(self.conv1, x, self.bn1)
+        else:
+            hidden = self.gate(self.bn1(self.conv1(x)))
+        return self.gate(self.bn2(self.conv2(hidden)) + self.downsample(x))
 
 
 class ALIKE(sparse.SparseExtractor):
@@ -79,6 +86,12 @@ class ALIKE(sparse.SparseExtractor):
 
     def dense(self, image: Tensor) -> tuple[Tensor, Tensor]:
         """``(scores [B, 1, H, W] in (0, 1), descriptors [B, dim, H, W] unnormalized)`` at the input resolution."""
+        fused = self.head_input(image)
+        out = self.convhead2(fused.to(self.convhead2.weight.dtype)).float()
+        return torch.sigmoid(out[:, -1:]), out[:, :-1]
+
+    def head_input(self, image: Tensor) -> Tensor:
+        """The multi-scale features ``convhead2`` reads (compute dtype)."""
         x1 = self.block1(image.to(self.compute_dtype))
         x2 = self.block2(F.max_pool2d(x1, 2))
         x3 = self.block3(F.max_pool2d(x2, 4))
@@ -90,12 +103,15 @@ class ALIKE(sparse.SparseExtractor):
         )
         if not self.config.single_head:
             fused = self.gate(self.convhead1(fused))
-        out = self.convhead2(fused.to(self.convhead2.weight.dtype)).float()
-        return torch.sigmoid(out[:, -1:]), out[:, :-1]
+        return fused
 
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
         cfg = self.config
-        scores_map, descriptor_map = self.dense(image)
+        # convhead2 split by output row: the score row dense (FP32, read straight from the compute-dtype features), the
+        # descriptor rows only at the selected keypoints (the dense FP32 descriptor map is only ever indexed there)
+        fused = self.head_input(image)
+        weight, bias = self.convhead2.weight, self.convhead2.bias
+        scores_map = torch.sigmoid(ops.conv2d_single_output(fused, weight[-1:], None if bias is None else bias[-1:]))
         _, _, h, w = scores_map.shape
         nms = sparse.simple_nms(scores_map, 2)
         r = cfg.radius
@@ -111,5 +127,7 @@ class ALIKE(sparse.SparseExtractor):
             if len(index) > cfg.n_limit:
                 index = index[flat[index].sort(descending=True)[1][: cfg.n_limit]]
         keypoints = torch.stack((index % w, index // w), dim=1)
-        descriptors = F.normalize(descriptor_map[0, :, keypoints[:, 1], keypoints[:, 0]].t(), dim=-1)
+        at_keypoints = fused[0, :, keypoints[:, 1], keypoints[:, 0]].t().float()
+        descriptors = F.linear(at_keypoints, weight[:-1, :, 0, 0].float(), None if bias is None else bias[:-1].float())
+        descriptors = F.normalize(descriptors, dim=-1)
         return keypoints.float(), scores_map.reshape(-1)[index], descriptors

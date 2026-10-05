@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim.layers.conv import conv_relu
 from flashim.models import sparse
 from flashim.models.superpoint import weights
 from flashim.platforms import default_device
@@ -53,22 +54,22 @@ class SuperPoint(sparse.SparseExtractor):
         return model.to(torch.device(device or default_device())).eval()
 
     def encode(self, image: Tensor) -> Tensor:
-        x = self.relu(self.conv1a(sparse.rgb_to_gray(image).to(self.compute_dtype)))
-        x = self.pool(self.relu(self.conv1b(x)))
-        x = self.relu(self.conv2a(x))
-        x = self.pool(self.relu(self.conv2b(x)))
-        x = self.relu(self.conv3a(x))
-        x = self.pool(self.relu(self.conv3b(x)))
-        return self.relu(self.conv4b(self.relu(self.conv4a(x))))
+        x = conv_relu(self.conv1a, sparse.rgb_to_gray(image).to(self.compute_dtype))
+        x = self.pool(conv_relu(self.conv1b, x))
+        x = conv_relu(self.conv2a, x)
+        x = self.pool(conv_relu(self.conv2b, x))
+        x = conv_relu(self.conv3a, x)
+        x = self.pool(conv_relu(self.conv3b, x))
+        return conv_relu(self.conv4b, conv_relu(self.conv4a, x))
 
     def score_map(self, x: Tensor) -> Tensor:
         """Dense per-pixel scores ``[1, H, W]`` (FP32), before NMS."""
-        scores = F.softmax(self.convPb(self.relu(self.convPa(x))).float(), 1)[:, :-1]
+        scores = F.softmax(self.convPb(conv_relu(self.convPa, x)).float(), 1)[:, :-1]
         b, _, h, w = scores.shape
         return scores.permute(0, 2, 3, 1).reshape(b, h, w, 8, 8).permute(0, 1, 3, 2, 4).reshape(b, h * 8, w * 8)
 
     def dense_descriptors(self, x: Tensor) -> Tensor:
-        return F.normalize(self.convDb(self.relu(self.convDa(x))).float(), dim=1)
+        return F.normalize(self.convDb(conv_relu(self.convDa, x)).float(), dim=1)
 
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
         x = self.encode(image)
