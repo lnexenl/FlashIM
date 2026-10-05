@@ -175,7 +175,8 @@ def main() -> None:
     torch.set_num_threads(ncpu)
     torch.backends.cudnn.benchmark = False
     data_root = Path(args.data_root) if args.data_root else ROMAV2_DATA / "megadepth"
-    if args.extra or args.model in flashim.registry.LEGACY_LOADERS:
+    # keyword API for models that have one, unless --overrides are given (it would drop them silently)
+    if args.extra or (args.model in flashim.registry.LEGACY_LOADERS and not args.overrides):
         model = flashim.load(args.model, preset=args.preset, engine=args.engine, **(json.loads(args.extra) if args.extra else {}))
     else:
         model = flashim.load(args.model, args.preset, overrides=[f"engine.kind={args.engine}", *args.overrides])

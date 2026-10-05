@@ -38,7 +38,10 @@ class SparsePipeline(nn.Module):
 
     @property
     def calibration_metadata(self) -> dict[str, str] | None:
-        return {"extractor": self.extractor.calibration_metadata, "matcher": self.matcher.calibration_metadata}
+        # getattr: an AttributeError raised inside an nn.Module property surfaces as "no attribute", so a bare access
+        # here made getattr(pipeline, "calibration_metadata", None) return None for extractors without one (ALIKED)
+        return {"extractor": getattr(self.extractor, "calibration_metadata", None),
+                "matcher": self.matcher.calibration_metadata}
 
     def extract(self, image: ImageLike, **kwargs) -> SparseFeatures:
         return self.extractor.extract(image, **kwargs)
