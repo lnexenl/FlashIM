@@ -1,5 +1,5 @@
 """LightGlue architecture configuration (the RDD release, ``rdd_lg.pth``, is the default; see
-``ALIKED_CONFIG`` for cvg/LightGlue's ALIKED-paired weights)."""
+``ALIKED_CONFIG`` for cvg/LightGlue's ALIKED-descriptor weights)."""
 
 from __future__ import annotations
 
@@ -21,9 +21,10 @@ class LightGlueConfig:
     reference_size_order: bool = True
 
 
-# cvg/LightGlue's ALIKED variant (``raco_aliked_lightglue.pth``): a 128 -> 256 input projection (ALIKED's
-# descriptor dim is 128, but this LightGlue was trained with a 256-wide transformer), the correct (x, y)
-# keypoint-normalization order, and the upstream default match threshold.
+# cvg/LightGlue's ALIKED-descriptor variants, ``aliked_lightglue.pth`` (ALIKED's own keypoints) and
+# ``raco_aliked_lightglue.pth`` (RaCo's keypoints): a 128 -> 256 input projection (ALIKED's descriptor dim is 128, but
+# these LightGlues were trained with a 256-wide transformer), the correct (x, y) keypoint-normalization order, and
+# the upstream default match threshold.
 ALIKED_CONFIG = LightGlueConfig(input_dim=128, dim=256, filter_threshold=0.1, reference_size_order=False)
 
 # cvg/LightGlue's SuperPoint and DISK variants (``superpoint_lightglue.pth`` / ``disk_lightglue.pth``): same

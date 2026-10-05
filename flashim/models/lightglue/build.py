@@ -30,9 +30,10 @@ def load_lightglue(
 ) -> LightGlue:
     """Load LightGlue weights, apply a precision/quantization preset and an execution engine.
 
-    ``variant``: ``"rdd"`` (default, ``rdd_lg.pth``, dim 256 throughout) or ``"aliked"`` (cvg/LightGlue's
-    ``raco_aliked_lightglue.pth``, ALIKED's 128-d descriptors projected to a 256-wide transformer — see
-    :data:`flashim.models.lightglue.config.ALIKED_CONFIG`). ``engine="compile"`` compiles the positional
+    ``variant``: ``"rdd"`` (default, ``rdd_lg.pth``, dim 256 throughout), ``"aliked"`` (cvg/LightGlue's
+    ``aliked_lightglue.pth``, trained on ALIKED's keypoints) or ``"raco-aliked"`` (``raco_aliked_lightglue.pth``,
+    trained on RaCo's keypoints), both projecting ALIKED's 128-d descriptors to a 256-wide transformer — see
+    :data:`flashim.models.lightglue.config.ALIKED_CONFIG`. ``engine="compile"`` compiles the positional
     encoding, every transformer layer and the assignment head once per keypoint count. ``attention``:
     ``"sdpa"`` (torch SDPA) or ``"sage"`` / ``"sage-fp8"`` (SageAttention INT8-QK attention; needs the
     ``sageattention`` package). On platforms without native MXFP8 GEMMs the FP8 preset runs with emulation
@@ -104,12 +105,13 @@ def load_raco_aliked_lightglue(
     extractor_kwargs: dict | None = None,
     **kwargs,
 ) -> SparsePipeline:
-    """RaCo keypoints + ALIKED descriptors (``extractor_preset``) matched by cvg/LightGlue's ALIKED-trained
-    weights (``preset``): the pipeline of `fabio-sim/LightGlue-ONNX`'s ``raco_aliked``. ``kwargs`` go to
+    """RaCo keypoints + ALIKED descriptors (``extractor_preset``) matched by cvg/LightGlue's weights trained on
+    that pairing (``raco_aliked_lightglue.pth``, ``preset``): the pipeline of `fabio-sim/LightGlue-ONNX`'s
+    ``raco_aliked``. ``kwargs`` go to
     :func:`load_lightglue`, ``extractor_kwargs`` (``raco_checkpoint``, ``raco_config``, ``aliked_kwargs``,
     ``fused_ranker``) to :func:`flashim.models.raco.build.load_raco_aliked`."""
     from flashim.models.raco.build import raco_aliked_overlay
 
     overlay = raco_aliked_overlay(extractor_preset, engine=engine, **(extractor_kwargs or {}))
     extractor = {"model": "raco-aliked", "preset": extractor_preset, **overlay}
-    return _pipeline("raco-aliked-lightglue", preset, extractor, engine, device, kwargs, "aliked")
+    return _pipeline("raco-aliked-lightglue", preset, extractor, engine, device, kwargs, "raco-aliked")

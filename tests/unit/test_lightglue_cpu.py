@@ -114,3 +114,15 @@ def test_early_stopping_exits_early_and_matches_full_depth_when_disabled():
     model.config = dataclasses.replace(SMALL, depth_confidence=0.95)
     model.match_features(a, b)
     assert model.executed_layers == 1
+
+
+def test_each_pipeline_uses_the_lightglue_trained_on_its_keypoints():
+    """cvg/LightGlue trains one LightGlue per (detector, descriptor) pair: ALIKED's own keypoints and RaCo's
+    keypoints with ALIKED descriptors have separate releases, which must not be swapped."""
+    from flashim.build import resolve
+    from flashim.models.lightglue import weights
+
+    assert weights.CVG_FILES["aliked"] == "aliked_lightglue.pth"
+    assert weights.CVG_FILES["raco-aliked"] == "raco_aliked_lightglue.pth"
+    for pipeline, variant in (("aliked-lightglue", "aliked"), ("raco-aliked-lightglue", "raco-aliked")):
+        assert resolve(pipeline, "fp32").components["matcher"].variant == variant

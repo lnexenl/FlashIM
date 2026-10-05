@@ -18,7 +18,14 @@ from flashim.models.lightglue.config import (
 )
 from flashim.models.lightglue.model import CrossBlock, LightGlue, SelfBlock
 
-VARIANTS = {"rdd": LightGlueConfig(), "aliked": ALIKED_CONFIG, "superpoint": SUPERPOINT_CONFIG, "disk": DISK_CONFIG, "xfeat": XFEAT_CONFIG}
+VARIANTS = {
+    "rdd": LightGlueConfig(),
+    "aliked": ALIKED_CONFIG,
+    "raco-aliked": ALIKED_CONFIG,
+    "superpoint": SUPERPOINT_CONFIG,
+    "disk": DISK_CONFIG,
+    "xfeat": XFEAT_CONFIG,
+}
 
 
 def _load(config: RunConfig) -> LightGlue:
@@ -26,9 +33,6 @@ def _load(config: RunConfig) -> LightGlue:
     if variant not in VARIANTS:
         raise ValueError(f"Unknown variant {variant!r}; choose from {sorted(VARIANTS)}")
     arch = dataclasses.replace(VARIANTS[variant], **config.arch)
-    if variant == "aliked":
-        state = weights.load_aliked_state_dict(arch.num_heads, arch.num_layers, config.checkpoint)
-        return LightGlue.from_pretrained(arch, state_dict=state, device=config.device)
     if variant == "xfeat":
         from flashim.models.xfeat.weights import load_lighterglue_state_dict
 
@@ -64,7 +68,7 @@ _QUANTIZED = {name: p for name, p in quant.PRESETS.items() if p.config is not No
 SPEC = ModelSpec(
     name="lightglue",
     role="matcher",
-    description="LightGlue sparse matcher: SparseFeatures x SparseFeatures -> matches (variant rdd | aliked)",
+    description="LightGlue sparse matcher: SparseFeatures x SparseFeatures -> matches (variant rdd | aliked | raco-aliked | superpoint | disk | xfeat)",
     load=_load,
     presets={
         "fp32": {},
@@ -130,8 +134,9 @@ ALIKED_LIGHTGLUE = _pipeline(
     "ALIKED + LightGlue (cvg's ALIKED-trained weights); components.extractor.preset = ALIKED's (default fp32)",
 )
 RACO_ALIKED_LIGHTGLUE = _pipeline(
-    "raco-aliked-lightglue", "raco-aliked", "fp32", "aliked", "fp32",
-    "RaCo keypoints + ALIKED descriptors + LightGlue; components.extractor.preset = RaCo/ALIKED's (default fp32)",
+    "raco-aliked-lightglue", "raco-aliked", "fp32", "raco-aliked", "fp32",
+    "RaCo keypoints + ALIKED descriptors + LightGlue (cvg's RaCo + ALIKED weights); components.extractor.preset = "
+    "RaCo/ALIKED's (default fp32)",
 )
 SUPERPOINT_LIGHTGLUE = _pipeline(
     "superpoint-lightglue", "superpoint", "fp32", "superpoint", "fp32",

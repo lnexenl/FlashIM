@@ -238,16 +238,18 @@ below from 16.6 ms to 14.6 ms. Numerics unaffected (parity tests still bit-exact
 ## ALIKED + LightGlue
 
 ```python
-pipeline = flashim.load("aliked-lightglue", preset="fp32", aliked_preset="fp32")  # LightGlue weights: cvg/LightGlue's raco_aliked_lightglue.pth
+pipeline = flashim.load("aliked-lightglue", preset="fp32", aliked_preset="fp32")  # LightGlue weights: cvg/LightGlue's aliked_lightglue.pth
 m = pipeline.match("a.jpg", "b.jpg", resize=1024, top_k=1024)
 ```
 
-cvg/LightGlue's ALIKED-trained weights (`input_dim=128 -> dim=256` via `input_proj`, `filter_threshold=0.1`,
-see `lightglue.config.ALIKED_CONFIG`); `variant="aliked"` in `load_lightglue()`, or the shortcut
-`load_aliked_lightglue()` / `flashim.load("aliked-lightglue")`. `int8`/`fp8` LightGlue presets both load,
-but their shipped calibration table was computed on RDD's descriptor distribution, not ALIKED's — usable
-for a speed check, not a claim about their quantized accuracy for this pairing (no calibration table exists
-for ALIKED yet).
+cvg/LightGlue's weights trained on ALIKED's own keypoints and descriptors (`aliked_lightglue.pth`;
+`input_dim=128 -> dim=256` via `input_proj`, `filter_threshold=0.1`, see `lightglue.config.ALIKED_CONFIG`);
+`variant="aliked"` in `load_lightglue()`, or the shortcut `load_aliked_lightglue()` / `flashim.load("aliked-lightglue")`.
+cvg/LightGlue trains one LightGlue per (detector, descriptor) pair, so the RaCo pairing below has its own weights
+(`variant="raco-aliked"`). The `int8`/`fp8` presets use calibration tables computed on each pairing's features
+(`lightglue/calibration/lightglue_{aliked,raco-aliked}_{int8,fp8}_mega.safetensors`). MegaDepth-1500 AUC@5 (unified
+protocol, 4 seeds, fp32 ALIKED): fp32 0.627, bf16 0.627, int8 0.620, fp8 0.613 (RaCo + ALIKED: bf16 0.640, int8 0.638,
+fp8 0.634); before the weights were corrected this pipeline scored 0.595 in fp32.
 
 ## RaCo + ALIKED + LightGlue
 
@@ -260,7 +262,8 @@ The `raco_aliked` pipeline of [fabio-sim/LightGlue-ONNX](https://github.com/fabi
 (`flashim/models/raco`). It is **not** the plain ALIKED pipeline above: [RaCo](https://github.com/cvg/RaCo) is a separate
 detector network (ALIKED-style CNN -> NMS -> 2K candidates with soft-argmax) plus a **ranker** (9 residual blocks at full
 resolution) that reorders the candidates and keeps the top K; ALIKED then only *describes* those keypoints (encoder +
-SDDH, no score head/DKD) and LightGlue matches them. Keypoints and ranker scores are bit-exact against their PyTorch
+SDDH, no score head/DKD) and LightGlue matches them, with cvg/LightGlue's weights for this pairing
+(`raco_aliked_lightglue.pth`, trained on RaCo's keypoints). Keypoints and ranker scores are bit-exact against their PyTorch
 modules in FP32 (identical keypoint set, `tests/parity/raco`), and the full pipeline returns the same 172 matches.
 
 Speed, same 1024x1024 pair, 1024 keypoints, threshold 0.1, RTX 5070 Ti, decode/resize excluded:
@@ -304,7 +307,7 @@ returns wrong values when its input was produced on a side stream (ALIKED's `blo
 kept on the caller's stream.
 
 INT8/FP8: LightGlue's quantized presets do not help at 1024 keypoints (bf16 13.8 ms vs int8 14.6 ms vs fp8 15.3 ms in
-the plain-ALIKED pipeline) and use a calibration table computed on RDD descriptors. LightGlue-ONNX's own ModelOpt FP8
+the plain-ALIKED pipeline; measured before each pairing had its own calibration table). LightGlue-ONNX's own ModelOpt FP8
 engines are not comparable: they also quantize RaCo (56-59 matches vs ~165 in FP16) and were calibrated on 3 pairs.
 Their INT8 quantization was not completed.
 

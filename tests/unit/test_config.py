@@ -68,7 +68,7 @@ def test_pipeline_components_and_propagation(tmp_path):
     path.write_text('device = "cpu"\n[engine]\nkind = "compile"\n[components.extractor]\npreset = "bf16"\n')
     config = resolve("raco-aliked-lightglue", "int8", config=path)
     extractor, matcher = config.components["extractor"], config.components["matcher"]
-    assert (matcher.preset, matcher.precision.quant, matcher.variant) == ("int8", "int8", "aliked")
+    assert (matcher.preset, matcher.precision.quant, matcher.variant) == ("int8", "int8", "raco-aliked")
     raco, aliked = extractor.components["raco"], extractor.components["aliked"]
     assert "fused_ranker" in raco.optimize.passes and aliked.precision.compute_dtype == "bf16"
     assert {c.engine.kind for c in (matcher, raco, aliked)} == {"compile"}

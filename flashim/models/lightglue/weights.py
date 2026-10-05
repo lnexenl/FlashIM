@@ -9,22 +9,15 @@ from pathlib import Path
 import torch
 
 CHECKPOINT_ENV = "FLASHIM_LIGHTGLUE_CHECKPOINT"
-ALIKED_CHECKPOINT_ENV = "FLASHIM_ALIKED_LIGHTGLUE_CHECKPOINT"
 CHECKPOINT_HELP = (
     "Download rdd_lg.pth from the Google Drive folder linked in https://github.com/xtcpete/rdd (README), then pass "
     f"checkpoint=..., set {CHECKPOINT_ENV}, or place it at <torch hub dir>/checkpoints/rdd_lg.pth."
-)
-ALIKED_CHECKPOINT_HELP = (
-    "Download raco_aliked_lightglue.pth from "
-    "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/raco_aliked_lightglue.pth, then pass "
-    f"checkpoint=..., set {ALIKED_CHECKPOINT_ENV}, or place it at "
-    "<torch hub dir>/checkpoints/raco_aliked_lightglue.pth."
 )
 
 LICENSES = {
     "code": "Apache-2.0 (LightGlue, cvg/LightGlue; RDD, xtcpete/rdd); FlashIM re-implementation",
     "weights": "RDD release checkpoint rdd_lg.pth (LightGlue trained on RDD descriptors), or cvg/LightGlue's "
-    "raco_aliked_lightglue.pth (LightGlue trained on ALIKED descriptors, 128 -> 256 input projection)",
+    "per-extractor releases (<variant>_lightglue.pth, see CVG_FILES)",
 }
 
 _UNUSED = re.compile(r"^confidence_thresholds|^log_assignment\.\d+\.r$")
@@ -63,18 +56,6 @@ def find_checkpoint(path: str | Path | None = None) -> Path:
     raise FileNotFoundError(f"LightGlue checkpoint not found. {CHECKPOINT_HELP}")
 
 
-def find_aliked_checkpoint(path: str | Path | None = None) -> Path:
-    candidates = [
-        path,
-        os.environ.get(ALIKED_CHECKPOINT_ENV),
-        Path(torch.hub.get_dir()) / "checkpoints" / "raco_aliked_lightglue.pth",
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            return Path(candidate)
-    raise FileNotFoundError(f"ALIKED LightGlue checkpoint not found. {ALIKED_CHECKPOINT_HELP}")
-
-
 def load_state_dict(
     num_heads: int, num_layers: int, path: str | Path | None = None, map_location: str | torch.device = "cpu"
 ) -> dict[str, torch.Tensor]:
@@ -82,14 +63,15 @@ def load_state_dict(
     return convert_state_dict(state, num_heads, num_layers)
 
 
-def load_aliked_state_dict(
-    num_heads: int, num_layers: int, path: str | Path | None = None, map_location: str | torch.device = "cpu"
-) -> dict[str, torch.Tensor]:
-    state = torch.load(find_aliked_checkpoint(path), map_location=map_location, weights_only=True)
-    return convert_state_dict(state, num_heads, num_layers)
-
-
-CVG_FILES = {"superpoint": "superpoint_lightglue.pth", "disk": "disk_lightglue.pth", "sift": "sift_lightglue.pth"}
+# cvg/LightGlue trains one LightGlue per (detector, descriptor) pair: ``aliked`` is ALIKED's own keypoints and
+# descriptors, ``raco-aliked`` RaCo's keypoints with ALIKED descriptors (same architecture, different weights).
+CVG_FILES = {
+    "superpoint": "superpoint_lightglue.pth",
+    "disk": "disk_lightglue.pth",
+    "sift": "sift_lightglue.pth",
+    "aliked": "aliked_lightglue.pth",
+    "raco-aliked": "raco_aliked_lightglue.pth",
+}
 
 
 def load_cvg_state_dict(
@@ -99,7 +81,7 @@ def load_cvg_state_dict(
     from flashim.models.weights_util import find_weights
 
     file = find_weights(
-        CVG_FILES[variant], path=path, env=f"FLASHIM_{variant.upper()}_LIGHTGLUE_CHECKPOINT",
+        CVG_FILES[variant], path=path, env=f"FLASHIM_{variant.upper().replace('-', '_')}_LIGHTGLUE_CHECKPOINT",
         help=f"Download https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/{CVG_FILES[variant]}",
     )
     return convert_state_dict(torch.load(file, map_location=map_location, weights_only=True), num_heads, num_layers)

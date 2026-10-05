@@ -31,7 +31,7 @@ def main() -> None:
     parser.add_argument("--resize", type=int, default=1600)
     parser.add_argument("--top-k", type=int, default=4096)
     parser.add_argument("--rdd-preset", default=None, help="extractor preset (default: fp8 for rdd, fp32 otherwise)")
-    parser.add_argument("--extractor", default="rdd", help="rdd | aliked | superpoint | disk (LightGlue variant = extractor)")
+    parser.add_argument("--extractor", default="rdd", help="rdd | aliked | raco-aliked | superpoint | disk | xfeat (LightGlue variant = extractor)")
     parser.add_argument("--percentile", type=float, default=0.9999, help="INT8 observer quantile of |x|")
     parser.add_argument("--checkpoint")
     parser.add_argument("--out", required=True)
