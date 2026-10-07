@@ -137,6 +137,13 @@ def test_mxfp8_linear_triton_matches_reference():
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
 
 
+_tilelang_gemm = pytest.mark.skipif(
+    torch.cuda.is_available() and platform_for(DEV).supports(Feature.WGMMA),
+    reason="sm_90 keeps mxfp8_linear on Triton (measured faster than the TileLang kernel on an H20)",
+)
+
+
+@_tilelang_gemm
 @pytest.mark.parametrize("n,k", [(64, 3200), (196, 2016), (196, 2304), (128, 2016)])  # real DISK / LoFTR shapes
 @pytest.mark.parametrize("bias", [False, True])
 def test_mxfp8_linear_tilelang_matches_reference(n, k, bias):
@@ -165,6 +172,9 @@ def test_mxfp8_linear_dispatch_prefers_tilelang_above_k_threshold():
     ops.reset_call_counts()
     ops.mxfp8_linear(q_big, None, big)
     ops.mxfp8_linear(q_small, None, small)
+    if platform_for(DEV).supports(Feature.WGMMA):  # sm_90: Triton for every shape
+        assert ops.call_counts()["mxfp8_linear"] == {"triton": 2}
+        return
     assert ops.call_counts()["mxfp8_linear"] == {"tilelang": 1, "triton": 1}
 
 
@@ -539,13 +549,47 @@ def test_mxfp8_gelu_mlp_matches_two_linears(rows, impl):
     hidden_exponent = mx.calibrate_block32_exponent(F.gelu(torch.randn(64, 1024) * 2)).to(DEV)
     fast, ref = _both(ops.mxfp8_gelu_mlp, impl, q, w1, b1, hidden_exponent, w2)
     if impl == "triton_mma":  # one E4M3 MMA per scale block, scaled and summed in FP32: the per-op kernels' numerics
-        hidden = ops.mxfp8_linear.get("triton")(q, None, w1)
-        chain = ops.mxfp8_linear.get("triton")(ops.gelu_quantize.get("triton")(hidden, hidden_exponent, input_bias=b1), None, w2)
+        linear = ops.mxfp8_linear.get("triton")
+        if platform_for(DEV).supports(Feature.WGMMA):
+            # sm_90: Triton lowers tiles of 64+ rows to wgmma and smaller ones to mma.sync, and the two E4M3 MMAs
+            # round differently (H20, the 256 -> 1024 linear: wgmma differs from the exactly rounded BF16 result in
+            # 2.6% of the outputs, mma.sync in 4 of 4.2M). Give the per-op kernels the fused kernel's 32-row tiles.
+            from flashim.backends.triton.gemm import MLP_MMA_TILE, fp8_gemm_bf16
+
+            def linear(activation, bias, weight):
+                return fp8_gemm_bf16(activation, weight, bias, config=(MLP_MMA_TILE["block_m"], 64, 32, 4, 3))
+
+        hidden = linear(q, None, w1)
+        chain = linear(ops.gelu_quantize.get("triton")(hidden, hidden_exponent, input_bias=b1), None, w2)
         assert torch.equal(fast, chain)
         assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
         return
     # Same rounding points; FP32 accumulation order differs only inside each block-scaled MMA.
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-3
+
+
+@pytest.mark.parametrize("rows", [1, 200, 4099])
+def test_mxfp8_gelu_mlp_dispatches_to_the_per_op_chain_on_sm90(rows):
+    """Hopper: the op runs ``mxfp8_linear -> gelu_quantize -> mxfp8_linear`` (wgmma tiles; faster than the fused kernel
+    there), so its output is the per-op kernels' output bit for bit."""
+    if not platform_for(DEV).supports(Feature.WGMMA):
+        pytest.skip("sm_90 only")
+    torch.manual_seed(0)
+    w1 = QuantizedWeight.from_float(torch.randn(1024, 256, device=DEV) * 0.05)
+    w2 = QuantizedWeight.from_float(torch.randn(256, 1024, device=DEV) * 0.05)
+    b1 = torch.randn(1024, device=DEV) * 0.1
+    x = torch.randn(rows, 256, device=DEV, dtype=torch.bfloat16)
+    q = quantize_static(x, mx.calibrate_block32_exponent(x.float()))
+    hidden_exponent = mx.calibrate_block32_exponent(F.gelu(torch.randn(64, 1024) * 2)).to(DEV)
+    ops.reset_call_counts()
+    fast = ops.mxfp8_gelu_mlp(q, w1, b1, hidden_exponent, w2)
+    assert ops.call_counts()["mxfp8_gelu_mlp"] == {"triton_chain": 1}
+    linear = ops.mxfp8_linear.get("triton")
+    hidden = linear(q, None, w1)
+    chain = linear(ops.gelu_quantize.get("triton")(hidden, hidden_exponent, input_bias=b1), None, w2)
+    assert torch.equal(fast, chain)
+    ref = ops.mxfp8_gelu_mlp.get("reference")(q, w1, b1, hidden_exponent, w2)
+    assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
 
 
 @pytest.mark.parametrize("k,dtype", [(5, torch.bfloat16), (3, torch.float32), (1, torch.bfloat16)])

@@ -814,7 +814,20 @@ _MXFP8_CONV2D_CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_MXFP8_CONV2D_CONFIGS, key=["ROWS_BUCKET", "COUT", "CIN", "TAPS"])
+def _mxfp8_conv2d_tiles(configs, named_args, **kwargs):
+    """Hopper: 64+-row tiles only. Triton lowers them to wgmma and 32-row ones to mma.sync there, and the two E4M3 MMAs
+    round differently (``backends/triton/gemm._is_sm90``), so the output bits would depend on which tile the autotuner
+    happened to time fastest. The 64- and 128-row tiles won every shape measured on an H20 (64 -> 64 and 128 -> 128
+    3x3, 256 -> 256, 512 -> 512, 128 -> 128 5x5)."""
+    if platform_for(named_args["x_ptr"].device).capability == (9, 0):
+        return [c for c in configs if c.kwargs["BLOCK_M"] >= 64]
+    return configs
+
+
+@triton.autotune(
+    configs=_MXFP8_CONV2D_CONFIGS, key=["ROWS_BUCKET", "COUT", "CIN", "TAPS"],
+    prune_configs_by={"early_config_prune": _mxfp8_conv2d_tiles},
+)
 @triton.jit(do_not_specialize=_SIZE_ARGS)
 def _mxfp8_conv2d_kernel(
     x_ptr, w_ptr, wexp_ptr, cexp_ptr, bias_ptr, out_ptr, oexp_ptr,

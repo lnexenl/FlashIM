@@ -83,6 +83,30 @@ contain them). Use TMA descriptors + mbarrier, warp-specialized producer (`setma
 (`setmaxnreg.inc`), wgmma with accumulators in registers. Triton 3.x emits wgmma/TMA on sm_90 for `tl.dot` (tensor
 descriptors via `tl.make_tensor_descriptor`). kernelwiki's Hopper pages apply directly.
 
+Measured on an H20 (sm_90, Triton 3.6, 2026-10-07; raw numbers in `results/slurm/h20_tune/`):
+
+- Triton lowers a `tl.dot` tile with 64 or more rows to wgmma and a smaller one to `mma.sync`. For E4M3 the two round
+  differently: `mma.sync` matches the exactly rounded BF16 result (4 of 4.2M outputs of a 256 -> 1024 linear differ),
+  wgmma differs in 2.6%. FP8 kernels are therefore bit-identical only among tiles of one row class (they are across
+  all tiles on sm_89): compare against the same class, and keep an autotuned FP8 kernel's candidates in one class
+  (`_mxfp8_conv2d_tiles`), or its output bits depend on the autotune timing.
+- wgmma tiles are 2-2.7x faster than 32-row `mma.sync` tiles on large FP8 GEMMs, so a fused kernel built on 32-row
+  tiles loses to a chain of per-op kernels (`mxfp8_gelu_mlp`: 0.563 against 0.308 ms at 30000 rows; sm_90 runs the
+  chain, `triton_chain`), and the TileLang `mxfp8_linear` (`mma.sync`) loses to Triton (same bits, 2-30% slower).
+- FP8 GEMM: 64 x 128 tiles with one 32-wide K block per iteration and 3 stages, 7-26% over the sm_120 defaults; the Ada
+  pick (128 x 64) is slower than those defaults here. INT8 GEMM: the Ada pick (64-row tiles, 4 warps) wins here too
+  (9-25%).
+- Carried over from Ada after measuring: the fused MXFP8 conv above 36 dot calls (1.4-2.1x over im2col + GEMM) and conv
+  chaining (1-6% on a conv pair). Not carried over: the two-pass `dual_softmax_mutual` (1.1-2.4x *slower* at 95 MiB
+  to 1 GiB; three passes stay) and the group-major depthwise grid (TileLang wins dispatch through `Feature.TMA` and
+  is the fastest: INT8 26-38% over Triton).
+- Accuracy of the above (MegaDepth-1500, 3 RANSAC seeds, fp8 presets of 14 sparse models before -> after, eager):
+  AUC@5 -0.0009 .. +0.0076, mean +0.0012; every int8 preset and RoMaV2 are bit-identical
+  (`results/accuracy/h20_tuning/`, `results/hashes/h20_*`). The fp8 gaps to BF16 of XFeat (-0.014), XFeat+LighterGlue
+  (-0.14) and SuperPoint+LightGlue (-0.035) are the same on an L20: not a Hopper effect.
+- SageAttention: build with `TORCH_CUDA_ARCH_LIST="8.9+PTX"` to serve sm_89 and sm_90 from one install (the driver
+  JITs the PTX on Hopper); `8.9;9.0` does not compile (every gencode is passed to its Hopper-only extension).
+
 **Datacenter Blackwell (sm_100a / 103a / 110).** `-arch=sm_100a` (`sm_103a`, `sm_110a`): tcgen05 is arch-specific and
 not forward-compatible between the 10x and 12x families. Accumulators live in TMEM, one thread issues the MMA,
 2-CTA pairs share B. NVFP4 / MXFP block-scaled MMAs take scale factors in TMEM. This is where kernelwiki and

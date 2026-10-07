@@ -245,6 +245,13 @@ def fused_mxfp8_conv2d_worthwhile(taps: int, channel_blocks: int, platform: Plat
         # DISK+LightGlue; 3 RANSAC seeds, seed spread about 0.003). Other FP8 architectures without block-scaled
         # tensor cores keep the ceiling until measured.
         return True
+    if platform is not None and platform.capability == (9, 0):
+        # Measured on an H20 (module forward, one image, against im2col + GEMM): 256 -> 256 3x3 at 224x300 0.659 ->
+        # 0.403 ms (72 dot calls), 512 -> 512 3x3 at 112x150 0.597 -> 0.419 (144), 128 -> 128 5x5 at 224x300 0.621 ->
+        # 0.291 (100); up to 36 dot calls 0.759 -> 0.163 and 0.294 -> 0.119. MegaDepth-1500 AUC@5 of the fp8 presets
+        # there, with this and the 64+-row tiles of ``_mxfp8_conv2d_tiles``: -0.0009 .. +0.0076 (mean +0.0016 over
+        # DeDoDe, DeDoDe-G, DaD, RIPE, LoFTR, DISK, DISK+LightGlue, ALIKE and XFeat; 3 RANSAC seeds).
+        return True
     return taps * channel_blocks <= 36
 
 

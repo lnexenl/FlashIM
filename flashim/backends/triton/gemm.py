@@ -9,7 +9,7 @@ import triton.language as tl
 from torch import Tensor
 
 from flashim import ops
-from flashim.backends.triton.quantize import to_e4m3
+from flashim.backends.triton.quantize import gelu_quantize, to_e4m3
 from flashim.ops._registry import DeviceSpec
 from flashim.platforms import Feature, platform_for
 from flashim.quant.tensor import QuantizedTensor, QuantizedWeight
@@ -18,6 +18,13 @@ from flashim.quant.tensor import QuantizedTensor, QuantizedWeight
 def _is_sm89(device: torch.device) -> bool:
     """Launch configs tuned on Ada (an L20) apply to that architecture only."""
     return platform_for(device).capability == (8, 9)
+
+
+def _is_sm90(device: torch.device) -> bool:
+    """Hopper (measured on an H20). Triton lowers ``tl.dot`` tiles of 64+ rows to wgmma there and smaller ones to
+    mma.sync; the two E4M3 MMAs round differently (wgmma differs from the exactly rounded BF16 result in 2.6% of a
+    256 -> 1024 linear's outputs, mma.sync in 4 of 4.2M), so FP8 kernels are bit-identical only within a row class."""
+    return platform_for(device).capability == (9, 0)
 
 
 @triton.jit
@@ -99,6 +106,23 @@ def _gemm_config_sm89(rows: int, k: int, n: int) -> tuple[int, int, int, int, in
     return _gemm_config(rows, k, n)
 
 
+def _gemm_config_sm90(rows: int, k: int, n: int) -> tuple[int, int, int, int, int]:
+    """Hopper (measured on an H20 over block_m {32, 64, 128} x block_n {64, 128, 256} x block_k {32, 64}): the 64 x 128
+    wgmma tiles of :func:`_gemm_config` with one 32-wide K block per iteration and 3 stages, bit-identical to its
+    64-wide K blocks: 2505 x 1024 -> 4096 0.135 -> 0.120 ms, 5377 x 4096 -> 1024 0.340 -> 0.316, 5000 x 3072 -> 768
+    0.166 -> 0.134, 16464 x 4608 -> 512 0.501 -> 0.372, 65856 x 2304 -> 256 0.406 -> 0.354, 2505 x 4096 -> 1024 0.223
+    -> 0.209 (64-wide K with 3 stages: 0.185 there, slower on the others). The Ada pick (128 x 64) loses here (0.175 /
+    0.382 / 0.214 / 0.586 / 0.587 ms), and 32-row tiles (mma.sync) are 2-2.7x slower. Up to 1024 rows is flat and
+    N < 128 was not measured: both keep :func:`_gemm_config`."""
+    block_m, block_n, block_k, num_warps, num_stages = _gemm_config(rows, k, n)
+    if rows > 1024 and n >= 128:
+        return block_m, block_n, 32, num_warps, 3
+    return block_m, block_n, block_k, num_warps, num_stages
+
+
+_GEMM_CONFIGS = {(8, 9): _gemm_config_sm89, (9, 0): _gemm_config_sm90}
+
+
 def fp8_gemm_bf16(
     activation: QuantizedTensor, weight: QuantizedWeight, bias: Tensor | None, config: tuple | None = None
 ) -> Tensor:
@@ -108,7 +132,7 @@ def fp8_gemm_bf16(
     n, k = weight.out_features, weight.in_features
     out = torch.empty(rows, n, device=matrix.device, dtype=torch.bfloat16)
     if config is None:
-        config = (_gemm_config_sm89 if _is_sm89(matrix.device) else _gemm_config)(rows, k, n)
+        config = _GEMM_CONFIGS.get(platform_for(matrix.device).capability, _gemm_config)(rows, k, n)
     block_m, block_n, block_k, num_warps, num_stages = config
     _fp8_gemm_kernel[(triton.cdiv(rows, block_m) * triton.cdiv(n, block_n),)](
         matrix,
@@ -307,11 +331,13 @@ def _int8_gemm_kernel(
     )
 
 
-def _int8_gemm_config(rows: int, n: int, sm89: bool = False) -> tuple[int, int, int, int, int]:
-    """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages). ``sm89``: 4-warp 64-row tiles measured faster than
-    128 x 128 with 8 warps on an L20 (exact INT32 accumulation: bit-identical), e.g. 2505 x 1024 -> 3072 0.088 -> 0.077
-    ms, 2505 x 4096 -> 1024 0.114 -> 0.103, 131072 x 512 -> 512 0.341 -> 0.320 (64 x 128); N <= 256 is flat."""
-    if sm89 and rows >= 2048 and n >= 512:
+def _int8_gemm_config(rows: int, n: int, small_tiles: bool = False) -> tuple[int, int, int, int, int]:
+    """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages). ``small_tiles`` (sm_89, sm_90): 4-warp 64-row tiles
+    measured faster than 128 x 128 with 8 warps on an L20 (exact INT32 accumulation: bit-identical), e.g. 2505 x 1024
+    -> 3072 0.088 -> 0.077 ms, 2505 x 4096 -> 1024 0.114 -> 0.103, 131072 x 512 -> 512 0.341 -> 0.320 (64 x 128); N <=
+    256 is flat. On an H20 the same picks win too: 0.079 -> 0.065, 0.122 -> 0.091, 0.328 -> 0.267 ms, and 16464 x 4608
+    -> 512 0.314 -> 0.286."""
+    if small_tiles and rows >= 2048 and n >= 512:
         return 64, 128 if rows >= 32768 else 64, 64, 4, 3
     if rows >= 512:
         return 128, 128, 64, 8, 3
@@ -327,7 +353,7 @@ def int8_gemm_bf16(
     rows, k = a.shape
     n = weight.shape[0]
     out = torch.empty(rows, n, device=a.device, dtype=torch.bfloat16)
-    block_m, block_n, block_k, num_warps, num_stages = config or _int8_gemm_config(rows, n, _is_sm89(a.device))
+    block_m, block_n, block_k, num_warps, num_stages = config or _int8_gemm_config(rows, n, _is_sm89(a.device) or _is_sm90(a.device))
     _int8_gemm_kernel[(triton.cdiv(rows, block_m) * triton.cdiv(n, block_n),)](
         a,
         weight,
@@ -653,9 +679,23 @@ def _mxfp8_gelu_mlp_impl(x, w1, b1, hidden_exponent, w2):
     return mxfp8_gelu_mlp(x, w1, b1, hidden_exponent.to(x.device, torch.int8), w2)
 
 
-# FP8 GPUs without block-scaled MMA (sm_89, sm_90); the narrower sm_100+ registration above wins where it applies.
+# FP8 GPUs without block-scaled MMA (sm_89, sm_90); the narrower registrations around it win where they apply.
 @ops.mxfp8_gelu_mlp.register(
     "triton_mma", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3], when=_mlp_eligible
 )
 def _mxfp8_gelu_mlp_mma_impl(x, w1, b1, hidden_exponent, w2):
     return mxfp8_gelu_mlp_mma(x, w1, b1, hidden_exponent.to(x.device, torch.int8), w2)
+
+
+# Hopper: the three per-op kernels. Their linears run 64-row wgmma tiles, the fused kernel's 32-row tiles mma.sync (see
+# ``_is_sm90``; the outputs differ accordingly). H20, K1 = 256, hidden = 1024, N2 = 256 at 2048 / 8192 / 30000 rows:
+# 0.073 / 0.098 / 0.308 ms against 0.070 / 0.192 / 0.563 ms for ``triton_mma`` (0.119 / 0.141 / 0.524 ms with 64-row tiles,
+# then bit-identical to this chain).
+@ops.mxfp8_gelu_mlp.register(
+    "triton_chain", device=DeviceSpec("cuda", min_capability=(9, 0), max_capability=(9, 0)),
+    requires=[Feature.TRITON, Feature.FP8_E4M3], when=_mlp_eligible,
+)
+def _mxfp8_gelu_mlp_chain_impl(x, w1, b1, hidden_exponent, w2):
+    hidden = fp8_gemm_bf16(x, w1, None)
+    activated = gelu_quantize(hidden, hidden_exponent.to(x.device, torch.int8), "none", input_bias=b1)
+    return fp8_gemm_bf16(activated, w2, None)

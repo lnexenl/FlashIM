@@ -31,6 +31,11 @@ from flashim.quant.methods.int8_linear import StaticInt8Linear
 from flashim.quant.methods.linear import StaticMXFP8Linear
 from flashim.quant.tensor import Int8Tensor, QuantizedTensor, QuantizedWeight
 
+# Where a conv writes the next conv's quantized input from its epilogue (``chain_output``), bit-identical to the separate
+# quantize pass. Measured on an L20 (see ``StaticMXFP8Conv2d``) and on an H20: a conv + ReLU pair 0.324 -> 0.304 ms (FP8,
+# 64 -> 64 3x3 at 448x600), 0.802 -> 0.770 (FP8, 256 -> 256 at 224x300), 0.210 -> 0.198 (INT8, 64 -> 64 at 448x600).
+CHAINED_CAPABILITIES = ((8, 9), (9, 0))
+
 
 def _pair(value) -> tuple[int, int]:
     return (value, value) if isinstance(value, int) else tuple(value)
@@ -78,7 +83,7 @@ class StaticInt8Conv2d(StaticInt8Linear):
         super().__init__(weight_int8, weight_scale, bias, input_scale)
         self.in_channels, self.geometry = in_channels, geometry
         # see ``StaticMXFP8Conv2d.chain_output``
-        self.chain_output = platform_for(weight_int8.device).capability == (8, 9)
+        self.chain_output = platform_for(weight_int8.device).capability in CHAINED_CAPABILITIES
 
     @classmethod
     def from_conv(cls, conv: nn.Conv2d, input_scale: Tensor) -> StaticInt8Conv2d:
@@ -153,7 +158,7 @@ class StaticMXFP8Conv2d(StaticMXFP8Linear):
         self.use_fused = fused_mxfp8_conv2d_worthwhile(taps, input_exponent.shape[0], platform)
         # Write the next quantized conv's E4M3 input from this layer's epilogue (:meth:`feeds`): same bytes as that
         # layer's own quantize pass, which ncu shows DRAM-bound (about 800 GB/s on an L20). Enabled where measured.
-        self.chain_output = self.use_fused and platform.capability == (8, 9)
+        self.chain_output = self.use_fused and platform.capability in CHAINED_CAPABILITIES
 
     @classmethod
     def from_conv(cls, conv: nn.Conv2d, input_exponent: Tensor) -> StaticMXFP8Conv2d:
