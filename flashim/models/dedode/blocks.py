@@ -16,6 +16,7 @@ from torch import Tensor, nn
 
 from flashim import ops
 from flashim.layers import IndexedSeparableConvBlock, fused_relu_end, sequential_forward
+from flashim.layers.conv import chains
 from flashim.layers.transformer import TransformerBlock
 
 VGG_CUT = {"11": (tvm.vgg11_bn, 22), "13": (tvm.vgg13_bn, 28), "19": (tvm.vgg19_bn, 40)}
@@ -38,7 +39,11 @@ class VGG(nn.Module):
                 feats.append(x)
                 sizes.append(x.shape[-2:])
             end = fused_relu_end(layers, i)  # conv -> folded BN -> ReLU as one quantized conv with a ReLU epilogue
-            x = layer(x) if end is None else layer(x, relu=True)
+            if end is None:
+                x = layer(x)
+            else:  # ... which also writes the next conv's quantized input when that conv follows directly
+                consumer = layers[end + 1] if end + 1 < len(layers) else None
+                x = layer(x, relu=True, quantize_for=consumer) if chains(layer, consumer) else layer(x, relu=True)
             i = i + 1 if end is None else end + 1
         return feats, sizes
 

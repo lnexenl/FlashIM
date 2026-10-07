@@ -15,7 +15,7 @@ from flashim.ops.gemm import int8_linear, mxfp8_linear, mxfp8_scaled_mm
 from flashim.platforms import Feature, Platform
 from flashim.quant.formats.int8 import quantize_symmetric
 from flashim.quant.formats.mx import quantize_dynamic_2d, swizzle_scales
-from flashim.quant.tensor import QuantizedTensor, QuantizedWeight
+from flashim.quant.tensor import QuantizedTensor, QuantizedWeight, quantize_int8_static, quantize_static
 
 # -- depthwise 5x5 + bias + ReLU -> dynamic MXFP8 ----------------------------------------------
 
@@ -167,10 +167,11 @@ im2col_gather = Op("im2col_gather", _im2col_gather_reference)
 def _int8_conv2d_reference(
     x: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None,
     kh: int, kw: int, sh: int, sw: int, ph: int, pw: int, dh: int, dw: int, *, relu: bool = False,
-    residual: Tensor | None = None,
+    residual: Tensor | None = None, out_scale: Tensor | None = None,
 ) -> Tensor:
     """``x`` int8 ``[B, H, W, Cin]``, ``weight`` int8 ``[Cout, kh*kw*Cin]`` in ``(ky, kx, c)`` order (as
-    ``StaticInt8Conv2d.from_conv`` lays it out) -> BF16 ``[B, Ho, Wo, Cout]``.
+    ``StaticInt8Conv2d.from_conv`` lays it out) -> BF16 ``[B, Ho, Wo, Cout]``; with ``out_scale`` (the activation scale
+    of the layer consuming the result) that BF16 tensor quantized by :func:`quantize_int8_static`, int8.
 
     Reference is the unfused pipeline (``im2col_gather`` then ``int8_linear``) ``StaticInt8Conv2d`` used
     before backends fused the gather into the GEMM's K-loop: one tap per full-``Cin`` ``tl.dot``, gathered
@@ -183,7 +184,8 @@ def _int8_conv2d_reference(
     wo = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
     cols = im2col_gather(x, kh, kw, sh, sw, ph, pw, dh, dw)
     out = int8_linear(cols, weight, a_scale, w_scale, bias, relu=relu and residual is None).reshape(b, ho, wo, -1)
-    return out if residual is None else _add_residual(out, residual, relu)
+    out = out if residual is None else _add_residual(out, residual, relu)
+    return out if out_scale is None else quantize_int8_static(out, out_scale).values
 
 
 def _add_residual(out: Tensor, residual: Tensor, relu: bool) -> Tensor:
@@ -234,6 +236,15 @@ def fused_mxfp8_conv2d_worthwhile(taps: int, channel_blocks: int, platform: Plat
     """
     if platform is not None and block_scaled_conv_available(platform):
         return True
+    if platform is not None and platform.capability == (8, 9):
+        # Measured on an L20 with the kernel's (tap, block) pairs as one pipelined run-time loop (the regressions
+        # above were its unrolled form): faster than im2col + GEMM at 63 / 72 / 100 / 144 dot calls (3.7x / 1.9x /
+        # 3.3x / 1.3x with the same GEMM bits; numbers in ``_mxfp8_conv2d_kernel``). Their bias / residual / ReLU now
+        # share the kernel's single BF16 rounding (im2col + GEMM rounded before the bias): MegaDepth-1500 AUC@5 of the
+        # fp8 presets moved by -0.0022 .. +0.0038 (mean -0.0001 over DeDoDe, DeDoDe-G, DaD, RIPE, LoFTR, DISK and
+        # DISK+LightGlue; 3 RANSAC seeds, seed spread about 0.003). Other FP8 architectures without block-scaled
+        # tensor cores keep the ceiling until measured.
+        return True
     return taps * channel_blocks <= 36
 
 
@@ -255,13 +266,14 @@ def block_scaled_conv_available(platform: Platform) -> bool:
 def _mxfp8_conv2d_reference(
     x: Tensor, channel_exponent: Tensor, weight: Tensor, weight_exponent: Tensor, bias: Tensor | None,
     kh: int, kw: int, sh: int, sw: int, ph: int, pw: int, dh: int, dw: int, *, relu: bool = False,
-    residual: Tensor | None = None,
+    residual: Tensor | None = None, out_exponent: Tensor | None = None,
 ) -> Tensor:
     """``x`` E4M3 ``[B, H, W, Cin]`` (``Cin`` already padded to a multiple of 32), ``channel_exponent`` int8
     ``[Cin / 32]`` (one static exponent per input-channel block, the *same* for every tap: a tap only changes which
     weight reads a pixel, not the pixel's own scale). ``weight`` E4M3 ``[Cout, kh*kw*Cin]`` in ``(ky, kx, c)`` order
     with ``weight_exponent`` int8 ``[Cout, kh*kw*Cin / 32]`` (as ``StaticMXFP8Conv2d.from_conv`` lays it out) ->
-    BF16 ``[B, Ho, Wo, Cout]``.
+    BF16 ``[B, Ho, Wo, Cout]``. With ``out_exponent`` (int8 ``[Cout / 32]``: the static input exponents of the layer
+    consuming the result) the output is that BF16 tensor quantized by :func:`quantize_static`, E4M3 ``[B, Ho, Wo, Cout]``.
 
     Reference is the unfused pipeline (``im2col_gather`` then ``mxfp8_linear``) ``StaticMXFP8Conv2d`` used before:
     the gather gives every tap its own (duplicated) block of ``channel_exponent`` so the flattened K axis has one
@@ -278,8 +290,10 @@ def _mxfp8_conv2d_reference(
     packed_weight = QuantizedWeight(weight, weight_exponent, tuple(weight.shape))
     out = mxfp8_linear(activation, bias, packed_weight).reshape(b, ho, wo, -1)
     if residual is not None:  # see int8_conv2d
-        return _add_residual(out, residual, relu)
-    return F.relu(out) if relu else out  # ReLU commutes with the BF16 rounding: same bits as the fused epilogue
+        out = _add_residual(out, residual, relu)
+    elif relu:
+        out = F.relu(out)  # ReLU commutes with the BF16 rounding: same bits as the fused epilogue
+    return out if out_exponent is None else quantize_static(out, out_exponent).values
 
 
 mxfp8_conv2d = Op("mxfp8_conv2d", _mxfp8_conv2d_reference, composite=True)

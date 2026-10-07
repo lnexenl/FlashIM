@@ -29,7 +29,7 @@ from flashim.quant.formats import mx
 from flashim.quant.formats.int8 import quantize_symmetric, weight_scales
 from flashim.quant.methods.int8_linear import StaticInt8Linear
 from flashim.quant.methods.linear import StaticMXFP8Linear
-from flashim.quant.tensor import QuantizedTensor, QuantizedWeight
+from flashim.quant.tensor import Int8Tensor, QuantizedTensor, QuantizedWeight
 
 
 def _pair(value) -> tuple[int, int]:
@@ -77,6 +77,8 @@ class StaticInt8Conv2d(StaticInt8Linear):
     def __init__(self, weight_int8, weight_scale, bias, input_scale, *, in_channels: int, **geometry) -> None:
         super().__init__(weight_int8, weight_scale, bias, input_scale)
         self.in_channels, self.geometry = in_channels, geometry
+        # see ``StaticMXFP8Conv2d.chain_output``
+        self.chain_output = platform_for(weight_int8.device).capability == (8, 9)
 
     @classmethod
     def from_conv(cls, conv: nn.Conv2d, input_scale: Tensor) -> StaticInt8Conv2d:
@@ -89,17 +91,38 @@ class StaticInt8Conv2d(StaticInt8Linear):
             in_channels=conv.in_channels, **geometry,
         )
 
-    def forward(self, x: Tensor, relu: bool = False, residual: Tensor | None = None) -> Tensor:
-        """``relu(conv(x) [+ residual])`` with the ReLU and the residual (``[B, Cout, Ho, Wo]``) in the epilogue."""
-        q = ops.quantize_int8(_pixels(x), self.input_scale)
+    def feeds(self, consumer: nn.Module) -> bool:
+        """Whether ``forward(x, quantize_for=consumer)`` may return ``consumer``'s quantized input (an
+        :class:`Int8Tensor`, which ``consumer.forward`` accepts) instead of this layer's BF16 output."""
+        return (
+            self.chain_output and isinstance(consumer, StaticInt8Conv2d) and consumer.in_channels == self.out_features
+        )
+
+    def forward(
+        self, x: Tensor | Int8Tensor, relu: bool = False, residual: Tensor | None = None,
+        quantize_for: nn.Module | None = None,
+    ) -> Tensor | Int8Tensor:
+        """``relu(conv(x) [+ residual])`` with the ReLU and the residual (``[B, Cout, Ho, Wo]``) in the epilogue.
+        ``x`` may be the :class:`Int8Tensor` a previous layer produced for this one (``quantize_for``, as in
+        ``StaticMXFP8Conv2d.forward``)."""
+        if isinstance(x, Int8Tensor):
+            if x.scale is not self.input_scale:
+                raise ValueError("prequantized input was not produced for this layer")
+            q, dtype = x, torch.bfloat16
+        else:
+            q, dtype = ops.quantize_int8(_pixels(x), self.input_scale), x.dtype
         (kh, kw), (sh, sw), (ph, pw), (dh, dw) = (
             self.geometry["kernel"], self.geometry["stride"], self.geometry["padding"], self.geometry["dilation"],
         )
+        chained = quantize_for is not None and dtype == torch.bfloat16 and self.feeds(quantize_for)
         out = ops.int8_conv2d(
             q.values, self.weight_int8, self.input_scale, self.weight_scale, self.bias,
             kh, kw, sh, sw, ph, pw, dh, dw, relu=relu, residual=None if residual is None else residual.permute(0, 2, 3, 1),
+            **({"out_scale": quantize_for.input_scale} if chained else {}),
         )
-        return out.permute(0, 3, 1, 2).to(x.dtype)
+        if chained:
+            return Int8Tensor(out, quantize_for.input_scale)
+        return out.permute(0, 3, 1, 2).to(dtype)
 
     def extra_repr(self) -> str:
         return f"{self.in_channels}->{self.out_features}, {self.geometry['kernel']}, int8"
@@ -126,7 +149,11 @@ class StaticMXFP8Conv2d(StaticMXFP8Linear):
         super().__init__(weight, bias, input_exponent.repeat(taps))
         self.in_channels, self.taps, self.geometry = in_channels, taps, geometry
         self.register_buffer("channel_exponent", input_exponent.to(device=weight.values.device, dtype=torch.int8))
-        self.use_fused = fused_mxfp8_conv2d_worthwhile(taps, input_exponent.shape[0], platform_for(weight.values.device))
+        platform = platform_for(weight.values.device)
+        self.use_fused = fused_mxfp8_conv2d_worthwhile(taps, input_exponent.shape[0], platform)
+        # Write the next quantized conv's E4M3 input from this layer's epilogue (:meth:`feeds`): same bytes as that
+        # layer's own quantize pass, which ncu shows DRAM-bound (about 800 GB/s on an L20). Enabled where measured.
+        self.chain_output = self.use_fused and platform.capability == (8, 9)
 
     @classmethod
     def from_conv(cls, conv: nn.Conv2d, input_exponent: Tensor) -> StaticMXFP8Conv2d:
@@ -142,24 +169,48 @@ class StaticMXFP8Conv2d(StaticMXFP8Linear):
             in_channels=conv.in_channels, taps=taps, **geometry,
         )
 
-    def forward(self, x: Tensor, relu: bool = False, residual: Tensor | None = None) -> Tensor:
-        """``relu(conv(x) [+ residual])``; ReLU and the residual (``[B, Cout, Ho, Wo]``) in the fused kernel's epilogue."""
-        q = ops.quantize_mxfp8(_pixels(x), self.channel_exponent)
+    def feeds(self, consumer: nn.Module) -> bool:
+        """Whether ``forward(x, quantize_for=consumer)`` may return ``consumer``'s quantized input (a
+        :class:`QuantizedTensor`, which ``consumer.forward`` accepts) instead of this layer's BF16 output."""
+        return (
+            self.chain_output
+            and isinstance(consumer, StaticMXFP8Conv2d)
+            and consumer.in_channels == self.out_features
+            and consumer.channel_exponent.shape[0] * mx.BLOCK == self.weight_values.shape[0]
+        )
+
+    def forward(
+        self, x: Tensor | QuantizedTensor, relu: bool = False, residual: Tensor | None = None,
+        quantize_for: nn.Module | None = None,
+    ) -> Tensor | QuantizedTensor:
+        """``relu(conv(x) [+ residual])``; ReLU and the residual (``[B, Cout, Ho, Wo]``) in the fused kernel's epilogue.
+        ``x`` may be the :class:`QuantizedTensor` a previous layer produced for this one; ``quantize_for`` (a layer
+        this one :meth:`feeds`, called next with the result and nothing else) makes this layer return such a tensor."""
+        if isinstance(x, QuantizedTensor):
+            if x.scale_exponent is not self.channel_exponent:
+                raise ValueError("prequantized input was not produced for this layer")
+            q, dtype = x, torch.bfloat16
+        else:
+            q, dtype = ops.quantize_mxfp8(_pixels(x), self.channel_exponent), x.dtype
         (kh, kw), (sh, sw), (ph, pw), (dh, dw) = (
             self.geometry["kernel"], self.geometry["stride"], self.geometry["padding"], self.geometry["dilation"],
         )
         if self.use_fused:
             weight = self.weight_values.view(torch.float8_e4m3fn)
+            chained = quantize_for is not None and dtype == torch.bfloat16 and self.feeds(quantize_for)
             out = ops.mxfp8_conv2d(
                 q.values, self.channel_exponent, weight, self.weight_exponent, self.bias_bf16,
                 kh, kw, sh, sw, ph, pw, dh, dw, relu=relu,
                 residual=None if residual is None else residual.permute(0, 2, 3, 1),
+                **({"out_exponent": quantize_for.channel_exponent} if chained else {}),
             )
-            return out[..., : self.out_features].to(x.dtype).permute(0, 3, 1, 2)
+            if chained:
+                return QuantizedTensor(out, quantize_for.channel_exponent, (*out.shape[:-1], self.out_features))
+            return out[..., : self.out_features].to(dtype).permute(0, 3, 1, 2)
         cols, (ho, wo) = im2col_bytes(q.values, (kh, kw), (sh, sw), (ph, pw), (dh, dw))
         act = QuantizedTensor(cols, self.input_exponent, (cols.shape[0], cols.shape[1]))
-        out = self._finish(self.gemm(act, None), (cols.shape[0],), x.dtype)
-        out = out.reshape(x.shape[0], ho, wo, -1).permute(0, 3, 1, 2)
+        out = self._finish(self.gemm(act, None), (cols.shape[0],), dtype)
+        out = out.reshape(q.values.shape[0], ho, wo, -1).permute(0, 3, 1, 2)
         if residual is not None:
             out = out + residual
         return F.relu(out, inplace=True) if relu else out

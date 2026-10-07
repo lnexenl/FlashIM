@@ -27,7 +27,7 @@ class ConvBlock(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if isinstance(self.gate, nn.ReLU):  # ReLU in the (quantized) convolutions' epilogue when they support it
-            return conv_relu(self.conv2, conv_relu(self.conv1, x, self.bn1), self.bn2)
+            return conv_relu(self.conv2, conv_relu(self.conv1, x, self.bn1, feeds=self.conv2), self.bn2)
         return self.gate(self.bn2(self.conv2(self.gate(self.bn1(self.conv1(x))))))
 
 
@@ -41,7 +41,7 @@ class ResBlock(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if isinstance(self.gate, nn.ReLU):
-            hidden = conv_relu(self.conv1, x, self.bn1)
+            hidden = conv_relu(self.conv1, x, self.bn1, feeds=self.conv2)
         else:
             hidden = self.gate(self.bn1(self.conv1(x)))
         return self.gate(self.bn2(self.conv2(hidden)) + self.downsample(x))

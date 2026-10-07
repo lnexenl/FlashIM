@@ -31,6 +31,33 @@ def _round_to_dense(value, ROUND: tl.constexpr):
     return value.to(tl.float32)
 
 
+def _f32_to_e4m3_double_rounds() -> bool:
+    return torch.cuda.is_available() and any(
+        torch.cuda.get_device_capability(index) < (9, 0) for index in range(torch.cuda.device_count())
+    )
+
+
+# Triton 3.6 emits ``cvt.rn.satfinite.e4m3x2.f32`` only for sm_90+. Below, FP32 -> E4M3 is lowered as
+# ``cvt.rz.f16.f32`` + ``cvt.rn.satfinite.e4m3x2.f16x2``: truncating first sends 0.4% of FP32 values to the wrong
+# neighbour (measured on an L20 against ``Tensor.to(float8_e4m3fn)``; BF16-rounded values fit FP16 and are exact).
+# sm_89 has the FP32 instruction, so it is emitted by hand whenever such a device is present (byte-identical to
+# torch on sm_89, signed zeros / subnormals / saturation included; producers measured within 3% of the FP16 route
+# there); sm_90+ alone keeps Triton's own lowering.
+_E4M3_INLINE_ASM = tl.constexpr(_f32_to_e4m3_double_rounds())
+
+
+@triton.jit
+def to_e4m3(value):
+    """FP32 -> E4M3, round to nearest even, saturating: ``value.to(tl.float8e4nv)`` with one rounding on sm_89."""
+    if _E4M3_INLINE_ASM:  # pack=1: any block shape (pack=2 does not compile for single-element blocks)
+        code = tl.inline_asm_elementwise(
+            "{ .reg .b16 pair; cvt.rn.satfinite.e4m3x2.f32 pair, $1, $1; cvt.u32.u16 $0, pair; }",
+            "=r,r", [value], dtype=tl.int8, is_pure=True, pack=1,
+        )
+        return code.to(tl.float8e4nv, bitcast=True)
+    return value.to(tl.float8e4nv)
+
+
 @triton.jit
 def _store_quantized(out_ptr, row, cols, activated, scale_ptr, padded_channels, valid=True, INT8: tl.constexpr = False):
     store = (cols < padded_channels) & valid
@@ -41,7 +68,7 @@ def _store_quantized(out_ptr, row, cols, activated, scale_ptr, padded_channels, 
     else:
         exponent = tl.load(scale_ptr + cols // 32, mask=store, other=0).to(tl.float32)
         scaled = activated * tl.exp2(-exponent)
-        quantized = tl.maximum(tl.minimum(scaled, 448.0), -448.0).to(tl.float8e4nv)
+        quantized = to_e4m3(tl.maximum(tl.minimum(scaled, 448.0), -448.0))
         tl.store(out_ptr + row * padded_channels + cols, quantized, mask=store)
 
 

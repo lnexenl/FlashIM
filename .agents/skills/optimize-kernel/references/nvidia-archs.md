@@ -48,6 +48,36 @@ stages by the measured `shared_memory_per_block_optin`. FP8 only from sm_89 (`Fe
 storage format must be dequantized to bf16 before `mma.sync` (a memory-bandwidth win only). INT8 `mma` exists from
 Turing on and runs at 2x fp16 rate; Triton int8 dot is `DeviceSpec(min_capability=(7, 5))` here.
 
+Measured on an L20 (sm_89, Triton 3.6, 2026-10-06):
+
+- Triton lowers FP32 -> E4M3 through a *truncated* FP16 below sm_90 (0.4% wrong codes); use `to_e4m3`
+  (`backends/triton/quantize.py`), which emits `cvt.rn.satfinite.e4m3x2.f32` by hand.
+- One E4M3 `mma.sync` (k = 32) is only accurate to about 1e-4 of sum|products| (FP32 matmul: 1e-8). Compare a new FP8
+  kernel bitwise against the existing Triton FP8 path, not against the FP32 reference with a tight tolerance.
+- There is no block-scaled MMA: MXFP8 costs one MMA per 32-wide scale block plus an FP32 scale of its result. That
+  scaling is about 13% of `_fp8_gemm_kernel`. Write the K loop as a *run-time* loop Triton can pipeline:
+  `mxfp8_conv2d` gained 1.2-3.7x from turning its unrolled (tap, block) loops into one such loop; the same change
+  lost on INT8 (accumulation fused into the MMA already) and on the fused MLP kernel.
+- ncu (`results/profile/2026-10-06_mxfp8_conv2d_sm89/REPORT.md`): after that change `_mxfp8_conv2d_kernel` and
+  `_fp8_gemm_kernel` are tensor-pipe bound (62-83% of peak, `math_pipe_throttle` the top stall, `long_scoreboard`
+  3-9%); the FP8 ceiling is about 117 TMAC/s. Non-root ncu works on `einstein` and `infinite-frontier` only
+  (`grep RmProfilingAdminOnly /proc/driver/nvidia/params`); binary `/usr/local/cuda-13.3/bin/ncu`, Python module in
+  `/opt/nvidia/nsight-compute/2026.2.1/extras/python`. Use the autotuned kernel's `.fn` with an explicit tile in the
+  driver so `-k regex:<kernel> --launch-skip 3 -c 1` profiles one known config.
+- ncu on the remaining kernels (`results/profile/2026-10-06_sm89_kernels/REPORT.md`): several are DRAM-bound
+  (650-830 GB/s is the ceiling). What that led to: a two-pass `dual_softmax_mutual` for matrices over 256 MiB
+  (1.25x on LoFTR's 1.1 GB matrix; slower below, where the matrix stays in L2), quantized convs writing the next
+  conv's input from their epilogue (`feeds` / `quantize_for`, bit-identical, up to 2.6% end to end), a group-major
+  grid for 512-channel depthwise producers (1.06-1.17x), and 32-wide chunks for INT8 convs whose channel count pads
+  badly (LoFTR 196 channels: 1.45x). A high `no_instruction` share (42% in `_refiner_input_kernel`) is not by
+  itself a reason to make loops run-time: there the unrolled taps index registers statically, and the run-time
+  version was 0.65-0.85x and not bit-identical.
+- GEMM tile sizes tuned elsewhere are 7-27% off here (128 x 64 x 32 FP8, 64 x 64 x 64 INT8), 1.4-1.9x for short K
+  loops with 64 x 64 tiles; depthwise / deformable-attention tiles are flat. Timing noise between measurements in one
+  process is about 6%: interleave old and new.
+- `TRITON_OVERRIDE_ARCH=sm120` plus a faked `torch.cuda.get_device_capability` compiles another arch's code path for
+  PTX comparison (compile check only).
+
 **Hopper (sm_90a).** Build with `-arch=sm_90a` (the `a` is required for wgmma / setmaxnreg; PTX for `sm_90` will not
 contain them). Use TMA descriptors + mbarrier, warp-specialized producer (`setmaxnreg.dec`) and consumer warpgroups
 (`setmaxnreg.inc`), wgmma with accumulators in registers. Triton 3.x emits wgmma/TMA on sm_90 for `tl.dot` (tensor

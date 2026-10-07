@@ -15,12 +15,19 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 
-def conv_relu(conv: nn.Module, x: Tensor, norm: nn.Module | None = None) -> Tensor:
+def chains(producer: nn.Module, consumer: nn.Module | None) -> bool:
+    """Whether ``producer(x, relu=True, quantize_for=consumer)`` hands ``consumer`` its quantized input directly
+    (quantized convolutions implement ``feeds``); the result must then go to ``consumer`` and nowhere else."""
+    feeds = getattr(producer, "feeds", None)
+    return consumer is not None and feeds is not None and feeds(consumer)
+
+
+def conv_relu(conv: nn.Module, x: Tensor, norm: nn.Module | None = None, feeds: nn.Module | None = None) -> Tensor:
     """``relu(norm(conv(x)))``, with the ReLU in the convolution's epilogue when the module supports it (quantized
     convolutions set ``fuses_relu``) and ``norm`` is folded away (``None`` / :class:`nn.Identity`); otherwise the plain
     in-place ReLU. Same bits either way: ReLU commutes with the epilogue's BF16 rounding."""
     if getattr(conv, "fuses_relu", False) and (norm is None or isinstance(norm, nn.Identity)):
-        return conv(x, relu=True)
+        return conv(x, relu=True, quantize_for=feeds) if chains(conv, feeds) else conv(x, relu=True)
     return F.relu(conv(x) if norm is None else norm(conv(x)), inplace=True)
 
 
@@ -46,7 +53,8 @@ def sequential_forward(layers: Sequence[nn.Module], x: Tensor) -> Tensor:
             x = layers[i](x)
             i += 1
         else:
-            x = layers[i](x, relu=True)
+            consumer = layers[end + 1] if end + 1 < len(layers) else None
+            x = layers[i](x, relu=True, quantize_for=consumer) if chains(layers[i], consumer) else layers[i](x, relu=True)
             i = end + 1
     return x
 

@@ -86,17 +86,43 @@ def test_depthwise_relu_mxfp8_tilelang_matches_triton(batch, channels, hw):
     assert torch.equal(z.float(), torch.zeros_like(z.float()))
 
 
-@pytest.mark.sm120
+_needs_e4m3 = pytest.mark.skipif(
+    not torch.cuda.is_available() or not platform_for(DEV).supports(Feature.FP8_E4M3), reason="needs E4M3 MMA (sm_89+)"
+)
+
+
+# cuBLAS block-scaled MMA: FP32 summation order only. The Triton kernel runs one E4M3 mma.sync per scale block,
+# whose FP32 results differ enough from the emulation to flip about 1% of the BF16 output roundings on sm_89.
+@pytest.mark.parametrize("impl,tol", [pytest.param("cublas", 1e-4, marks=pytest.mark.sm120),
+                                      pytest.param("triton", 1e-3, marks=_needs_e4m3)])
 @pytest.mark.parametrize("rows", [1, 300, 2500])
-def test_mxfp8_scaled_mm_matches_emulation(rows):
+def test_mxfp8_scaled_mm_matches_emulation(rows, impl, tol):
     w = QuantizedWeight.from_float(torch.randn(768, 1024, device=DEV))
     x = torch.randn(rows, 1024, device=DEV)
     exponent = mx.calibrate_block32_exponent(x)
     q = quantize_static(x, exponent)
     args = (q.matrix(), w.values.t(), mx.static_input_scales(exponent, rows), mx.swizzle_scales(w.scale_exponent))
-    fast, ref = _both(ops.mxfp8_scaled_mm, "cublas", *args, None)
+    fast, ref = _both(ops.mxfp8_scaled_mm, impl, *args, None)
     rel = (fast.float() - ref.float()).norm() / ref.float().norm()
-    assert rel < 1e-4
+    assert rel < tol
+
+
+@_needs_e4m3
+@pytest.mark.parametrize("rows,k,n", [(1, 32, 32), (333, 128, 128), (4099, 512, 512), (130, 96, 40)])
+def test_mxfp8_scaled_mm_triton_dynamic_scales(rows, k, n):
+    """Per-(row, 32-block) scales on both operands in the swizzled layout (what ``depthwise5x5_relu_mxfp8`` produces),
+    with a bias; rows / N that are not multiples of the tile."""
+    torch.manual_seed(3)
+    x = torch.randn(rows, k, device=DEV).relu() * torch.rand(rows, 1, device=DEV) * 8
+    x[rows // 2, :32] = 0  # an all-zero block: exponent -127
+    a, a_exponent = mx.quantize_dynamic_2d(x)
+    w, w_exponent = mx.quantize_dynamic_2d(torch.randn(n, k, device=DEV) * 0.1)
+    bias = torch.randn(n, device=DEV).to(torch.bfloat16)
+    args = (a, w.t(), mx.swizzle_scales(a_exponent), mx.swizzle_scales(w_exponent), bias)
+    assert ops.mxfp8_scaled_mm.explain(*args)["triton"] in ("selected", "lower priority")
+    fast, ref = _both(ops.mxfp8_scaled_mm, "triton", *args)
+    assert fast.shape == ref.shape == (rows, n) and fast.dtype == torch.bfloat16
+    assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-3
 
 
 def test_mxfp8_linear_triton_matches_reference():
@@ -499,9 +525,11 @@ def test_layernorm_quantize_return_sum(fmt):
     assert _mismatch(fast.values, ref.values) < 1e-4
 
 
-@pytest.mark.sm120
+@pytest.mark.parametrize("impl", [pytest.param("triton", marks=pytest.mark.sm120), "triton_mma"])
 @pytest.mark.parametrize("rows", [1, 200, 4099])
-def test_mxfp8_gelu_mlp_matches_two_linears(rows):
+def test_mxfp8_gelu_mlp_matches_two_linears(rows, impl):
+    if not platform_for(DEV).supports(Feature.FP8_E4M3):
+        pytest.skip("needs E4M3 MMA (sm_89+)")
     torch.manual_seed(0)
     w1 = QuantizedWeight.from_float(torch.randn(1024, 256, device=DEV) * 0.05)
     w2 = QuantizedWeight.from_float(torch.randn(256, 1024, device=DEV) * 0.05)
@@ -509,7 +537,13 @@ def test_mxfp8_gelu_mlp_matches_two_linears(rows):
     x = torch.randn(rows, 256, device=DEV, dtype=torch.bfloat16)
     q = quantize_static(x, mx.calibrate_block32_exponent(x.float()))
     hidden_exponent = mx.calibrate_block32_exponent(F.gelu(torch.randn(64, 1024) * 2)).to(DEV)
-    fast, ref = _both(ops.mxfp8_gelu_mlp, "triton", q, w1, b1, hidden_exponent, w2)
+    fast, ref = _both(ops.mxfp8_gelu_mlp, impl, q, w1, b1, hidden_exponent, w2)
+    if impl == "triton_mma":  # one E4M3 MMA per scale block, scaled and summed in FP32: the per-op kernels' numerics
+        hidden = ops.mxfp8_linear.get("triton")(q, None, w1)
+        chain = ops.mxfp8_linear.get("triton")(ops.gelu_quantize.get("triton")(hidden, hidden_exponent, input_bias=b1), None, w2)
+        assert torch.equal(fast, chain)
+        assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
+        return
     # Same rounding points; FP32 accumulation order differs only inside each block-scaled MMA.
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-3
 
