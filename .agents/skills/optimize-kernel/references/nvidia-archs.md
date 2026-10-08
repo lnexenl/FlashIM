@@ -48,10 +48,90 @@ stages by the measured `shared_memory_per_block_optin`. FP8 only from sm_89 (`Fe
 storage format must be dequantized to bf16 before `mma.sync` (a memory-bandwidth win only). INT8 `mma` exists from
 Turing on and runs at 2x fp16 rate; Triton int8 dot is `DeviceSpec(min_capability=(7, 5))` here.
 
+Run on a Jetson AGX Orin (sm_87, aarch64, JetPack 6.2, Triton 3.6; 2026-10-07): the BF16 / FP32 / INT8 Triton
+kernels and the CUDA C++ `raco_resblock` pass their tests against the references there. `tl.dot` lowers to `mma.sync`
+m16n8k16 (BF16) and m16n8k32 (INT8). Triton refuses `tl.float8e4nv` outright ("not supported in this architecture"),
+so a kernel that only *writes* E4M3 (a quantize producer) needs `requires=[Feature.FP8_E4M3]` as much as an FP8 MMA
+does. FP8 presets are therefore replaced by their INT8 counterparts on such GPUs (`ModelSpec.fp8_fallbacks`): on the
+torch references RoMaV2 `fp8` took 3334 ms per pair there, `int8-full` 1122 ms, `bf16` 1981 ms.
+
+Launch choices measured there (timing with CUDA events only: CUPTI refuses unprivileged users, so no ncu and no
+`torch.profiler` kernel times; `results/orin/op_breakdown.py` times every dispatched op with a synchronize instead):
+
+- INT8 GEMM: the 128 x 128 tile with 4 warps (2-11% over 8 warps, 7-25% over the sm_89 / sm_90 64-row picks).
+- INT8 conv chaining pays as on Ada (7% on an eight-conv chain); it is enabled for sm_87.
+- The 512-channel depthwise producer is flat between the group-major and group-minor grids (within 3% either way,
+  2 x 512 x 200 x 200 and 256 x 256): the Ada pick is not carried over.
+- Host overhead is large: a Triton launch costs about 80 us of CPU, so a 300 x 256 INT8 GEMM (0.083 ms) loses to
+  cuBLAS BF16 (0.044 ms), and conv autotuning re-timed its candidates in every process (10 s for RoMaV2's INT8 VGG).
+  The conv kernels now keep their timings in Triton's cache (`cache_results`, keyed by architecture): first forward
+  12.5 -> 2.7 s; `FLASHIM_AUTOTUNE_CACHE=0` re-times.
+- `engine=compile` works (Inductor warns "Not enough SMs to use max_autotune_gemm mode": 16 SMs) and buys little once
+  the fused kernels are in: RoMaV2 `int8-fast-vgg` 667 -> 655 ms (188 s of compilation), SuperPoint `bf16` 64.9 ->
+  58.9 ms, `int8` 48.5 -> 46.1 ms. `compile-full` was not run there.
+- Memory-bound elementwise chains are slow next to fused kernels (LPDDR5 shared with the CPU): DINOv3's upstream
+  RoPE math 1.54 ms per call against 0.46 ms for the fused `rope_qk` kernel (RoMaV2's `fused_rope` pass).
+
+Environment: `requirements-jetson.txt`.
+
+Measured on an L20 (sm_89, Triton 3.6, 2026-10-06):
+
+- Triton lowers FP32 -> E4M3 through a *truncated* FP16 below sm_90 (0.4% wrong codes); use `to_e4m3`
+  (`backends/triton/quantize.py`), which emits `cvt.rn.satfinite.e4m3x2.f32` by hand.
+- One E4M3 `mma.sync` (k = 32) is only accurate to about 1e-4 of sum|products| (FP32 matmul: 1e-8). Compare a new FP8
+  kernel bitwise against the existing Triton FP8 path, not against the FP32 reference with a tight tolerance.
+- There is no block-scaled MMA: MXFP8 costs one MMA per 32-wide scale block plus an FP32 scale of its result. That
+  scaling is about 13% of `_fp8_gemm_kernel`. Write the K loop as a *run-time* loop Triton can pipeline:
+  `mxfp8_conv2d` gained 1.2-3.7x from turning its unrolled (tap, block) loops into one such loop; the same change
+  lost on INT8 (accumulation fused into the MMA already) and on the fused MLP kernel.
+- ncu (`results/profile/2026-10-06_mxfp8_conv2d_sm89/REPORT.md`): after that change `_mxfp8_conv2d_kernel` and
+  `_fp8_gemm_kernel` are tensor-pipe bound (62-83% of peak, `math_pipe_throttle` the top stall, `long_scoreboard`
+  3-9%); the FP8 ceiling is about 117 TMAC/s. Non-root ncu works on `einstein` and `infinite-frontier` only
+  (`grep RmProfilingAdminOnly /proc/driver/nvidia/params`); binary `/usr/local/cuda-13.3/bin/ncu`, Python module in
+  `/opt/nvidia/nsight-compute/2026.2.1/extras/python`. Use the autotuned kernel's `.fn` with an explicit tile in the
+  driver so `-k regex:<kernel> --launch-skip 3 -c 1` profiles one known config.
+- ncu on the remaining kernels (`results/profile/2026-10-06_sm89_kernels/REPORT.md`): several are DRAM-bound
+  (650-830 GB/s is the ceiling). What that led to: a two-pass `dual_softmax_mutual` for matrices over 256 MiB
+  (1.25x on LoFTR's 1.1 GB matrix; slower below, where the matrix stays in L2), quantized convs writing the next
+  conv's input from their epilogue (`feeds` / `quantize_for`, bit-identical, up to 2.6% end to end), a group-major
+  grid for 512-channel depthwise producers (1.06-1.17x), and 32-wide chunks for INT8 convs whose channel count pads
+  badly (LoFTR 196 channels: 1.45x). A high `no_instruction` share (42% in `_refiner_input_kernel`) is not by
+  itself a reason to make loops run-time: there the unrolled taps index registers statically, and the run-time
+  version was 0.65-0.85x and not bit-identical.
+- GEMM tile sizes tuned elsewhere are 7-27% off here (128 x 64 x 32 FP8, 64 x 64 x 64 INT8), 1.4-1.9x for short K
+  loops with 64 x 64 tiles; depthwise / deformable-attention tiles are flat. Timing noise between measurements in one
+  process is about 6%: interleave old and new.
+- `TRITON_OVERRIDE_ARCH=sm120` plus a faked `torch.cuda.get_device_capability` compiles another arch's code path for
+  PTX comparison (compile check only).
+
 **Hopper (sm_90a).** Build with `-arch=sm_90a` (the `a` is required for wgmma / setmaxnreg; PTX for `sm_90` will not
 contain them). Use TMA descriptors + mbarrier, warp-specialized producer (`setmaxnreg.dec`) and consumer warpgroups
 (`setmaxnreg.inc`), wgmma with accumulators in registers. Triton 3.x emits wgmma/TMA on sm_90 for `tl.dot` (tensor
 descriptors via `tl.make_tensor_descriptor`). kernelwiki's Hopper pages apply directly.
+
+Measured on an H20 (sm_90, Triton 3.6, 2026-10-07; raw numbers in `results/slurm/h20_tune/`):
+
+- Triton lowers a `tl.dot` tile with 64 or more rows to wgmma and a smaller one to `mma.sync`. For E4M3 the two round
+  differently: `mma.sync` matches the exactly rounded BF16 result (4 of 4.2M outputs of a 256 -> 1024 linear differ),
+  wgmma differs in 2.6%. FP8 kernels are therefore bit-identical only among tiles of one row class (they are across
+  all tiles on sm_89): compare against the same class, and keep an autotuned FP8 kernel's candidates in one class
+  (`_mxfp8_conv2d_tiles`), or its output bits depend on the autotune timing.
+- wgmma tiles are 2-2.7x faster than 32-row `mma.sync` tiles on large FP8 GEMMs, so a fused kernel built on 32-row
+  tiles loses to a chain of per-op kernels (`mxfp8_gelu_mlp`: 0.563 against 0.308 ms at 30000 rows; sm_90 runs the
+  chain, `triton_chain`), and the TileLang `mxfp8_linear` (`mma.sync`) loses to Triton (same bits, 2-30% slower).
+- FP8 GEMM: 64 x 128 tiles with one 32-wide K block per iteration and 3 stages, 7-26% over the sm_120 defaults; the Ada
+  pick (128 x 64) is slower than those defaults here. INT8 GEMM: the Ada pick (64-row tiles, 4 warps) wins here too
+  (9-25%).
+- Carried over from Ada after measuring: the fused MXFP8 conv above 36 dot calls (1.4-2.1x over im2col + GEMM) and conv
+  chaining (1-6% on a conv pair). Not carried over: the two-pass `dual_softmax_mutual` (1.1-2.4x *slower* at 95 MiB
+  to 1 GiB; three passes stay) and the group-major depthwise grid (TileLang wins dispatch through `Feature.TMA` and
+  is the fastest: INT8 26-38% over Triton).
+- Accuracy of the above (MegaDepth-1500, 3 RANSAC seeds, fp8 presets of 14 sparse models before -> after, eager):
+  AUC@5 -0.0009 .. +0.0076, mean +0.0012; every int8 preset and RoMaV2 are bit-identical
+  (`results/accuracy/h20_tuning/`, `results/hashes/h20_*`). The fp8 gaps to BF16 of XFeat (-0.014), XFeat+LighterGlue
+  (-0.14) and SuperPoint+LightGlue (-0.035) are the same on an L20: not a Hopper effect.
+- SageAttention: build with `TORCH_CUDA_ARCH_LIST="8.9+PTX"` to serve sm_89 and sm_90 from one install (the driver
+  JITs the PTX on Hopper); `8.9;9.0` does not compile (every gencode is passed to its Hopper-only extension).
 
 **Datacenter Blackwell (sm_100a / 103a / 110).** `-arch=sm_100a` (`sm_103a`, `sm_110a`): tcgen05 is arch-specific and
 not forward-compatible between the 10x and 12x families. Accumulators live in TMEM, one thread issues the MMA,
