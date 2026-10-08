@@ -37,7 +37,7 @@ class BasicBlock(nn.Module):
         self.downsample = None if stride == 1 else nn.Sequential(conv1x1(cin, cout, stride), nn.BatchNorm2d(cout))
 
     def forward(self, x: Tensor) -> Tensor:
-        y = conv_relu(self.conv1, x, self.bn1)
+        y = conv_relu(self.conv1, x, self.bn1, feeds=self.conv2)
         identity = x if self.downsample is None else self.downsample(x)
         if getattr(self.conv2, "fuses_relu", False) and isinstance(self.bn2, nn.Identity):
             # the residual add and ReLU in the quantized conv's epilogue (one BF16 rounding instead of two)

@@ -21,6 +21,13 @@ def _mismatch(a: torch.Tensor, b: torch.Tensor) -> float:
     return (a.view(torch.uint8) != b.view(torch.uint8)).float().mean().item()
 
 
+# E4M3 conversions and MMA exist from sm_89 on (not on Ampere: sm_80 / sm_86 / Jetson Orin's sm_87).
+_needs_e4m3 = pytest.mark.skipif(
+    not torch.cuda.is_available() or not platform_for(DEV).supports(Feature.FP8_E4M3), reason="needs E4M3 (sm_89+)"
+)
+
+
+@_needs_e4m3
 @pytest.mark.parametrize("channels", [768, 1024, 1000, 48])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("residual", [False, True])
@@ -37,6 +44,7 @@ def test_layernorm_quantize(channels, dtype, residual):
     assert (fast.dequantize() - ref.dequantize()).abs().max() <= ref.dequantize().abs().max() * 0.07
 
 
+@_needs_e4m3
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
 def test_gelu_quantize(approximate):
     x = torch.randn(257, 3072, device=DEV, dtype=torch.bfloat16) * 4
@@ -45,6 +53,7 @@ def test_gelu_quantize(approximate):
     assert _mismatch(fast.values, ref.values) < 1e-4
 
 
+@_needs_e4m3
 @pytest.mark.parametrize("channels", [32, 128, 512])
 @pytest.mark.parametrize("hw", [(7, 9), (50, 50)])
 def test_depthwise_relu_mxfp8(channels, hw):
@@ -86,19 +95,41 @@ def test_depthwise_relu_mxfp8_tilelang_matches_triton(batch, channels, hw):
     assert torch.equal(z.float(), torch.zeros_like(z.float()))
 
 
-@pytest.mark.sm120
+# cuBLAS block-scaled MMA: FP32 summation order only. The Triton kernel runs one E4M3 mma.sync per scale block,
+# whose FP32 results differ enough from the emulation to flip about 1% of the BF16 output roundings on sm_89.
+@pytest.mark.parametrize("impl,tol", [pytest.param("cublas", 1e-4, marks=pytest.mark.sm120),
+                                      pytest.param("triton", 1e-3, marks=_needs_e4m3)])
 @pytest.mark.parametrize("rows", [1, 300, 2500])
-def test_mxfp8_scaled_mm_matches_emulation(rows):
+def test_mxfp8_scaled_mm_matches_emulation(rows, impl, tol):
     w = QuantizedWeight.from_float(torch.randn(768, 1024, device=DEV))
     x = torch.randn(rows, 1024, device=DEV)
     exponent = mx.calibrate_block32_exponent(x)
     q = quantize_static(x, exponent)
     args = (q.matrix(), w.values.t(), mx.static_input_scales(exponent, rows), mx.swizzle_scales(w.scale_exponent))
-    fast, ref = _both(ops.mxfp8_scaled_mm, "cublas", *args, None)
+    fast, ref = _both(ops.mxfp8_scaled_mm, impl, *args, None)
     rel = (fast.float() - ref.float()).norm() / ref.float().norm()
-    assert rel < 1e-4
+    assert rel < tol
 
 
+@_needs_e4m3
+@pytest.mark.parametrize("rows,k,n", [(1, 32, 32), (333, 128, 128), (4099, 512, 512), (130, 96, 40)])
+def test_mxfp8_scaled_mm_triton_dynamic_scales(rows, k, n):
+    """Per-(row, 32-block) scales on both operands in the swizzled layout (what ``depthwise5x5_relu_mxfp8`` produces),
+    with a bias; rows / N that are not multiples of the tile."""
+    torch.manual_seed(3)
+    x = torch.randn(rows, k, device=DEV).relu() * torch.rand(rows, 1, device=DEV) * 8
+    x[rows // 2, :32] = 0  # an all-zero block: exponent -127
+    a, a_exponent = mx.quantize_dynamic_2d(x)
+    w, w_exponent = mx.quantize_dynamic_2d(torch.randn(n, k, device=DEV) * 0.1)
+    bias = torch.randn(n, device=DEV).to(torch.bfloat16)
+    args = (a, w.t(), mx.swizzle_scales(a_exponent), mx.swizzle_scales(w_exponent), bias)
+    assert ops.mxfp8_scaled_mm.explain(*args)["triton"] in ("selected", "lower priority")
+    fast, ref = _both(ops.mxfp8_scaled_mm, "triton", *args)
+    assert fast.shape == ref.shape == (rows, n) and fast.dtype == torch.bfloat16
+    assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-3
+
+
+@_needs_e4m3
 def test_mxfp8_linear_triton_matches_reference():
     w = QuantizedWeight.from_float(torch.randn(96, 160, device=DEV))  # not a multiple of 128
     x = torch.randn(77, 160, device=DEV)
@@ -111,6 +142,16 @@ def test_mxfp8_linear_triton_matches_reference():
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
 
 
+_tilelang_gemm = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not platform_for(DEV).supports(Feature.TILELANG, Feature.FP8_E4M3)
+    or platform_for(DEV).supports(Feature.WGMMA),
+    reason="needs TileLang and E4M3 MMA; sm_90 keeps mxfp8_linear on Triton (measured faster than the TileLang "
+    "kernel on an H20)",
+)
+
+
+@_tilelang_gemm
 @pytest.mark.parametrize("n,k", [(64, 3200), (196, 2016), (196, 2304), (128, 2016)])  # real DISK / LoFTR shapes
 @pytest.mark.parametrize("bias", [False, True])
 def test_mxfp8_linear_tilelang_matches_reference(n, k, bias):
@@ -129,6 +170,7 @@ def test_mxfp8_linear_tilelang_matches_reference(n, k, bias):
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
 
 
+@_needs_e4m3
 def test_mxfp8_linear_dispatch_prefers_tilelang_above_k_threshold():
     """Large-K, cuBLAS-ineligible shapes reach the new kernel through normal dispatch; smaller ones stay on Triton."""
     big = QuantizedWeight.from_float(torch.randn(64, 3200, device=DEV))
@@ -139,6 +181,9 @@ def test_mxfp8_linear_dispatch_prefers_tilelang_above_k_threshold():
     ops.reset_call_counts()
     ops.mxfp8_linear(q_big, None, big)
     ops.mxfp8_linear(q_small, None, small)
+    if platform_for(DEV).supports(Feature.WGMMA):  # sm_90: Triton for every shape
+        assert ops.call_counts()["mxfp8_linear"] == {"triton": 2}
+        return
     assert ops.call_counts()["mxfp8_linear"] == {"tilelang": 1, "triton": 1}
 
 
@@ -157,13 +202,28 @@ def test_rope_qk(table_dtype):
     assert (fk.float() - rk.float()).abs().max() <= tol
 
 
-@pytest.mark.parametrize("radius", [1, 3])
-def test_local_corr(radius):
-    f0 = torch.randn(2, 48, 30, 40, device=DEV)
-    f1 = torch.randn_like(f0)
-    warp = torch.rand(2, 30, 40, 2, device=DEV) * 2.2 - 1.1  # includes out-of-frame samples
-    fast, ref = _both(ops.local_corr, "fused_local_corr", f0, f1, warp, radius)
-    assert fast.shape == (2, (2 * radius + 1) ** 2, 30, 40)
+@pytest.mark.parametrize(
+    "channels,hw,radius",
+    [(48, (30, 40), 1), (48, (30, 40), 3), (192, (37, 45), 3), (48, (64, 80), 1), (5, (7, 9), 0),
+     (256, (13, 11), 2)],
+)
+@pytest.mark.parametrize("layout", ["nchw", "channels_last"])
+def test_local_corr(channels, hw, radius, layout):
+    torch.manual_seed(4)
+    if layout == "channels_last":  # RoMaV2's refiner: NCHW views of BHWC features, warp a [B, 2, H, W] view
+        f0 = torch.randn(2, *hw, channels, device=DEV).permute(0, 3, 1, 2)
+        f1 = torch.randn(2, *hw, channels, device=DEV).permute(0, 3, 1, 2)
+        warp = (torch.rand(2, 2, *hw, device=DEV) * 2.2 - 1.1).permute(0, 2, 3, 1)  # includes out-of-frame
+    else:
+        f0 = torch.randn(2, channels, *hw, device=DEV)
+        f1 = torch.randn_like(f0)
+        warp = torch.rand(2, *hw, 2, device=DEV) * 2.2 - 1.1
+    assert ops.local_corr.explain(f0, f1, warp, radius)["triton"] == "selected"
+    fast, ref = _both(ops.local_corr, "triton", f0, f1, warp, radius)
+    assert fast.shape == (2, (2 * radius + 1) ** 2, *hw) and fast.dtype == torch.float32
+    assert fast.is_contiguous()
+    # FP32 summation order, plus taps whose coordinate is within ~1e-5 px of an integer (the reference
+    # switches corners there, the kernel's shared corners extrapolate by that much).
     assert torch.allclose(fast, ref, atol=1e-4, rtol=1e-4)
 
 
@@ -356,6 +416,7 @@ def test_deformable_attention_compiles_without_fallback():
     torch.testing.assert_close(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
 
 
+@_needs_e4m3
 def test_quantize_mxfp8():
     x = torch.randn(300, 96, device=DEV, dtype=torch.bfloat16) * 5
     exponent = mx.calibrate_block32_exponent(x.float())
@@ -364,7 +425,7 @@ def test_quantize_mxfp8():
 
 
 @pytest.mark.parametrize("channels", [16, 48, 96, 257])
-@pytest.mark.parametrize("fmt", ["int8", "mxfp8"])
+@pytest.mark.parametrize("fmt", ["int8", pytest.param("mxfp8", marks=_needs_e4m3)])
 def test_quantize_channels_first_view(channels, fmt):
     """The channels-last view of NCHW memory (quantized convolutions' input) is read in place: bytes equal to
     quantizing the packed copy, and to the reference."""
@@ -383,6 +444,7 @@ def test_quantize_channels_first_view(channels, fmt):
     assert torch.equal(fast.values.view(torch.uint8), ref.values.view(torch.uint8))
 
 
+@_needs_e4m3
 def test_layernorm_quantize_input_bias_and_dense_output():
     torch.manual_seed(0)
     x = torch.randn(333, 256, device=DEV, dtype=torch.bfloat16) * 3
@@ -396,6 +458,7 @@ def test_layernorm_quantize_input_bias_and_dense_output():
     torch.testing.assert_close(fast_dense, ref_dense, atol=0.02, rtol=0.01)
 
 
+@_needs_e4m3
 def test_gelu_quantize_input_bias():
     x = torch.randn(257, 1024, device=DEV, dtype=torch.bfloat16) * 4
     bias = torch.randn(1024, device=DEV, dtype=torch.bfloat16)
@@ -499,9 +562,11 @@ def test_layernorm_quantize_return_sum(fmt):
     assert _mismatch(fast.values, ref.values) < 1e-4
 
 
-@pytest.mark.sm120
+@pytest.mark.parametrize("impl", [pytest.param("triton", marks=pytest.mark.sm120), "triton_mma"])
 @pytest.mark.parametrize("rows", [1, 200, 4099])
-def test_mxfp8_gelu_mlp_matches_two_linears(rows):
+def test_mxfp8_gelu_mlp_matches_two_linears(rows, impl):
+    if not platform_for(DEV).supports(Feature.FP8_E4M3):
+        pytest.skip("needs E4M3 MMA (sm_89+)")
     torch.manual_seed(0)
     w1 = QuantizedWeight.from_float(torch.randn(1024, 256, device=DEV) * 0.05)
     w2 = QuantizedWeight.from_float(torch.randn(256, 1024, device=DEV) * 0.05)
@@ -509,9 +574,49 @@ def test_mxfp8_gelu_mlp_matches_two_linears(rows):
     x = torch.randn(rows, 256, device=DEV, dtype=torch.bfloat16)
     q = quantize_static(x, mx.calibrate_block32_exponent(x.float()))
     hidden_exponent = mx.calibrate_block32_exponent(F.gelu(torch.randn(64, 1024) * 2)).to(DEV)
-    fast, ref = _both(ops.mxfp8_gelu_mlp, "triton", q, w1, b1, hidden_exponent, w2)
+    fast, ref = _both(ops.mxfp8_gelu_mlp, impl, q, w1, b1, hidden_exponent, w2)
+    if impl == "triton_mma":  # one E4M3 MMA per scale block, scaled and summed in FP32: the per-op kernels' numerics
+        linear = ops.mxfp8_linear.get("triton")
+        if platform_for(DEV).supports(Feature.WGMMA):
+            # sm_90: Triton lowers tiles of 64+ rows to wgmma and smaller ones to mma.sync, and the two E4M3 MMAs
+            # round differently (H20, the 256 -> 1024 linear: wgmma differs from the exactly rounded BF16 result in
+            # 2.6% of the outputs, mma.sync in 4 of 4.2M). Give the per-op kernels the fused kernel's 32-row tiles.
+            from flashim.backends.triton.gemm import MLP_MMA_TILE, fp8_gemm_bf16
+
+            def linear(activation, bias, weight):
+                return fp8_gemm_bf16(activation, weight, bias, config=(MLP_MMA_TILE["block_m"], 64, 32, 4, 3))
+
+        hidden = linear(q, None, w1)
+        chain = linear(ops.gelu_quantize.get("triton")(hidden, hidden_exponent, input_bias=b1), None, w2)
+        assert torch.equal(fast, chain)
+        assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
+        return
     # Same rounding points; FP32 accumulation order differs only inside each block-scaled MMA.
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-3
+
+
+@pytest.mark.parametrize("rows", [1, 200, 4099])
+def test_mxfp8_gelu_mlp_dispatches_to_the_per_op_chain_on_sm90(rows):
+    """Hopper: the op runs ``mxfp8_linear -> gelu_quantize -> mxfp8_linear`` (wgmma tiles; faster than the fused kernel
+    there), so its output is the per-op kernels' output bit for bit."""
+    if not platform_for(DEV).supports(Feature.WGMMA):
+        pytest.skip("sm_90 only")
+    torch.manual_seed(0)
+    w1 = QuantizedWeight.from_float(torch.randn(1024, 256, device=DEV) * 0.05)
+    w2 = QuantizedWeight.from_float(torch.randn(256, 1024, device=DEV) * 0.05)
+    b1 = torch.randn(1024, device=DEV) * 0.1
+    x = torch.randn(rows, 256, device=DEV, dtype=torch.bfloat16)
+    q = quantize_static(x, mx.calibrate_block32_exponent(x.float()))
+    hidden_exponent = mx.calibrate_block32_exponent(F.gelu(torch.randn(64, 1024) * 2)).to(DEV)
+    ops.reset_call_counts()
+    fast = ops.mxfp8_gelu_mlp(q, w1, b1, hidden_exponent, w2)
+    assert ops.call_counts()["mxfp8_gelu_mlp"] == {"triton_chain": 1}
+    linear = ops.mxfp8_linear.get("triton")
+    hidden = linear(q, None, w1)
+    chain = linear(ops.gelu_quantize.get("triton")(hidden, hidden_exponent, input_bias=b1), None, w2)
+    assert torch.equal(fast, chain)
+    ref = ops.mxfp8_gelu_mlp.get("reference")(q, w1, b1, hidden_exponent, w2)
+    assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
 
 
 @pytest.mark.parametrize("k,dtype", [(5, torch.bfloat16), (3, torch.float32), (1, torch.bfloat16)])
@@ -522,12 +627,11 @@ def test_conv2d_at_points_matches_dense(k, dtype):
     weight, bias = torch.randn(16, 24, k, k, device=DEV), torch.randn(16, device=DEV)
     points = torch.cat([torch.randint(0, 45, (300, 1)), torch.randint(0, 37, (300, 1))], 1).to(DEV)
     points[:4] = torch.tensor([[0, 0], [44, 36], [0, 36], [44, 0]], device=DEV)  # corners: padding taps
-    torch.backends.cudnn.allow_tf32 = False
-    try:
-        dense = F.conv2d(x.float(), weight, bias, padding=k // 2)[0][:, points[:, 1], points[:, 0]].t()
-    finally:
-        torch.backends.cudnn.allow_tf32 = True
+    # FP64: cuDNN's FP32 convolution is not a full-precision oracle everywhere. On a Jetson AGX Thor (sm_110, cuDNN
+    # 9.19) it stays at TF32 accuracy with ``allow_tf32`` off: 7e-3 of the output's standard deviation on this case.
+    dense = F.conv2d(x.double(), weight.double(), bias.double(), padding=k // 2)[0][:, points[:, 1], points[:, 0]].t()
     out = ops.conv2d_at_points(x, weight, bias, points)
+    dense = dense.to(out.dtype)
     torch.testing.assert_close(out, dense, atol=1e-4, rtol=1e-4)
 
 

@@ -8,7 +8,6 @@ dependencies = [
     "torch==2.11.0",
     "torchvision>=0.23.0",
     "triton==3.6.0 ; sys_platform == 'linux'",
-    "fused-local-corr==0.3.211 ; sys_platform == 'linux'",
     "einops>=0.8.1",
     "numpy>=2.0",
     "pillow>=12.0.0",
@@ -31,12 +30,8 @@ dev = [
     "pytest>=8.4.2",
     "ruff>=0.14.5",
     "kornia>=0.8",  # oracle of the DISK / LoFTR parity tests
-    "romav2",
     "matplotlib>=3.11.2",
 ]
-
-[tool.uv.sources]
-romav2 = { path = "../RoMaV2", editable = true }
 
 [build-system]
 requires = ["uv_build>=0.8.15,<0.12"]
@@ -51,7 +46,7 @@ markers = [
     "cuda: needs a CUDA device",
     "sm120: needs compute capability >= 12.0 (MXFP8 scaled_mm)",
     "weights: needs the romav2.0.1.pt checkpoint",
-    "oracle: needs the romav2 reference package",
+    "oracle: needs the romav2 reference package (not a dependency: `uv pip install -e ../RoMaV2`)",
     "slow: long-running (full model / benchmarks)",
 ]
 

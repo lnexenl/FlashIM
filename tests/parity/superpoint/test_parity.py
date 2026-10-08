@@ -29,6 +29,8 @@ def oracle():
 def _image(size=640):
     from flashim.models.romav2.model import load_image
 
+    if not IMAGE.exists():
+        pytest.skip("needs a MegaDepth image")
     image = load_image(str(IMAGE), torch.device("cuda"))
     h, w = image.shape[-2:]
     scale = size / max(h, w)

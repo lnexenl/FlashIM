@@ -229,7 +229,6 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "einops" },
-    { name = "fused-local-corr", marker = "sys_platform == 'linux'" },
     { name = "numpy" },
     { name = "pillow" },
     { name = "safetensors" },
@@ -254,14 +253,12 @@ dev = [
     { name = "kornia" },
     { name = "matplotlib" },
     { name = "pytest" },
-    { name = "romav2" },
     { name = "ruff" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "einops", specifier = ">=0.8.1" },
-    { name = "fused-local-corr", marker = "sys_platform == 'linux'", specifier = "==0.3.211" },
     { name = "hardmatch", marker = "extra == 'eval'", specifier = ">=1.0.0" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "opencv-python", marker = "extra == 'eval'", specifier = ">=4.12.0.88" },
@@ -281,7 +278,6 @@ dev = [
     { name = "kornia", specifier = ">=0.8" },
     { name = "matplotlib", specifier = ">=3.11.2" },
     { name = "pytest", specifier = ">=8.4.2" },
-    { name = "romav2", editable = "../RoMaV2" },
     { name = "ruff", specifier = ">=0.14.5" },
 ]
 
@@ -349,19 +345,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/77/cd/9be253869fc42e764de7f3dedd6969af7d44ff9c3375214a3442a6f3fc08/fsspec-2026.9.0.tar.gz", hash = "sha256:0f08147951c8cb31d844c3547d631053b127863b60be04cf06e121333ee0e2fe", size = 333545, upload-time = "2026-09-18T17:50:42.825Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6c/c0/a98505f18594f1bce828bb159cec0fcf9860562f1a2c85913409fc8f3d9e/fsspec-2026.9.0-py3-none-any.whl", hash = "sha256:8dd6e646e99ea382bd85f97a45e6b526a442d79423a7dc673f1e2756d05fcb5f", size = 221738, upload-time = "2026-09-18T17:50:41.341Z" },
-]
-
-[[package]]
-name = "fused-local-corr"
-version = "0.3.211"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-    { name = "torch" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0c/82/547f2611af62694dd811c1a66dbbd4435ca83b037d144d4549b682b5392c/fused_local_corr-0.3.211-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:df40916b9628b8aa3ca8fbd731a4be32cf21a4fe4ea7d025171d5e7269389f73", size = 3297420, upload-time = "2026-04-04T20:12:15.174Z" },
-    { url = "https://files.pythonhosted.org/packages/41/8a/78057d96c046c9e8fedec54ff540eed66a04c1eaad9abd00568b475b7c48/fused_local_corr-0.3.211-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9ce4a97d18c5e43f683dabd69ec503dd8d74ec8056b77c1a699fe5816a93f746", size = 3297576, upload-time = "2026-04-04T20:12:17.345Z" },
 ]
 
 [[package]]
@@ -563,18 +546,6 @@ wheels = [
 ]
 
 [[package]]
-name = "markdown-it-py"
-version = "4.2.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "mdurl" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/06/ff/7841249c247aa650a76b9ee4bbaeae59370dc8bfd2f6c01f3630c35eb134/markdown_it_py-4.2.0.tar.gz", hash = "sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49", size = 82454, upload-time = "2026-05-07T12:08:28.36Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b3/81/4da04ced5a082363ecfa159c010d200ecbd959ae410c10c0264a38cac0f5/markdown_it_py-4.2.0-py3-none-any.whl", hash = "sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a", size = 91687, upload-time = "2026-05-07T12:08:27.182Z" },
-]
-
-[[package]]
 name = "markupsafe"
 version = "3.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -696,15 +667,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/7b/30/687ccce22f66a57fed85942450e88062773bcbf1a42914e70c7148ec71dc/matplotlib-3.11.2-cp315-cp315t-musllinux_1_2_x86_64.whl", hash = "sha256:75b6d88402770e181b5d06a67dda4129c31da7d05004d63a21c310ec78d1b83c", size = 10824960, upload-time = "2026-09-11T19:05:13.9Z" },
     { url = "https://files.pythonhosted.org/packages/d3/34/117fe35a8d05054b4b34d2d29287099927c24c3841d36e06d9fa2f20c1cf/matplotlib-3.11.2-cp315-cp315t-win_amd64.whl", hash = "sha256:a6939df7567114b6bac7f4c5e06c84a67f197c1b2f2e4b234d4eecb3bfec9482", size = 9551204, upload-time = "2026-09-11T19:05:16.48Z" },
     { url = "https://files.pythonhosted.org/packages/63/5a/9f440e7bec8b80d0af2a65d1165b2f4e718982dad785531f62255d9ff19b/matplotlib-3.11.2-cp315-cp315t-win_arm64.whl", hash = "sha256:d480038c83691532ed52ff3147db51fa902fc78cb2d8349993a1cdb684435bff", size = 9233946, upload-time = "2026-09-11T19:05:19.063Z" },
-]
-
-[[package]]
-name = "mdurl"
-version = "0.1.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec958cb99bd3efefba235e65cdeb9c84d24a8293ba1d90/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba", size = 8729, upload-time = "2022-08-14T12:40:10.846Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
 ]
 
 [[package]]
@@ -1161,57 +1123,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
 ]
-
-[[package]]
-name = "rich"
-version = "15.0.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "markdown-it-py" },
-    { name = "pygments" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13a6a0c696dacf35430f72e0ec571c4275d2371fca3e9/rich-15.0.0.tar.gz", hash = "sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36", size = 230680, upload-time = "2026-04-12T08:24:00.75Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl", hash = "sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb", size = 310654, upload-time = "2026-04-12T08:24:02.83Z" },
-]
-
-[[package]]
-name = "romav2"
-version = "2.0.1"
-source = { editable = "../RoMaV2" }
-dependencies = [
-    { name = "einops" },
-    { name = "fused-local-corr", marker = "sys_platform == 'linux'" },
-    { name = "pillow" },
-    { name = "rich" },
-    { name = "torch" },
-    { name = "torchvision" },
-    { name = "tqdm" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "einops", specifier = ">=0.8.1" },
-    { name = "fused-local-corr", marker = "sys_platform == 'linux'" },
-    { name = "huggingface-hub", marker = "extra == 'tensorrt'" },
-    { name = "kornia", marker = "extra == 'eval'", specifier = ">=0.8.2" },
-    { name = "matplotlib", marker = "extra == 'eval'", specifier = ">=3.10.7" },
-    { name = "nvidia-modelopt", extras = ["onnx"], marker = "extra == 'tensorrt'", specifier = ">=0.45.0" },
-    { name = "onnx", marker = "extra == 'tensorrt'", specifier = ">=1.17" },
-    { name = "opencv-python", marker = "extra == 'eval'", specifier = ">=4.12.0.88" },
-    { name = "pillow", specifier = ">=12.0.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4.2" },
-    { name = "rich", specifier = ">=14.2.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.14.5" },
-    { name = "slurm-util", marker = "extra == 'dev'", specifier = ">=0.2.7" },
-    { name = "tensorrt", marker = "extra == 'tensorrt'", specifier = ">=11.1" },
-    { name = "torch" },
-    { name = "torchvision", specifier = ">=0.23.0" },
-    { name = "tqdm", specifier = ">=4.67.1" },
-    { name = "wandb", marker = "extra == 'eval'", specifier = ">=0.23.0" },
-    { name = "wxbs-benchmark", marker = "extra == 'eval'", specifier = ">=0.0.4" },
-]
-provides-extras = ["eval", "dev", "tensorrt"]
 
 [[package]]
 name = "ruff"

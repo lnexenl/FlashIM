@@ -31,6 +31,37 @@ def test_matches_reference(shape, scale, biased):
     assert (log_conf - ref_conf).abs().max() <= 1e-4 * max(1.0, scale)
 
 
+# the column-band variant used for matrices far larger than L2 (not selected at these sizes): against the reference too
+@pytest.mark.parametrize("shape", [(1, 1), (1, 7), (5, 1), (17, 513), (65, 63), (129, 1025), (700, 9), (2048, 2048)])
+@pytest.mark.parametrize("scale", [1.0, 30.0])
+@pytest.mark.parametrize("biased", [False, True])
+def test_two_pass_matches_reference(shape, scale, biased):
+    from flashim.backends.triton.correlation import dual_softmax_mutual_two_pass
+
+    torch.manual_seed(0)
+    rows, cols = shape
+    sim = torch.randn(rows, cols, device=DEV) * scale
+    bias = (-torch.rand(rows, device=DEV), -torch.rand(cols, device=DEV)) if biased else (None, None)
+    log_conf, index, mutual = dual_softmax_mutual_two_pass(sim, *bias)
+    ref_conf, ref_index, ref_mutual = ops.dual_softmax_mutual.get("reference")(sim, *bias)
+    assert index.dtype == torch.int64 and mutual.dtype == torch.bool and log_conf.dtype == torch.float32
+    assert torch.equal(index, ref_index)
+    assert torch.equal(mutual, ref_mutual)
+    assert (log_conf - ref_conf).abs().max() <= 1e-4 * max(1.0, scale)
+
+
+def test_two_pass_large_values_do_not_overflow():
+    from flashim.backends.triton.correlation import dual_softmax_mutual_two_pass
+
+    sim = torch.full((40, 50), 200.0, device=DEV)
+    sim[3, 7] = 300.0
+    log_conf, index, mutual = dual_softmax_mutual_two_pass(sim)
+    ref_conf, _, _ = ops.dual_softmax_mutual.get("reference")(sim)
+    assert torch.isfinite(log_conf).all()
+    assert index[3] == 7 and mutual[3]
+    assert (log_conf - ref_conf).abs().max() <= 1e-3
+
+
 def test_large_values_do_not_overflow():
     sim = torch.full((40, 50), 200.0, device=DEV)  # exp(200) overflows FP32 without the running-maximum rescale
     sim[3, 7] = 300.0

@@ -28,6 +28,8 @@ def oracle():
 def _image():
     from flashim.models.romav2.model import load_image
 
+    if not IMAGE.exists():
+        pytest.skip("needs a MegaDepth image")
     image = load_image(str(IMAGE), torch.device("cuda"))
     return torch.nn.functional.interpolate(image, size=(480, 640), mode="bilinear", antialias=True)
 

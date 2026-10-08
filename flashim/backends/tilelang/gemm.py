@@ -11,7 +11,7 @@ from torch import Tensor
 
 from flashim import ops
 from flashim.ops._registry import DeviceSpec
-from flashim.platforms import Feature
+from flashim.platforms import Feature, platform_for
 from flashim.quant.tensor import QuantizedTensor, QuantizedWeight
 
 BLOCK_M = 64
@@ -33,6 +33,11 @@ def _cublas_eligible(weight: QuantizedWeight) -> bool:
 
 
 def _accepts(weight: QuantizedWeight) -> bool:
+    """Not on Hopper, where Triton's GEMM is at least as fast with the same bits (H20, K = 3200 / 2016 / 2304:
+    0.222 / 0.324 / 0.403 ms against 0.226 / 0.423 / 0.464 ms here at 67200 rows, 0.818 / 1.254 / 1.581 against 0.837 /
+    1.628 / 1.796 ms at 268800 rows, and 2-3x at 4000 rows)."""
+    if platform_for(weight.values.device).capability == (9, 0):
+        return False
     return weight.in_features >= MIN_K and not _cublas_eligible(weight)
 
 

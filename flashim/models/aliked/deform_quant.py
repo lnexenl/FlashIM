@@ -4,7 +4,7 @@ per module. See ``flashim/ops/aliked.py`` for why the offset/gather stays FP32."
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Self
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor, nn
@@ -14,6 +14,9 @@ from flashim.models.aliked.blocks import DeformableConv2d
 from flashim.ops.aliked import gather_deform_patches
 from flashim.quant.calibration import Int8CalibrationTable
 from flashim.quant.methods.int8_linear import StaticInt8Linear
+
+if TYPE_CHECKING:
+    from typing import Self  # 3.11+ (JetPack 6 ships Python 3.10)
 
 
 class QuantizedDeformableConv2d(nn.Module):

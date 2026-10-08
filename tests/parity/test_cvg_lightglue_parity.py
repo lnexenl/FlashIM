@@ -38,7 +38,7 @@ def test_fp32_matches_cvg_lightglue(upstream, variant):
     from flashim.models.weights_util import find_weights
 
     try:
-        checkpoint = find_weights(weights.CVG_FILES[variant])
+        checkpoint = find_weights(weights.CVG_CHECKPOINTS[variant])
     except FileNotFoundError as exc:
         pytest.skip(str(exc))
     extractor_name, input_dim = VARIANTS[variant]

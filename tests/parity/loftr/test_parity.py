@@ -34,6 +34,8 @@ def test_fp32_matches_oracle(oracle, monkeypatch):
 
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    if not all(path.exists() for path in IMAGES):
+        pytest.skip("needs MegaDepth images")
     grays = []
     for path in IMAGES:
         image = load_image(str(path), torch.device("cuda"))

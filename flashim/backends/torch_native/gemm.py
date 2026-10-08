@@ -31,7 +31,7 @@ def _scaled_mm_cublas(a: Tensor, b_t: Tensor, a_scale: Tensor, b_scale: Tensor, 
     )
 
 
-@ops.mxfp8_scaled_mm.register("cublas", device=DeviceSpec("cuda"), requires=[Feature.MXFP8_SCALED_MM])
+@ops.mxfp8_scaled_mm.register("cublas", device=DeviceSpec("cuda"), requires=[Feature.MXFP8_SCALED_MM], priority=1)
 def _mxfp8_scaled_mm_cublas(a, b_t, a_scale, b_scale, bias=None):
     return _scaled_mm_cublas(a, b_t, a_scale, b_scale, bias)
 
