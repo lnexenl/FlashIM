@@ -1,16 +1,15 @@
 """FlashIM's native LightGlue against the reference implementation (RDD's ``src/matchers/lightglue.py``)."""
 
 import importlib.util
-from pathlib import Path
 
 import pytest
 import torch
 
-from ..conftest import MEGADEPTH_IMAGES
+from ..conftest import MEGADEPTH_IMAGES, ORACLES
 
 pytestmark = [pytest.mark.cuda, pytest.mark.slow]
 
-REFERENCE = Path.home() / "work" / "RDD" / "src" / "matchers" / "lightglue.py"
+REFERENCE = ORACLES / "rdd" / "src" / "matchers" / "lightglue.py"
 IMAGES = [MEGADEPTH_IMAGES / "505127_40b48ea397_o.jpg", MEGADEPTH_IMAGES / "505128_561e05e146_o.jpg"]
 
 

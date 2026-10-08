@@ -1,3 +1,5 @@
+# Follows code that RoMaV2 took from Meta (DINOv3 License Agreement, Copyright (c) Meta Platforms, Inc. and affiliates);
+# see THIRD_PARTY_NOTICES.md.
 """DPT dense-prediction head as used by the RoMaV2 matcher (inference only).
 
 Everything up to ``output_conv1`` and the final upsample runs under BF16 autocast;

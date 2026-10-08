@@ -31,6 +31,7 @@ dev = [
     "ruff>=0.14.5",
     "kornia>=0.8",  # oracle of the DISK / LoFTR parity tests
     "matplotlib>=3.11.2",
+    "timm", "yacs", "pyyaml",  # imported by the vendored RDD reference (tests/oracles/rdd)
 ]
 
 [build-system]
@@ -46,9 +47,10 @@ markers = [
     "cuda: needs a CUDA device",
     "sm120: needs compute capability >= 12.0 (MXFP8 scaled_mm)",
     "weights: needs the romav2.0.1.pt checkpoint",
-    "oracle: needs the romav2 reference package (not a dependency: `uv pip install -e ../RoMaV2`)",
+    "oracle: needs the vendored romav2 reference package (tests/oracles/romav2)",
     "slow: long-running (full model / benchmarks)",
 ]
 
 [tool.ruff]
 line-length = 110
+extend-exclude = ["tests/oracles"]  # vendored upstream reference code, kept as published

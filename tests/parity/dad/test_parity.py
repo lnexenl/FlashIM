@@ -1,24 +1,23 @@
-"""FlashIM's DaD detector against Parskatt/dad (``~/work/oracles/dad``)."""
+"""FlashIM's DaD detector against Parskatt/dad (vendored in ``tests/oracles/dad``)."""
 
 import sys
-from pathlib import Path
 
 import pytest
 import torch
 
 import flashim
-from flashim.paths import MEGADEPTH_IMAGES
+from flashim.paths import MEGADEPTH_IMAGES, ORACLES
 
 pytestmark = [pytest.mark.slow, pytest.mark.cuda]
 
-ORACLE = Path.home() / "work" / "oracles" / "dad"
+ORACLE = ORACLES / "dad"
 IMAGE = MEGADEPTH_IMAGES / "3383162411_67cc9af85e_o.jpg"
 
 
 @pytest.fixture(scope="module")
 def dad():
     if not (ORACLE / "dad").exists() or not IMAGE.exists():
-        pytest.skip("needs the dad checkout and a MegaDepth image")
+        pytest.skip("needs the MegaDepth image")
     sys.path.insert(0, str(ORACLE))
     try:
         import dad

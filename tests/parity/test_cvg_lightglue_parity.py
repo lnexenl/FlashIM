@@ -1,17 +1,16 @@
-"""FlashIM LightGlue vs cvg/LightGlue (``~/work/oracles/LightGlue``) for the per-extractor releases, on the same
+"""FlashIM LightGlue vs cvg/LightGlue (vendored in ``tests/oracles/lightglue``) for the per-extractor releases, on the same
 features: FP32 match lists must be identical. Upstream is built without ``features=`` (that path downloads under a
 versioned file name) and loads the checkpoint FlashIM resolves, through upstream's own key renaming."""
 
 import sys
-from pathlib import Path
 
 import pytest
 import torch
 
-from ..conftest import MEGADEPTH_IMAGES
+from ..conftest import MEGADEPTH_IMAGES, ORACLES
 
 pytestmark = [pytest.mark.cuda, pytest.mark.slow]
-ORACLE = Path.home() / "work" / "oracles" / "LightGlue"
+ORACLE = ORACLES / "lightglue"
 IMAGES = [MEGADEPTH_IMAGES / name  # an overlapping pair: hundreds of matches
           for name in ("101776896_21fc24b031_o.jpg", "101795964_72e8f63ab1_o.jpg")]
 # variant -> (extractor whose features it matches, descriptor dim)
@@ -22,7 +21,7 @@ VARIANTS = {"aliked": ("aliked", 128), "raco-aliked": ("raco-aliked", 128), "sup
 @pytest.fixture(scope="module")
 def upstream():
     if not (ORACLE / "lightglue").is_dir() or not all(path.exists() for path in IMAGES):
-        pytest.skip(f"needs the cvg/LightGlue checkout at {ORACLE} and MegaDepth images")
+        pytest.skip("needs the MegaDepth images")
     sys.path.insert(0, str(ORACLE))
     try:
         from lightglue.lightglue import LightGlue

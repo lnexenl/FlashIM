@@ -1,22 +1,23 @@
-"""FlashIM's native RaCo + ALIKED against fabio-sim/LightGlue-ONNX's PyTorch modules (checked out at
-``~/work/LightGlue-ONNX``, itself derived from cvg/RaCo). Needs CUDA, the RaCo/ALIKED checkpoints and the checkout."""
+"""FlashIM's native RaCo + ALIKED against fabio-sim/LightGlue-ONNX's PyTorch modules (vendored in
+``tests/oracles/raco``, itself derived from cvg/RaCo). Needs CUDA and the RaCo/ALIKED checkpoints."""
 
 import sys
-from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from flashim.paths import ASSETS, ORACLES
+
 pytestmark = [pytest.mark.cuda, pytest.mark.slow]
-ROOT = Path.home() / "work" / "LightGlue-ONNX"
-IMAGES = [ROOT / "assets" / "sacre_coeur1.jpg", ROOT / "assets" / "sacre_coeur2.jpg"]
+ROOT = ORACLES / "raco"
+IMAGES = [ASSETS / "sacre_coeur1.jpg", ASSETS / "sacre_coeur2.jpg"]
 
 
 @pytest.fixture(scope="module")
 def oracle():
     if not (ROOT / "lightglue_dynamo").exists() or not all(p.exists() for p in IMAGES):
-        pytest.skip(f"needs the LightGlue-ONNX checkout at {ROOT}")
+        pytest.skip("needs the sacre_coeur images")
     from flashim.models.raco.weights import find_checkpoint
 
     try:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -10,8 +11,12 @@ from flashim import ops
 from flashim.paths import (  # noqa: F401  (re-exported to the tests)
     ASSETS,
     MEGADEPTH_IMAGES,
+    ORACLES,
     ROMAV2_CALIBRATION,
 )
+
+# the RoMaV2 reference package (vendored) shadows any installed copy
+sys.path.insert(0, str(ORACLES / "romav2"))
 
 CHECKPOINT = Path(torch.hub.get_dir()) / "checkpoints" / "romav2.0.1.pt"
 

@@ -1,7 +1,6 @@
-"""FlashIM's SuperPoint against cvg/LightGlue's ``lightglue.SuperPoint`` (checked out at ``~/work/oracles/LightGlue``)."""
+"""FlashIM's SuperPoint against cvg/LightGlue's ``lightglue.SuperPoint`` (downloaded on demand, see ``_reference.py``: its Magic Leap notice forbids copying it here)."""
 
 import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -9,21 +8,25 @@ import torch
 import flashim
 from flashim.paths import MEGADEPTH_IMAGES
 
+from ._reference import reference_root
+
 pytestmark = [pytest.mark.slow, pytest.mark.cuda]
 
-ORACLE = Path.home() / "work" / "oracles" / "LightGlue"
 IMAGE = MEGADEPTH_IMAGES / "3383162411_67cc9af85e_o.jpg"
 
 
 @pytest.fixture(scope="module")
 def oracle():
-    if not (ORACLE / "lightglue" / "superpoint.py").exists() or not IMAGE.exists():
-        pytest.skip("needs the LightGlue checkout and a MegaDepth image")
-    sys.path.insert(0, str(ORACLE))
+    if not IMAGE.exists():
+        pytest.skip("needs the MegaDepth image")
+    root = str(reference_root())
+    sys.path.insert(0, root)
     try:
-        from lightglue import SuperPoint as Reference
+        from lightglue.superpoint import SuperPoint as Reference
     finally:
-        sys.path.remove(str(ORACLE))
+        sys.path.remove(root)
+        for name in [m for m in sys.modules if m == "lightglue" or m.startswith("lightglue.")]:
+            del sys.modules[name]  # the vendored LightGlue of test_cvg_lightglue_parity is the other 'lightglue'
     return Reference(max_num_keypoints=2048).eval().cuda()
 
 

@@ -1,7 +1,6 @@
-"""FlashIM's RIPE against fraunhoferhhi/RIPE (``~/work/oracles/RIPE``)."""
+"""FlashIM's RIPE against fraunhoferhhi/RIPE (downloaded on demand, see ``_reference.py``: RIPE's license does not allow shipping its code here)."""
 
 import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -10,23 +9,25 @@ import flashim
 from flashim.models.ripe import weights
 from flashim.paths import MEGADEPTH_IMAGES
 
+from ._reference import reference_root
+
 pytestmark = [pytest.mark.slow, pytest.mark.cuda]
 
-ORACLE = Path.home() / "work" / "oracles" / "RIPE"
 IMAGE = MEGADEPTH_IMAGES / "3383162411_67cc9af85e_o.jpg"
 
 
 @pytest.fixture(scope="module")
 def oracle():
-    if not (ORACLE / "ripe").exists() or not IMAGE.exists():
-        pytest.skip("needs the RIPE checkout and a MegaDepth image")
-    sys.path.insert(0, str(ORACLE))
+    if not IMAGE.exists():
+        pytest.skip("needs the MegaDepth image")
+    root = str(reference_root())
+    sys.path.insert(0, root)
     try:
         from ripe.models.backbones.vgg import VGG
         from ripe.models.ripe import RIPE
         from ripe.models.upsampler.hypercolumn_features import HyperColumnFeatures
     finally:
-        sys.path.remove(str(ORACLE))
+        sys.path.remove(root)
     model = RIPE(net=VGG(pretrained=False), upsampler=HyperColumnFeatures())
     model.load_state_dict(weights.load_state_dict())
     return model.cuda().eval()

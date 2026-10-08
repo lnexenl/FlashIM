@@ -1,3 +1,4 @@
+# Portions adapted from RoMaV2 (MIT, Copyright (c) 2025 Johan Edstedt); see THIRD_PARTY_NOTICES.md.
 """RoMaV2 convolutional warp refiners (strides 4, 2, 1)."""
 
 from __future__ import annotations

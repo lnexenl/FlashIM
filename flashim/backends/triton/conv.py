@@ -1,3 +1,4 @@
+# Portions adapted from RoMaV2 (MIT, Copyright (c) 2025 Johan Edstedt); see THIRD_PARTY_NOTICES.md.
 """Depthwise 5x5 conv-block kernels (ported from RoMaV2 ``refiner_fused_mxfp8.py``), and fused implicit-GEMM
 convolutions for a full ``groups == 1`` ``nn.Conv2d``.
 

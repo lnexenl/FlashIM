@@ -1,21 +1,20 @@
-"""FlashIM's native RDD against the reference implementation (github.com/xtcpete/rdd checked out at ~/work/RDD).
+"""FlashIM's native RDD against the reference implementation (github.com/xtcpete/rdd vendored in tests/oracles/rdd).
 
 The reference needs ``timm``, ``yacs`` and ``pyyaml`` (not FlashIM dependencies); tests skip without them.
 """
 
 import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 
-from ...conftest import MEGADEPTH_IMAGES
+from ...conftest import MEGADEPTH_IMAGES, ORACLES
 
 pytestmark = [pytest.mark.cuda, pytest.mark.slow]
 
-RDD_ROOT = Path.home() / "work" / "RDD"
+RDD_ROOT = ORACLES / "rdd"
 IMAGES = [MEGADEPTH_IMAGES / "505127_40b48ea397_o.jpg", MEGADEPTH_IMAGES / "505128_561e05e146_o.jpg"]
 
 

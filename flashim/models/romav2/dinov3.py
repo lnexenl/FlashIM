@@ -1,3 +1,5 @@
+# Follows code that RoMaV2 took from Meta (DINOv3 License Agreement, Copyright (c) Meta Platforms, Inc. and affiliates);
+# see THIRD_PARTY_NOTICES.md.
 """Inference-only DINOv3 ViT-L/16 feature extractor (RoMaV2 coarse descriptor).
 
 Written for FlashIM; architecture and numerics follow the upstream model as RoMaV2

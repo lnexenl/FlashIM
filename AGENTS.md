@@ -122,9 +122,8 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
 
 - Use `.venv/bin/python` (torch 2.11.0+cu130, triton 3.6). Never run Python from inside `flashim/`
   (`flashim/types.py` shadows the stdlib `types`).
-- `uv sync` removes anything not in the lockfile (sageattention, tilelang, the romav2 oracle, hand-built extras):
-  use `uv sync --extra eval --extra tilelang --group dev`, then `uv pip install -e ../RoMaV2` for the RoMaV2 parity
-  tests; sageattention must be rebuilt by the user (GCC 16 breaks torch headers:
+- `uv sync` removes anything not in the lockfile (sageattention, tilelang, hand-built extras):
+  use `uv sync --extra eval --extra tilelang --group dev`; sageattention must be rebuilt by the user (GCC 16 breaks torch headers:
   `CC=clang CXX=clang++ CUDAHOSTCXX=clang++ NVCC_APPEND_FLAGS=-allow-unsupported-compiler`, needs libomp).
 - Jetson (AGX Orin, JetPack 6.2, sm_87, aarch64): no `uv sync` there. NVIDIA's L4T torch exists for Python 3.10
   only: `requirements-jetson.txt` (its header has the commands, including the `.pth` that stands in for the
@@ -144,16 +143,15 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   calling shell).
 - zsh: unquoted `$cfg` does not word-split (use `${=cfg}`).
 - `git clone` of GitHub repos fails in the sandbox proxy; download the archive zip instead.
-- Sparse-model oracles are archive zips under `~/work/oracles/` (LightGlue, accelerated_features, ALIKE, DeDoDe,
-  RIPE, dad, LoFTR; the models no longer read `~/work/oracles/weights`); DISK and LoFTR are also checked against
-  `kornia` (dev dep).
+- The upstream reference code of the parity tests is vendored under `tests/oracles/<model>/` (only the files the tests
+  import, each with a license header and the upstream LICENSE next to it; `tests/oracles/README.md`). Checkpoints come
+  from FlashIM's own weight lookup. DISK and LoFTR are checked against `kornia` (dev dep). The oracles' own imports
+  (`timm`, `yacs`, `pyyaml` for RDD; `kornia`, `cv2`) are in the dev group.
   Parity-test pitfalls: put upstream modules in `.eval()`; disable `cudnn.allow_tf32` (BN folding changes TF32
   rounding); `torch.cdist` on pixel coordinates needs `compute_mode="donot_use_mm_for_euclid_dist"`; compare
   keypoints as sets, not by index (a few threshold-borderline points flip and shift every later index).
-- Oracles live next to the repo: `~/work/RoMaV2` (the oracle *package*, not a dependency: installed by hand, see above),
-  `~/work/RDD`, `~/work/ALIKED`, LightGlue-ONNX for RaCo. Nothing else reads from the RoMaV2 checkout: the test /
-  benchmark images are in `assets/` (copied from RoMaV2 and MegaDepth scene 0015, MIT: `assets/LICENSE-RoMaV2`), the
-  datasets and calibration manifests under `data/` (or `$FLASHIM_DATA`; `flashim/paths.py`; locally symlinks to
+- Nothing reads from a RoMaV2 (or other upstream) checkout: the test / benchmark images are in `assets/` (copied from
+  RoMaV2, MegaDepth scene 0015 and LightGlue-ONNX; `assets/LICENSE-RoMaV2`), the datasets and calibration manifests under `data/` (or `$FLASHIM_DATA`; `flashim/paths.py`; locally symlinks to
   `~/work/RoMaV2/data/{megadepth,scannet,quantization}`). `data/` and `results/` are gitignored, and so is the
   third-party `kernelwiki` skill.
 - The autotuned conv kernels (`backends/triton/conv.py`) keep their timings in Triton's cache, so a pick made on a

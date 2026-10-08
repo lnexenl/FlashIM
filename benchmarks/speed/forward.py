@@ -13,12 +13,13 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import time
 from pathlib import Path
 
 import torch
 
-from flashim.paths import IMAGE_A, IMAGE_B, ROMAV2_CALIBRATION
+from flashim.paths import IMAGE_A, IMAGE_B, ORACLES, ROMAV2_CALIBRATION
 
 _ROMAV2_VARIANTS = {"fp8-p8": "none", "fp8-s4": "s4_fused", "fp8-s42": "s4_fused_s2_fused"}
 
@@ -33,6 +34,7 @@ def _build_flashim(args):
 
 def _build_romav2(args):
     """RoMaV2's own FastFP8 runtime (reference numbers, same process conditions)."""
+    sys.path.insert(0, str(ORACLES / "romav2"))  # the vendored reference package
     from romav2 import RoMaV2
     from romav2.fast_fp8 import FastFP8Model
     from romav2.full_fp8_runtime import FullFP8Calibration

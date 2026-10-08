@@ -10,6 +10,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 ASSETS = REPO / "assets"
+ORACLES = REPO / "tests" / "oracles"  # upstream reference code of the parity tests (vendored, licenses alongside)
 DATA = Path(os.environ.get("FLASHIM_DATA", REPO / "data")).expanduser()
 MEGADEPTH_IMAGES = ASSETS / "megadepth_0015"
 IMAGE_A = MEGADEPTH_IMAGES / "3383162411_67cc9af85e_o.jpg"

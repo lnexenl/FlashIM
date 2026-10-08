@@ -1,3 +1,4 @@
+# Portions adapted from RoMaV2 (MIT, Copyright (c) 2025 Johan Edstedt); see THIRD_PARTY_NOTICES.md.
 """Producer -> static MXFP8 quantize kernels: LayerNorm (+ residual) and GELU (ported from
 RoMaV2 ``fast_fp8_fusion.py`` / ``full_fp8.py``; byte-identical numerics).
 

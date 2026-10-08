@@ -1,5 +1,5 @@
-"""FlashIM's native ALIKED against the reference implementation (github.com/Shiaoming/ALIKED, checked out at
-``~/work/ALIKED``, released checkpoints under its ``models/`` folder).
+"""FlashIM's native ALIKED against the reference implementation (github.com/Shiaoming/ALIKED, vendored in
+``tests/oracles/aliked``; the released checkpoints come from FlashIM's weight lookup).
 
 The reference's compiled ``custom_ops.get_patches`` CUDA extension is not a build dependency here; both the
 reference and FlashIM use the same pure-PyTorch patch-sampling fallback (see ``descriptor.sample_patches``),
@@ -7,21 +7,21 @@ so this compares the two implementations' math rather than the presence of a com
 """
 
 import sys
-from pathlib import Path
 
 import pytest
 import torch
 
+from flashim.models.aliked import weights
+from flashim.paths import ORACLES
+
 pytestmark = [pytest.mark.slow]
 
-ALIKED_ROOT = Path.home() / "work" / "ALIKED"
+ALIKED_ROOT = ORACLES / "aliked"
 VARIANTS = ["aliked-t16", "aliked-n16", "aliked-n16rot", "aliked-n32"]
 
 
 @pytest.fixture(scope="module")
 def oracle_module():
-    if not (ALIKED_ROOT / "nets" / "aliked.py").exists():
-        pytest.skip(f"needs the ALIKED reference repository at {ALIKED_ROOT}")
     sys.path.insert(0, str(ALIKED_ROOT))
     try:
         import nets.aliked as aliked_module
@@ -48,10 +48,9 @@ def oracle_module():
 
 
 def _oracle(oracle_module, variant: str):
-    checkpoint = ALIKED_ROOT / "models" / f"{variant}.pth"
-    if not checkpoint.is_file():
-        pytest.skip(f"needs {checkpoint}")
-    return oracle_module.ALIKED(model_name=variant, device="cpu", load_pretrained=True).eval()
+    oracle = oracle_module.ALIKED(model_name=variant, device="cpu", load_pretrained=False).eval()
+    oracle.load_state_dict(weights.load_state_dict(variant))
+    return oracle
 
 
 @torch.inference_mode()
@@ -60,7 +59,7 @@ def test_dense_maps_and_sparse_features_match_reference(oracle_module, variant):
     from flashim.models.aliked import ALIKED
 
     oracle = _oracle(oracle_module, variant)
-    ours = ALIKED.from_pretrained(variant=variant, checkpoint=ALIKED_ROOT / "models" / f"{variant}.pth", device="cpu")
+    ours = ALIKED.from_pretrained(variant=variant, checkpoint=weights.find_checkpoint(variant), device="cpu")
 
     torch.manual_seed(0)
     image = torch.rand(1, 3, 176, 240)
@@ -86,9 +85,7 @@ def test_bf16_feature_map_tracks_fp32(oracle_module):
 
     from flashim.models.aliked.build import load_aliked
 
-    checkpoint = ALIKED_ROOT / "models" / "aliked-n16.pth"
-    if not checkpoint.is_file():
-        pytest.skip(f"needs {checkpoint}")
+    checkpoint = weights.find_checkpoint("aliked-n16")
     reference = load_aliked("fp32", checkpoint=checkpoint, device="cpu")
     model = load_aliked("bf16", checkpoint=checkpoint, device="cpu")
 

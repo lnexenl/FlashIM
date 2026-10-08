@@ -315,7 +315,7 @@ model = flashim.load("loftr", "bf16"); model.match("a.jpg", "b.jpg", resize=840)
 ```
 
 Ten models were added, all as native PyTorch ports that load the released checkpoints with `strict=True` and have a parity
-test against the upstream code (`tests/parity/<model>`; upstream checkouts and weights in `~/work/oracles`, DISK / LoFTR also
+test against the upstream code (`tests/parity/<model>`; the upstream reference code is vendored in `tests/oracles`, DISK / LoFTR also
 against kornia). Detector, descriptor and matching follow each method's own protocol:
 
 | model | what it is | matching | working resolution |
@@ -470,7 +470,7 @@ flashim/
   geometry/    pose estimation + AUC metrics
 benchmarks/    speed/forward.py, accuracy/run.py (MegaDepth-1500, ScanNet-1500), accuracy/run_sparse.py (RDD)
 scripts/       calibrate_romav2.py, calibrate_rdd.py
-tests/         unit, ops (impl vs reference), quant, parity (vs the RoMaV2 package, ~/work/RDD, ~/work/ALIKED)
+tests/         unit, ops (impl vs reference), quant, parity (vs the vendored upstream code in tests/oracles)
 ```
 
 Op overrides: `FLASHIM_OPS="rope_qk:reference,-local_corr"`; `FLASHIM_STRICT_OPS=1` raises
@@ -510,9 +510,7 @@ offline machine, copy the checkpoint folder over. Calibration tables ship in the
 ```bash
 uv sync --extra eval                     # Python 3.12 (.python-version), torch 2.11 (cu130), triton 3.6
 uv run pytest -m "not slow"              # unit / ops / quant
-uv pip install -e ../RoMaV2              # the RoMaV2 oracle is not a dependency (`uv sync` removes it again)
-uv run pytest tests/parity               # bit-exactness vs the upstream code (needs weights + GPU; skips oracles
-                                         # that are not installed / checked out)
+uv run pytest tests/parity               # bit-exactness vs the vendored upstream code (needs weights + GPU)
 uv run python benchmarks/speed/forward.py --preset fp8 --engine compile
 uv run python benchmarks/accuracy/run.py --dataset mega1500 --preset fp8 --seed 17
 ```

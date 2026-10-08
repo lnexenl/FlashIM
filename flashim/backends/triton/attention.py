@@ -1,3 +1,4 @@
+# Portions adapted from RoMaV2 (MIT, Copyright (c) 2025 Johan Edstedt); see THIRD_PARTY_NOTICES.md.
 """Triton attention kernels: one-launch RoPE for Q/K (ported from RoMaV2 ``rope_fusion.py``) and multi-scale
 deformable attention."""
 

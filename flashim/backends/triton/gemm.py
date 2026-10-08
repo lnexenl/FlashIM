@@ -1,3 +1,4 @@
+# Portions adapted from RoMaV2 (MIT, Copyright (c) 2025 Johan Edstedt); see THIRD_PARTY_NOTICES.md.
 """GEMM kernels: FP8 (E4M3) GEMM with block-32 scales for shapes cuBLAS MXFP8 cannot take,
 and a small-N BF16 -> FP32 linear."""
 

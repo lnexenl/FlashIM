@@ -1,17 +1,17 @@
-"""FlashIM's ALIKE against Shiaoming/ALIKE (checked out at ``~/work/oracles/ALIKE``)."""
+"""FlashIM's ALIKE against Shiaoming/ALIKE (vendored in ``tests/oracles/alike``)."""
 
 import sys
-from pathlib import Path
 
 import pytest
 import torch
 
 import flashim
-from flashim.paths import MEGADEPTH_IMAGES
+from flashim.models.alike import weights
+from flashim.paths import MEGADEPTH_IMAGES, ORACLES
 
 pytestmark = [pytest.mark.slow, pytest.mark.cuda]
 
-ORACLE = Path.home() / "work" / "oracles" / "ALIKE"
+ORACLE = ORACLES / "alike"
 IMAGE = MEGADEPTH_IMAGES / "3383162411_67cc9af85e_o.jpg"
 VARIANTS = ["alike-t", "alike-n", "alike-l"]
 
@@ -19,7 +19,7 @@ VARIANTS = ["alike-t", "alike-n", "alike-l"]
 @pytest.fixture(scope="module")
 def alike_module():
     if not (ORACLE / "alike.py").exists() or not IMAGE.exists():
-        pytest.skip("needs the ALIKE checkout and a MegaDepth image")
+        pytest.skip("needs the MegaDepth image")
     sys.path.insert(0, str(ORACLE))
     try:
         import alike
@@ -39,8 +39,10 @@ def _image():
 def test_fp32_matches_oracle(alike_module, variant, monkeypatch):
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)  # BN folding changes TF32 rounding
     image = _image()
-    cfg = dict(alike_module.configs[variant])
-    ref = alike_module.ALike(**cfg, top_k=1000, device="cuda").eval()
+    cfg = dict(alike_module.configs[variant], model_path="")  # upstream loads from its own models/ folder
+    ref = alike_module.ALike(**cfg, top_k=1000, device="cuda")
+    ref.load_state_dict(weights.load_state_dict(variant))
+    ref = ref.to("cuda").eval()
     model = flashim.load("alike", "fp32", overrides=[f"variant={variant}"])
     with torch.inference_mode():
         ref_desc, ref_scores = ref.extract_dense_map(image)

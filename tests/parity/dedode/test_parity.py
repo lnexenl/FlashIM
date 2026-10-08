@@ -1,25 +1,24 @@
-"""FlashIM's DeDoDe (detector L v2, descriptors B and G) against Parskatt/DeDoDe (``~/work/oracles/DeDoDe``)."""
+"""FlashIM's DeDoDe (detector L v2, descriptors B and G) against Parskatt/DeDoDe (vendored in ``tests/oracles/dedode``)."""
 
 import sys
-from pathlib import Path
 
 import pytest
 import torch
 
 import flashim
 from flashim.models.dedode import weights
-from flashim.paths import MEGADEPTH_IMAGES
+from flashim.paths import MEGADEPTH_IMAGES, ORACLES
 
 pytestmark = [pytest.mark.slow, pytest.mark.cuda]
 
-ORACLE = Path.home() / "work" / "oracles" / "DeDoDe"
+ORACLE = ORACLES / "dedode"
 IMAGE = MEGADEPTH_IMAGES / "3383162411_67cc9af85e_o.jpg"
 
 
 @pytest.fixture(scope="module")
 def zoo():
     if not (ORACLE / "DeDoDe").exists() or not IMAGE.exists():
-        pytest.skip("needs the DeDoDe checkout and a MegaDepth image")
+        pytest.skip("needs the MegaDepth image")
     sys.path.insert(0, str(ORACLE))
     try:
         import DeDoDe.model_zoo.dedode_models as zoo

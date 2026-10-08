@@ -16,7 +16,7 @@ CHECKPOINT = Checkpoint(
 )
 
 LICENSES = {
-    "code": "MIT-style (Magic Leap SuperPoint) via cvg/LightGlue's port; FlashIM re-implementation",
+    "code": "FlashIM re-implementation of SuperPoint (Magic Leap); no upstream code copied (LightGlue's superpoint.py carries a Magic Leap no-redistribution notice)",
     "weights": "superpoint_v1.pth (Magic Leap; non-commercial research license, see the SuperPoint release)",
 }
 
