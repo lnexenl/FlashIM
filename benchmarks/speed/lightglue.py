@@ -51,7 +51,7 @@ def main() -> None:
         end.synchronize()
         times.append(start.elapsed_time(end))
     print(json.dumps({
-        "preset": args.preset, "engine": args.engine, "attention": args.attention, "top_k": args.top_k,
+        "preset": model.preset, "engine": args.engine, "attention": args.attention, "top_k": args.top_k,
         "matches": len(result.confidence),
         "median_ms": round(statistics.median(times), 3), "min_ms": round(min(times), 3),
         "gpu": torch.cuda.get_device_name(),

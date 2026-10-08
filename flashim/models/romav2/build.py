@@ -36,8 +36,9 @@ def load_romav2(
         validated configuration);
       - ``"compile-full"``: additionally folds VGG BatchNorm and compiles VGG, the DPT
         head and the refiner conv stacks (~20% faster; changes rounding vs ``compile``).
-    On platforms without native MXFP8 GEMMs, FP8 presets run with emulation kernels
-    (``strict=True`` raises instead).
+    On a GPU without FP8 (below sm_89) an FP8 preset is replaced by its INT8 counterpart (``SPEC.fp8_fallbacks``:
+    ``fp8`` -> ``int8``). Where it is kept without a native MXFP8 GEMM (the CPU,
+    or a ``calibration`` passed here) it runs with emulation kernels; ``strict=True`` raises instead of either.
 
     ``attention``: ``"sdpa"`` (torch SDPA, default), ``"sage"`` or ``"sage-fp8"`` (SageAttention INT8-QK attention
     in every quantized transformer block; needs the ``sageattention`` package; not RoMaV2-exact).

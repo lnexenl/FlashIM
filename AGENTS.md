@@ -37,7 +37,8 @@ flashim/
                shared by the sparse extractors (superpoint, alike, disk, xfeat, dedode(-g), dad, ripe, loftr,
                sift, orb): `SparseExtractor` base (resize, coordinate mapping, MNN matching, BN folding, compute
                dtype), `extractor_spec()` (the fp32 / bf16 / int8 / fp8 presets from a list of quantizable globs),
-               checkpoint lookup (`~/work/oracles/weights` is searched last)
+               checkpoint lookup (`checkpoint=` / env var / torch hub folder, else download of the release
+               pinned by URL + SHA-256 in each model's `weights.py`)
   engines/     region torch.compile, CUDA-graph runner
 benchmarks/    speed/, accuracy/ (MegaDepth-1500, ScanNet-1500, HardMatch), profile/
 scripts/       calibration
@@ -64,6 +65,9 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   `pre_quant` / `post_quant`, `requires=` a platform predicate, `exact=`), never as a flag flipped by hand in a
   loader. Presets are config overlays (`extends` allowed). The resolved config is `model.run_config`
   (`model.config` is the architecture config in several models); what happened is `model.build_report`.
+  An FP8 preset names the preset built in its place on a GPU without FP8 in the spec's `fp8_fallbacks` (its INT8
+  counterpart; `tests/unit/test_config.py` fails for an FP8 preset without one). `flashim.build` applies it,
+  `flashim.resolve` without `platform=` does not.
 - **New models**: build from `flashim.layers` where the pattern fits so quantization/fusion apply for free; keep
   upstream parameter names so checkpoints load with `strict=True`; add a parity test against the upstream code.
 - Keep comments/docstrings at the density of the surrounding code; record *measured* reasons for design choices
@@ -91,7 +95,8 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   im2col + GEMM (`quant/methods/conv2d.py`; groups == 1 only): measured *slower* than BF16 on the small nets here.
 - **Add a model**: `models/<m>/` with `model.py`, `weights.py`, `quant.py`, `spec.py` (register it in
   `flashim/registry.py` `SPECS`), a `load_<m>` shim in `build.py` if a keyword API is wanted, CPU unit tests and a
-  parity test against the oracle.
+  parity test against the oracle. `weights.py` pins each release as `Checkpoint(filename, url, sha256)` and loads it
+  through `find_weights` (auto-download; add the module to `tests/unit/test_weights.py`).
 
 ## Verifying changes
 
@@ -102,7 +107,7 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   (`ruff check --fix` on a directory rewrote the user's uncommitted files once); preview with `--diff`.
 - **Refactors must be bit-identical**: run the same inference in a `git worktree` of the previous commit and in the
   working tree (`PYTHONPATH=<tree>`), compare output hashes and `ops.call_counts()` for several configs (RoMaV2
-  fp8 / fp8-fast / int8-fast / bf16, RDD+LightGlue fp8 / int8, ALIKED+LightGlue, RaCo+ALIKED+LightGlue with
+  fp8 / int8 / bf16, RDD+LightGlue fp8 / int8, ALIKED+LightGlue, RaCo+ALIKED+LightGlue with
   `extractor_preset="bf16"`). Make sure the path under test actually runs (check call counts: e.g.
   `raco-aliked-lightglue`'s `preset` only sets LightGlue).
 - **Accuracy changes** are accepted by task-level AUC, not tensor allclose: MegaDepth-1500 / ScanNet-1500, 3 seeds
@@ -117,9 +122,19 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
 
 - Use `.venv/bin/python` (torch 2.11.0+cu130, triton 3.6). Never run Python from inside `flashim/`
   (`flashim/types.py` shadows the stdlib `types`).
-- `uv sync` removes anything not in the lockfile (sageattention, tilelang, hand-built extras): use
-  `uv sync --extra eval --extra tilelang --group dev`; sageattention must be rebuilt by the user (GCC 16 breaks torch
-  headers: `CC=clang CXX=clang++ CUDAHOSTCXX=clang++ NVCC_APPEND_FLAGS=-allow-unsupported-compiler`, needs libomp).
+- `uv sync` removes anything not in the lockfile (sageattention, tilelang, the romav2 oracle, hand-built extras):
+  use `uv sync --extra eval --extra tilelang --group dev`, then `uv pip install -e ../RoMaV2` for the RoMaV2 parity
+  tests; sageattention must be rebuilt by the user (GCC 16 breaks torch headers:
+  `CC=clang CXX=clang++ CUDAHOSTCXX=clang++ NVCC_APPEND_FLAGS=-allow-unsupported-compiler`, needs libomp).
+- Jetson (AGX Orin, JetPack 6.2, sm_87, aarch64): no `uv sync` there. NVIDIA's L4T torch exists for Python 3.10
+  only: `requirements-jetson.txt` (its header has the commands, including the `.pth` that stands in for the
+  editable install), so keep the code importable on 3.10 (`typing.Self`, `tomllib`,
+  `logging.getLevelNamesMapping` are 3.11+). Triton comes from PyPI (the L4T wheel has no `ptxas`). CUDA needs the
+  user in the `video` *and* `render` groups (`/dev/nvmap`, `/dev/dri/renderD*`; without `render`: "Error 801").
+  No FP8 below sm_89: fp8 presets are replaced by INT8 ones (`fp8_fallbacks`). CPU results differ from x86 in the
+  last ulp (OpenBLAS / FMA). Test suite there: 34 min cold (INT8 conv autotuning is 3-4 min per shape on its
+  CPU), 2 min warm, the same failures as on x86. No kernel profiler there (CUPTI needs privileges): time ops with
+  CUDA events (`results/orin/op_breakdown.py`).
 - `/tmp` is a 16 GB tmpfs: set `TORCHINDUCTOR_CACHE_DIR=~/.cache/flashim/inductor` for compile benchmarks with many
   shapes. CUDA C++ kernels JIT-build into `~/.cache/flashim/cuda` (`nvcc` from `/opt/cuda`, `-allow-unsupported-compiler`,
   no torch headers).
@@ -130,12 +145,16 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
 - zsh: unquoted `$cfg` does not word-split (use `${=cfg}`).
 - `git clone` of GitHub repos fails in the sandbox proxy; download the archive zip instead.
 - Sparse-model oracles are archive zips under `~/work/oracles/` (LightGlue, accelerated_features, ALIKE, DeDoDe,
-  RIPE, dad, LoFTR; weights in `~/work/oracles/weights`); DISK and LoFTR are also checked against `kornia` (dev dep).
+  RIPE, dad, LoFTR; the models no longer read `~/work/oracles/weights`); DISK and LoFTR are also checked against
+  `kornia` (dev dep).
   Parity-test pitfalls: put upstream modules in `.eval()`; disable `cudnn.allow_tf32` (BN folding changes TF32
   rounding); `torch.cdist` on pixel coordinates needs `compute_mode="donot_use_mm_for_euclid_dist"`; compare
   keypoints as sets, not by index (a few threshold-borderline points flip and shift every later index).
-- Oracles live next to the repo: `~/work/RoMaV2` (editable dev dependency), `~/work/RDD`, `~/work/ALIKED`,
-  LightGlue-ONNX for RaCo. Data under `data/` and results under `results/` are gitignored.
+- Oracles live next to the repo: `~/work/RoMaV2` (not a dependency: installed by hand, see above), `~/work/RDD`,
+  `~/work/ALIKED`, LightGlue-ONNX for RaCo. Data under `data/` and results under `results/` are gitignored.
+- The autotuned conv kernels (`backends/triton/conv.py`) keep their timings in Triton's cache, so a pick made on a
+  busy GPU sticks until the kernel source changes: `FLASHIM_AUTOTUNE_CACHE=0` re-times in every process (do that
+  when comparing tiles). Editing that file shifts line numbers, which recompiles every kernel in it.
 - TileLang 0.1.14: no `from __future__ import annotations` in TileLang files; width <= 16 miscompiles;
   `T.no_set_max_nreg()`; an explicit `fence.proxy.async` is needed before TMA refills a stage read by plain loads.
 - `torchvision.ops.deform_conv2d` ignores the current CUDA stream: keep ALIKED on the caller's stream.

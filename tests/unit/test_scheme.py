@@ -1,6 +1,7 @@
 import pytest
 
-from flashim.models.romav2.quant import PRESETS, PROTECTED
+from flashim.models.romav2.quant import ORACLE_PRESETS, PROTECTED
+from flashim.models.romav2.quant import PRESETS as _PUBLIC
 from flashim.quant.scheme import MXFP8, QuantConfig, QuantScheme
 
 
@@ -17,6 +18,8 @@ def test_protected_modules_are_a_hard_error():
     cfg = QuantConfig({"bad": QuantScheme(targets=("refiners.*",))}, name="bad")
     with pytest.raises(ValueError, match="protected"):
         cfg.check_protected(["refiners.4.warp_head", "refiners.4.block1"], PROTECTED)
+
+PRESETS = {**_PUBLIC, **ORACLE_PRESETS}
 
 
 @pytest.mark.parametrize("name", [p for p in PRESETS if PRESETS[p].config is not None])

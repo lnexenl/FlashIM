@@ -1,4 +1,4 @@
-"""fp8-fast refines both match directions as one batch with one projection per feature map.
+"""fp8 refines both match directions as one batch with one projection per feature map.
 That must be bit-identical to refining each direction separately with the same kernels."""
 
 import pytest
@@ -12,7 +12,7 @@ pytestmark = [pytest.mark.cuda, pytest.mark.weights, pytest.mark.slow]
 def test_stacked_directions_bit_exact(fp32_highest):
     from flashim.models.romav2.build import load_romav2
 
-    model = load_romav2("fp8-fast", setting="mega1500", engine="eager")
+    model = load_romav2("fp8", setting="mega1500", engine="eager")
     assert model.batched_directions
     inputs = model.prepare(ASSETS / "toronto_A.jpg", ASSETS / "toronto_B.jpg")
     with torch.inference_mode():

@@ -4,7 +4,7 @@
 set -u
 cd "$(dirname "$0")/../.."
 mkdir -p results/accuracy
-for cfg in "bf16 compile" "fp8 compile" "fp8-fast compile-full"; do
+for cfg in "bf16 compile" "fp8 compile-full"; do
   set -- $cfg
   for seed in 17 29 42; do
     tag="hardmatch_${1}_${2}_seed${seed}"

@@ -1,27 +1,27 @@
 """RoMaV2 quantization presets and protected modules.
 
-Presets (all MXFP8, E4M3 values + E8M0 block-32 scales):
+Public presets (what ``flashim.load("romav2", preset)`` is documented to take):
 
 - ``bf16``    : no quantization.
-- ``int8``    : every DINOv3 and matcher-ViT linear as symmetric INT8 (per-channel weights, static
-  per-tensor percentile-calibrated activations, INT32 accumulation); attention and refiners BF16.
-- ``int8-dpt``: ``int8`` + the DPT head's four 1x1 input projections.
-- ``int8-full``: ``int8-dpt`` + the pointwise conv of every refiner block (depthwise + ReLU produce the
-  INT8 activation directly); RoMaV2's ``recipes/int8_full.yaml`` (its ``layer*_rn`` rules match 3x3 convs
-  and are inert there).
-- ``fp8-p8``  : RoMaV2 "P8" -- every DINOv3 and matcher-ViT linear with static
-  calibrated activation scales; SDPA attention stays BF16; refiners BF16.
-- ``fp8-s4``  : ``fp8-p8`` + stride-4 refiner blocks fused (dynamic MXFP8 pointwise).
-- ``fp8``     : ``fp8-p8`` + stride-4 and stride-2 refiner blocks fused (default).
-- ``fp8-fast``: ``fp8`` + FlashIM refiner kernels: fused BF16 stride-1 conv blocks, a fused
-  refiner input (warp sampling, displacement embedding, local correlation in one pass) and
-  fused output heads (FP32 warp/confidence convs + updates), one projection per feature map
-  (RoMaV2 recomputes each for the second direction) and both directions refined as one batch.
-  Numerics differ from RoMaV2 by reduction order / rounding points only; pending AUC.
+- ``int8``    : static INT8 (per-channel weights, per-tensor percentile-calibrated activations, INT32
+  accumulation) for every DINOv3 and matcher-ViT linear, the DPT head's four 1x1 input projections and the
+  pointwise conv of the stride-4 / stride-2 refiner blocks, plus FlashIM refiner kernels: fused BF16 stride-1
+  conv blocks, a fused refiner input (warp sampling, displacement embedding, local correlation in one pass) and
+  fused output heads (FP32 warp/confidence convs + updates), one projection per feature map (RoMaV2 recomputes
+  each for the second direction) and both directions refined as one batch. Not RoMaV2-exact (reduction order /
+  rounding points).
+- ``fp8``     : MXFP8 (E4M3 values + E8M0 block-32 scales) for every DINOv3 and matcher-ViT linear with static
+  calibrated activation scales, fused MXFP8 stride-4 and stride-2 refiner blocks (dynamic MXFP8 pointwise) and
+  the same FlashIM refiner kernels as ``int8``. Not RoMaV2-exact.
+
+Oracle presets (``ORACLE_PRESETS``: kept for the parity tests and the comparison with RoMaV2's own FastFP8
+runtime, not meant for use): ``fp8-p8`` is RoMaV2 "P8" (transformer linears only, SDPA attention and refiners
+BF16), ``fp8-s4`` adds fused stride-4 refiner blocks, ``fp8-s42`` stride-4 and stride-2 (RoMaV2's
+``s4_fused_s2_fused``); all bit-identical to the oracle.
 
 Accuracy evidence for these configurations (RoMaV2 P8 reports, RTX 5070 Ti,
 3 seeds, AUC@5 delta vs BF16): ``fp8-p8`` Mega -0.0025 / ScanNet -0.0011;
-``fp8`` Mega -0.0038 / ScanNet -0.0023 (Mega seed 17 alone: -0.0061).
+``fp8-s42`` Mega -0.0038 / ScanNet -0.0023 (Mega seed 17 alone: -0.0061).
 """
 
 from __future__ import annotations
@@ -41,6 +41,8 @@ from flashim.quant.scheme import (
 CALIBRATION_DIR = Path(__file__).parent / "calibration"
 DEFAULT_CALIBRATION = CALIBRATION_DIR / "romav2_full_fp8_mega1500.safetensors"
 INT8_CALIBRATION = CALIBRATION_DIR / "romav2_int8_mega1500.safetensors"
+# INT8_CALIBRATION's entries + the VGG19-BN fine-feature convs (calibrate_romav2.py --merge).
+INT8_VGG_CALIBRATION = CALIBRATION_DIR / "romav2_int8_vgg_mega1500.safetensors"
 
 # Never quantized: coordinate-producing heads, geometry embeddings, the patch
 # embedding and the refiner projections that feed FP32 sampling/correlation.
@@ -57,15 +59,14 @@ _TRANSFORMER = QuantScheme(targets=("f.blocks.*", "matcher.mv_vit.*"), weights=M
 _INT8_DPT = QuantScheme(
     targets=("matcher.head.projects.*",), weights=INT8_WEIGHTS, input_activations=INT8_ACTIVATIONS
 )
-_INT8_REFINER = QuantScheme(
-    targets=("refiners.*.block1.conv_pointwise", "refiners.*.hidden_blocks.*.conv_pointwise"),
-    weights=INT8_WEIGHTS,
-    input_activations=INT8_ACTIVATIONS,
-)
 _INT8_REFINER_S42 = QuantScheme(
     targets=("refiners.4.*.conv_pointwise", "refiners.2.*.conv_pointwise"),
     weights=INT8_WEIGHTS,
     input_activations=INT8_ACTIVATIONS,
+)
+# The VGG19-BN fine features' 3x3 convs (BatchNorm folded first: the ``fold_fine_features`` pass).
+_INT8_FINE_FEATURES = QuantScheme(
+    targets=("refiner_features.layers.*",), weights=INT8_WEIGHTS, input_activations=INT8_ACTIVATIONS
 )
 _INT8_TRANSFORMER = QuantScheme(
     targets=("f.blocks.*", "matcher.mv_vit.blocks.*"),
@@ -87,6 +88,10 @@ class Preset:
     name: str
     config: QuantConfig | None
     fold_refiners: bool = False
+    # VGG19-BN fine features with BatchNorm folded and channels-last weights (changes rounding).
+    fold_fine_features: bool = False
+    # DINOv3's RoPE as the fused ``ops.rope_qk`` kernel instead of the upstream math (one BF16 ulp on 24% of q / k).
+    fused_rope: bool = False
     # Refiner stages whose BF16 conv blocks run as one fused kernel each (no quantization).
     fused_bf16_refiners: tuple[int, ...] = ()
     # Refiner glue as fused ops: block1 input (warp sampling, disp_emb, local corr) and
@@ -105,42 +110,36 @@ PRESETS: dict[str, Preset] = {
     "bf16": Preset("bf16", None, description="BF16 reference"),
     "int8": Preset(
         "int8",
-        QuantConfig({"transformer": _INT8_TRANSFORMER}, name="int8"),
-        calibration=INT8_CALIBRATION,
-        description="static INT8 transformer linears (per-channel weights, per-tensor activations), BF16 refiners",
-    ),
-    "int8-dpt": Preset(
-        "int8-dpt",
-        QuantConfig({"transformer": _INT8_TRANSFORMER, "dpt": _INT8_DPT}, name="int8-dpt"),
-        calibration=INT8_CALIBRATION,
-        description="int8 + INT8 DPT input projections (1x1 convs)",
-    ),
-    "int8-full": Preset(
-        "int8-full",
         QuantConfig(
-            {"transformer": _INT8_TRANSFORMER, "dpt": _INT8_DPT, "refiner": _INT8_REFINER}, name="int8-full"
-        ),
-        fold_refiners=True,
-        calibration=INT8_CALIBRATION,
-        description="int8-dpt + static INT8 pointwise convs in every refiner block (RoMaV2 int8_full recipe)",
-    ),
-    "int8-fast": Preset(
-        "int8-fast",
-        QuantConfig(
-            {"transformer": _INT8_TRANSFORMER, "dpt": _INT8_DPT, "refiner": _INT8_REFINER_S42}, name="int8-fast"
+            {"transformer": _INT8_TRANSFORMER, "dpt": _INT8_DPT, "refiner": _INT8_REFINER_S42}, name="int8"
         ),
         fold_refiners=True,
         fused_bf16_refiners=(1,),
         fused_refiner_io=True,
         batched_directions=True,
         calibration=INT8_CALIBRATION,
-        description="int8-full with INT8 refiner blocks at strides 4/2 only + FlashIM refiner kernels "
-        "(fused BF16 stride-1 blocks, fused refiner input/heads, batched directions); not RoMaV2-exact",
+        description="static INT8 transformer linears + DPT projections + stride-4/2 refiner blocks, FlashIM refiner "
+        "kernels (fused BF16 stride-1 blocks, fused refiner input/heads, batched directions); not RoMaV2-exact",
     ),
+    "fp8": Preset(
+        "fp8",
+        QuantConfig({"transformer": _TRANSFORMER, "refiner": _refiner_scheme(4, 2)}, name="fp8"),
+        fold_refiners=True,
+        fused_bf16_refiners=(1,),
+        fused_refiner_io=True,
+        batched_directions=True,
+        fused_mx_blocks=True,
+        description="static MXFP8 transformer linears + fused MXFP8 stride-4/2 refiner blocks, FlashIM refiner "
+        "kernels (fused BF16 stride-1 blocks, fused refiner input); not RoMaV2-exact",
+    ),
+}
+
+# Bit-identical to RoMaV2's FastFP8 runtime with the matching refiner variant (tests/parity/romav2).
+ORACLE_PRESETS: dict[str, Preset] = {
     "fp8-p8": Preset(
         "fp8-p8",
         QuantConfig({"transformer": _TRANSFORMER}, name="fp8-p8"),
-        description="static MXFP8 transformer linears, BF16 refiners",
+        description="RoMaV2 P8: static MXFP8 transformer linears, BF16 refiners",
     ),
     "fp8-s4": Preset(
         "fp8-s4",
@@ -148,21 +147,10 @@ PRESETS: dict[str, Preset] = {
         fold_refiners=True,
         description="fp8-p8 + fused MXFP8 stride-4 refiner blocks",
     ),
-    "fp8": Preset(
-        "fp8",
-        QuantConfig({"transformer": _TRANSFORMER, "refiner": _refiner_scheme(4, 2)}, name="fp8"),
+    "fp8-s42": Preset(
+        "fp8-s42",
+        QuantConfig({"transformer": _TRANSFORMER, "refiner": _refiner_scheme(4, 2)}, name="fp8-s42"),
         fold_refiners=True,
         description="fp8-p8 + fused MXFP8 stride-4 and stride-2 refiner blocks",
-    ),
-    "fp8-fast": Preset(
-        "fp8-fast",
-        QuantConfig({"transformer": _TRANSFORMER, "refiner": _refiner_scheme(4, 2)}, name="fp8-fast"),
-        fold_refiners=True,
-        fused_bf16_refiners=(1,),
-        fused_refiner_io=True,
-        batched_directions=True,
-        fused_mx_blocks=True,
-        description="fp8 + FlashIM refiner kernels (fused BF16 stride-1 blocks, fused refiner input); "
-        "not RoMaV2-exact",
     ),
 }

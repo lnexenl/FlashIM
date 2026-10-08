@@ -21,7 +21,7 @@ import torch
 ROMAV2_ROOT = Path.home() / "work" / "RoMaV2"
 IMAGE_A = ROMAV2_ROOT / "data/megadepth/Undistorted_SfM/0015/images/3383162411_67cc9af85e_o.jpg"
 IMAGE_B = ROMAV2_ROOT / "data/megadepth/Undistorted_SfM/0015/images/299056923_ecd980298c_o.jpg"
-_ROMAV2_VARIANTS = {"fp8-p8": "none", "fp8-s4": "s4_fused", "fp8": "s4_fused_s2_fused"}
+_ROMAV2_VARIANTS = {"fp8-p8": "none", "fp8-s4": "s4_fused", "fp8-s42": "s4_fused_s2_fused"}
 
 
 def _build_flashim(args):
@@ -71,7 +71,7 @@ def _build_romav2(args):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--impl", choices=("flashim", "romav2"), default="flashim")
-    parser.add_argument("--preset", default="fp8", choices=("bf16", "int8", "int8-dpt", "int8-full", "int8-fast", "fp8-p8", "fp8-s4", "fp8", "fp8-fast"))
+    parser.add_argument("--preset", default="fp8", choices=("bf16", "int8", "fp8", "fp8-p8", "fp8-s4", "fp8-s42"))
     parser.add_argument("--engine", default="compile", choices=("eager", "compile", "compile-full"))
     parser.add_argument("--setting", default="mega1500")
     parser.add_argument("--image-a", default=str(IMAGE_A))
@@ -107,7 +107,7 @@ def main() -> None:
     times.sort()
     result = {
         "impl": args.impl,
-        "preset": args.preset,
+        "preset": getattr(model, "preset", args.preset),  # FP8 presets are replaced on a GPU without FP8
         "engine": args.engine,
         "setting": args.setting,
         "gpu": torch.cuda.get_device_name(),

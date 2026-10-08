@@ -64,13 +64,16 @@ def main() -> None:
         }))
         return
     times, feats = timed(lambda: model.extract(image, resize=args.resize, top_k=args.top_k), args.warmups, args.iterations)
-    other = model.extract(str(IMAGE_B), resize=args.resize, top_k=args.top_k)
-    match_times, matches = timed(lambda: model.match_features(feats, other), 3, 20)
+    match_ms = match_count = None
+    if hasattr(model, "match_features"):  # RaCo-ALIKED only feeds LightGlue: no matcher of its own
+        other = model.extract(str(IMAGE_B), resize=args.resize, top_k=args.top_k)
+        match_times, matches = timed(lambda: model.match_features(feats, other), 3, 20)
+        match_ms, match_count = round(statistics.median(match_times), 3), len(matches.confidence)
     print(json.dumps({
         "tag": args.tag, "model": args.model, "preset": model.preset, "engine": args.engine, "resize": args.resize, "top_k": args.top_k,
         "keypoints": int(feats.keypoints.shape[1]),
         "extract_median_ms": round(statistics.median(times), 3), "extract_min_ms": round(min(times), 3),
-        "match_median_ms": round(statistics.median(match_times), 3), "matches": len(matches.confidence),
+        "match_median_ms": match_ms, "matches": match_count,
         "peak_mem_mb": round(torch.cuda.max_memory_allocated() / 2**20, 1),
         "gpu": torch.cuda.get_device_name(),
     }))

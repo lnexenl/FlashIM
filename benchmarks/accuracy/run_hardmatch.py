@@ -5,7 +5,7 @@ keypoints of the original files; a MAGSAC fundamental matrix (0.25 px, 100k iter
 fit and scored by the symmetric epipolar error of the annotated correspondences; the metric
 is mAA over 0..10 px. Data (660 MB) is downloaded on first use.
 
-    python benchmarks/accuracy/run_hardmatch.py --preset fp8-fast --engine compile-full --seed 17
+    python benchmarks/accuracy/run_hardmatch.py --preset fp8 --engine compile-full --seed 17
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ def _git(*args: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default="romav2")
-    parser.add_argument("--preset", default="fp8-fast")
+    parser.add_argument("--preset", default="fp8")
     parser.add_argument("--engine", default="compile-full", choices=("eager", "compile", "compile-full"))
     parser.add_argument("--setting", default="wxbs", help="RoMaV2 resolution preset (wxbs: 800 LR + 1024 HR)")
     parser.add_argument("--num-samples", type=int, default=5000)

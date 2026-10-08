@@ -34,15 +34,11 @@ MODELS = [
 # correspondences out" (RoMaV2's own compiled forward benchmark, no separate extract/match split to combine).
 # Sourced from the curated Notion Results database rather than results/speed/*.json, whose RoMaV2 entries are
 # a mix of ad-hoc dumps from before the current benchmarks/ naming convention (abc_, step1_, int8opt_, ...) --
-# these 7 are the ones with both a Forward ms and a matching Mega1500 AUC@5 recorded.
+# these 3 are the ones with both a Forward ms and a matching Mega1500 AUC@5 recorded.
 ROMAV2 = [
     ("bf16", "compile", 344, 0.6210),
-    ("fp8", "compile", 204, 0.6173),
-    ("int8", "compile", 324, 0.6241),
-    ("int8-full", "compile", 194, 0.6201),
-    ("fp8", "compile-full", 165, 0.6194),
-    ("fp8-fast", "compile-full", 110, 0.6187),
-    ("int8-fast", "compile-full", 103, 0.6222),
+    ("fp8", "compile-full", 110, 0.6187),
+    ("int8", "compile-full", 103, 0.6222),
 ]
 
 # unified-protocol results (sparse_matrix.sh); older runs (OpenCV / per-model resize) stay in results/accuracy/

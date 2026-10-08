@@ -19,7 +19,7 @@ Every model is built by one generic builder from a `RunConfig` (`flashim/config.
 overrides layer on top (later wins). The keyword API above is a thin layer over the same builder.
 
 ```python
-model = flashim.load("romav2", "fp8-fast", overrides=["engine.kind=compile-full", "arch.setting=mega1500"])
+model = flashim.load("romav2", "fp8", overrides=["engine.kind=compile-full", "arch.setting=mega1500"])
 model = flashim.load("raco-aliked-lightglue", "int8", config="run.toml")   # .toml / .json (.yaml with PyYAML)
 flashim.resolve("rdd-lightglue", "fp8").to_dict()      # the config a build would use, without building
 model.run_config.digest(), model.build_report          # what was asked for / what was actually applied
@@ -45,41 +45,41 @@ skipped with a warning (`optimize.strict=true` raises).
 
 | model | presets | notes |
 |---|---|---|
-| `romav2` | `bf16`, `fp8-p8`, `fp8-s4`, `fp8` (default), `fp8-fast`, `int8`, `int8-dpt`, `int8-full`, `int8-fast` | native port of RoMa v2; `bf16`/`fp8-*` outputs are bit-identical to the RoMaV2 reference implementation |
+| `romav2` | `bf16`, `int8`, `fp8` (default) | native port of RoMa v2; `bf16` is bit-identical to the RoMaV2 reference implementation (so are the `fp8-p8` / `fp8-s4` / `fp8-s42` oracle presets the parity tests use) |
 | `rdd` | `fp32`, `bf16`, `fp8` (default), `fp8-full`, `fp8-backbone` | native port of [RDD](https://github.com/xtcpete/rdd) (CVPR'25, sparse detector + descriptor); `fp32` matches the reference to 1e-5 (see [RDD](#rdd)) |
 | `aliked` | `fp32` (default), `bf16` | native port of [ALIKED](https://github.com/Shiaoming/ALIKED) (TIM'23, sparse detector + descriptor); `fp32` matches the reference bit-exactly (see [ALIKED](#aliked)) |
 | `superpoint`, `alike`, `disk`, `xfeat`, `ripe`, `dedode`, `dedode-g`, `dad`, `loftr` | `fp32`, `bf16` (default), `int8`, `fp8` | native ports, each verified against its upstream implementation (see [More sparse and semi-dense models](#more-sparse-and-semi-dense-models)) |
 | `superpoint-lightglue`, `disk-lightglue`, `xfeat-lightglue` | `fp32`, `bf16`, `int8`, `fp8` | extractor + LightGlue (cvg weights; XFeat's LighterGlue), matcher preset selects the pair, `components.extractor.preset` the extractor |
 | `sift`, `orb` | `fp32` | OpenCV baselines (no weights: nothing to quantize) |
 
-RoMaV2 presets (MXFP8 = E4M3 values, E8M0 scale per 32 elements):
+RoMaV2 presets:
 
-- `fp8-p8` — every DINOv3 / matcher-ViT linear with *static* calibrated activation scales, fused LayerNorm→quant and GELU→quant producers, BF16 SDPA attention, BF16 refiners.
-- `fp8-s4` / `fp8` — additionally fuse stride-4 (and stride-2) refiner blocks: one Triton kernel for depthwise 5x5 + bias + ReLU + *dynamic* MXFP8 quantization, then a block-scaled MXFP8 pointwise GEMM.
-- `fp8-fast` — `fp8` plus FlashIM refiner kernels: fused BF16 stride-1 conv blocks, a fused refiner
-  input (warp sampling, displacement embedding and local correlation in one pass) and fused FP32
-  output heads. Not bit-identical to RoMaV2 (reduction order / rounding points); validated by pose AUC.
+- `bf16` — the reference.
+- `fp8` — MXFP8 (E4M3 values, E8M0 scale per 32 elements): every DINOv3 / matcher-ViT linear with *static*
+  calibrated activation scales (fused LayerNorm→quant and GELU→quant producers), fused stride-4 and stride-2
+  refiner blocks (one Triton kernel for depthwise 5x5 + bias + ReLU + *dynamic* MXFP8 quantization, then a
+  block-scaled MXFP8 pointwise GEMM), and FlashIM refiner kernels: fused BF16 stride-1 conv blocks, a fused refiner
+  input (warp sampling, displacement embedding and local correlation in one pass), fused FP32 output heads and both
+  match directions refined as one batch. Not bit-identical to RoMaV2 (reduction order / rounding points); validated
+  by pose AUC.
+- `int8` — RoMaV2's `int8_*` recipe (symmetric per-output-channel int8 weights, *static* per-tensor activation
+  scales calibrated with the 99.99th-percentile observer over 64 pairs, INT32 accumulation with a fused
+  dequantize + bias epilogue; Triton GEMM, `torch._int_mm` kept as an alternative implementation) on the
+  transformer linears and the DPT head's four 1x1 input projections, INT8 refiner blocks at strides 4/2 (stride 1
+  stays fused BF16; C=128 blocks run as one fused depthwise + INT8 GEMM kernel, C=512 producers as TileLang) and the
+  same FlashIM refiner kernels as `fp8`. Not RoMaV2-exact.
 
-INT8 presets (RoMaV2's `int8_*` recipes: symmetric per-output-channel int8 weights, *static* per-tensor
-activation scales calibrated with the 99.99th-percentile observer over 64 pairs, INT32 accumulation with a
-fused dequantize + bias epilogue; Triton GEMM, `torch._int_mm` kept as an alternative implementation):
+Compile is an engine, not a preset: any preset runs with `engine="eager"`, `"compile"` or `"compile-full"`. The oracle
+presets `fp8-p8` (transformer linears only, BF16 attention and refiners), `fp8-s4` and `fp8-s42` (+ fused stride-4 /
+stride-4 and 2 refiner blocks) reproduce RoMaV2's FastFP8 runtime bit for bit and exist for the parity tests.
 
-- `int8` — DINOv3 and matcher-ViT linears; fused LayerNorm→int8 / GELU→int8 producers; BF16 attention and refiners.
-- `int8-dpt` — `int8` + the DPT head's four 1x1 input projections.
-- `int8-full` — `int8-dpt` + the pointwise conv of every refiner block (depthwise 5x5 + ReLU writes the int8
-  activation directly). RoMaV2's `int8_full.yaml`; its `layer*_rn` rules match 3x3 convs and are inert there.
-
-- `int8-fast` — `int8-full` with the `fp8-fast` refiner kernels: INT8 blocks at strides 4/2 only (stride 1 stays
-  fused BF16), fused refiner input/heads, batched directions. C=128 blocks run as one fused depthwise + INT8 GEMM
-  kernel, C=512 producers as TileLang. Not RoMaV2-exact.
-
-Optional INT8 attention: `flashim.load("romav2", preset="int8-fast", attention="sage-fp8")` (or `"sage"`: INT8 QK +
+Optional INT8 attention: `flashim.load("romav2", preset="int8", attention="sage-fp8")` (or `"sage"`: INT8 QK +
 FP16 PV) runs every quantized transformer block's attention through [SageAttention](https://github.com/thu-ml/SageAttention)
 (INT8 Q/K with K smoothing, FP8/FP16 PV). Needs `sageattention` 2.x built for your GPU (not a project dependency;
-with GCC 16 build it with clang). `int8-fast` + `compile-full`: 102.7 ms -> 99.7 (`sage`) / 95.4 ms (`sage-fp8`);
+with GCC 16 build it with clang). `int8` + `compile-full`: 102.7 ms -> 99.7 (`sage`) / 95.4 ms (`sage-fp8`);
 AUC@5 vs `bf16` (3 seeds, Mega / ScanNet): `sage` -0.0012 / -0.0002, `sage-fp8` +0.0008 / +0.0010 (noise ~0.003).
 
-Calibrate with `scripts/calibrate_romav2.py --format int8 --preset int8-full [--merge]`; the shipped table is
+Calibrate with `scripts/calibrate_romav2.py --format int8 --preset int8 [--merge]`; the shipped table is
 `flashim/models/romav2/calibration/romav2_int8_mega1500.safetensors`.
 
 Engines: `eager`; `compile` (DINOv3 + matcher ViT, RoMaV2's validated setting); `compile-full`
@@ -91,26 +91,17 @@ Measured on an RTX 5070 Ti (mega1500 setting, 800² LR + 1024² HR, bidirectiona
 |---|---|---|
 | `bf16` + `compile` | 344 ms | 1.0x |
 | RoMaV2 FastFP8 (s4+s2 fused) + compile | 210 ms | 1.64x |
-| `fp8` + `compile` | 204 ms | 1.69x |
-| `fp8` + `compile-full` | 165 ms | 2.09x |
-| `fp8-fast` + `compile-full` | 110 ms | 3.13x |
-| `int8` + `compile` | 324 ms | 1.07x |
-| `int8-full` + `compile` | 194 ms | 1.78x |
-| `int8-full` + `compile-full` | 152 ms | 2.27x |
-| `int8-fast` + `compile-full` | 103 ms | 3.36x |
+| `fp8` + `compile-full` | 110 ms | 3.13x |
+| `int8` + `compile-full` | 103 ms | 3.36x |
 
-(`fp8` + `compile` 203 ms and `fp8` + `compile-full` 164 ms in the same session; `int8-fast` is faster than `fp8-fast`.)
+(`int8` is faster than `fp8`.)
 
-Pose AUC@5 change vs `bf16` (3 seeds): `fp8`+`compile` Mega1500 -0.0042 / ScanNet1500 -0.0017;
-`fp8`+`compile-full` -0.0020 / -0.0026; `fp8-fast`+`compile-full` -0.0023 / +0.0007
-(gate: 3-seed mean >= -0.005; every `fp8-fast` seed is within -0.005).
-
-INT8 pose AUC@5 change vs `bf16` (3 seeds, `compile`, Mega1500 / ScanNet1500): `int8` +0.0031 / -0.0009;
-`int8-full` -0.0010 / +0.0000 (per-seed Mega -0.0027..+0.0006), inside the RANSAC seed noise of ~0.003 and
-better than `fp8` (-0.0038 / -0.0010); `int8-fast`+`compile-full` -0.0010 / +0.0004. HardMatch not run for INT8.
+Pose AUC@5 change vs `bf16` (3 seeds, `compile-full`, Mega1500 / ScanNet1500): `fp8` -0.0023 / +0.0007 (gate:
+3-seed mean >= -0.005; every `fp8` seed is within -0.005); `int8` -0.0010 / +0.0004 (inside the RANSAC seed noise
+of ~0.003). HardMatch not run for INT8.
 
 HardMatch (LoMa, ECCV 2026; 900 hand-labelled hard pairs, mAA@10px, 3 seeds, `wxbs` setting):
-`bf16` 0.4786, `fp8` 0.4707 (-0.0079), `fp8-fast` 0.4712 (-0.0074). FP8's cost is larger on these
+`bf16` 0.4786, `fp8-s42` (RoMaV2's own FP8 recipe) 0.4707 (-0.0079), `fp8` 0.4712 (-0.0074). FP8's cost is larger on these
 deliberately hard pairs than on MegaDepth/ScanNet; FlashIM's extra kernels add none of it.
 Run with `benchmarks/accuracy/run_hardmatch.py` (official `hardmatch` package protocol).
 
@@ -129,9 +120,8 @@ m = model.match("a.jpg", "b.jpg", resize=1600)            # SparseMatchResult (m
 ```
 
 ConvNeXt-tiny backbone -> 5-level multi-scale deformable-attention encoder (4 layers; 140k tokens at 1600 px) ->
-descriptor map; a small FP32 conv net produces the keypoint score map. `rdd.pth` is distributed via the Google
-Drive link in the RDD README (not auto-downloaded); pass `checkpoint=`, set `FLASHIM_RDD_CHECKPOINT`, or put it at
-`<torch hub dir>/checkpoints/rdd.pth`.
+descriptor map; a small FP32 conv net produces the keypoint score map. `rdd.pth` (and LightGlue's `rdd_lg.pth`)
+is downloaded on first use from the Google Drive folder linked in the RDD README (see [Checkpoints](#checkpoints)).
 
 - `bf16` — descriptor branch in BF16; detector, softmax and all sampling / position math in FP32.
 - `fp8` — `bf16` + the encoder's value / output / FFN linears as static MXFP8, run by a fused encoder pass:
@@ -177,9 +167,8 @@ A small conv encoder (plain 3x3 convs at strides 1/2, deformable 3x3 convs at st
 feature fusion; a 4-layer conv head produces the keypoint score map and `SDDH` samples descriptors at
 deformable offsets around each detected keypoint (DKD: soft-NMS + soft-argmax sub-pixel refinement). Four
 released checkpoints (`variant=`): `aliked-t16` (64-d), `aliked-n16` / `aliked-n16rot` (128-d, default),
-`aliked-n32` (128-d, 32 sample points). Checkpoints are distributed from the `models/` folder of the ALIKED
-repo (not auto-downloaded); pass `checkpoint=`, set `FLASHIM_ALIKED_CHECKPOINT`, or put `<variant>.pth` at
-`<torch hub dir>/checkpoints/`.
+`aliked-n32` (128-d, 32 sample points), downloaded on first use from the `models/` folder of the ALIKED repo
+(see [Checkpoints](#checkpoints)).
 
 - `fp32` — the checkpoint's own precision; matches the reference implementation's dense maps, keypoints and
   scores bit-exactly, descriptors to cosine > 0.99999 (deformable-sampling summation order only).
@@ -461,8 +450,8 @@ flashim/
                files by computation (attention, conv, correlation, density, gemm, quantize);
                model-specific ops in a file named after the model (romav2.py, aliked.py)
   backends/    optimized impls, one package per kernel language / library, mirroring ops/ file names:
-               triton/, tilelang/, cuda/ (JIT CUDA C++), torch_native/ (cuBLAS), external/ (sageattention,
-               fused-local-corr); out-of-tree backends via the `flashim.backends` entry point
+               triton/, tilelang/, cuda/ (JIT CUDA C++), torch_native/ (cuBLAS), external/ (sageattention);
+               out-of-tree backends via the `flashim.backends` entry point
   log.py       logging (FLASHIM_LOG), dispatch tracing, profiler / NVTX ranges
   config.py    RunConfig: typed, layered (preset < file < overrides), serializable run configuration
   build.py     ModelSpec (presets, passes, engines) + the generic builder all models go through
@@ -490,15 +479,40 @@ if a GPU call falls back to a torch reference.
 ## Platforms
 
 FP8 presets run natively on Blackwell (sm_100 / sm_120) through `F.scaled_mm`
-block-scaled MXFP8. Elsewhere they fall back to a Triton FP8 GEMM (sm_89+) or to
-emulation kernels (any device, including CPU) — same numerics contract, slower.
+block-scaled MXFP8, and through a Triton FP8 GEMM on sm_89 / sm_90.
+
+A GPU without FP8 (Ampere, Jetson Orin) builds the preset's INT8 counterpart instead: `fp8` -> `int8`; RDD, which has no INT8 preset, ->
+`bf16`. A warning says so, and `model.preset` / `model.build_report.fallbacks` record it. On a Jetson AGX Orin
+(eager) RoMaV2 `fp8` would take 3.3 s per pair emulated, against 1.1 s for the earlier `int8-full` (now `int8`, which adds the fast refiner kernels) and 2.0 s for `bf16`.
+
+FP8 is kept, on emulation kernels (same numerics contract, slower), on the CPU, when a calibration table is
+passed with the preset, and by `flashim.build_config(flashim.resolve(name, preset))`; `optimize.strict=true`
+raises instead of replacing or emulating.
+
+## Checkpoints
+
+Every model downloads its upstream release on first use into the torch hub checkpoint folder
+(`$TORCH_HOME/hub/checkpoints`, default `~/.cache/torch/hub/checkpoints`) and checks it against the SHA-256 pinned
+in `flashim/models/<model>/weights.py`; a file already there is used as is. `checkpoint=` or the model's
+`FLASHIM_<MODEL>_CHECKPOINT` variable (e.g. `FLASHIM_RDD_CHECKPOINT`) points at a local file instead. For an
+offline machine, copy the checkpoint folder over. Calibration tables ship in the repository.
+
+## Checkpoints
+
+Every model downloads its upstream release on first use into the torch hub checkpoint folder
+(`$TORCH_HOME/hub/checkpoints`, default `~/.cache/torch/hub/checkpoints`) and checks it against the SHA-256 pinned
+in `flashim/models/<model>/weights.py`; a file already there is used as is. `checkpoint=` or the model's
+`FLASHIM_<MODEL>_CHECKPOINT` variable (e.g. `FLASHIM_RDD_CHECKPOINT`) points at a local file instead. For an
+offline machine, copy the checkpoint folder over. Calibration tables ship in the repository.
 
 ## Development
 
 ```bash
-uv sync --extra eval                     # torch 2.11 (cu130), triton 3.6, fused-local-corr
+uv sync --extra eval                     # Python 3.12 (.python-version), torch 2.11 (cu130), triton 3.6
 uv run pytest -m "not slow"              # unit / ops / quant
-uv run pytest tests/parity               # bit-exactness vs ../RoMaV2 (needs weights + GPU)
+uv pip install -e ../RoMaV2              # the RoMaV2 oracle is not a dependency (`uv sync` removes it again)
+uv run pytest tests/parity               # bit-exactness vs the upstream code (needs weights + GPU; skips oracles
+                                         # that are not installed / checked out)
 uv run python benchmarks/speed/forward.py --preset fp8 --engine compile
 uv run python benchmarks/accuracy/run.py --dataset mega1500 --preset fp8 --seed 17
 ```

@@ -38,7 +38,7 @@ def configs() -> list[tuple[str, str, str, list[str], str]]:
     out += [("aliked-lightglue-int8", "aliked-lightglue", "int8", [], "pipeline")]
     out += [("raco-aliked-lightglue-bf16x", "raco-aliked-lightglue", "int8", ["components.extractor.preset=bf16"],
              "pipeline")]
-    out += [(f"romav2-{p}", "romav2", p, [], "dense") for p in ("bf16", "fp8", "fp8-fast", "int8-fast")]
+    out += [(f"romav2-{p}", "romav2", p, [], "dense") for p in ("bf16", "fp8", "int8")]
     return out
 
 
