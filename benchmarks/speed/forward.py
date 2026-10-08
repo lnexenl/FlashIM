@@ -18,9 +18,8 @@ from pathlib import Path
 
 import torch
 
-ROMAV2_ROOT = Path.home() / "work" / "RoMaV2"
-IMAGE_A = ROMAV2_ROOT / "data/megadepth/Undistorted_SfM/0015/images/3383162411_67cc9af85e_o.jpg"
-IMAGE_B = ROMAV2_ROOT / "data/megadepth/Undistorted_SfM/0015/images/299056923_ecd980298c_o.jpg"
+from flashim.paths import IMAGE_A, IMAGE_B, ROMAV2_CALIBRATION
+
 _ROMAV2_VARIANTS = {"fp8-p8": "none", "fp8-s4": "s4_fused", "fp8-s42": "s4_fused_s2_fused"}
 
 
@@ -44,7 +43,7 @@ def _build_romav2(args):
     model.apply_setting(args.setting)
     runner, target = model, model
     if args.preset != "bf16":
-        cal = FullFP8Calibration.load(ROMAV2_ROOT / "data/quantization/romav2_full_fp8_mega1500.pt")
+        cal = FullFP8Calibration.load(ROMAV2_CALIBRATION)
         runner = FastFP8Model(model, cal, keep_bf16_modules=("refiners",))
         apply_refiner_variant(runner.model, cal, _ROMAV2_VARIANTS[args.preset])
         target = runner.model

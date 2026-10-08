@@ -21,8 +21,9 @@ import numpy as np
 import torch
 
 import flashim
+from flashim.paths import DATA
 
-DEFAULT_ROOT = Path.home() / "work" / "FlashIM" / "data" / "hardmatch"
+DEFAULT_ROOT = DATA / "hardmatch"
 
 
 class FlashIMMatcher:

@@ -8,11 +8,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from ..conftest import ROMAV2_ROOT
+from ..conftest import MEGADEPTH_IMAGES
 
 pytestmark = [pytest.mark.cuda, pytest.mark.slow]
 ORACLE = Path.home() / "work" / "oracles" / "LightGlue"
-IMAGES = [ROMAV2_ROOT / "data/megadepth/Undistorted_SfM/0015/images" / name  # an overlapping pair: hundreds of matches
+IMAGES = [MEGADEPTH_IMAGES / name  # an overlapping pair: hundreds of matches
           for name in ("101776896_21fc24b031_o.jpg", "101795964_72e8f63ab1_o.jpg")]
 # variant -> (extractor whose features it matches, descriptor dim)
 VARIANTS = {"aliked": ("aliked", 128), "raco-aliked": ("raco-aliked", 128), "superpoint": ("superpoint", 256),

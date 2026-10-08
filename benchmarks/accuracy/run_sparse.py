@@ -35,7 +35,7 @@ import torch
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
-from run import MEGA_SCENES, ROMAV2_DATA, PosePool, _git, _read_rgb, prefetch
+from run import MEGA_SCENES, PosePool, _git, _read_rgb, prefetch
 
 import flashim
 import flashim.registry
@@ -45,6 +45,7 @@ from flashim.geometry.pose import (
     estimate_pose_cv2_ransac,
     summarize,
 )
+from flashim.paths import DATA
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +175,7 @@ def main() -> None:
     cv2.setNumThreads(ncpu)
     torch.set_num_threads(ncpu)
     torch.backends.cudnn.benchmark = False
-    data_root = Path(args.data_root) if args.data_root else ROMAV2_DATA / "megadepth"
+    data_root = Path(args.data_root) if args.data_root else DATA / "megadepth"
     # keyword API for models that have one, unless --overrides are given (it would drop them silently)
     if args.extra or (args.model in flashim.registry.LEGACY_LOADERS and not args.overrides):
         model = flashim.load(args.model, preset=args.preset, engine=args.engine, **(json.loads(args.extra) if args.extra else {}))

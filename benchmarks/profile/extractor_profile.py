@@ -12,15 +12,15 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from pathlib import Path
 
 import torch
 from torch.profiler import ProfilerActivity, profile
 
 import flashim
 from flashim.models.romav2.model import load_image
+from flashim.paths import IMAGE_A
 
-IMAGE = Path.home() / "work/RoMaV2/data/megadepth/Undistorted_SfM/0015/images/3383162411_67cc9af85e_o.jpg"
+IMAGE = IMAGE_A
 
 GROUPS = (
     ("gemm", ("gemm", "cutlass", "cublas", "nvjet", "int8_linear", "scaled_mm", "_mm", "sm80_xmma", "sm90_xmma")),

@@ -7,10 +7,13 @@ import pytest
 import torch
 
 from flashim import ops
+from flashim.paths import (  # noqa: F401  (re-exported to the tests)
+    ASSETS,
+    MEGADEPTH_IMAGES,
+    ROMAV2_CALIBRATION,
+)
 
-ROMAV2_ROOT = Path.home() / "work" / "RoMaV2"
 CHECKPOINT = Path(torch.hub.get_dir()) / "checkpoints" / "romav2.0.1.pt"
-ASSETS = ROMAV2_ROOT / "assets"
 
 HAS_CUDA = torch.cuda.is_available()
 CAPABILITY = torch.cuda.get_device_capability() if HAS_CUDA else (0, 0)

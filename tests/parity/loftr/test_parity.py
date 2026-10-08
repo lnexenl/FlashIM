@@ -1,16 +1,16 @@
 """FlashIM's LoFTR against kornia's ``LoFTR`` (same checkpoint, loaded from the local copy)."""
 
-from pathlib import Path
 
 import pytest
 import torch
 
 import flashim
 from flashim.models.loftr import weights
+from flashim.paths import MEGADEPTH_IMAGES
 
 pytestmark = [pytest.mark.slow, pytest.mark.cuda]
 
-ROOT = Path.home() / "work/RoMaV2/data/megadepth/Undistorted_SfM/0015/images"
+ROOT = MEGADEPTH_IMAGES
 IMAGES = [ROOT / "3383162411_67cc9af85e_o.jpg", ROOT / "299056923_ecd980298c_o.jpg"]
 
 

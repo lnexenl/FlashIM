@@ -150,8 +150,12 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   Parity-test pitfalls: put upstream modules in `.eval()`; disable `cudnn.allow_tf32` (BN folding changes TF32
   rounding); `torch.cdist` on pixel coordinates needs `compute_mode="donot_use_mm_for_euclid_dist"`; compare
   keypoints as sets, not by index (a few threshold-borderline points flip and shift every later index).
-- Oracles live next to the repo: `~/work/RoMaV2` (not a dependency: installed by hand, see above), `~/work/RDD`,
-  `~/work/ALIKED`, LightGlue-ONNX for RaCo. Data under `data/` and results under `results/` are gitignored.
+- Oracles live next to the repo: `~/work/RoMaV2` (the oracle *package*, not a dependency: installed by hand, see above),
+  `~/work/RDD`, `~/work/ALIKED`, LightGlue-ONNX for RaCo. Nothing else reads from the RoMaV2 checkout: the test /
+  benchmark images are in `assets/` (copied from RoMaV2 and MegaDepth scene 0015, MIT: `assets/LICENSE-RoMaV2`), the
+  datasets and calibration manifests under `data/` (or `$FLASHIM_DATA`; `flashim/paths.py`; locally symlinks to
+  `~/work/RoMaV2/data/{megadepth,scannet,quantization}`). `data/` and `results/` are gitignored, and so is the
+  third-party `kernelwiki` skill.
 - The autotuned conv kernels (`backends/triton/conv.py`) keep their timings in Triton's cache, so a pick made on a
   busy GPU sticks until the kernel source changes: `FLASHIM_AUTOTUNE_CACHE=0` re-times in every process (do that
   when comparing tiles). Editing that file shifts line numbers, which recompiles every kernel in it.

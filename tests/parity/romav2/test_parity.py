@@ -12,12 +12,12 @@ from flashim import ops
 from flashim.ops._registry import DeviceSpec
 from flashim.ops.correlation import local_window
 
-from ...conftest import ASSETS, ROMAV2_ROOT
+from ...conftest import ASSETS, ROMAV2_CALIBRATION
 
 pytestmark = [pytest.mark.cuda, pytest.mark.weights, pytest.mark.oracle, pytest.mark.slow]
 
 PAIR = (ASSETS / "toronto_A.jpg", ASSETS / "toronto_B.jpg")
-CAL = ROMAV2_ROOT / "data/quantization/romav2_full_fp8_mega1500.pt"
+CAL = ROMAV2_CALIBRATION
 VARIANTS = {"fp8-p8": "none", "fp8-s4": "s4_fused", "fp8-s42": "s4_fused_s2_fused"}
 
 

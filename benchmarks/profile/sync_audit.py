@@ -19,8 +19,9 @@ from torch.profiler import ProfilerActivity, profile
 
 import flashim
 from flashim.models.romav2.model import load_image
+from flashim.paths import MEGADEPTH_IMAGES
 
-IMAGES = Path.home() / "work/RoMaV2/data/megadepth/Undistorted_SfM/0015/images"
+IMAGES = MEGADEPTH_IMAGES
 IMAGE_A, IMAGE_B = IMAGES / "3383162411_67cc9af85e_o.jpg", IMAGES / "299056923_ecd980298c_o.jpg"
 ROOT = str(Path(flashim.__file__).parent)
 

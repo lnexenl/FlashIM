@@ -26,10 +26,7 @@ import torch
 
 from flashim import ops
 from flashim.models.romav2.build import load_romav2
-
-ROMAV2_DATA = Path.home() / "work" / "RoMaV2" / "data"
-IMAGE_A = ROMAV2_DATA / "megadepth/Undistorted_SfM/0015/images/3383162411_67cc9af85e_o.jpg"
-IMAGE_B = ROMAV2_DATA / "megadepth/Undistorted_SfM/0015/images/299056923_ecd980298c_o.jpg"
+from flashim.paths import IMAGE_A, IMAGE_B
 
 TOP_REGIONS = ("f", "matcher", "matcher.mv_vit", "matcher.head", "refiner_features", "refiners.4", "refiners.2", "refiners.1")
 EAGER_SUBREGIONS = (

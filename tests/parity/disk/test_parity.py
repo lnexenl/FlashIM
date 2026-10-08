@@ -1,16 +1,16 @@
 """FlashIM's DISK against kornia's ``DISK.from_pretrained("depth")`` (same checkpoint, loaded from the local copy)."""
 
-from pathlib import Path
 
 import pytest
 import torch
 
 import flashim
 from flashim.models.disk import weights
+from flashim.paths import MEGADEPTH_IMAGES
 
 pytestmark = [pytest.mark.slow, pytest.mark.cuda]
 
-IMAGE = Path.home() / "work/RoMaV2/data/megadepth/Undistorted_SfM/0015/images/3383162411_67cc9af85e_o.jpg"
+IMAGE = MEGADEPTH_IMAGES / "3383162411_67cc9af85e_o.jpg"
 
 
 @pytest.fixture(scope="module")

@@ -11,12 +11,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from ...conftest import ROMAV2_ROOT
+from ...conftest import MEGADEPTH_IMAGES
 
 pytestmark = [pytest.mark.cuda, pytest.mark.slow]
 
 RDD_ROOT = Path.home() / "work" / "RDD"
-IMAGES = sorted((ROMAV2_ROOT / "data/megadepth/Undistorted_SfM/0015/images").glob("*.jpg"))[:2]
+IMAGES = [MEGADEPTH_IMAGES / "505127_40b48ea397_o.jpg", MEGADEPTH_IMAGES / "505128_561e05e146_o.jpg"]
 
 
 @pytest.fixture(scope="module")
@@ -47,7 +47,7 @@ def oracle(checkpoint):
 
 def _images():
     if not IMAGES:
-        pytest.skip("needs MegaDepth images under ~/work/RoMaV2/data/megadepth")
+        pytest.skip("needs MegaDepth images under assets/megadepth_0015")
     from PIL import Image
 
     out = []

@@ -6,8 +6,8 @@ per-tensor 99.99th-percentile scales, RoMaV2's ``percentile`` observer) and writ
 FlashIM calibration table (safetensors).
 
     python scripts/calibrate_romav2.py \
-        --manifest ~/work/RoMaV2/data/quantization/calibration_local.jsonl \
-        --root ~/work/RoMaV2 --setting mega1500 --max-pairs 8 --out cal.safetensors
+        --manifest data/quantization/calibration_local.jsonl \
+        --root . --setting mega1500 --max-pairs 8 --out cal.safetensors
 """
 
 from __future__ import annotations

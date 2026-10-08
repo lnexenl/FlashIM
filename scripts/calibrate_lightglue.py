@@ -4,8 +4,8 @@ Runs RDD (``--rdd-preset``, default ``fp8``: the features LightGlue sees in depl
 pairs, then LightGlue in BF16 with observers on every linear its FP8/INT8 presets target.
 
     python scripts/calibrate_lightglue.py --format fp8 \\
-        --manifest ~/work/RoMaV2/data/quantization/calibration_local.jsonl \\
-        --root ~/work/RoMaV2 --max-pairs 32 --out flashim/models/lightglue/calibration/lightglue_fp8_mega.safetensors
+        --manifest data/quantization/calibration_local.jsonl \\
+        --root . --max-pairs 32 --out flashim/models/lightglue/calibration/lightglue_fp8_mega.safetensors
 """
 
 from __future__ import annotations

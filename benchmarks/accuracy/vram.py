@@ -19,10 +19,11 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from run import MEGA_SCENES, ROMAV2_DATA, _read_rgb
+from run import MEGA_SCENES, _read_rgb
 
 import flashim
 import flashim.registry
+from flashim.paths import DATA
 
 
 def main() -> None:
@@ -37,7 +38,7 @@ def main() -> None:
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
-    root = ROMAV2_DATA / "megadepth"
+    root = DATA / "megadepth"
     jobs = []
     for scene_name in MEGA_SCENES[: args.pairs]:
         scene = np.load(root / scene_name, allow_pickle=True)

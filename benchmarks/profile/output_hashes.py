@@ -23,7 +23,9 @@ from pathlib import Path
 
 import torch
 
-IMAGES = Path.home() / "work/RoMaV2/data/megadepth/Undistorted_SfM/0015/images"
+from flashim.paths import MEGADEPTH_IMAGES
+
+IMAGES = MEGADEPTH_IMAGES
 IMAGE_A, IMAGE_B = IMAGES / "3383162411_67cc9af85e_o.jpg", IMAGES / "299056923_ecd980298c_o.jpg"
 EXTRACTORS = ("superpoint", "alike", "disk", "xfeat", "ripe", "dedode", "dedode-g", "dad")
 

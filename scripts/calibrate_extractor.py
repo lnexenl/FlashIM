@@ -5,7 +5,7 @@ MegaDepth-1500) with observers on every layer its int8 / fp8 quant config target
 ``calibrations`` entry points to.
 
     python scripts/calibrate_extractor.py --model superpoint --format fp8 --format int8 \\
-        --manifest ~/work/RoMaV2/data/quantization/calibration_local.jsonl --root ~/work/RoMaV2 --max-pairs 32
+        --manifest data/quantization/calibration_local.jsonl --root . --max-pairs 32
 """
 
 from __future__ import annotations

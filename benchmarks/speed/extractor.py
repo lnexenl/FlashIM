@@ -11,14 +11,13 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
-from pathlib import Path
 
 import torch
 
 import flashim
+from flashim.paths import IMAGE_A, IMAGE_B
 
-IMAGE = Path.home() / "work/RoMaV2/data/megadepth/Undistorted_SfM/0015/images/3383162411_67cc9af85e_o.jpg"
-IMAGE_B = Path.home() / "work/RoMaV2/data/megadepth/Undistorted_SfM/0015/images/299056923_ecd980298c_o.jpg"
+IMAGE = IMAGE_A
 
 
 def timed(fn, warmups: int, iterations: int) -> tuple[list[float], object]:

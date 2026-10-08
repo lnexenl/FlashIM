@@ -8,11 +8,12 @@ import torch
 
 import flashim
 from flashim.models.ripe import weights
+from flashim.paths import MEGADEPTH_IMAGES
 
 pytestmark = [pytest.mark.slow, pytest.mark.cuda]
 
 ORACLE = Path.home() / "work" / "oracles" / "RIPE"
-IMAGE = Path.home() / "work/RoMaV2/data/megadepth/Undistorted_SfM/0015/images/3383162411_67cc9af85e_o.jpg"
+IMAGE = MEGADEPTH_IMAGES / "3383162411_67cc9af85e_o.jpg"
 
 
 @pytest.fixture(scope="module")

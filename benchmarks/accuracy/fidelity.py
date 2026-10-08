@@ -23,9 +23,10 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from run import MEGA_SCENES, ROMAV2_DATA
+from run import MEGA_SCENES
 
 import flashim
+from flashim.paths import DATA
 
 PROTOCOL = {  # model -> (resize, top_k), as benchmarks/accuracy/sparse_matrix.sh
     "superpoint": (1600, 4096), "disk": (1600, 4096), "alike": (1600, 4096), "xfeat": (1600, 4096),
@@ -34,7 +35,7 @@ PROTOCOL = {  # model -> (resize, top_k), as benchmarks/accuracy/sparse_matrix.s
 
 
 def pairs(per_scene: int) -> list[tuple[str, str]]:
-    root = ROMAV2_DATA / "megadepth"
+    root = DATA / "megadepth"
     out = []
     for scene_name in MEGA_SCENES:
         scene = np.load(root / scene_name, allow_pickle=True)

@@ -7,7 +7,7 @@ from flashim.quant.calibration import CalibrationTable, Calibrator, import_romav
 from flashim.quant.formats import mx
 from flashim.quant.tensor import QuantizedWeight, quantize_static
 
-from ..conftest import ROMAV2_ROOT
+from ..conftest import ROMAV2_CALIBRATION
 
 
 def test_exponent_rules():
@@ -67,7 +67,7 @@ def test_calibrator_and_table_roundtrip(tmp_path):
         assert torch.equal(loaded[name].input_exponent, table[name].input_exponent)
 
 
-ROMAV2_CAL = ROMAV2_ROOT / "data/quantization/romav2_full_fp8_mega1500.pt"
+ROMAV2_CAL = ROMAV2_CALIBRATION
 
 
 @pytest.mark.skipif(not ROMAV2_CAL.exists(), reason="RoMaV2 calibration file not present")

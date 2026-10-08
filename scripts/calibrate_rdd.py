@@ -4,8 +4,8 @@ Runs ``extract`` over the images of manifest pairs with observers on every linea
 targets, and writes a FlashIM calibration table (safetensors, block-32 amax exponents).
 
     python scripts/calibrate_rdd.py \\
-        --manifest ~/work/RoMaV2/data/quantization/calibration_local.jsonl \\
-        --root ~/work/RoMaV2 --max-pairs 16 --out flashim/models/rdd/calibration/rdd_fp8_mega.safetensors
+        --manifest data/quantization/calibration_local.jsonl \\
+        --root . --max-pairs 16 --out flashim/models/rdd/calibration/rdd_fp8_mega.safetensors
 """
 
 from __future__ import annotations
