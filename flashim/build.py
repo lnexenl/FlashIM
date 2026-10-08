@@ -11,9 +11,10 @@ Every model goes through the same stages, in this order::
     engine                                 per-kind setup + torch.compile of the spec's regions
     spec.apply_inference                   per-call defaults
 
-A pass whose platform requirement is not met is skipped (logged; ``optimize.strict`` raises instead). The returned
-model carries ``model.run_config`` (the resolved :class:`RunConfig`: what was asked for) and ``model.build_report``
-(:class:`BuildReport`: what actually happened).
+A pass whose platform requirement is not met is skipped (logged; ``optimize.strict`` raises instead). On a GPU without
+FP8 (below sm_89: Ampere, Jetson Orin) :func:`build` replaces an FP8 preset by the spec's ``fp8_fallbacks`` entry, its
+INT8 counterpart (see :func:`resolve`). The returned model carries ``model.run_config`` (the resolved
+:class:`RunConfig`: what is built) and ``model.build_report`` (:class:`BuildReport`: what actually happened).
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from torch import nn
 
 from flashim.config import RunConfig, load_file, merge, parse_overrides, resolve_preset
 from flashim.log import get_logger
-from flashim.platforms import Feature, Platform, platform_for
+from flashim.platforms import Feature, Platform, default_device, platform_for
 
 logger = get_logger("build")
 
@@ -69,6 +70,11 @@ class ModelSpec:
     default_preset: str
     quant_configs: Mapping[str, Any] = field(default_factory=dict)  # name -> QuantConfig
     calibrations: Mapping[str, Path] = field(default_factory=dict)  # quant name -> default table
+    # FP8 preset -> the preset built in its place on a GPU without FP8: its INT8 counterpart (INT8 MMA is native from
+    # sm_75 on), BF16 where the model has none. Measured on a Jetson AGX Orin (sm_87), where FP8 runs on the torch
+    # references: RoMaV2 fp8 3334 ms against int8 (then int8-full) 1122 ms (bf16 1981 ms), LightGlue 209 against 56 ms, RDD fp8
+    # 1151 ms against bf16 398 ms.
+    fp8_fallbacks: Mapping[str, str] = field(default_factory=dict)
     protected: tuple[str, ...] = ()
     passes: Mapping[str, Pass] = field(default_factory=dict)
     engines: Mapping[str, EngineSpec] = field(default_factory=lambda: {"eager": EAGER})
@@ -101,6 +107,7 @@ class BuildReport:
     skipped: dict[str, str] = field(default_factory=dict)  # skipped pass -> reason
     quant: dict[str, Any] | None = None
     emulated_quant: bool = False
+    fallbacks: dict[str, str] = field(default_factory=dict)  # model / component path -> "asked -> built" preset
     compiled_regions: list[str] = field(default_factory=list)
     components: dict[str, BuildReport] = field(default_factory=dict)
 
@@ -149,15 +156,47 @@ def spec_names() -> list[str]:
 _PROPAGATED = ("device", "engine")  # pipeline-level keys applied to components that do not set them
 
 
+def _keeps_fp8(user: Mapping[str, Any]) -> str | None:
+    """Why a user config rules the FP8 fallback out (``None``: it does not): ``optimize.strict`` (build what was asked
+    or raise), or a calibration table passed with a preset, which is an FP8 table. One answer for the whole config,
+    components included: a pipeline's preset and its matcher's calibration table are replaced together or not at all."""
+    optimize, precision = user.get("optimize") or {}, user.get("precision") or {}
+    if optimize.get("strict"):
+        return "optimize.strict"
+    if precision.get("calibration") or (optimize.get("options") or {}).get("calibration_table") is not None:
+        return "a calibration table was passed"
+    return next(filter(None, map(_keeps_fp8, (user.get("components") or {}).values())), None)
+
+
+def _fp8_fallback(spec: ModelSpec, preset: str, platform: Platform, keep: str | None) -> str:
+    """``preset``, or ``spec.fp8_fallbacks[preset]`` when ``platform`` is a GPU without FP8. The CPU keeps FP8: it has
+    no INT8 kernels either, and FP8 emulation there is how the numerics are checked without a GPU."""
+    fallback = spec.fp8_fallbacks.get(preset)
+    if fallback is None or platform.device_type == "cpu" or platform.supports(Feature.FP8_E4M3):
+        return preset
+    if keep is not None:
+        logger.warning("%s: no FP8 on %s, preset %r kept (%s)", spec.name, platform.describe(), preset, keep)
+        return preset
+    logger.warning("%s: no FP8 on %s, preset %r replaced by %r", spec.name, platform.describe(), preset, fallback)
+    return fallback
+
+
 def resolve(
     name: str,
     preset: str | None = None,
     config: RunConfig | Mapping[str, Any] | str | Path | None = None,
     overrides: Iterable[str] | Mapping[str, Any] = (),
+    *,
+    platform: Platform | None = None,
 ) -> RunConfig:
     """Resolve ``name``'s ``preset`` (default: the spec's) + ``config`` (a RunConfig, dict or file) + dotted
-    ``overrides`` into a validated :class:`RunConfig`."""
-    spec = get_spec(name)
+    ``overrides`` into a validated :class:`RunConfig`.
+
+    With ``platform`` (:func:`build` passes the target device's), a preset that needs FP8 is replaced by the spec's
+    ``fp8_fallbacks`` entry when that platform is a GPU without FP8, here and in every component, unless the config
+    sets ``optimize.strict`` or passes a calibration table anywhere (:func:`_keeps_fp8`); ``preset`` of the result names
+    the preset that is built. Without ``platform`` the result does not depend on the machine: build it with
+    :func:`build_config` to run an FP8 preset emulated on such a GPU."""
     user: dict[str, Any] = {}
     if isinstance(config, RunConfig):
         user = config.to_dict()
@@ -166,9 +205,17 @@ def resolve(
     elif config is not None:
         user = dict(config)
     user = merge(user, parse_overrides(overrides))
+    return _resolve(name, preset, user, platform, None if platform is None else _keeps_fp8(user))
+
+
+def _resolve(name: str, preset: str | None, user: dict[str, Any], platform: Platform | None, keep: str | None) -> RunConfig:
+    """``user``: everything layered over the preset (for a component: the pipeline preset's entry + the user's)."""
+    spec = get_spec(name)
     user.pop("model", None)
     preset = preset or user.pop("preset", None) or spec.default_preset
     user.pop("preset", None)
+    if platform is not None:
+        preset = _fp8_fallback(spec, preset, platform, keep)
     data = merge(resolve_preset(spec.presets, preset), user)
     user_components = user.get("components") or {}
     for component, sub in (data.get("components") or {}).items():
@@ -177,7 +224,7 @@ def resolve(
             if key in user and key not in (user_components.get(component) or {}):
                 sub[key] = merge(sub.get(key) or {}, user[key]) if isinstance(user[key], Mapping) else user[key]
         sub_name = sub.pop("model")
-        data["components"][component] = resolve(sub_name, sub.pop("preset", None), sub).to_dict()
+        data["components"][component] = _resolve(sub_name, sub.pop("preset", None), sub, platform, keep).to_dict()
     data.update(model=spec.name, preset=preset)
     resolved = RunConfig.from_dict(data)
     spec.check(resolved)
@@ -300,8 +347,22 @@ def build(
     config: RunConfig | Mapping[str, Any] | str | Path | None = None,
     overrides: Iterable[str] | Mapping[str, Any] = (),
 ) -> nn.Module:
-    """``resolve`` + ``build_config``: e.g. ``build("romav2", "fp8-fast", overrides=["engine.kind=compile-full"])``."""
-    return build_config(resolve(name, preset, config, overrides))
+    """``resolve`` for the target device's platform + ``build_config``: e.g. ``build("romav2", "fp8",
+    overrides=["engine.kind=compile-full"])``. Presets the platform replaced are in ``model.build_report.fallbacks``."""
+    overrides = overrides if isinstance(overrides, Mapping) else list(overrides)
+    asked = resolve(name, preset, config, overrides)
+    built = resolve(name, preset, config, overrides, platform=platform_for(asked.device or default_device()))
+    model = build_config(built)
+    model.build_report.fallbacks = _preset_changes(asked, built)
+    return model
+
+
+def _preset_changes(asked: RunConfig, built: RunConfig, path: str = "") -> dict[str, str]:
+    changes = {} if asked.preset == built.preset else {path or asked.model: f"{asked.preset} -> {built.preset}"}
+    for name, component in built.components.items():
+        if name in asked.components:
+            changes.update(_preset_changes(asked.components[name], component, f"{path}.{name}".lstrip(".")))
+    return changes
 
 
 def dtype(name: str) -> torch.dtype:

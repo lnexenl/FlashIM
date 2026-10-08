@@ -43,7 +43,8 @@ def get_logger(name: str) -> logging.Logger:
 def _parse_level(level: str | int) -> int:
     if isinstance(level, int):
         return level
-    levels = logging.getLevelNamesMapping()
+    # getLevelNamesMapping is 3.11+ (JetPack 6 ships Python 3.10): the table it copies
+    levels = getattr(logging, "getLevelNamesMapping", lambda: dict(logging._nameToLevel))()
     if level.strip().upper() not in levels:
         raise ValueError(f"Unknown log level {level!r}; choose from {sorted(levels)}")
     return levels[level.strip().upper()]

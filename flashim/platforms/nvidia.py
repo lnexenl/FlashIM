@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import logging
 import os
 import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
 from flashim.platforms.base import Feature, Platform, Vendor
+
+logger = logging.getLogger(__name__)
 
 
 def has_module(name: str) -> bool:
@@ -25,6 +30,44 @@ def nvcc_path() -> str | None:
         if home and (Path(home) / "bin" / "nvcc").is_file():
             return str(Path(home) / "bin" / "nvcc")
     return shutil.which("nvcc")
+
+
+def _ptxas_assembles(ptxas: str, arch: str) -> bool:
+    """Whether ``ptxas`` knows ``arch``: an empty module assembles."""
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "probe.ptx"
+        source.write_text(f".version 8.5\n.target {arch}\n.address_size 64\n")
+        try:
+            command = [ptxas, f"--gpu-name={arch}", str(source), "-o", os.devnull]
+            return subprocess.run(command, capture_output=True, check=False).returncode == 0
+        except OSError:
+            return False
+
+
+# Architectures Triton 3.6's bundled assemblers have been run with here (sm_100: compile-checked): no probe.
+_TRITON_ASSEMBLES = frozenset({7, 8, 9, 10, 12})
+
+
+def triton_targets(capability: tuple[int, int]) -> bool:
+    """Whether the installed Triton can assemble kernels for ``capability``. Triton 3.6 bundles the CUDA 12.9 ``ptxas``
+    for Blackwell, which does not know sm_110 (Jetson AGX Thor: "Value 'sm_110a' is not defined for option
+    'gpu-name'"). There Triton, and with it Inductor's kernels, is pointed at the CUDA toolkit's ``ptxas`` (13.0 or
+    newer; ``TRITON_PTXAS_BLACKWELL_PATH``, left alone when already set) if that one assembles for the device."""
+    if capability[0] in _TRITON_ASSEMBLES:
+        return True
+    arch = f"sm_{capability[0]}{capability[1]}a"
+    configured = os.environ.get("TRITON_PTXAS_BLACKWELL_PATH")
+    bundled = Path(importlib.util.find_spec("triton").origin).parent / "backends" / "nvidia" / "bin" / "ptxas-blackwell"
+    if _ptxas_assembles(configured or str(bundled), arch):
+        return True
+    nvcc = nvcc_path()
+    toolkit = None if nvcc is None else Path(nvcc).with_name("ptxas")
+    if configured is None and toolkit is not None and toolkit.is_file() and _ptxas_assembles(str(toolkit), arch):
+        os.environ["TRITON_PTXAS_BLACKWELL_PATH"] = str(toolkit)
+        logger.info("Triton's ptxas does not know %s: using %s", arch, toolkit)
+        return True
+    logger.warning("no ptxas for %s (Triton's, TRITON_PTXAS_BLACKWELL_PATH, the CUDA toolkit's): Triton kernels are off", arch)
+    return False
 
 
 def _has_mxfp8_api() -> bool:
@@ -54,7 +97,7 @@ def isa_features(capability: tuple[int, int]) -> set[Feature]:
 def detect(index: int) -> Platform:
     capability = torch.cuda.get_device_capability(index)
     features = {Feature.CUDA_GRAPHS, *isa_features(capability)}
-    if has_module("triton"):
+    if has_module("triton") and triton_targets(capability):
         features.add(Feature.TRITON)
     if has_module("tilelang"):
         features.add(Feature.TILELANG)

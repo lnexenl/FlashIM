@@ -2,7 +2,7 @@
 
     import flashim
     model = flashim.load("romav2", preset="fp8", setting="mega1500", engine="compile")      # keyword API
-    model = flashim.load("romav2", "fp8-fast", overrides=["engine.kind=compile-full"])    # config API
+    model = flashim.load("romav2", "fp8", overrides=["engine.kind=compile-full"])    # config API
     result = model.match("a.jpg", "b.jpg")          # DenseMatchResult
     matches, conf, prec_a, prec_b = model.sample(result, 5000)
 

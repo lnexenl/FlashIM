@@ -30,8 +30,9 @@ def load_rdd(
     """Load RDD weights, apply a precision/quantization preset and an execution engine (see ``quant.py``).
 
     ``engine="compile"`` compiles the backbone, input projections, detector and transformer once per input
-    resolution (``compile_mode=None`` compiles ~5x faster than max-autotune for ~3% more runtime). On platforms
-    without native MXFP8 GEMMs FP8 presets run with emulation kernels (``strict=True`` raises instead).
+    resolution (``compile_mode=None`` compiles ~5x faster than max-autotune for ~3% more runtime). On a GPU without
+    FP8 (below sm_89) the FP8 presets are replaced by ``bf16`` (RDD has no INT8 preset); on the CPU they run with
+    emulation kernels (``strict=True`` raises instead of either).
     ``detector_dtype`` overrides the keypoint-detector precision (its score head stays FP32). ``checkpoint``: path
     to ``rdd.pth`` (see :mod:`flashim.models.rdd.weights` for the search order). Equivalent to
     ``flashim.build("rdd", preset, config=...)``.

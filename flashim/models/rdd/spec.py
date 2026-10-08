@@ -53,6 +53,7 @@ SPEC = ModelSpec(
     default_preset="fp8",
     quant_configs={name: preset.config for name, preset in quant.PRESETS.items() if preset.config is not None},
     calibrations={name: preset.calibration for name, preset in quant.PRESETS.items() if preset.config is not None},
+    fp8_fallbacks={name: "bf16" for name in ("fp8", "fp8-full", "fp8-backbone")},  # no INT8 preset (yet)
     protected=quant.PROTECTED,
     passes={
         "fuse_query_projections": Pass(

@@ -78,6 +78,7 @@ SPEC = ModelSpec(
     default_preset="fp8",
     quant_configs={name: p.config for name, p in _QUANTIZED.items()},
     calibrations={name: p.calibration for name, p in _QUANTIZED.items()},
+    fp8_fallbacks={"fp8": "int8"},
     protected=quant.PROTECTED,
     engines={"eager": EngineSpec(), "compile": EngineSpec(_regions, recompile_limit=64)},
     set_precision=_set_precision,
@@ -120,6 +121,8 @@ def _pipeline(name: str, extractor: str, extractor_preset: str, variant: str, de
             for preset in ("fp32", "bf16", *_QUANTIZED)
         },
         default_preset=default,
+        # the pipeline's preset, not only the matcher's: the INT8 preset carries the variant's INT8 calibration table
+        fp8_fallbacks=SPEC.fp8_fallbacks,
         compose=_compose,
         apply_inference=_apply_inference,
     )
