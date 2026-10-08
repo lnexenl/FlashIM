@@ -123,6 +123,11 @@ class XFeat(sparse.SparseExtractor):
         b, _, h, w = scores.shape
         return scores.permute(0, 2, 3, 1).reshape(b, h, w, 8, 8).permute(0, 1, 3, 2, 4).reshape(b, 1, h * 8, w * 8)
 
+    def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
+        h, w = image.shape[-2:]
+        feats = F.normalize(self.dense(image)[0], dim=1)
+        return F.normalize(_sample(feats, keypoints, h, w, "bicubic"), dim=-1)
+
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
         h, w = image.shape[-2:]
         feats, logits, reliability = self.dense(image)

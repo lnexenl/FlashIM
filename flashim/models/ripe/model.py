@@ -59,9 +59,16 @@ class RIPE(sparse.SparseExtractor):
         scores = heat[0, 0, ys, xs]
         order = torch.argsort(-scores)[: top_k if top_k else None]
         keypoints, scores = keypoints[order], scores[order]
+        return keypoints.float(), scores / heat.max(), self._describe(features, keypoints, h, w)
+
+    def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
+        h, w = image.shape[-2:]
+        return self._describe(self.heatmap(image)[1], keypoints, h, w)
+
+    def _describe(self, features: list[Tensor], keypoints: Tensor, h: int, w: int) -> Tensor:
         grid = (2.0 * keypoints.float() / device_constant([w - 1, h - 1], keypoints, torch.float32) - 1.0).view(1, 1, -1, 2)
         hyper = torch.cat(
             [F.grid_sample(f.float(), grid, mode="bilinear", align_corners=True)[0, :, 0] for f in features], dim=0
         )  # [960, K]
         desc = self.conv_dim_reduction_coarse_desc(hyper[None].to(self.conv_dim_reduction_coarse_desc.weight.dtype))[0].t()
-        return keypoints.float(), scores / heat.max(), F.normalize(desc.float(), dim=-1)
+        return F.normalize(desc.float(), dim=-1)

@@ -105,6 +105,14 @@ class ALIKE(sparse.SparseExtractor):
             fused = self.gate(self.convhead1(fused))
         return fused
 
+    def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
+        """``convhead2``'s descriptor rows are a 1x1 convolution, so they commute with the bilinear read: the features
+        are interpolated at the keypoints, then projected."""
+        weight, bias = self.convhead2.weight, self.convhead2.bias
+        at_keypoints = sparse.bilinear_at(self.head_input(image), keypoints)
+        descriptors = F.linear(at_keypoints, weight[:-1, :, 0, 0].float(), None if bias is None else bias[:-1].float())
+        return F.normalize(descriptors, dim=-1)
+
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
         cfg = self.config
         # convhead2 split by output row: the score row dense (FP32, read straight from the compute-dtype features), the
