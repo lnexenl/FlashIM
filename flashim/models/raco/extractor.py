@@ -1,6 +1,9 @@
-"""RaCo keypoints + ALIKED descriptors: the ``raco_aliked`` extractor of cvg/LightGlue's ALIKED pairing."""
+"""RaCo keypoints + descriptors from another model: ALIKED (:class:`RaCoALIKED`, the pairing cvg's LightGlue weights
+were trained on) or any model with ``describe_keypoints`` (:class:`RaCoExtractor`)."""
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn.functional as F
@@ -9,11 +12,97 @@ from torch import Tensor, nn
 from flashim.models.aliked.model import ALIKED
 from flashim.models.raco.model import RaCo
 from flashim.models.romav2.model import ImageLike, load_image
-from flashim.types import SparseFeatures
+from flashim.types import SparseFeatures, SparseMatchResult
 from flashim.utils import device_constant
 
+ALIGN = 32  # RaCo's stride
 
-class RaCoALIKED(nn.Module):
+
+class _RaCoBase(nn.Module):
+    """``extract`` around a subclass' :meth:`_run` (``image -> keypoints [1, K, 2], scores [1, K], descriptors [1, K,
+    C]``): load, resize to the working resolution, map the keypoints back to the original image."""
+
+    raco: RaCo
+    preset: str | None = None
+    engine: str | None = None
+    quant_report = None
+    calibration_metadata: dict[str, str] | None = None
+
+    @property
+    def device(self) -> torch.device:
+        return self.raco.device
+
+    @property
+    def align(self) -> int:
+        """Working resolutions are multiples of this (RaCo's 32, or more when the descriptor model needs it)."""
+        return ALIGN
+
+    def _run(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
+        raise NotImplementedError
+
+    @torch.inference_mode()
+    def extract(self, image: ImageLike, *, resize: int | None = None, top_k: int | None = None) -> SparseFeatures:
+        """``resize``: long side of the working resolution, both sides floored to multiples of :attr:`align`
+        (keypoints come back in the original image's coordinates). Without it the image must already be aligned."""
+        image = load_image(image, self.device)
+        if image.shape[0] != 1:
+            raise ValueError(f"{type(self).__name__}.extract processes one image at a time (batch size 1)")
+        height, width = image.shape[-2:]
+        new_h, new_w = height, width
+        align = self.align
+        if resize is not None:
+            aspect = width / height
+            new_h, new_w = (resize, int(resize * aspect)) if height > width else (int(resize / aspect), resize)
+            new_h, new_w = max(align, (new_h // align) * align), max(align, (new_w // align) * align)
+        elif height % align or width % align:
+            raise ValueError(f"{type(self).__name__} needs {align}-aligned images, got {height}x{width}; pass resize=")
+        if (new_h, new_w) != (height, width):
+            image = F.interpolate(image, size=(new_h, new_w), mode="bilinear", align_corners=False, antialias=True)
+        keypoints, scores, descriptors = self._run(image, top_k)
+        keypoints = keypoints * device_constant([width / new_w, height / new_h], keypoints)
+        return SparseFeatures(keypoints, scores, descriptors, (height, width))
+
+
+class RaCoExtractor(_RaCoBase):
+    """RaCo (detector + ranker) chooses the keypoints; ``descriptor`` (any model with ``describe_keypoints(image,
+    keypoints)``: SuperPoint, ALIKE, DISK, XFeat, DeDoDe, DaD, RIPE, RDD) describes them on the same working image.
+    Keypoints follow RaCo's pixel-edge convention (pixel index + 0.5) like :class:`RaCoALIKED`, ``scores`` are the
+    ranker scores, and matching is the descriptor model's own (``match_features``: mutual NN, dual softmax, ...).
+    The descriptors are the model's, read at RaCo's sub-pixel positions: the descriptor model never saw these
+    keypoints in training, so a matcher trained for its own detector (LightGlue) is applied out of distribution."""
+
+    def __init__(self, raco: RaCo, descriptor: nn.Module) -> None:
+        super().__init__()
+        if not hasattr(descriptor, "describe_keypoints"):
+            raise TypeError(f"{type(descriptor).__name__} has no describe_keypoints(image, keypoints)")
+        self.raco, self.descriptor = raco, descriptor
+
+    @property
+    def align(self) -> int:
+        return math.lcm(ALIGN, getattr(self.descriptor, "div_by", ALIGN))  # DeDoDe-G: 56 -> 224
+
+    def _run(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
+        raco = self.raco
+        x = raco.normalize(image)
+        keypoints, scores = raco.rank(raco.ranker_map(x), raco.detect(x, top_k), top_k)
+        descriptors = self.descriptor.describe_keypoints(image, keypoints[0] - 0.5)  # descriptors want pixel indices
+        return keypoints, scores, descriptors[None]
+
+    @torch.inference_mode()
+    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> SparseMatchResult:
+        return self.descriptor.match_features(a, b, threshold)
+
+    @torch.inference_mode()
+    def match(
+        self, img_a: ImageLike, img_b: ImageLike, *, resize: int | None = None, top_k: int | None = None,
+        threshold: float | None = None,
+    ) -> SparseMatchResult:
+        return self.match_features(
+            self.extract(img_a, resize=resize, top_k=top_k), self.extract(img_b, resize=resize, top_k=top_k), threshold
+        )
+
+
+class RaCoALIKED(_RaCoBase):
     """RaCo (detector + ranker) chooses the keypoints; ALIKED's encoder + SDDH head (its own score head and DKD are
     not used) describes them. ``extract`` returns :class:`SparseFeatures` whose keypoints follow RaCo's pixel-edge
     convention (pixel index + 0.5) and whose ``scores`` are the ranker scores."""
@@ -22,14 +111,6 @@ class RaCoALIKED(nn.Module):
         super().__init__()
         self.raco, self.aliked = raco, aliked
         self.concurrent = False  # overlap the independent CNNs on CUDA streams (measured no gain at 1024^2)
-        self.preset: str | None = None
-        self.engine: str | None = None
-        self.quant_report = None
-        self.calibration_metadata: dict[str, str] | None = None
-
-    @property
-    def device(self) -> torch.device:
-        return self.raco.device
 
     def _side_streams(self, device: torch.device) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
         streams = getattr(self, "_streams_", None)
@@ -64,24 +145,3 @@ class RaCoALIKED(nn.Module):
         ranker_map.record_stream(main)
         keypoints, scores = raco.rank(ranker_map, candidates, top_k)
         return keypoints, scores, aliked.describe_at(feature_map, keypoints)
-
-    @torch.inference_mode()
-    def extract(self, image: ImageLike, *, resize: int | None = None, top_k: int | None = None) -> SparseFeatures:
-        """``resize``: long side of the working resolution, both sides floored to multiples of 32 (keypoints come
-        back in the original image's coordinates). Without it the image must already be 32-aligned."""
-        image = load_image(image, self.device)
-        if image.shape[0] != 1:
-            raise ValueError("RaCoALIKED.extract processes one image at a time (batch size 1)")
-        height, width = image.shape[-2:]
-        new_h, new_w = height, width
-        if resize is not None:
-            aspect = width / height
-            new_h, new_w = (resize, int(resize * aspect)) if height > width else (int(resize / aspect), resize)
-            new_h, new_w = (new_h // 32) * 32, (new_w // 32) * 32
-        elif height % 32 or width % 32:
-            raise ValueError(f"RaCo needs 32-aligned images, got {height}x{width}; pass resize=")
-        if (new_h, new_w) != (height, width):
-            image = F.interpolate(image, size=(new_h, new_w), mode="bilinear", align_corners=False, antialias=True)
-        keypoints, scores, descriptors = self._run(image, top_k)
-        keypoints = keypoints * device_constant([width / new_w, height / new_h], keypoints)
-        return SparseFeatures(keypoints, scores, descriptors, (height, width))

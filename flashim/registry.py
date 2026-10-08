@@ -50,6 +50,15 @@ LEGACY_LOADERS = {
     "raco-aliked-lightglue": "flashim.models.lightglue.build:load_raco_aliked_lightglue",
 }
 
+# RaCo keypoints + the descriptors of any model that can describe given keypoints (raco-superpoint, raco-disk, ...).
+for _descriptor in ("superpoint", "alike", "disk", "xfeat", "dedode", "dedode-g", "dad", "ripe", "rdd"):
+    SPECS[f"raco-{_descriptor}"] = f"flashim.models.raco.spec:RACO_{_descriptor.upper().replace('-', '_')}"
+# ... and matched by LightGlue weights of the descriptor model (not trained on RaCo's keypoints).
+for _descriptor in ("superpoint", "disk", "xfeat", "rdd"):
+    SPECS[f"raco-{_descriptor}-lightglue"] = (
+        f"flashim.models.lightglue.spec:RACO_{_descriptor.upper()}_LIGHTGLUE"
+    )
+
 for _name, _target in SPECS.items():
     register_spec(_name, _target)
 
