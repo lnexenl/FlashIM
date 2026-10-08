@@ -6,10 +6,14 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import find_weights
+from flashim.models.weights_util import Checkpoint, find_weights
 
 CHECKPOINT_ENV = "FLASHIM_SUPERPOINT_CHECKPOINT"
-HELP = "Download https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth"
+CHECKPOINT = Checkpoint(
+    "superpoint_v1.pth",
+    "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth",
+    "52b6708629640ca883673b5d5c097c4ddad37d8048b33f09c8ca0d69db12c40e",
+)
 
 LICENSES = {
     "code": "MIT-style (Magic Leap SuperPoint) via cvg/LightGlue's port; FlashIM re-implementation",
@@ -18,4 +22,5 @@ LICENSES = {
 
 
 def load_state_dict(path: str | Path | None = None, map_location="cpu") -> dict[str, torch.Tensor]:
-    return torch.load(find_weights("superpoint_v1.pth", path=path, env=CHECKPOINT_ENV, help=HELP), map_location=map_location, weights_only=True)
+    file = find_weights(CHECKPOINT, path=path, env=CHECKPOINT_ENV)
+    return torch.load(file, map_location=map_location, weights_only=True)
