@@ -66,6 +66,14 @@ def sample_descriptors(keypoints: Tensor, descriptors: Tensor, stride: int) -> T
     return F.normalize(out, dim=-1)
 
 
+def bilinear_at(feature_map: Tensor, keypoints: Tensor) -> Tensor:
+    """``[1, C, H, W]`` map sampled bilinearly (FP32) at ``keypoints`` ``[K, 2]`` ``(x, y)`` in the map's pixel indices
+    (``align_corners=True``, so integer keypoints read the stored values exactly) -> ``[K, C]``."""
+    h, w = feature_map.shape[-2:]
+    grid = (2.0 * keypoints.float() / device_constant([w - 1, h - 1], keypoints, torch.float32) - 1.0).view(1, 1, -1, 2)
+    return F.grid_sample(feature_map.float(), grid, mode="bilinear", align_corners=True)[0, :, 0].t()
+
+
 def mutual_nn_match(desc0: Tensor, desc1: Tensor, threshold: float) -> tuple[Tensor, Tensor, Tensor]:
     """Mutual-nearest-neighbour cosine matches with similarity >= ``threshold`` (L2-normalized ``[N, C]``)."""
     if desc0.shape[0] == 0 or desc1.shape[0] == 0:  # no keypoints in one image: argmax has no dim to reduce
@@ -124,6 +132,12 @@ class SparseExtractor(nn.Module):
 
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
         raise NotImplementedError
+
+    def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
+        """L2-normalized descriptors ``[K, C]`` at externally chosen ``keypoints`` ``[K, 2]`` (``(x, y)`` pixel indices
+        of ``image``, a working-resolution ``[1, 3, H, W]`` RGB image; fractional positions are interpolated), e.g. the
+        ones a different detector picked (:class:`~flashim.models.raco.extractor.RaCoExtractor`)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot describe externally chosen keypoints")
 
     @torch.inference_mode()
     def extract(self, image: ImageLike, *, resize: int | None = None, top_k: int | None = None) -> SparseFeatures:

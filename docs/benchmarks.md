@@ -10,21 +10,18 @@ Latency of every model, preset and engine, measured on one GPU with one protocol
   models resize inside the timed call.
 - **Units**: milliseconds. The fastest number of a row is in bold.
 
-Presets and engines are described in [models.md](models.md).
+Presets are described in [models.md](models.md).
 
 ## RoMaV2 (dense)
 
-Preloaded forward in both directions, mega1500 setting (800² LR + 1024² HR), B=1. Compiled engines vary 15-25% between
-processes, so each is the best of two processes. The speed-up is over `bf16` in the same engine.
+Preloaded forward in both directions, mega1500 setting (800² LR + 1024² HR), B=1, run with `compile-full`, best of two processes
+(compiled runs vary 15-25% between processes). Speed-up over `bf16`.
 
-| preset | eager | compile | compile-full | speed-up (compile-full) |
-|---|---|---|---|---|
-| `bf16` | 350.7 | 332.4 | **195.0** | 1.00x |
-| `int8` | 140.1 | 133.7 | **104.0** | 1.87x |
-| `fp8` | 155.7 | 140.9 | **110.0** | 1.77x |
-
-`int8` and `fp8` were measured under their former names, `int8-fast` and `fp8-fast`. The RoMaV2 table in
-[models.md](models.md#romav2) (344 / 110 / 103 ms, speed-up over `bf16` + `compile`) comes from separate runs.
+| preset | forward | speed-up |
+|---|---|---|
+| `bf16` | 195.0 | 1.00x |
+| `int8` | 104.0 | 1.87x |
+| `fp8` | 110.0 | 1.77x |
 
 ## Sparse extractors
 
@@ -94,7 +91,7 @@ fail it are in bold.
 | disk-lightglue | +0.0011 | -0.0022 |
 | xfeat-lightglue | **-0.0244** | **-0.1366** |
 
-RoMaV2, RDD and the ALIKED pipelines were not part of that run. Their accuracy is in [models.md](models.md).
+RoMaV2, RDD and the ALIKED pipelines were not part of that run. Their accuracy is on their model pages ([models.md](models.md)).
 
 ## Running it
 

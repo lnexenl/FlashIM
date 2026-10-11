@@ -164,6 +164,21 @@ class DISK(sparse.SparseExtractor):
         mask[..., r : h - r, r : w - r] = keep
         return mask
 
+    def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
+        """DISK describes whole pixels (its 5x5 head has no sub-pixel reading): fractional keypoints round to the
+        nearest pixel."""
+        h, w = image.shape[-2:]
+        index = torch.stack(
+            (keypoints[:, 0].round().clamp(0, w - 1), keypoints[:, 1].round().clamp(0, h - 1)), -1
+        ).long()
+        head = self.unet.path_up[-1].conv[3]
+        if isinstance(head, SplitHeadConv):
+            features = self.unet(image.to(self.compute_dtype), head_input=True)
+            descriptors = ops.conv2d_at_points(features, head.desc.weight, head.desc.bias, index).float()
+        else:
+            descriptors = self.dense(image)[1][0][:, index[:, 1], index[:, 0]].t()
+        return F.normalize(descriptors, dim=-1)
+
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
         head = self.unet.path_up[-1].conv[3]
         if isinstance(head, SplitHeadConv):  # the descriptor half of the head only at the selected keypoints

@@ -86,6 +86,9 @@ class SuperPoint(sparse.SparseExtractor):
         keypoints = keypoints.float()
         return keypoints, kp_scores, sparse.sample_descriptors(keypoints, self.dense_descriptors(x), 8)
 
+    def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
+        return sparse.sample_descriptors(keypoints.float(), self.dense_descriptors(self.encode(image)), 8)
+
     def forward(self, image: Tensor) -> tuple[Tensor, Tensor]:
         """Dense outputs: ``(score_map [1, H, W], descriptors [1, C, H/8, W/8])`` (post-softmax, pre-NMS)."""
         x = self.encode(image)

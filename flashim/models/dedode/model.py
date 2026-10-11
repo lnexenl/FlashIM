@@ -115,6 +115,9 @@ class DeDoDe(sparse.SparseExtractor):
         descriptors = F.normalize(self.descriptor(x, points=keypoints), dim=-1)
         return keypoints, probs, descriptors
 
+    def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
+        return F.normalize(self.descriptor(self.normalize(image), points=keypoints.float()), dim=-1)
+
     @torch.inference_mode()
     def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> SparseMatchResult:
         corr = (a.descriptors[0].float() @ b.descriptors[0].float().t()) * self.inv_temperature

@@ -155,6 +155,20 @@ XFEAT_LIGHTGLUE = _pipeline(
 )
 
 
+def _raco_pipeline(descriptor: str, default: str) -> ModelSpec:
+    return _pipeline(
+        f"raco-{descriptor}-lightglue", f"raco-{descriptor}", default, descriptor, default,
+        f"RaCo keypoints + {descriptor} descriptors + LightGlue with {descriptor}'s weights (trained on its own "
+        f"keypoints, not RaCo's); components.extractor.preset = {descriptor}'s (default {default})",
+    )
+
+
+RACO_SUPERPOINT_LIGHTGLUE = _raco_pipeline("superpoint", "fp32")
+RACO_DISK_LIGHTGLUE = _raco_pipeline("disk", "fp32")
+RACO_XFEAT_LIGHTGLUE = _raco_pipeline("xfeat", "fp32")
+RACO_RDD_LIGHTGLUE = _raco_pipeline("rdd", "fp8")
+
+
 def legacy_overrides(
     *,
     variant: str = "rdd",

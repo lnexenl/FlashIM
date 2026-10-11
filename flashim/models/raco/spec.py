@@ -1,4 +1,4 @@
-"""RaCo (detector + ranker) and RaCo + ALIKED (``raco-aliked``) specs."""
+"""RaCo (detector + ranker), RaCo + ALIKED (``raco-aliked``) and RaCo + any descriptor model (``raco-<model>``) specs."""
 
 from __future__ import annotations
 
@@ -77,3 +77,51 @@ RACO_ALIKED = ModelSpec(
     default_preset="fp32",
     compose=_compose,
 )
+
+
+# -- RaCo keypoints + another model's descriptors ------------------------------------------------------------
+
+# Models that implement ``describe_keypoints`` (SIFT / ORB cannot: their descriptors need a scale and orientation).
+DESCRIBERS = ("superpoint", "alike", "disk", "xfeat", "dedode", "dedode-g", "dad", "ripe", "rdd")
+
+
+def described_spec(descriptor: str) -> ModelSpec:
+    """``raco-<descriptor>``: RaCo's detector + ranker pick the keypoints, ``descriptor`` describes them. The preset is
+    the descriptor model's (``fp32``, ``bf16``, ``int8``, ``fp8``, ...); RaCo runs in ``fp32`` for ``fp32`` and in
+    ``bf16`` for every other one. Components ``raco`` and ``descriptor`` take their own settings
+    (``components.descriptor.preset=bf16``)."""
+    from flashim.build import get_spec
+
+    inner = get_spec(descriptor)
+
+    def compose(config: RunConfig, build) -> nn.Module:
+        from flashim.models.raco.extractor import RaCoExtractor
+
+        return RaCoExtractor(build(config.components["raco"]), build(config.components["descriptor"]))
+
+    return ModelSpec(
+        name=f"raco-{descriptor}",
+        role="extractor",
+        description=f"RaCo keypoints + {descriptor} descriptors, matched by {descriptor}'s own matcher",
+        load=None,
+        presets={
+            preset: {
+                "components": {
+                    "raco": {"model": "raco", "preset": "fp32" if preset == "fp32" else "bf16"},
+                    "descriptor": {"model": descriptor, "preset": preset},
+                }
+            }
+            for preset in inner.presets
+        },
+        default_preset=inner.default_preset,
+        fp8_fallbacks=inner.fp8_fallbacks,
+        compose=compose,
+    )
+
+
+def __getattr__(name: str) -> ModelSpec:
+    """``RACO_<MODEL>`` for the registry's lazy ``module:ATTR`` targets (building one reads the descriptor's spec)."""
+    descriptor = name.removeprefix("RACO_").lower().replace("_", "-")
+    if name.startswith("RACO_") and descriptor in DESCRIBERS:
+        return described_spec(descriptor)
+    raise AttributeError(name)

@@ -121,6 +121,12 @@ class RDD(nn.Module):
             fused = fused + F.interpolate(level, size=fused.shape[-2:], mode="bilinear", align_corners=False)
         return fused
 
+    def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
+        """L2-normalized bicubic descriptors ``[K, C]`` at ``keypoints`` ``[K, 2]`` (pixel indices of ``image``)."""
+        descriptor_map = self.describe(image)
+        height, width = image.shape[-2:]
+        return kp.sample_descriptors(F.normalize(descriptor_map.float(), dim=1), keypoints[None], height, width)[0]
+
     def matchability(self, descriptor_map: Tensor) -> Tensor:
         return self.matchibility_head(descriptor_map)
 

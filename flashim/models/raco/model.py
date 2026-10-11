@@ -1,4 +1,4 @@
-"""RaCo keypoint detector + ranker (cvg/RaCo), native FlashIM port.
+"""RaCo keypoint detector + ranker (architecture of cvg/RaCo).
 
 A small ALIKED-style CNN (no deformable convs) predicts a keypoint logit map; local maxima are taken as
 ``candidate_multiplier x K`` candidates (soft-argmax refined); a second, full-resolution residual CNN (the

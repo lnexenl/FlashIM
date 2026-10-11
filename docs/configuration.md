@@ -7,7 +7,7 @@ config; files, dicts and dotted overrides layer on top.
 
 ```python
 # keyword API: the model's own load_* function
-model = flashim.load("romav2", preset="fp8", setting="mega1500", engine="compile")
+model = flashim.load("romav2", preset="fp8", setting="mega1500", engine="compile-full")
 
 # config API: preset + config file or dict + dotted overrides
 model = flashim.load("romav2", "fp8", overrides=["engine.kind=compile-full", "arch.setting=mega1500"])
