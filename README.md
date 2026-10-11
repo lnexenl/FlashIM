@@ -41,7 +41,7 @@ uv sync --extra eval
 ```python
 import flashim
 
-model = flashim.load("romav2", preset="fp8", setting="mega1500", engine="compile")
+model = flashim.load("romav2", preset="fp8", setting="mega1500", engine="compile-full")
 result = model.match("a.jpg", "b.jpg")                       # DenseMatchResult (warp, overlap, precision)
 matches, conf, prec_a, prec_b = model.sample(result, 5000)
 kpts_a, kpts_b = model.to_pixel_coordinates(matches, h_a, w_a, h_b, w_b)
@@ -57,15 +57,15 @@ Weights download on first use and are checked against pinned SHA-256 hashes ([Ch
 ## Results
 
 All numbers are from an RTX 5070 Ti. The latency of every model, preset and engine is in the
-[inference benchmark](docs/benchmarks.md); models, presets and accuracy evidence are in [docs/models.md](docs/models.md).
+[inference benchmark](docs/benchmarks.md); models, presets and accuracy evidence are in [docs/models.md](docs/models.md) and the page of each model.
 
-**RoMaV2** (dense; 800² + 1024², both directions, forward only):
+**RoMaV2** (dense; 800² + 1024², both directions, forward only, `compile-full`):
 
-| configuration | forward | vs BF16 |
+| preset | forward | vs `bf16` |
 |---|---|---|
-| `bf16` + `compile` | 344 ms | 1.0x |
-| `fp8` + `compile-full` | 110 ms | 3.13x |
-| `int8` + `compile-full` | 103 ms | 3.36x |
+| `bf16` | 195 ms | 1.00x |
+| `fp8` | 110 ms | 1.77x |
+| `int8` | 104 ms | 1.87x |
 
 Pose AUC@5 vs `bf16` (3 seeds, MegaDepth-1500 / ScanNet-1500): `fp8` -0.0023 / +0.0007, `int8` -0.0010 / +0.0004, inside the RANSAC seed noise of about 0.003.
 On the 900 deliberately hard HardMatch pairs `fp8` costs 0.0074 mAA@10px, the same as RoMaV2's own FP8 recipe.
