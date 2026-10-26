@@ -5,7 +5,7 @@ import torch
 
 from flashim import log
 from flashim.ops._registry import OPS, DeviceSpec, Op
-from flashim.platforms import Feature, Platform, Vendor, detect, platform_for, register_detector
+from flashim.platforms import Feature, Platform, Vendor, detect, nvidia, platform_for, register_detector
 from flashim.platforms.nvidia import isa_features
 
 
@@ -16,6 +16,30 @@ def test_isa_features_are_not_monotonic_in_capability():
     assert Feature.TMA in sm120
     assert Feature.WGMMA not in sm120 and Feature.TCGEN05 not in sm120
     assert Feature.TMA not in isa_features((8, 9))
+
+
+def test_triton_is_pointed_at_a_ptxas_that_knows_the_architecture(monkeypatch, tmp_path):
+    """sm_110 (Jetson AGX Thor) is unknown to the ptxas Triton 3.6 bundles: the CUDA toolkit's is used if it works."""
+    pytest.importorskip("triton")
+    toolkit = tmp_path / "bin" / "ptxas"
+    toolkit.parent.mkdir()
+    toolkit.touch()
+    monkeypatch.setattr(nvidia, "nvcc_path", lambda: str(toolkit.with_name("nvcc")))
+    probed = []
+    knows = {str(toolkit)}
+    monkeypatch.setattr(nvidia, "_ptxas_assembles", lambda ptxas, arch: probed.append((ptxas, arch)) or ptxas in knows)
+
+    monkeypatch.delenv("TRITON_PTXAS_BLACKWELL_PATH", raising=False)
+    assert nvidia.triton_targets((12, 0)) and nvidia.triton_targets((8, 7)) and not probed  # known: no subprocess
+    assert nvidia.triton_targets((11, 0))
+    assert nvidia.os.environ["TRITON_PTXAS_BLACKWELL_PATH"] == str(toolkit)
+    assert [arch for _, arch in probed] == ["sm_110a", "sm_110a"] and probed[0][0].endswith("ptxas-blackwell")
+
+    monkeypatch.setenv("TRITON_PTXAS_BLACKWELL_PATH", "/user/ptxas")  # the user's choice is not overridden
+    assert not nvidia.triton_targets((11, 0)) and nvidia.os.environ["TRITON_PTXAS_BLACKWELL_PATH"] == "/user/ptxas"
+    monkeypatch.delenv("TRITON_PTXAS_BLACKWELL_PATH")
+    knows.clear()
+    assert not nvidia.triton_targets((11, 0)) and "TRITON_PTXAS_BLACKWELL_PATH" not in nvidia.os.environ
 
 
 def test_rocm_never_matches_cuda_kernels():

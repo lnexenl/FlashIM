@@ -627,12 +627,11 @@ def test_conv2d_at_points_matches_dense(k, dtype):
     weight, bias = torch.randn(16, 24, k, k, device=DEV), torch.randn(16, device=DEV)
     points = torch.cat([torch.randint(0, 45, (300, 1)), torch.randint(0, 37, (300, 1))], 1).to(DEV)
     points[:4] = torch.tensor([[0, 0], [44, 36], [0, 36], [44, 0]], device=DEV)  # corners: padding taps
-    torch.backends.cudnn.allow_tf32 = False
-    try:
-        dense = F.conv2d(x.float(), weight, bias, padding=k // 2)[0][:, points[:, 1], points[:, 0]].t()
-    finally:
-        torch.backends.cudnn.allow_tf32 = True
+    # FP64: cuDNN's FP32 convolution is not a full-precision oracle everywhere. On a Jetson AGX Thor (sm_110, cuDNN
+    # 9.19) it stays at TF32 accuracy with ``allow_tf32`` off: 7e-3 of the output's standard deviation on this case.
+    dense = F.conv2d(x.double(), weight.double(), bias.double(), padding=k // 2)[0][:, points[:, 1], points[:, 0]].t()
     out = ops.conv2d_at_points(x, weight, bias, points)
+    dense = dense.to(out.dtype)
     torch.testing.assert_close(out, dense, atol=1e-4, rtol=1e-4)
 
 
