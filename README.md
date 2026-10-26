@@ -461,8 +461,8 @@ flashim/
                files by computation (attention, conv, correlation, density, gemm, quantize);
                model-specific ops in a file named after the model (romav2.py, aliked.py)
   backends/    optimized impls, one package per kernel language / library, mirroring ops/ file names:
-               triton/, tilelang/, cuda/ (JIT CUDA C++), torch_native/ (cuBLAS), external/ (sageattention,
-               fused-local-corr); out-of-tree backends via the `flashim.backends` entry point
+               triton/, tilelang/, cuda/ (JIT CUDA C++), torch_native/ (cuBLAS), external/ (sageattention);
+               out-of-tree backends via the `flashim.backends` entry point
   log.py       logging (FLASHIM_LOG), dispatch tracing, profiler / NVTX ranges
   config.py    RunConfig: typed, layered (preset < file < overrides), serializable run configuration
   build.py     ModelSpec (presets, passes, engines) + the generic builder all models go through
@@ -496,9 +496,11 @@ emulation kernels (any device, including CPU) — same numerics contract, slower
 ## Development
 
 ```bash
-uv sync --extra eval                     # torch 2.11 (cu130), triton 3.6, fused-local-corr
+uv sync --extra eval                     # Python 3.12 (.python-version), torch 2.11 (cu130), triton 3.6
 uv run pytest -m "not slow"              # unit / ops / quant
-uv run pytest tests/parity               # bit-exactness vs ../RoMaV2 (needs weights + GPU)
+uv pip install -e ../RoMaV2              # the RoMaV2 oracle is not a dependency (`uv sync` removes it again)
+uv run pytest tests/parity               # bit-exactness vs the upstream code (needs weights + GPU; skips oracles
+                                         # that are not installed / checked out)
 uv run python benchmarks/speed/forward.py --preset fp8 --engine compile
 uv run python benchmarks/accuracy/run.py --dataset mega1500 --preset fp8 --seed 17
 ```

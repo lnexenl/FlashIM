@@ -47,7 +47,7 @@ KERNEL_CATEGORIES = (
     ("triton: depthwise+relu->mxfp8", r"_depthwise5x5_relu_mxfp8_kernel"),
     ("triton: rope", r"_rope_qk_kernel"),
     ("triton: fp8 gemm fallback", r"_fp8_gemm_kernel"),
-    ("local_corr (fused_local_corr)", r"(?i)corr"),
+    ("triton: local_corr", r"(?i)corr"),
     ("grid_sample / interpolate", r"(?i)(grid_sampl|upsample|interpolat|bilinear|bicubic)"),
     ("conv (cuDNN/implicit gemm)", r"(?i)(conv|implicit|cudnn|winograd|fprop|dgrad|xmma_fprop|depthwise)"),
     ("gemm bf16/fp32 (cuBLAS/cutlass)", r"(?i)(gemm|nvjet|cutlass|sm\d+_xmma|ampere_|sgemm|matmul)"),

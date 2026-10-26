@@ -1,6 +1,9 @@
-"""Mutual dual-softmax matches of a similarity matrix without the ``[L, S]`` probability intermediates."""
+"""Local correlation around a warp; mutual dual-softmax matches of a similarity matrix without the ``[L, S]``
+probability intermediates."""
 
 from __future__ import annotations
+
+import math
 
 import torch
 import triton
@@ -9,7 +12,116 @@ from torch import Tensor
 
 from flashim import ops
 from flashim.ops._registry import DeviceSpec
+from flashim.ops.correlation import local_window
 from flashim.platforms import Feature, platform_for
+
+# -- local correlation ---------------------------------------------------------------------------------------
+
+
+@triton.jit
+def _local_corr_kernel(
+    f0_ptr, f1_ptr, warp_ptr, window_ptr, out_ptr, rows, scale,
+    s0b, s0c, s0h, s0w, s1b, s1c, s1h, s1w, swb, swh, sww, swc,
+    HEIGHT: tl.constexpr, WIDTH: tl.constexpr, C: tl.constexpr, CC: tl.constexpr, R: tl.constexpr,
+    TT: tl.constexpr, BLOCK_M: tl.constexpr,
+):
+    """Local correlation ``[B, K, H, W]``:
+    ``out[b, k, y, x] = scale * f0[b, :, y, x] . bilinear(f1[b], warp[b, y, x] + window[k])``.
+
+    The window offsets are whole feature pixels, so the taps share their integer corners: the dot products
+    with the ``(2R+2)^2`` corners around the warp point are computed once and blended into the ``(2R+1)^2``
+    taps (one gather per corner instead of four per tap). Corner row ``v`` feeds tap rows ``v - 1`` and ``v``,
+    so only those two ``[BLOCK_M, TT]`` accumulators are live and each tap row is stored once complete: a
+    ``[BLOCK_M, K]`` accumulator measured 180-1800 register spills (sm_120) and 2.2-3x the time.
+
+    Each tap's bilinear weights come from its own normalized coordinate ``warp + window[k]`` (``window`` is
+    :func:`~flashim.ops.correlation.local_window`), as ``grid_sample`` sees it, not from exact pixel offsets:
+    in FP32 the two differ by ~1e-5 px, which measured 8x the reference error of the former
+    ``fused-local-corr`` package at C=192. Out-of-frame corners read zero (``grid_sample`` zeros padding)."""
+    row = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    valid = row < rows
+    b = row // (HEIGHT * WIDTH)
+    pix = row - b * (HEIGHT * WIDTH)
+    y = pix // WIDTH
+    x = pix - y * WIDTH
+    ch = tl.arange(0, CC)
+    cmask = ch < C
+
+    f0 = tl.load(
+        f0_ptr + (b * s0b + y * s0h + x * s0w)[:, None] + ch[None, :] * s0c,
+        mask=valid[:, None] & cmask[None, :], other=0.0,
+    )
+    wx = tl.load(warp_ptr + b * swb + y * swh + x * sww, mask=valid, other=0.0)
+    wy = tl.load(warp_ptr + b * swb + y * swh + x * sww + swc, mask=valid, other=0.0)
+    # grid_sample(align_corners=False): pixel = ((coord + 1) * size - 1) / 2
+    x0f = tl.floor(((wx + 1.0) * WIDTH - 1.0) * 0.5)
+    y0f = tl.floor(((wy + 1.0) * HEIGHT - 1.0) * 0.5)
+    x0 = x0f.to(tl.int32)
+    y0 = y0f.to(tl.int32)
+
+    SPAN: tl.constexpr = 2 * R + 2
+    TAPS: tl.constexpr = 2 * R + 1
+    t = tl.arange(0, TT)
+    tmask = t < TAPS
+    # Fraction of tap column t past its left corner x0 + t - R, and of tap row t past its top corner.
+    shift = (t - R).to(tl.float32)[None, :]
+    ox = tl.load(window_ptr + t * 2, mask=tmask, other=0.0)
+    frac_x = ((wx[:, None] + ox[None, :] + 1.0) * WIDTH - 1.0) * 0.5 - (x0f[:, None] + shift)
+    oy = tl.load(window_ptr + t * (2 * TAPS) + 1, mask=tmask, other=0.0)
+    frac_y = ((wy[:, None] + oy[None, :] + 1.0) * HEIGHT - 1.0) * 0.5 - (y0f[:, None] + shift)
+    out_base = out_ptr + (b * (TAPS * TAPS * HEIGHT * WIDTH) + pix)[:, None] + t[None, :] * (HEIGHT * WIDTH)
+    store_mask = valid[:, None] & tmask[None, :]
+
+    # Runtime loops: unrolled, the corner gathers were hoisted and spilled (C=192: 146-2292 spills on sm_120).
+    lower = tl.zeros((BLOCK_M, TT), dtype=tl.float32)  # tap row v - 1 (corner row v is its bottom row)
+    for v in range(SPAN):
+        upper = tl.zeros((BLOCK_M, TT), dtype=tl.float32)  # tap row v (corner row v is its top row)
+        wy_top = 1.0 - tl.sum(tl.where(t[None, :] == v, frac_y, 0.0), axis=1)
+        wy_bottom = tl.sum(tl.where(t[None, :] == v - 1, frac_y, 0.0), axis=1)  # 0 at v = 0
+        cy = y0 + (v - R)
+        in_y = valid & (cy >= 0) & (cy < HEIGHT)
+        for u in range(SPAN):
+            cx = x0 + (u - R)
+            inb = in_y & (cx >= 0) & (cx < WIDTH)
+            f1 = tl.load(
+                f1_ptr + (b * s1b + cy * s1h + cx * s1w)[:, None] + ch[None, :] * s1c,
+                mask=inb[:, None] & cmask[None, :], other=0.0,
+            )
+            dot = tl.sum(f0 * f1, axis=1) * scale
+            # corner column u is the left corner of tap column u and the right corner of tap column u - 1
+            hx = tl.where(t[None, :] == u, 1.0 - frac_x, tl.where(t[None, :] == u - 1, frac_x, 0.0))
+            hx = hx * dot[:, None]
+            upper += hx * wy_top[:, None]
+            lower += hx * wy_bottom[:, None]
+        if v >= 1:
+            tl.store(out_base + (v - 1) * TAPS * (HEIGHT * WIDTH), lower, mask=store_mask)
+        lower = upper
+
+
+def local_corr(
+    feature0: Tensor, feature1: Tensor, warp: Tensor, radius: int, *, block_m: int = 16, num_warps: int = 4
+) -> Tensor:
+    """FP32, any strides (channels-last views gather their channel vectors coalesced); ``[B, K, H, W]`` out.
+
+    16 rows x 4 warps was the fastest spill-free tile at all four RoMaV2 refiner calls (sm_120; C=192 r=3 at
+    200^2 / 320^2: 0.84 / 1.87 ms, C=48 r=1 at 400^2 / 640^2: 0.19 / 0.29 ms; 3.5-5.2x the former
+    ``fused-local-corr`` package)."""
+    batch, channels, h, w = feature0.shape
+    taps = 2 * radius + 1
+    cc = triton.next_power_of_2(channels)
+    out = torch.empty((batch, taps * taps, h, w), device=feature0.device, dtype=torch.float32)
+    rows = batch * h * w
+    window = local_window(radius, h, w, feature0.device)
+    _local_corr_kernel[(triton.cdiv(rows, block_m),)](
+        feature0, feature1, warp, window, out, rows, 1.0 / math.sqrt(channels),
+        *feature0.stride(), *feature1.stride(), *warp.stride(),
+        HEIGHT=h, WIDTH=w, C=channels, CC=cc, R=radius, TT=triton.next_power_of_2(taps),
+        BLOCK_M=block_m, num_warps=num_warps,
+    )
+    return out
+
+
+# -- dual-softmax mutual matches --------------------------------------------------------------------------
 
 
 @triton.jit
@@ -255,6 +367,28 @@ def dual_softmax_mutual_two_pass(
 
 
 # -- registrations ---------------------------------------------------------------------------------------
+
+def _local_corr_eligible(feature0: Tensor, feature1: Tensor, warp: Tensor, radius: int) -> bool:
+    batch, channels, h, w = feature0.shape
+    return (
+        feature0.dtype == feature1.dtype == warp.dtype == torch.float32
+        and feature1.shape == feature0.shape
+        and tuple(warp.shape) == (batch, h, w, 2)
+        and channels <= 256
+        and 0 <= radius <= 3
+        and max(_span(feature0), _span(feature1), _span(warp), batch * (2 * radius + 1) ** 2 * h * w) < 2**31
+    )
+
+
+def _span(t: Tensor) -> int:
+    """Elements addressed by ``t``'s strides (the kernel's offsets are int32)."""
+    return 1 + sum((size - 1) * abs(stride) for size, stride in zip(t.shape, t.stride()))
+
+
+ops.local_corr.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_local_corr_eligible
+)(local_corr)
+
 
 def _eligible(sim: Tensor, row_bias: Tensor | None = None, col_bias: Tensor | None = None) -> bool:
     return sim.ndim == 2 and sim.dtype == torch.float32 and sim.is_contiguous() and sim.numel() > 0

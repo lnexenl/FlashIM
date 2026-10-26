@@ -193,13 +193,28 @@ def test_rope_qk(table_dtype):
     assert (fk.float() - rk.float()).abs().max() <= tol
 
 
-@pytest.mark.parametrize("radius", [1, 3])
-def test_local_corr(radius):
-    f0 = torch.randn(2, 48, 30, 40, device=DEV)
-    f1 = torch.randn_like(f0)
-    warp = torch.rand(2, 30, 40, 2, device=DEV) * 2.2 - 1.1  # includes out-of-frame samples
-    fast, ref = _both(ops.local_corr, "fused_local_corr", f0, f1, warp, radius)
-    assert fast.shape == (2, (2 * radius + 1) ** 2, 30, 40)
+@pytest.mark.parametrize(
+    "channels,hw,radius",
+    [(48, (30, 40), 1), (48, (30, 40), 3), (192, (37, 45), 3), (48, (64, 80), 1), (5, (7, 9), 0),
+     (256, (13, 11), 2)],
+)
+@pytest.mark.parametrize("layout", ["nchw", "channels_last"])
+def test_local_corr(channels, hw, radius, layout):
+    torch.manual_seed(4)
+    if layout == "channels_last":  # RoMaV2's refiner: NCHW views of BHWC features, warp a [B, 2, H, W] view
+        f0 = torch.randn(2, *hw, channels, device=DEV).permute(0, 3, 1, 2)
+        f1 = torch.randn(2, *hw, channels, device=DEV).permute(0, 3, 1, 2)
+        warp = (torch.rand(2, 2, *hw, device=DEV) * 2.2 - 1.1).permute(0, 2, 3, 1)  # includes out-of-frame
+    else:
+        f0 = torch.randn(2, channels, *hw, device=DEV)
+        f1 = torch.randn_like(f0)
+        warp = torch.rand(2, *hw, 2, device=DEV) * 2.2 - 1.1
+    assert ops.local_corr.explain(f0, f1, warp, radius)["triton"] == "selected"
+    fast, ref = _both(ops.local_corr, "triton", f0, f1, warp, radius)
+    assert fast.shape == (2, (2 * radius + 1) ** 2, *hw) and fast.dtype == torch.float32
+    assert fast.is_contiguous()
+    # FP32 summation order, plus taps whose coordinate is within ~1e-5 px of an integer (the reference
+    # switches corners there, the kernel's shared corners extrapolate by that much).
     assert torch.allclose(fast, ref, atol=1e-4, rtol=1e-4)
 
 

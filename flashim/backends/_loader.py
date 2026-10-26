@@ -34,7 +34,6 @@ BACKENDS: tuple[Backend, ...] = (
     Backend("tilelang", ("tilelang.conv", "tilelang.gemm"), packages=("tilelang",)),
     Backend("cuda", ("cuda.raco",)),  # JIT CUDA C++: needs nvcc (Feature.NVCC), built on first eligible call
     Backend("sageattention", ("external.sageattention",), packages=("sageattention",)),
-    Backend("fused_local_corr", ("external.local_corr",), packages=("local_corr",)),
 )
 
 LOADED: list[str] = []
