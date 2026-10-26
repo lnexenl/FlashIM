@@ -21,6 +21,13 @@ def _mismatch(a: torch.Tensor, b: torch.Tensor) -> float:
     return (a.view(torch.uint8) != b.view(torch.uint8)).float().mean().item()
 
 
+# E4M3 conversions and MMA exist from sm_89 on (not on Ampere: sm_80 / sm_86 / Jetson Orin's sm_87).
+_needs_e4m3 = pytest.mark.skipif(
+    not torch.cuda.is_available() or not platform_for(DEV).supports(Feature.FP8_E4M3), reason="needs E4M3 (sm_89+)"
+)
+
+
+@_needs_e4m3
 @pytest.mark.parametrize("channels", [768, 1024, 1000, 48])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("residual", [False, True])
@@ -37,6 +44,7 @@ def test_layernorm_quantize(channels, dtype, residual):
     assert (fast.dequantize() - ref.dequantize()).abs().max() <= ref.dequantize().abs().max() * 0.07
 
 
+@_needs_e4m3
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
 def test_gelu_quantize(approximate):
     x = torch.randn(257, 3072, device=DEV, dtype=torch.bfloat16) * 4
@@ -45,6 +53,7 @@ def test_gelu_quantize(approximate):
     assert _mismatch(fast.values, ref.values) < 1e-4
 
 
+@_needs_e4m3
 @pytest.mark.parametrize("channels", [32, 128, 512])
 @pytest.mark.parametrize("hw", [(7, 9), (50, 50)])
 def test_depthwise_relu_mxfp8(channels, hw):
@@ -86,11 +95,6 @@ def test_depthwise_relu_mxfp8_tilelang_matches_triton(batch, channels, hw):
     assert torch.equal(z.float(), torch.zeros_like(z.float()))
 
 
-_needs_e4m3 = pytest.mark.skipif(
-    not torch.cuda.is_available() or not platform_for(DEV).supports(Feature.FP8_E4M3), reason="needs E4M3 MMA (sm_89+)"
-)
-
-
 # cuBLAS block-scaled MMA: FP32 summation order only. The Triton kernel runs one E4M3 mma.sync per scale block,
 # whose FP32 results differ enough from the emulation to flip about 1% of the BF16 output roundings on sm_89.
 @pytest.mark.parametrize("impl,tol", [pytest.param("cublas", 1e-4, marks=pytest.mark.sm120),
@@ -125,6 +129,7 @@ def test_mxfp8_scaled_mm_triton_dynamic_scales(rows, k, n):
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-3
 
 
+@_needs_e4m3
 def test_mxfp8_linear_triton_matches_reference():
     w = QuantizedWeight.from_float(torch.randn(96, 160, device=DEV))  # not a multiple of 128
     x = torch.randn(77, 160, device=DEV)
@@ -138,8 +143,11 @@ def test_mxfp8_linear_triton_matches_reference():
 
 
 _tilelang_gemm = pytest.mark.skipif(
-    torch.cuda.is_available() and platform_for(DEV).supports(Feature.WGMMA),
-    reason="sm_90 keeps mxfp8_linear on Triton (measured faster than the TileLang kernel on an H20)",
+    not torch.cuda.is_available()
+    or not platform_for(DEV).supports(Feature.TILELANG, Feature.FP8_E4M3)
+    or platform_for(DEV).supports(Feature.WGMMA),
+    reason="needs TileLang and E4M3 MMA; sm_90 keeps mxfp8_linear on Triton (measured faster than the TileLang "
+    "kernel on an H20)",
 )
 
 
@@ -162,6 +170,7 @@ def test_mxfp8_linear_tilelang_matches_reference(n, k, bias):
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-2
 
 
+@_needs_e4m3
 def test_mxfp8_linear_dispatch_prefers_tilelang_above_k_threshold():
     """Large-K, cuBLAS-ineligible shapes reach the new kernel through normal dispatch; smaller ones stay on Triton."""
     big = QuantizedWeight.from_float(torch.randn(64, 3200, device=DEV))
@@ -407,6 +416,7 @@ def test_deformable_attention_compiles_without_fallback():
     torch.testing.assert_close(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
 
 
+@_needs_e4m3
 def test_quantize_mxfp8():
     x = torch.randn(300, 96, device=DEV, dtype=torch.bfloat16) * 5
     exponent = mx.calibrate_block32_exponent(x.float())
@@ -415,7 +425,7 @@ def test_quantize_mxfp8():
 
 
 @pytest.mark.parametrize("channels", [16, 48, 96, 257])
-@pytest.mark.parametrize("fmt", ["int8", "mxfp8"])
+@pytest.mark.parametrize("fmt", ["int8", pytest.param("mxfp8", marks=_needs_e4m3)])
 def test_quantize_channels_first_view(channels, fmt):
     """The channels-last view of NCHW memory (quantized convolutions' input) is read in place: bytes equal to
     quantizing the packed copy, and to the reference."""
@@ -434,6 +444,7 @@ def test_quantize_channels_first_view(channels, fmt):
     assert torch.equal(fast.values.view(torch.uint8), ref.values.view(torch.uint8))
 
 
+@_needs_e4m3
 def test_layernorm_quantize_input_bias_and_dense_output():
     torch.manual_seed(0)
     x = torch.randn(333, 256, device=DEV, dtype=torch.bfloat16) * 3
@@ -447,6 +458,7 @@ def test_layernorm_quantize_input_bias_and_dense_output():
     torch.testing.assert_close(fast_dense, ref_dense, atol=0.02, rtol=0.01)
 
 
+@_needs_e4m3
 def test_gelu_quantize_input_bias():
     x = torch.randn(257, 1024, device=DEV, dtype=torch.bfloat16) * 4
     bias = torch.randn(1024, device=DEV, dtype=torch.bfloat16)

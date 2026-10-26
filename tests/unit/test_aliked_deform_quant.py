@@ -4,6 +4,8 @@ CPU-only tests use the reference (pure-PyTorch) op impl; ``@pytest.mark.cuda`` t
 kernel against that same reference.
 """
 
+import platform
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -35,7 +37,10 @@ def test_gather_matches_torchvision_deform_conv2d(offset_scale):
     patches = gather_deform_patches(x, offset, k, padding=1)  # [B, C, K*K, oH, oW]
     ours = torch.einsum("oc,bcp->bop", weight.reshape(12, -1), patches.reshape(b, -1, h * w)).reshape(b, 12, h, w)
     ours = ours + bias.view(1, -1, 1, 1)
-    assert torch.equal(reference, ours)  # bit-exact on CPU
+    if platform.machine() == "x86_64":
+        assert torch.equal(reference, ours)  # bit-exact on CPU
+    else:  # aarch64 (Jetson Orin, OpenBLAS): up to 2 ulp (3.8e-6), both sides equally far from an FP64 GEMM
+        torch.testing.assert_close(ours, reference, rtol=0, atol=2e-5)
 
 
 def test_gather_zero_offset_equals_plain_unfold():

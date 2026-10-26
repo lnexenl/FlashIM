@@ -93,7 +93,7 @@ def main() -> None:
         return {"median_ms": round(statistics.median(times), 3), "min_ms": round(min(times), 3)}
 
     print(json.dumps({
-        "preset": args.preset, "rdd_preset": args.rdd_preset, "engine": args.engine, "attention": args.attention,
+        "preset": pipeline.matcher.preset, "rdd_preset": pipeline.extractor.preset, "engine": args.engine, "attention": args.attention,
         "resize": args.resize, "top_k": args.top_k, "matches": len(result.confidence),
         "full_pipeline": stats(total_times),
         "extract_a": stats(extract_a_times), "extract_b": stats(extract_b_times), "match": stats(match_times),

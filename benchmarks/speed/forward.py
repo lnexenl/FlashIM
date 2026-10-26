@@ -107,7 +107,7 @@ def main() -> None:
     times.sort()
     result = {
         "impl": args.impl,
-        "preset": args.preset,
+        "preset": getattr(model, "preset", args.preset),  # FP8 presets are replaced on a GPU without FP8
         "engine": args.engine,
         "setting": args.setting,
         "gpu": torch.cuda.get_device_name(),

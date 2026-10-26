@@ -134,6 +134,9 @@ SPEC = ModelSpec(
             for s in (4, 2, 1)
         },
         "fused_refiner_io": Pass(_fused_refiner_io, exact=False, description="fused refiner input + output heads"),
+# The INT8 preset closest to each FP8 one: the same transformer linears; quantized refiner blocks map to RoMaV2's
+# ``int8_full`` recipe (INT8 has no stride-4-only variant), the FlashIM refiner kernels to ``int8-fast``.
+_FP8_FALLBACKS = {"fp8-p8": "int8", "fp8-s4": "int8-full", "fp8": "int8-full", "fp8-fast": "int8-fast"}
         "fused_mx_blocks": Pass(_fused_mx_blocks, exact=False, description="dw + quantize + pw MXFP8 in one kernel"),
         "batched_directions": Pass(_batched_directions, description="both match directions as one batch"),
     },
@@ -144,6 +147,7 @@ SPEC = ModelSpec(
     },
     set_attention=_set_attention,
     apply_inference=_apply_inference,
+    fp8_fallbacks=_FP8_FALLBACKS,
     validate=_validate,
 )
 

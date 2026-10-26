@@ -436,21 +436,26 @@ def _layernorm_eligible(value, residual, weight, bias, eps, scale_exponent, **kw
     return _row_major(value) and (residual is None or (residual.shape == value.shape and _row_major(residual)))
 
 
+# The E4M3 producers need FP8 conversion instructions: Triton rejects ``tl.float8e4nv`` below sm_89 (compile-checked
+# for sm_87, Jetson Orin), where the torch references run instead.
 @ops.layernorm_quantize.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_layernorm_eligible
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3], when=_layernorm_eligible
 )
 def _layernorm_quantize_impl(value, residual, weight, bias, eps, scale_exponent, **kwargs):
     return layernorm_quantize(value, residual, weight, bias, eps, scale_exponent.to(value.device, torch.int8), **kwargs)
 
 
 @ops.gelu_quantize.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=lambda value, *a, **k: _row_major(value)
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3],
+    when=lambda value, *a, **k: _row_major(value),
 )
 def _gelu_quantize_impl(value: Tensor, scale_exponent: Tensor, approximate: str = "none", *, input_bias=None):
     return gelu_quantize(value, scale_exponent.to(value.device, torch.int8), approximate, input_bias=input_bias)
 
 
-@ops.quantize_mxfp8.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_quantize_eligible)
+@ops.quantize_mxfp8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3], when=_quantize_eligible
+)
 def _quantize_mxfp8_impl(value: Tensor, scale_exponent: Tensor) -> QuantizedTensor:
     return quantize_static(value, scale_exponent.to(value.device, torch.int8))
 

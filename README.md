@@ -488,8 +488,24 @@ if a GPU call falls back to a torch reference.
 ## Platforms
 
 FP8 presets run natively on Blackwell (sm_100 / sm_120) through `F.scaled_mm`
-block-scaled MXFP8. Elsewhere they fall back to a Triton FP8 GEMM (sm_89+) or to
-emulation kernels (any device, including CPU) — same numerics contract, slower.
+block-scaled MXFP8, and through a Triton FP8 GEMM on sm_89 / sm_90.
+
+A GPU without FP8 (Ampere, Jetson Orin) builds the preset's INT8 counterpart instead: `fp8` -> `int8`; RoMaV2
+`fp8-p8` -> `int8`, `fp8-s4` / `fp8` -> `int8-full`, `fp8-fast` -> `int8-fast`; RDD, which has no INT8 preset, ->
+`bf16`. A warning says so, and `model.preset` / `model.build_report.fallbacks` record it. On a Jetson AGX Orin
+(eager) RoMaV2 `fp8` would take 3.3 s per pair emulated, against 1.1 s for `int8-full` and 2.0 s for `bf16`.
+
+FP8 is kept, on emulation kernels (same numerics contract, slower), on the CPU, when a calibration table is
+passed with the preset, and by `flashim.build_config(flashim.resolve(name, preset))`; `optimize.strict=true`
+raises instead of replacing or emulating.
+
+## Checkpoints
+
+Every model downloads its upstream release on first use into the torch hub checkpoint folder
+(`$TORCH_HOME/hub/checkpoints`, default `~/.cache/torch/hub/checkpoints`) and checks it against the SHA-256 pinned
+in `flashim/models/<model>/weights.py`; a file already there is used as is. `checkpoint=` or the model's
+`FLASHIM_<MODEL>_CHECKPOINT` variable (e.g. `FLASHIM_RDD_CHECKPOINT`) points at a local file instead. For an
+offline machine, copy the checkpoint folder over. Calibration tables ship in the repository.
 
 ## Development
 

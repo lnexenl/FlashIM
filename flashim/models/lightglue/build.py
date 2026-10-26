@@ -36,8 +36,8 @@ def load_lightglue(
     :data:`flashim.models.lightglue.config.ALIKED_CONFIG`. ``engine="compile"`` compiles the positional
     encoding, every transformer layer and the assignment head once per keypoint count. ``attention``:
     ``"sdpa"`` (torch SDPA) or ``"sage"`` / ``"sage-fp8"`` (SageAttention INT8-QK attention; needs the
-    ``sageattention`` package). On platforms without native MXFP8 GEMMs the FP8 preset runs with emulation
-    kernels (``strict=True`` raises instead). ``depth_confidence`` in (0, 1) enables early stopping
+    ``sageattention`` package). On a GPU without FP8 (below sm_89) the FP8 preset is replaced by ``int8``; on the CPU
+    it runs with emulation kernels (``strict=True`` raises instead of either). ``depth_confidence`` in (0, 1) enables early stopping
     (LightGlue recommends 0.95): layers stop once that fraction of keypoints is confident, so with
     ``engine="compile"`` each executed depth reuses the per-layer graphs (one host sync per layer).
     Equivalent to ``flashim.build("lightglue", preset, config=...)``.

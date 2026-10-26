@@ -11,7 +11,7 @@ import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Self
+from typing import TYPE_CHECKING
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -19,6 +19,9 @@ from torch import Tensor, nn
 
 from flashim.quant.formats.int8 import INT8_MAX, safe_scale
 from flashim.quant.formats.mx import BLOCK, padded_channels, scale_exponent_from_amax
+
+if TYPE_CHECKING:
+    from typing import Self  # 3.11+ (JetPack 6 ships Python 3.10)
 
 FORMAT = "flashim.calibration.mx-block32"
 VERSION = 1

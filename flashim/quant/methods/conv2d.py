@@ -35,6 +35,9 @@ from flashim.quant.tensor import Int8Tensor, QuantizedTensor, QuantizedWeight
 # quantize pass. Measured on an L20 (see ``StaticMXFP8Conv2d``) and on an H20: a conv + ReLU pair 0.324 -> 0.304 ms (FP8,
 # 64 -> 64 3x3 at 448x600), 0.802 -> 0.770 (FP8, 256 -> 256 at 224x300), 0.210 -> 0.198 (INT8, 64 -> 64 at 448x600).
 CHAINED_CAPABILITIES = ((8, 9), (9, 0))
+# INT8 also on sm_87 (no FP8 there). Measured on a Jetson AGX Orin, bit-identical: RoMaV2's eight INT8 VGG convs,
+# batch 2, 32.8 -> 30.5 ms at 800x800 and 51.9 -> 48.0 ms at 1024x1024.
+INT8_CHAINED_CAPABILITIES = (*CHAINED_CAPABILITIES, (8, 7))
 
 
 def _pair(value) -> tuple[int, int]:
@@ -83,7 +86,7 @@ class StaticInt8Conv2d(StaticInt8Linear):
         super().__init__(weight_int8, weight_scale, bias, input_scale)
         self.in_channels, self.geometry = in_channels, geometry
         # see ``StaticMXFP8Conv2d.chain_output``
-        self.chain_output = platform_for(weight_int8.device).capability in CHAINED_CAPABILITIES
+        self.chain_output = platform_for(weight_int8.device).capability in INT8_CHAINED_CAPABILITIES
 
     @classmethod
     def from_conv(cls, conv: nn.Conv2d, input_scale: Tensor) -> StaticInt8Conv2d:

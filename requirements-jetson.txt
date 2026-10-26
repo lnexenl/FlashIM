@@ -1,0 +1,26 @@
+# Jetson AGX Orin (JetPack 6.2: CUDA 12.6, cuDNN 9.3, Python 3.10, sm_87). The uv.lock environment does not apply:
+# torch needs NVIDIA's L4T build, which exists for cp310 only (the versions below are the ones uv.lock pins on x86).
+#   uv venv --no-project --python /usr/bin/python3.10 <venv>
+#   uv pip install --python <venv>/bin/python -r requirements-jetson.txt
+#   echo <repository root> > <venv>/lib/python3.10/site-packages/flashim-repo.pth
+# The last line stands in for the editable install (requires-python >= 3.12 refuses it on 3.10).
+# CUDA needs the user in the `video` and `render` groups. Keep the venv on local disk if the checkout is on NFS.
+torch @ https://pypi.jetson-ai-lab.io/jp6/cu126/+f/46b/b8b13f844b211/torch-2.11.0-cp310-cp310-linux_aarch64.whl#sha256=46bb8b13f844b2111f6f41abc703d01075a7185e0c587cb002e957ede2b8c8a3
+torchvision @ https://pypi.jetson-ai-lab.io/jp6/cu126/+f/d11/6f08d3d62417d/torchvision-0.26.0-cp310-cp310-linux_aarch64.whl#sha256=d116f08d3d62417dc36cbf41923e491b8b49b77399575f0878ae391e6e77a159
+# PyPI's aarch64 wheel, not the L4T build of the same sources: that one ships without ptxas and cuda.h
+triton==3.6.0
+einops>=0.8.1
+numpy>=2.0
+pillow>=12.0.0
+safetensors>=0.5
+tomli>=2.0  # config files in TOML (tomllib is 3.11+)
+# eval
+hardmatch>=1.0.0
+opencv-python>=4.12.0.88
+# poselib>=2.0.4: no aarch64 wheel or sdist on PyPI (build PoseLib from source for run_sparse.py)
+tqdm>=4.67.1
+# dev (matplotlib 3.11 needs Python 3.11)
+pytest>=8.4.2
+ruff>=0.14.5
+kornia>=0.8
+matplotlib>=3.10

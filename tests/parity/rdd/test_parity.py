@@ -81,7 +81,8 @@ def test_reduced_precision_tracks_fp32(checkpoint, preset):
     import flashim
 
     reference = flashim.load("rdd", preset="fp32")
-    model = flashim.load("rdd", preset=preset)
+    # the preset as named, emulated on a GPU without FP8 (flashim.load builds its fallback there)
+    model = flashim.build_config(flashim.resolve("rdd", preset))
     if preset != "bf16":
         assert model.quant_report.fused_blocks == ["transformer.encoder"]
     for image in _images():

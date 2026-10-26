@@ -192,7 +192,10 @@ def load_file(path: str | Path) -> dict[str, Any]:
     path = Path(path)
     text = path.read_text()
     if path.suffix == ".toml":
-        import tomllib
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10 (JetPack 6): the backport
+            import tomli as tomllib
 
         return tomllib.loads(text)
     if path.suffix == ".json":

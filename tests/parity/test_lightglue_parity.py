@@ -62,7 +62,8 @@ def test_reduced_precision_tracks_fp32(features, preset):
     import flashim
 
     fp32 = flashim.load("lightglue", preset="fp32")
-    low = flashim.load("lightglue", preset=preset)
+    # the preset as named, emulated on a GPU without FP8 (flashim.load builds its fallback there)
+    low = flashim.build_config(flashim.resolve("lightglue", preset))
     a, b = features
     expected = fp32.match_features(a, b)
     result = low.match_features(a, b)

@@ -331,16 +331,21 @@ def _int8_gemm_kernel(
     )
 
 
-def _int8_gemm_config(rows: int, n: int, small_tiles: bool = False) -> tuple[int, int, int, int, int]:
+def _int8_gemm_config(
+    rows: int, n: int, small_tiles: bool = False, four_warps: bool = False
+) -> tuple[int, int, int, int, int]:
     """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages). ``small_tiles`` (sm_89, sm_90): 4-warp 64-row tiles
     measured faster than 128 x 128 with 8 warps on an L20 (exact INT32 accumulation: bit-identical), e.g. 2505 x 1024
     -> 3072 0.088 -> 0.077 ms, 2505 x 4096 -> 1024 0.114 -> 0.103, 131072 x 512 -> 512 0.341 -> 0.320 (64 x 128); N <=
     256 is flat. On an H20 the same picks win too: 0.079 -> 0.065, 0.122 -> 0.091, 0.328 -> 0.267 ms, and 16464 x 4608
-    -> 512 0.314 -> 0.286."""
+    -> 512 0.314 -> 0.286. ``four_warps`` (sm_87): on a Jetson AGX Orin the 128 x 128 tile wins, with 4 warps instead
+    of 8 (the 64-row picks above are 7-25% slower there): 2505 x 1024 -> 1024 0.126 -> 0.121 ms, 2505 x 1024 -> 4096
+    0.489 -> 0.451, 2505 x 4096 -> 1024 0.410 -> 0.368, 10020 x 1024 -> 1024 0.480 -> 0.440, 131072 x 512 -> 512 1.734 ->
+    1.693."""
     if small_tiles and rows >= 2048 and n >= 512:
         return 64, 128 if rows >= 32768 else 64, 64, 4, 3
     if rows >= 512:
-        return 128, 128, 64, 8, 3
+        return 128, 128, 64, 4 if four_warps else 8, 3
     if rows >= 128:
         return 64, 128, 64, 4, 4
     return 32, 64, 128, 4, 3
@@ -353,7 +358,9 @@ def int8_gemm_bf16(
     rows, k = a.shape
     n = weight.shape[0]
     out = torch.empty(rows, n, device=a.device, dtype=torch.bfloat16)
-    block_m, block_n, block_k, num_warps, num_stages = config or _int8_gemm_config(rows, n, _is_sm89(a.device) or _is_sm90(a.device))
+    block_m, block_n, block_k, num_warps, num_stages = config or _int8_gemm_config(
+        rows, n, _is_sm89(a.device) or _is_sm90(a.device), platform_for(a.device).capability == (8, 7)
+    )
     _int8_gemm_kernel[(triton.cdiv(rows, block_m) * triton.cdiv(n, block_n),)](
         a,
         weight,

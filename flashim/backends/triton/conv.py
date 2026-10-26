@@ -12,6 +12,8 @@ convolutions for a full ``groups == 1`` ``nn.Conv2d``.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -514,8 +516,8 @@ def _depthwise_eligible(value: Tensor, weight: Tensor, bias: Tensor, *_) -> bool
     )
 
 
-ops.depthwise5x5_relu_mxfp8.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_depthwise_eligible
+ops.depthwise5x5_relu_mxfp8.register(  # an E4M3 producer: see ``backends/triton/quantize.py``
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3], when=_depthwise_eligible
 )(depthwise5x5_relu_mxfp8)
 ops.depthwise5x5_relu_int8.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_depthwise_eligible
@@ -643,6 +645,10 @@ ops.im2col_gather.register(
 # and specialized on divisibility, every new image size re-autotuned and recompiled every config: 6-13 s per new size
 # for a SuperPoint int8 / fp8 extract on sm_120 (a MegaDepth evaluation has dozens of sizes).
 _SIZE_ARGS = ["B", "H", "W", "HO", "WO", "rows", "ROWS_BUCKET", "res_channels", "rs_b", "rs_h", "rs_w", "rs_c"]
+# Keep the autotuner's timings in Triton's cache (keyed by kernel source, architecture, tuning key and candidates), so
+# only the first process times the candidates: RoMaV2's eight INT8 VGG convs cost about 10 s of autotuning per process
+# start on a Jetson AGX Orin (first forward 12.5 -> 2.7 s) and on an L20. ``FLASHIM_AUTOTUNE_CACHE=0`` re-times.
+_CACHE_AUTOTUNE = os.environ.get("FLASHIM_AUTOTUNE_CACHE", "1") != "0"
 
 
 # -- fused INT8 conv2d (implicit GEMM) ----------------------------------------------------------
@@ -679,7 +685,7 @@ def _int8_conv2d_block_k(configs, named_args, **kwargs):
 
 @triton.autotune(
     configs=_INT8_CONV2D_CONFIGS, key=["ROWS_BUCKET", "COUT", "CIN", "TAPS"],
-    prune_configs_by={"early_config_prune": _int8_conv2d_block_k},
+    prune_configs_by={"early_config_prune": _int8_conv2d_block_k}, cache_results=_CACHE_AUTOTUNE,
 )
 @triton.jit(do_not_specialize=_SIZE_ARGS)
 def _int8_conv2d_kernel(
@@ -826,7 +832,7 @@ def _mxfp8_conv2d_tiles(configs, named_args, **kwargs):
 
 @triton.autotune(
     configs=_MXFP8_CONV2D_CONFIGS, key=["ROWS_BUCKET", "COUT", "CIN", "TAPS"],
-    prune_configs_by={"early_config_prune": _mxfp8_conv2d_tiles},
+    prune_configs_by={"early_config_prune": _mxfp8_conv2d_tiles}, cache_results=_CACHE_AUTOTUNE,
 )
 @triton.jit(do_not_specialize=_SIZE_ARGS)
 def _mxfp8_conv2d_kernel(
@@ -974,7 +980,7 @@ def _mxfp8_conv2d_scaled_block_k(configs, named_args, **kwargs):
 
 @triton.autotune(
     configs=_MXFP8_CONV2D_SCALED_CONFIGS, key=["ROWS_BUCKET", "COUT", "CIN", "TAPS"],
-    prune_configs_by={"early_config_prune": _mxfp8_conv2d_scaled_block_k},
+    prune_configs_by={"early_config_prune": _mxfp8_conv2d_scaled_block_k}, cache_results=_CACHE_AUTOTUNE,
 )
 @triton.jit(do_not_specialize=_SIZE_ARGS[1:])
 def _mxfp8_conv2d_scaled_kernel(

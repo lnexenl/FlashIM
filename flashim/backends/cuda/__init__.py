@@ -1,7 +1,8 @@
 """CUDA C++ kernels, JIT-compiled with ``nvcc`` on first use.
 
 Sources live in ``csrc/``; each is built into a shared library cached under ``~/.cache/flashim/cuda`` (keyed by a
-hash of the source, the target architecture and the compiler), and launched through ``ctypes`` on PyTorch's current
+hash of the source, the target architecture, the compiler and the host machine: a home directory can be shared by
+x86-64 and aarch64 hosts), and launched through ``ctypes`` on PyTorch's current
 stream — no torch C++ headers, so no dependence on the host compiler's compatibility with them. Every CUDA kernel has a
 Triton/torch fallback: :func:`load` returns ``None`` (with one logged warning) when there is no toolchain or the build
 fails, and callers must then use it.
@@ -14,6 +15,7 @@ import functools
 import hashlib
 import logging
 import os
+import platform
 import subprocess
 from pathlib import Path
 
@@ -41,7 +43,7 @@ def load(name: str, capability: tuple[int, int] | None = None) -> ctypes.CDLL | 
         return None
     major, minor = capability or torch.cuda.get_device_capability()
     arch = f"sm_{major}{minor}"
-    key = hashlib.sha256(source.read_bytes() + f"{arch}{nvcc}{_FLAGS}".encode()).hexdigest()[:16]
+    key = hashlib.sha256(source.read_bytes() + f"{arch}{nvcc}{_FLAGS}{platform.machine()}".encode()).hexdigest()[:16]
     library = _cache_dir() / f"{name}-{arch}-{key}.so"
     if not library.is_file():
         library.parent.mkdir(parents=True, exist_ok=True)
