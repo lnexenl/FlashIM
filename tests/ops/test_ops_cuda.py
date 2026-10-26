@@ -647,6 +647,29 @@ def test_conv2d_single_output(k, hw, dtype):
         assert ((out.double() - exact).abs().max() / exact.abs().max()) < 1e-5  # full FP32, not TF32
 
 
+@pytest.mark.parametrize(
+    "k,shape,dtype",
+    [(5, (2, 12, 37, 72), torch.bfloat16), (5, (1, 81, 130, 264), torch.bfloat16), (3, (2, 33, 61, 88), torch.float32),
+     (5, (1, 80, 50, 64), torch.float16)],
+)
+def test_conv2d_single_output_cuda(k, shape, dtype):
+    """The CUDA C++ stencil: ragged tiles, a partial last channel stage, batch > 1, a channel-slice view (strided
+    planes), the dtype it reads."""
+    from flashim.backends.cuda import conv as cuda_conv
+
+    if not cuda_conv._available():
+        pytest.skip("nvcc unavailable")
+    torch.manual_seed(0)
+    b, c, h, w = shape
+    x = torch.randn(b, c + 3, h, w, device=DEV).to(dtype)[:, 1 : 1 + c]
+    weight, bias = torch.randn(1, c, k, k, device=DEV) * 0.1, torch.randn(1, device=DEV)
+    assert ops.conv2d_single_output.explain(x, weight, bias)["cuda"] == "selected"
+    exact = F.conv2d(x.double(), weight.double(), bias.double(), padding=k // 2)
+    out = ops.conv2d_single_output.get("cuda")(x, weight, bias)
+    assert out.dtype == torch.float32 and out.shape == exact.shape
+    assert ((out.double() - exact).abs().max() / exact.abs().max()) < 1e-5
+
+
 @pytest.mark.parametrize("fmt", ["int8", "mxfp8"])
 @pytest.mark.parametrize("layout", ["nhwc", "nchw"])
 def test_conv2d_residual_relu_epilogue(fmt, layout):
