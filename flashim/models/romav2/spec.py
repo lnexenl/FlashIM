@@ -46,6 +46,12 @@ def _fold_refiners(model: RoMaV2, ctx: BuildContext) -> list[str]:
     return fold_block_batchnorm(model.refiners)
 
 
+def _fold_fine_features(model: RoMaV2, ctx: BuildContext) -> int:
+    """VGG19-BN fine features: BatchNorm folded into the convs, channels-last weights (what ``compile-full`` sets up
+    for its compiled VGG). Not exact: the fold changes rounding."""
+    return model.refiner_features.fold_batchnorm(channels_last=True)
+
+
 def _fused_bf16(stride: int):
     def apply(model: RoMaV2, ctx: BuildContext) -> list[str]:
         from flashim.quant.passes.separable_conv_block import fuse_bf16_blocks
@@ -71,6 +77,16 @@ def _fused_mx_blocks(model: RoMaV2, ctx: BuildContext) -> int:
     for block in blocks:
         block.fuse_pointwise = True
     return len(blocks)
+
+
+def _fused_rope(model: RoMaV2, ctx: BuildContext) -> int:
+    """DINOv3's RoPE through ``ops.rope_qk`` dispatch (one fused kernel for q and k) instead of the pinned upstream
+    math. Not exact: the kernel's FMA contraction moves 24% of the rotated elements by one BF16 ulp. Measured on a
+    Jetson AGX Orin, 16 x 2505 x 64 BF16: 1.54 -> 0.46 ms per call, 42 calls per mega1500 pair."""
+    pinned = [module for module in model.f.modules() if getattr(module, "rope_impl", None) == "reference"]
+    for module in pinned:
+        module.rope_impl = None
+    return len(pinned)
 
 
 def _batched_directions(model: RoMaV2, ctx: BuildContext) -> None:
@@ -103,11 +119,13 @@ def _validate(config: RunConfig) -> None:
 
 def _overlay(preset: quant.Preset) -> dict:
     passes = ["fold_refiners"] if preset.fold_refiners else []
+    passes += ["fold_fine_features"] if preset.fold_fine_features else []
     passes += [f"fused_bf16_s{stride}" for stride in preset.fused_bf16_refiners]
     passes += [name for name, on in (
         ("fused_refiner_io", preset.fused_refiner_io),
         ("fused_mx_blocks", preset.fused_mx_blocks),
         ("batched_directions", preset.batched_directions),
+        ("fused_rope", preset.fused_rope),
     ) if on]
     return {
         "precision": {"compute_dtype": "bf16", "quant": preset.name if preset.config is not None else None},
@@ -116,6 +134,9 @@ def _overlay(preset: quant.Preset) -> dict:
 
 
 _QUANTIZED = {name: p for name, p in quant.PRESETS.items() if p.config is not None}
+# The INT8 preset closest to each FP8 one: the same transformer linears; quantized refiner blocks map to RoMaV2's
+# ``int8_full`` recipe (INT8 has no stride-4-only variant), the FlashIM refiner kernels to ``int8-fast``.
+_FP8_FALLBACKS = {"fp8-p8": "int8", "fp8-s4": "int8-full", "fp8": "int8-full", "fp8-fast": "int8-fast"}
 
 SPEC = ModelSpec(
     name="romav2",
@@ -126,19 +147,21 @@ SPEC = ModelSpec(
     default_preset="fp8",
     quant_configs={name: p.config for name, p in _QUANTIZED.items()},
     calibrations={name: p.calibration for name, p in _QUANTIZED.items()},
+    fp8_fallbacks=_FP8_FALLBACKS,
     protected=quant.PROTECTED,
     passes={
         "fold_refiners": Pass(_fold_refiners, stage="pre_quant", description="channels-last refiners, BN folded"),
+        "fold_fine_features": Pass(
+            _fold_fine_features, stage="pre_quant", exact=False, description="channels-last VGG fine features, BN folded"
+        ),
         **{
             f"fused_bf16_s{s}": Pass(_fused_bf16(s), exact=False, description=f"fused BF16 stride-{s} refiner blocks")
             for s in (4, 2, 1)
         },
         "fused_refiner_io": Pass(_fused_refiner_io, exact=False, description="fused refiner input + output heads"),
-# The INT8 preset closest to each FP8 one: the same transformer linears; quantized refiner blocks map to RoMaV2's
-# ``int8_full`` recipe (INT8 has no stride-4-only variant), the FlashIM refiner kernels to ``int8-fast``.
-_FP8_FALLBACKS = {"fp8-p8": "int8", "fp8-s4": "int8-full", "fp8": "int8-full", "fp8-fast": "int8-fast"}
         "fused_mx_blocks": Pass(_fused_mx_blocks, exact=False, description="dw + quantize + pw MXFP8 in one kernel"),
         "batched_directions": Pass(_batched_directions, description="both match directions as one batch"),
+        "fused_rope": Pass(_fused_rope, exact=False, description="DINOv3 RoPE as one fused kernel"),
     },
     engines={
         "eager": EngineSpec(),
@@ -147,7 +170,6 @@ _FP8_FALLBACKS = {"fp8-p8": "int8", "fp8-s4": "int8-full", "fp8": "int8-full", "
     },
     set_attention=_set_attention,
     apply_inference=_apply_inference,
-    fp8_fallbacks=_FP8_FALLBACKS,
     validate=_validate,
 )
 

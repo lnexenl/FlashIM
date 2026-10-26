@@ -51,8 +51,8 @@ def main() -> None:
     scheme_config = PRESETS[args.preset or ("int8" if int8 else "fp8-p8")].config
 
     def eligible(module) -> bool:
-        conv1x1 = isinstance(module, torch.nn.Conv2d) and module.kernel_size == (1, 1) and module.groups == 1
-        return isinstance(module, torch.nn.Linear) or (int8 and conv1x1)
+        conv = isinstance(module, torch.nn.Conv2d) and module.groups == 1  # 1x1s and e.g. the VGG fine features' 3x3s
+        return isinstance(module, torch.nn.Linear) or (int8 and conv)
 
     targets = [
         name for name, module in model.named_modules() if eligible(module) and scheme_config.scheme_for(name) is not None
@@ -80,7 +80,10 @@ def main() -> None:
     )
     if existing is not None:
         merged = {**(existing.input_scale if int8 else existing.linear), **(table.input_scale if int8 else table.linear)}
-        table = (Int8CalibrationTable(merged, table.metadata) if int8 else CalibrationTable(merged, table.metadata))
+        # the kept entries' own provenance, next to this run's
+        metadata = {**{f"base_{key}": value for key, value in existing.metadata.items()}, **table.metadata}
+        metadata["merged_layers"] = str(len(targets))
+        table = (Int8CalibrationTable(merged, metadata) if int8 else CalibrationTable(merged, metadata))
     tmp = Path(args.out).with_suffix(".tmp.safetensors")
     table.save(tmp)
     tmp.replace(args.out)

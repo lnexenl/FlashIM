@@ -45,7 +45,7 @@ skipped with a warning (`optimize.strict=true` raises).
 
 | model | presets | notes |
 |---|---|---|
-| `romav2` | `bf16`, `fp8-p8`, `fp8-s4`, `fp8` (default), `fp8-fast`, `int8`, `int8-dpt`, `int8-full`, `int8-fast` | native port of RoMa v2; `bf16`/`fp8-*` outputs are bit-identical to the RoMaV2 reference implementation |
+| `romav2` | `bf16`, `fp8-p8`, `fp8-s4`, `fp8` (default), `fp8-fast`, `int8`, `int8-dpt`, `int8-full`, `int8-fast`, `int8-fast-vgg` | native port of RoMa v2; `bf16`/`fp8-*` outputs are bit-identical to the RoMaV2 reference implementation |
 | `rdd` | `fp32`, `bf16`, `fp8` (default), `fp8-full`, `fp8-backbone` | native port of [RDD](https://github.com/xtcpete/rdd) (CVPR'25, sparse detector + descriptor); `fp32` matches the reference to 1e-5 (see [RDD](#rdd)) |
 | `aliked` | `fp32` (default), `bf16` | native port of [ALIKED](https://github.com/Shiaoming/ALIKED) (TIM'23, sparse detector + descriptor); `fp32` matches the reference bit-exactly (see [ALIKED](#aliked)) |
 | `superpoint`, `alike`, `disk`, `xfeat`, `ripe`, `dedode`, `dedode-g`, `dad`, `loftr` | `fp32`, `bf16` (default), `int8`, `fp8` | native ports, each verified against its upstream implementation (see [More sparse and semi-dense models](#more-sparse-and-semi-dense-models)) |
@@ -72,6 +72,11 @@ fused dequantize + bias epilogue; Triton GEMM, `torch._int_mm` kept as an altern
 - `int8-fast` — `int8-full` with the `fp8-fast` refiner kernels: INT8 blocks at strides 4/2 only (stride 1 stays
   fused BF16), fused refiner input/heads, batched directions. C=128 blocks run as one fused depthwise + INT8 GEMM
   kernel, C=512 producers as TileLang. Not RoMaV2-exact.
+- `int8-fast-vgg` — `int8-fast` + the VGG19-BN fine features (BatchNorm folded, channels-last, their eight 3x3 convs
+  as static INT8 with their own calibration entries) and DINOv3's RoPE as one fused kernel. Eager, per MegaDepth
+  pair: 136.5 -> 102.4 ms on an L20, 857 -> 665 ms on a Jetson AGX Orin. MegaDepth-1500 AUC@5 over 3 seeds on the
+  L20 (eager): 0.6203, against 0.6223 for `int8-fast` and 0.6203 for `bf16` (seed spread 0.003-0.005 each); on the
+  Orin 0.6198 against 0.6227 for `int8-fast`.
 
 Optional INT8 attention: `flashim.load("romav2", preset="int8-fast", attention="sage-fp8")` (or `"sage"`: INT8 QK +
 FP16 PV) runs every quantized transformer block's attention through [SageAttention](https://github.com/thu-ml/SageAttention)

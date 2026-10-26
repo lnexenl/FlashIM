@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
+from flashim.layers.conv import chains, fused_relu_end
 from flashim.models.romav2.geometry import imagenet_normalize
 
 # torchvision vgg19_bn.features[:27]: conv/bn/relu x2, pool, x2, pool, x4 (256), pool.
@@ -49,12 +50,24 @@ class VGG19BN(nn.Module):
             x = x.to(memory_format=torch.channels_last)
         with torch.autocast(x.device.type, torch.bfloat16):
             feats: dict[int, Tensor] = {}
-            scale = 1
-            for layer in self.layers:
+            scale, i = 1, 0
+            while i < len(self.layers):
+                layer = self.layers[i]
                 if isinstance(layer, nn.MaxPool2d):
                     feats[scale] = x.permute(0, 2, 3, 1)
                     scale *= 2
                     if scale > 4:
                         break  # the final pool's output is never used
-                x = layer(x)
+                relu = fused_relu_end(self.layers, i)
+                if relu is None:
+                    x = layer(x)
+                    i += 1
+                    continue
+                # A quantized conv (BatchNorm folded): ReLU in its epilogue, and the next conv's quantized input
+                # straight from it where the platform chains. It gets BF16, as autocast gives the plain conv.
+                consumer = self.layers[relu + 1]  # a conv or the pool: the config ends with "M"
+                if isinstance(x, Tensor) and x.dtype == torch.float32:
+                    x = x.to(torch.bfloat16)
+                x = layer(x, relu=True, quantize_for=consumer) if chains(layer, consumer) else layer(x, relu=True)
+                i = relu + 1
             return feats
