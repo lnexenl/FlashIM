@@ -6,17 +6,21 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import find_weights
+from flashim.models.weights_util import Checkpoint, find_weights
 
-HELP = "Download xfeat.pt / xfeat-lighterglue.pt from the `weights/` folder of https://github.com/verlab/accelerated_features"
+_REPO = "https://github.com/verlab/accelerated_features/raw/main/weights"
+CHECKPOINTS = {
+    name: Checkpoint(name, f"{_REPO}/{name}", sha)
+    for name, sha in (
+        ("xfeat.pt", "0f5187fd7bedd26c7fe6acc9685444493a165a35ecc087b33c2db3627f3ea10b"),
+        ("xfeat-lighterglue.pt", "766102df37f11189efe5b0811d1f47c72b22629b79bfabfcfff9d2a2f84654b8"),
+    )
+}
 LICENSES = {"code": "Apache-2.0 (verlab/accelerated_features); FlashIM re-implementation", "weights": "XFeat release"}
 
 
 def _find(name: str, path):
-    return find_weights(
-        name, path=path, env="FLASHIM_XFEAT_CHECKPOINT", help=HELP,
-        extra=[Path.home() / "work" / "oracles" / "accelerated_features" / "weights" / name],
-    )
+    return find_weights(CHECKPOINTS[name], path=path, env="FLASHIM_XFEAT_CHECKPOINT")
 
 
 def load_state_dict(path: str | Path | None = None, map_location="cpu") -> dict[str, torch.Tensor]:

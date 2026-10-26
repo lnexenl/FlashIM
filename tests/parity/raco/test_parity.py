@@ -36,6 +36,8 @@ def oracle():
 def _images():
     from flashim.models.romav2.model import load_image
 
+    if not all(p.exists() for p in IMAGES):
+        pytest.skip(f"needs the LightGlue-ONNX assets under {ROOT}")
     return [F.interpolate(load_image(p, "cuda"), size=(1024, 1024), mode="bilinear", align_corners=False) for p in IMAGES]
 
 

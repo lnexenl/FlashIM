@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 
 import torch
 
+from flashim.models.weights_util import Checkpoint, find_weights
+
 CHECKPOINT_ENV = "FLASHIM_RDD_CHECKPOINT"
-CHECKPOINT_HELP = (
-    "Download rdd.pth from the Google Drive folder linked in https://github.com/xtcpete/rdd (README), then pass "
-    f"checkpoint=..., set {CHECKPOINT_ENV}, or place it at <torch hub dir>/checkpoints/rdd.pth."
+# ``weights/rdd.pth`` of the Google Drive folder linked from https://github.com/xtcpete/rdd (its only
+# release); ``confirm=t`` skips Drive's page for files too large to virus-scan, the SHA-256 pins the content.
+CHECKPOINT = Checkpoint(
+    "rdd.pth",
+    "https://drive.usercontent.google.com/download?id=18Xyzwtrk7dqppZzPz01Tpo6cdMBk_h6J"
+    "&export=download&confirm=t",
+    "b9f72267db638d7daa3a896d2c688d5fe02ea0a2acf39a1d4218305b4153b1d6",
 )
 
 LICENSES = {
@@ -39,12 +44,7 @@ def convert_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor
 
 
 def find_checkpoint(path: str | Path | None = None) -> Path:
-    candidates = [path, os.environ.get(CHECKPOINT_ENV), Path(torch.hub.get_dir()) / "checkpoints" / "rdd.pth"]
-    candidates.append(Path.home() / "work" / "RDD" / "weights" / "rdd.pth")  # sibling checkout of the reference repo
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            return Path(candidate)
-    raise FileNotFoundError(f"RDD checkpoint not found. {CHECKPOINT_HELP}")
+    return find_weights(CHECKPOINT, path=path, env=CHECKPOINT_ENV)
 
 
 def load_state_dict(path: str | Path | None = None, map_location: str | torch.device = "cpu") -> dict[str, torch.Tensor]:

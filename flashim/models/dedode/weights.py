@@ -6,14 +6,27 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import find_weights
+from flashim.models.weights_util import Checkpoint, find_weights
 
 RELEASES = "https://github.com/Parskatt/DeDoDe/releases/download"
-FILES = {
-    "detector-L": ("dedode_detector_L_v2.pth", f"{RELEASES}/v2/dedode_detector_L_v2.pth"),
-    "descriptor-B": ("dedode_descriptor_B.pth", f"{RELEASES}/dedode_pretrained_models/dedode_descriptor_B.pth"),
-    "descriptor-G": ("dedode_descriptor_G.pth", f"{RELEASES}/dedode_pretrained_models/dedode_descriptor_G.pth"),
-    "dinov2": ("dinov2_vitl14_pretrain.pth", "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth"),
+CHECKPOINTS = {
+    "detector-L": Checkpoint(
+        "dedode_detector_L_v2.pth", f"{RELEASES}/v2/dedode_detector_L_v2.pth",
+        "4113809dd9e0367af013a45fc2255a6b243ff241cd06520d17a65d9e231bdc17",
+    ),
+    "descriptor-B": Checkpoint(
+        "dedode_descriptor_B.pth", f"{RELEASES}/dedode_pretrained_models/dedode_descriptor_B.pth",
+        "8eccfc270ec990ced60cd54a434411a47c4c504de13586f596d042e005b3022b",
+    ),
+    "descriptor-G": Checkpoint(
+        "dedode_descriptor_G.pth", f"{RELEASES}/dedode_pretrained_models/dedode_descriptor_G.pth",
+        "ef6e3f2911bb3c179960db15545a2137d0746054bb5bad75559524ccab1fee41",
+    ),
+    "dinov2": Checkpoint(
+        "dinov2_vitl14_pretrain.pth",
+        "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth",
+        "d5383ea8f4877b2472eb973e0fd72d557c7da5d3611bd527ceeb1d7162cbf428",
+    ),
 }
 LICENSES = {
     "code": "MIT (Parskatt/DeDoDe); DINOv2 Apache-2.0; FlashIM re-implementation",
@@ -22,8 +35,5 @@ LICENSES = {
 
 
 def load(name: str, path: str | Path | None = None, map_location="cpu") -> dict[str, torch.Tensor]:
-    file, url = FILES[name]
-    return torch.load(
-        find_weights(file, path=path, env=f"FLASHIM_DEDODE_{name.replace('-', '_').upper()}", help=f"Download {url}"),
-        map_location=map_location, weights_only=True,
-    )
+    file = find_weights(CHECKPOINTS[name], path=path, env=f"FLASHIM_DEDODE_{name.replace('-', '_').upper()}")
+    return torch.load(file, map_location=map_location, weights_only=True)

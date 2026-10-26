@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import torch
 
+from flashim.models.weights_util import Checkpoint, find_weights
+
 CHECKPOINT_ENV = "FLASHIM_RACO_CHECKPOINT"
-CHECKPOINT_URL = "https://github.com/cvg/RaCo/releases/download/v1.0.0/raco.pth"
-CHECKPOINT_HELP = (
-    f"Download raco.pth from {CHECKPOINT_URL}, then pass checkpoint=..., set {CHECKPOINT_ENV}, or place it at "
-    "<torch hub dir>/checkpoints/raco.pth."
+CHECKPOINT = Checkpoint(
+    "raco.pth",
+    "https://github.com/cvg/RaCo/releases/download/v1.0.0/raco.pth",
+    "79f0d862bb41abedd8dda33a9b0120f4dcd619c43a90398175bad1a019192e3a",
 )
 LICENSES = {
     "code": "Apache-2.0 (RaCo, cvg/RaCo); FlashIM re-implementation",
@@ -22,11 +23,7 @@ _UNUSED_PREFIX = "covariance_estimator_head."
 
 
 def find_checkpoint(path: str | Path | None = None) -> Path:
-    candidates = [path, os.environ.get(CHECKPOINT_ENV), Path(torch.hub.get_dir()) / "checkpoints" / "raco.pth"]
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            return Path(candidate)
-    raise FileNotFoundError(f"RaCo checkpoint not found. {CHECKPOINT_HELP}")
+    return find_weights(CHECKPOINT, path=path, env=CHECKPOINT_ENV)
 
 
 def load_state_dict(path: str | Path | None = None, map_location: str | torch.device = "cpu") -> dict[str, torch.Tensor]:

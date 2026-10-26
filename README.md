@@ -129,9 +129,8 @@ m = model.match("a.jpg", "b.jpg", resize=1600)            # SparseMatchResult (m
 ```
 
 ConvNeXt-tiny backbone -> 5-level multi-scale deformable-attention encoder (4 layers; 140k tokens at 1600 px) ->
-descriptor map; a small FP32 conv net produces the keypoint score map. `rdd.pth` is distributed via the Google
-Drive link in the RDD README (not auto-downloaded); pass `checkpoint=`, set `FLASHIM_RDD_CHECKPOINT`, or put it at
-`<torch hub dir>/checkpoints/rdd.pth`.
+descriptor map; a small FP32 conv net produces the keypoint score map. `rdd.pth` (and LightGlue's `rdd_lg.pth`)
+is downloaded on first use from the Google Drive folder linked in the RDD README (see [Checkpoints](#checkpoints)).
 
 - `bf16` — descriptor branch in BF16; detector, softmax and all sampling / position math in FP32.
 - `fp8` — `bf16` + the encoder's value / output / FFN linears as static MXFP8, run by a fused encoder pass:
@@ -177,9 +176,8 @@ A small conv encoder (plain 3x3 convs at strides 1/2, deformable 3x3 convs at st
 feature fusion; a 4-layer conv head produces the keypoint score map and `SDDH` samples descriptors at
 deformable offsets around each detected keypoint (DKD: soft-NMS + soft-argmax sub-pixel refinement). Four
 released checkpoints (`variant=`): `aliked-t16` (64-d), `aliked-n16` / `aliked-n16rot` (128-d, default),
-`aliked-n32` (128-d, 32 sample points). Checkpoints are distributed from the `models/` folder of the ALIKED
-repo (not auto-downloaded); pass `checkpoint=`, set `FLASHIM_ALIKED_CHECKPOINT`, or put `<variant>.pth` at
-`<torch hub dir>/checkpoints/`.
+`aliked-n32` (128-d, 32 sample points), downloaded on first use from the `models/` folder of the ALIKED repo
+(see [Checkpoints](#checkpoints)).
 
 - `fp32` — the checkpoint's own precision; matches the reference implementation's dense maps, keypoints and
   scores bit-exactly, descriptors to cosine > 0.99999 (deformable-sampling summation order only).

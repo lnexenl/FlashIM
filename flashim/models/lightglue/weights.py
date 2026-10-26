@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 
 import torch
 
+from flashim.models.weights_util import Checkpoint, find_weights
+
 CHECKPOINT_ENV = "FLASHIM_LIGHTGLUE_CHECKPOINT"
-CHECKPOINT_HELP = (
-    "Download rdd_lg.pth from the Google Drive folder linked in https://github.com/xtcpete/rdd (README), then pass "
-    f"checkpoint=..., set {CHECKPOINT_ENV}, or place it at <torch hub dir>/checkpoints/rdd_lg.pth."
+# ``weights/rdd_lg.pth`` of the Google Drive folder linked from https://github.com/xtcpete/rdd (its only
+# release); ``confirm=t`` skips Drive's page for files too large to virus-scan, the SHA-256 pins the content.
+CHECKPOINT = Checkpoint(
+    "rdd_lg.pth",
+    "https://drive.usercontent.google.com/download?id=19U_vjcThjo-Ykoh4mEVg7F3agaOyvH-S"
+    "&export=download&confirm=t",
+    "3c26a6207a735eb7941b7b5ef454fb9b205d6d76e00cd65fbe56e710319f05a9",
 )
 
 LICENSES = {
@@ -48,12 +53,7 @@ def convert_state_dict(state: dict[str, torch.Tensor], num_heads: int, num_layer
 
 
 def find_checkpoint(path: str | Path | None = None) -> Path:
-    candidates = [path, os.environ.get(CHECKPOINT_ENV), Path(torch.hub.get_dir()) / "checkpoints" / "rdd_lg.pth"]
-    candidates.append(Path.home() / "work" / "RDD" / "weights" / "rdd_lg.pth")  # sibling checkout of RDD
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            return Path(candidate)
-    raise FileNotFoundError(f"LightGlue checkpoint not found. {CHECKPOINT_HELP}")
+    return find_weights(CHECKPOINT, path=path, env=CHECKPOINT_ENV)
 
 
 def load_state_dict(
@@ -65,12 +65,18 @@ def load_state_dict(
 
 # cvg/LightGlue trains one LightGlue per (detector, descriptor) pair: ``aliked`` is ALIKED's own keypoints and
 # descriptors, ``raco-aliked`` RaCo's keypoints with ALIKED descriptors (same architecture, different weights).
-CVG_FILES = {
-    "superpoint": "superpoint_lightglue.pth",
-    "disk": "disk_lightglue.pth",
-    "sift": "sift_lightglue.pth",
-    "aliked": "aliked_lightglue.pth",
-    "raco-aliked": "raco_aliked_lightglue.pth",
+_CVG_SHA256 = {
+    "superpoint": "6ff7040d0a497fc6639337946d7538dae07428c18f77a067a0b5a960e7cc551a",
+    "disk": "b5b21d47ea24f2c5e501aec9c91b9716e4c8c3429a4dc1e615c133c4c9378335",
+    "sift": "5b52b8d9982d43532dc042606b346bb9594c9f5a4bd6f64362c63866287b4ac0",
+    "aliked": "d975e965b105311a6143194852297dff4f02aea5cc2e10cecfed966ca0e22503",
+    "raco-aliked": "a804c3fe2851cc3c765cda6a9f412845893c8d8e2a3048f848d7f6ba172e6312",
+}
+_CVG_RELEASE = "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv"
+CVG_FILES = {variant: f"{variant.replace('-', '_')}_lightglue.pth" for variant in _CVG_SHA256}
+CVG_CHECKPOINTS = {
+    variant: Checkpoint(file, f"{_CVG_RELEASE}/{file}", _CVG_SHA256[variant])
+    for variant, file in CVG_FILES.items()
 }
 
 
@@ -78,10 +84,6 @@ def load_cvg_state_dict(
     variant: str, num_heads: int, num_layers: int, path: str | Path | None = None, map_location="cpu"
 ) -> dict[str, torch.Tensor]:
     """cvg/LightGlue's per-extractor release (``<extractor>_lightglue.pth``)."""
-    from flashim.models.weights_util import find_weights
-
-    file = find_weights(
-        CVG_FILES[variant], path=path, env=f"FLASHIM_{variant.upper().replace('-', '_')}_LIGHTGLUE_CHECKPOINT",
-        help=f"Download https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/{CVG_FILES[variant]}",
-    )
+    env = f"FLASHIM_{variant.upper().replace('-', '_')}_LIGHTGLUE_CHECKPOINT"
+    file = find_weights(CVG_CHECKPOINTS[variant], path=path, env=env)
     return convert_state_dict(torch.load(file, map_location=map_location, weights_only=True), num_heads, num_layers)

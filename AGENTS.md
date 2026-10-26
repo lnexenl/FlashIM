@@ -37,7 +37,8 @@ flashim/
                shared by the sparse extractors (superpoint, alike, disk, xfeat, dedode(-g), dad, ripe, loftr,
                sift, orb): `SparseExtractor` base (resize, coordinate mapping, MNN matching, BN folding, compute
                dtype), `extractor_spec()` (the fp32 / bf16 / int8 / fp8 presets from a list of quantizable globs),
-               checkpoint lookup (`~/work/oracles/weights` is searched last)
+               checkpoint lookup (`checkpoint=` / env var / torch hub folder, else download of the release
+               pinned by URL + SHA-256 in each model's `weights.py`)
   engines/     region torch.compile, CUDA-graph runner
 benchmarks/    speed/, accuracy/ (MegaDepth-1500, ScanNet-1500, HardMatch), profile/
 scripts/       calibration
@@ -91,7 +92,8 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   im2col + GEMM (`quant/methods/conv2d.py`; groups == 1 only): measured *slower* than BF16 on the small nets here.
 - **Add a model**: `models/<m>/` with `model.py`, `weights.py`, `quant.py`, `spec.py` (register it in
   `flashim/registry.py` `SPECS`), a `load_<m>` shim in `build.py` if a keyword API is wanted, CPU unit tests and a
-  parity test against the oracle.
+  parity test against the oracle. `weights.py` pins each release as `Checkpoint(filename, url, sha256)` and loads it
+  through `find_weights` (auto-download; add the module to `tests/unit/test_weights.py`).
 
 ## Verifying changes
 
@@ -130,7 +132,8 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
 - zsh: unquoted `$cfg` does not word-split (use `${=cfg}`).
 - `git clone` of GitHub repos fails in the sandbox proxy; download the archive zip instead.
 - Sparse-model oracles are archive zips under `~/work/oracles/` (LightGlue, accelerated_features, ALIKE, DeDoDe,
-  RIPE, dad, LoFTR; weights in `~/work/oracles/weights`); DISK and LoFTR are also checked against `kornia` (dev dep).
+  RIPE, dad, LoFTR; the models no longer read `~/work/oracles/weights`); DISK and LoFTR are also checked against
+  `kornia` (dev dep).
   Parity-test pitfalls: put upstream modules in `.eval()`; disable `cudnn.allow_tf32` (BN folding changes TF32
   rounding); `torch.cdist` on pixel coordinates needs `compute_mode="donot_use_mm_for_euclid_dist"`; compare
   keypoints as sets, not by index (a few threshold-borderline points flip and shift every later index).
