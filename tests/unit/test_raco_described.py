@@ -33,14 +33,27 @@ def _raco():
     return RaCo(RaCoConfig(num_keypoints=16, candidate_multiplier=2)).eval()
 
 
-def test_descriptor_reads_pixel_indices_and_features_keep_raco_convention():
+def test_keypoints_are_pixel_centers_and_lightglue_sees_raco_convention():
     descriptor = _Descriptor()
     extractor = RaCoExtractor(_raco(), descriptor)
     features = extractor.extract(torch.rand(1, 3, 64, 96), top_k=16)
     assert isinstance(features, SparseFeatures)
     assert features.keypoints.shape == (1, 16, 2) and features.descriptors.shape == (1, 16, 4)
-    assert torch.allclose(descriptor.seen + 0.5, features.keypoints[0])  # RaCo: pixel index + 0.5
+    assert torch.equal(descriptor.seen, features.keypoints[0])  # pixel centers, as every model returns them
     assert extractor.match_features(features, features).keypoints_A.shape == (1, 2)  # the descriptor model's matcher
+
+    class Spy(nn.Module):  # a LightGlue stand-in: records its inputs, matches keypoint i to i
+        def match_features(self, a, b, threshold=None):
+            self.seen = a.keypoints
+            index = torch.arange(a.keypoints.shape[1])
+            return Matches(a.keypoints[0], b.keypoints[0], torch.ones(len(index)), index, index)
+
+    from flashim.models.lightglue.pipeline import SparsePipeline
+
+    pipeline = SparsePipeline(extractor, Spy())
+    matches = pipeline.match_features(features, features)
+    assert torch.equal(pipeline.matcher.seen, features.keypoints + 0.5)  # RaCo's pixel-edge convention
+    assert torch.equal(matches.keypoints_A, features.keypoints[0])
 
 
 def test_alignment_follows_the_descriptor_model():

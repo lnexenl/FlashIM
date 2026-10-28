@@ -15,6 +15,8 @@ First public release.
 - Four presets: `fp32`, `bf16`, `int8`, `fp8`. A model without the asked preset, and `fp8` on a GPU without FP8,
   builds the nearest one (`fp8` -> `int8` -> `bf16` -> `fp32`) and records it in `model.build_report.fallbacks`. A
   pipeline's preset applies to each of its components.
+- Keypoints of every model are `(x, y)` pixel-center coordinates of the original image, RaCo's included (RaCo's own
+  pixel-edge convention, pixel index + 0.5, is only what LightGlue sees in the `raco-*-lightglue` pipelines).
 - `flashim.resolve` returns the config a build would use; `model.run_config` and `model.build_report` say what was
   asked for and what was applied.
 

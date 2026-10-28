@@ -55,7 +55,7 @@ class Matches:
     """Correspondences between images A and B: what every model's ``match`` returns.
 
     ``keypoints_A`` / ``keypoints_B``: ``[N, 2]`` ``(x, y)`` in pixel coordinates of each *original* image (integer =
-    pixel center; RaCo-based extractors keep RaCo's pixel-edge convention, center + 0.5); ``confidence``: ``[N]``, the
+    pixel center); ``confidence``: ``[N]``, the
     model's own match score. Detector/descriptor models also return ``indices_A`` / ``indices_B`` into the keypoints
     of ``features_A`` / ``features_B`` (every keypoint of each image; ``None`` from ``match_features``, whose caller
     has them); dense models attach their full prediction as ``dense``.

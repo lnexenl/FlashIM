@@ -45,7 +45,8 @@ m.dense                          # dense models: the full DenseMatchResult (warp
 
 Options left `None` take the run config's `inference` section (`inference.max_matches=1024`), then the model's default.
 Detector/descriptor models also have `extract(image, resize=, top_k=)` and `match_features(a, b, threshold)`; RoMaV2 has
-`match_dense(a, b)` and `sample(dense, n)`. RaCo-based extractors keep RaCo's pixel-edge keypoints (center + 0.5).
+`match_dense(a, b)` and `sample(dense, n)`. Keypoints of every model are in pixel-center coordinates of the original
+image (integer = pixel center), RaCo's included.
 
 ## Sections
 

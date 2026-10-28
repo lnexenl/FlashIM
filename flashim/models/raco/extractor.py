@@ -21,9 +21,13 @@ ALIGN = 32  # RaCo's stride
 
 class _RaCoBase(FeatureMatcher, nn.Module):
     """``extract`` around a subclass' :meth:`_run` (``image -> keypoints [1, K, 2], scores [1, K], descriptors [1, K,
-    C]``): load, resize to the working resolution, map the keypoints back to the original image."""
+    C]``, keypoints in RaCo's pixel-edge convention: pixel index + 0.5): load, resize to the working resolution, map
+    the keypoints back to the original image in the pixel-center convention of every other model."""
 
     raco: RaCo
+    # what a LightGlue pipeline adds back: cvg's RaCo + ALIKED weights were trained on RaCo's pixel-edge keypoints,
+    # and the raco-<model>-lightglue pairings were measured with them
+    matcher_keypoint_offset = 0.5
     preset: str | None = None
     engine: str | None = None
     quant_report = None
@@ -60,15 +64,15 @@ class _RaCoBase(FeatureMatcher, nn.Module):
         if (new_h, new_w) != (height, width):
             image = F.interpolate(image, size=(new_h, new_w), mode="bilinear", align_corners=False, antialias=True)
         keypoints, scores, descriptors = self._run(image, top_k)
-        keypoints = keypoints * device_constant([width / new_w, height / new_h], keypoints)
+        # pixel-edge coordinates scale with the image as they are; pixel-center ones are 0.5 less
+        keypoints = keypoints * device_constant([width / new_w, height / new_h], keypoints) - 0.5
         return SparseFeatures(keypoints, scores, descriptors, (height, width))
 
 
 class RaCoExtractor(_RaCoBase):
     """RaCo (detector + ranker) chooses the keypoints; ``descriptor`` (any model with ``describe_keypoints(image,
     keypoints)``: SuperPoint, ALIKE, DISK, XFeat, DeDoDe, DaD, RIPE, RDD) describes them on the same working image.
-    Keypoints follow RaCo's pixel-edge convention (pixel index + 0.5) like :class:`RaCoALIKED`, ``scores`` are the
-    ranker scores, and matching is the descriptor model's own (``match_features``: mutual NN, dual softmax, ...).
+    ``scores`` are the ranker scores, and matching is the descriptor model's own (``match_features``: mutual NN, dual softmax, ...).
     The descriptors are the model's, read at RaCo's sub-pixel positions: the descriptor model never saw these
     keypoints in training, so a matcher trained for its own detector (LightGlue) is applied out of distribution."""
 
@@ -96,8 +100,7 @@ class RaCoExtractor(_RaCoBase):
 
 class RaCoALIKED(_RaCoBase):
     """RaCo (detector + ranker) chooses the keypoints; ALIKED's encoder + SDDH head (its own score head and DKD are
-    not used) describes them. ``extract`` returns :class:`SparseFeatures` whose keypoints follow RaCo's pixel-edge
-    convention (pixel index + 0.5) and whose ``scores`` are the ranker scores."""
+    not used) describes them. ``extract`` returns :class:`SparseFeatures` whose ``scores`` are the ranker scores."""
 
     def __init__(self, raco: RaCo, aliked: ALIKED) -> None:
         super().__init__()

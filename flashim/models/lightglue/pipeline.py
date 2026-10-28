@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 from torch import nn
 
@@ -46,4 +48,14 @@ class SparsePipeline(FeatureMatcher, nn.Module):
         return self.extractor.extract(image, **kwargs)
 
     def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
-        return self.matcher.match_features(a, b, threshold)
+        """LightGlue sees the keypoints shifted by the extractor's ``matcher_keypoint_offset`` (RaCo: back to the
+        pixel-edge convention its LightGlue weights were trained on); the matches keep the extractor's keypoints."""
+        offset = getattr(self.extractor, "matcher_keypoint_offset", 0.0)
+        if not offset:
+            return self.matcher.match_features(a, b, threshold)
+        shifted = (dataclasses.replace(f, keypoints=f.keypoints + offset) for f in (a, b))
+        result = self.matcher.match_features(*shifted, threshold)
+        if result.indices_A is None:  # no keypoints in one image
+            return result
+        ia, ib = result.indices_A, result.indices_B
+        return Matches(a.keypoints[0][ia], b.keypoints[0][ib], result.confidence, ia, ib)

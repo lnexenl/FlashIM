@@ -54,8 +54,8 @@ pipeline = flashim.load("raco-superpoint-lightglue", overrides=["components.extr
 
 The presets are the descriptor model's (`fp32`, `bf16`, `int8`, `fp8`); RaCo builds the nearest it has (`fp32` for
 `fp32`, `bf16` otherwise), and `components.raco` / `components.descriptor` take their own presets and settings. Images are resized to a
-multiple of 32 (224 for DeDoDe-G, whose ViT needs 56). Keypoints are in RaCo's pixel-edge convention, as in
-`raco-aliked`. These models never saw RaCo's keypoints in training, so a LightGlue checkpoint trained on their own
+multiple of 32 (224 for DeDoDe-G, whose ViT needs 56). Keypoints come back in the pixel-center convention of every
+other model; LightGlue still sees RaCo's own pixel-edge ones (pixel index + 0.5), as in `raco-aliked-lightglue`. These models never saw RaCo's keypoints in training, so a LightGlue checkpoint trained on their own
 detector is applied out of distribution, and DISK (whole-pixel descriptors) rounds RaCo's sub-pixel positions. MegaDepth-1500 AUC@5 (1200 px, 4096 keypoints, poselib 1.0 px, mean of 3 RANSAC seeds, BF16; RaCo runs at multiples of
 32, so 1184 px instead of 1200) against the model's own detector:
 
