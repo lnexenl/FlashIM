@@ -1,13 +1,14 @@
 """RoMaV2's :class:`~flashim.build.ModelSpec`.
 
-Presets are generated from :data:`flashim.models.romav2.quant.PRESETS` (whose docstring holds the accuracy evidence),
-so the quantization config and the refiner flags of a preset keep one definition. RoMaV2 always runs mixed BF16
-internally (DINOv3 weights BF16, autocast), so every preset's ``compute_dtype`` is ``bf16``.
+Presets (``bf16`` / ``int8`` / ``fp8``) are generated from :data:`flashim.models.romav2.quant.PRESETS` (whose docstring
+holds the accuracy evidence), so the quantization config and the refiner flags of a preset keep one definition. RoMaV2
+always runs mixed BF16 internally (DINOv3 weights BF16, autocast), so every preset's ``compute_dtype`` is ``bf16`` and
+``fp32`` builds ``bf16``. :data:`ORACLE_OVERLAYS` are the configs bit-identical to RoMaV2's FastFP8 runtime, for the
+parity tests and the oracle speed comparison (``flashim.load("romav2", "bf16", config=ORACLE_OVERLAYS["fp8-p8"])``).
 """
 
 from __future__ import annotations
 
-import dataclasses
 import os
 
 import torch
@@ -133,21 +134,18 @@ def _overlay(preset: quant.Preset) -> dict:
     }
 
 
-_ALL_PRESETS = {**quant.PRESETS, **quant.ORACLE_PRESETS}
-_QUANTIZED = {name: p for name, p in _ALL_PRESETS.items() if p.config is not None}
-# Every FP8 preset falls back to ``int8`` (the oracle presets' refiner blocks are BF16 there, close enough).
-_FP8_FALLBACKS = {name: "int8" for name in _QUANTIZED if name.startswith("fp8")}
+_QUANTIZED = {name: p for name, p in {**quant.PRESETS, **quant.ORACLE_PRESETS}.items() if p.config is not None}
+ORACLE_OVERLAYS = {name: _overlay(p) for name, p in quant.ORACLE_PRESETS.items()}
 
 SPEC = ModelSpec(
     name="romav2",
     role="dense",
     description="RoMa v2 dense matcher (DINOv3 ViT-L/16 + MV-ViT + DPT + conv refiners)",
     load=_load,
-    presets={name: _overlay(p) for name, p in _ALL_PRESETS.items()},
+    presets={name: _overlay(p) for name, p in quant.PRESETS.items()},
     default_preset="fp8",
     quant_configs={name: p.config for name, p in _QUANTIZED.items()},
     calibrations={name: p.calibration for name, p in _QUANTIZED.items()},
-    fp8_fallbacks=_FP8_FALLBACKS,
     protected=quant.PROTECTED,
     passes={
         "fold_refiners": Pass(_fold_refiners, stage="pre_quant", description="channels-last refiners, BN folded"),
@@ -173,33 +171,3 @@ SPEC = ModelSpec(
     validate=_validate,
 )
 
-
-def legacy_overrides(
-    *,
-    setting: str = "precise",
-    engine: str = "eager",
-    device=None,
-    calibration=None,
-    strict: bool = False,
-    config: RoMaV2Config | None = None,
-    compile_mode: str | None = "max-autotune-no-cudagraphs",
-    fast_sampling: bool | None = None,
-    attention: str = "sdpa",
-) -> dict:
-    """``load_romav2`` keyword arguments -> a config overlay."""
-    from flashim.quant.calibration import CalibrationTable, Int8CalibrationTable
-
-    overlay: dict = {
-        "arch": dataclasses.asdict(config) if config is not None else {"setting": setting},
-        "engine": {"kind": engine, "mode": compile_mode},
-        "optimize": {"strict": strict, "attention": attention},
-    }
-    if device is not None:
-        overlay["device"] = str(device)
-    if isinstance(calibration, (CalibrationTable, Int8CalibrationTable)):
-        overlay["optimize"]["options"] = {"calibration_table": calibration}
-    elif calibration is not None:
-        overlay["precision"] = {"calibration": str(calibration)}
-    if fast_sampling is not None:
-        overlay["inference"] = {"fast_sampling": fast_sampling}
-    return overlay

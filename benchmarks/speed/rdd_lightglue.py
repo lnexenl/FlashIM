@@ -40,16 +40,18 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=4096)
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
-    parser.add_argument("--extra", default="", help="JSON dict of extra flashim.load kwargs")
+    parser.add_argument("--extra", default="", help="JSON dict of dotted config overrides")
     args = parser.parse_args()
 
-    pipeline = flashim.load(
-        "rdd-lightglue", preset=args.preset, rdd_preset=args.rdd_preset, engine=args.engine,
-        attention=args.attention, **(json.loads(args.extra) if args.extra else {}),
-    )
+    overrides = {
+        "components.extractor.preset": args.rdd_preset,
+        "components.matcher.optimize.attention": args.attention,
+        **(json.loads(args.extra) if args.extra else {}),
+    }
+    pipeline = flashim.load("rdd-lightglue", args.preset, engine=args.engine, overrides=overrides)
 
     def full():
-        return pipeline.match(str(IMAGE_A), str(IMAGE_B), resize=args.resize, top_k=args.top_k)
+        return pipeline.match(str(IMAGE_A), str(IMAGE_B), resize=args.resize, max_matches=args.top_k)
 
     def parts():
         a = pipeline.extract(str(IMAGE_A), resize=args.resize, top_k=args.top_k)

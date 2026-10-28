@@ -97,12 +97,13 @@ def test_fp8_bit_exact(preset, fp32_highest):
     from romav2.full_fp8_runtime import FullFP8Calibration
     from romav2.staged_fp8 import apply_refiner_variant
 
-    from flashim.models.romav2.build import load_romav2
+    import flashim
+    from flashim.models.romav2.spec import ORACLE_OVERLAYS
 
     calibration = FullFP8Calibration.load(CAL)
     oracle = FastFP8Model(_oracle("mega1500"), calibration, keep_bf16_modules=("refiners",))
     apply_refiner_variant(oracle.model, calibration, VARIANTS[preset])
-    model = load_romav2(preset, setting="mega1500")
+    model = flashim.load("romav2", "bf16", config=ORACLE_OVERLAYS[preset], overrides={"arch.setting": "mega1500"})
     summary = model.quant_report.summary()
     # 146 RoMaV2 linears minus the 24 in DINOv3 blocks 18-23, which FlashIM truncates.
     assert summary["linears"] == 122 and summary["linear_kernels"] == {"cublas": 122}

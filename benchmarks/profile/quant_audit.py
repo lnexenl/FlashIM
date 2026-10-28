@@ -179,6 +179,11 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001 - a preset a model does not ship is reported, not fatal
             report["presets"][preset] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
             continue
+        if model.build_report.fallbacks:  # the nearest preset was built: not this one
+            fallbacks = "; ".join(f"{k}: {v}" for k, v in model.build_report.fallbacks.items())
+            report["presets"][preset] = {"error": f"replaced: {fallbacks}"[:200]}
+            del model
+            continue
         a, b = load_image(str(IMAGE_A), model.device), load_image(str(IMAGE_B), model.device)
         if args.part == "matcher":
             with torch.inference_mode():
@@ -191,7 +196,7 @@ def main() -> None:
         else:
             target, stage = model, "match"
             top_k = args.top_k if args.top_k > 0 else None
-            run = lambda m=model, a=a, b=b, k=top_k: m.match(a, b, resize=args.resize, top_k=k)
+            run = lambda m=model, a=a, b=b, k=top_k: m.match(a, b, resize=args.resize, max_matches=k)
         result = measure(model, target, run, args.repeats, parents=tuple(sorted(fused)) if preset in ("fp32", "bf16") else ())
         fused |= {name for name, row in result["units"].items() if row["quant"]}
         result["stage"] = stage

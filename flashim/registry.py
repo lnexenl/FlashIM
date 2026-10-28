@@ -1,14 +1,7 @@
-"""Model registry behind :func:`flashim.load` / :func:`flashim.build`.
-
-Each model registers its :class:`~flashim.build.ModelSpec` (imported lazily) and, for the keyword API, its
-``load_*`` function: ``flashim.load(name, preset, engine=..., ...)`` keeps working through those; the config API is
-``flashim.load(name, preset, config=..., overrides=[...])``.
-"""
+"""Model registry behind :func:`flashim.load`: each model registers its :class:`~flashim.build.ModelSpec` (imported
+lazily)."""
 
 from __future__ import annotations
-
-import importlib
-from collections.abc import Callable
 
 from flashim.build import register_spec
 
@@ -38,18 +31,6 @@ SPECS = {
     "disk-lightglue": "flashim.models.lightglue.spec:DISK_LIGHTGLUE",
 }
 
-# Keyword-API loaders (``module:function``).
-LEGACY_LOADERS = {
-    "romav2": "flashim.models.romav2.build:load_romav2",
-    "rdd": "flashim.models.rdd.build:load_rdd",
-    "lightglue": "flashim.models.lightglue.build:load_lightglue",
-    "aliked": "flashim.models.aliked.build:load_aliked",
-    "raco-aliked": "flashim.models.raco.build:load_raco_aliked",
-    "rdd-lightglue": "flashim.models.lightglue.build:load_rdd_lightglue",
-    "aliked-lightglue": "flashim.models.lightglue.build:load_aliked_lightglue",
-    "raco-aliked-lightglue": "flashim.models.lightglue.build:load_raco_aliked_lightglue",
-}
-
 # RaCo keypoints + the descriptors of any model that can describe given keypoints (raco-superpoint, raco-disk, ...).
 for _descriptor in ("superpoint", "alike", "disk", "xfeat", "dedode", "dedode-g", "dad", "ripe", "rdd"):
     SPECS[f"raco-{_descriptor}"] = f"flashim.models.raco.spec:RACO_{_descriptor.upper().replace('-', '_')}"
@@ -62,9 +43,3 @@ for _descriptor in ("superpoint", "disk", "xfeat", "rdd"):
 for _name, _target in SPECS.items():
     register_spec(_name, _target)
 
-
-def legacy_loader(name: str) -> Callable:
-    if name not in LEGACY_LOADERS:
-        raise ValueError(f"Model {name!r} has no keyword API; use config= / overrides=")
-    module, attr = LEGACY_LOADERS[name].split(":")
-    return getattr(importlib.import_module(module), attr)

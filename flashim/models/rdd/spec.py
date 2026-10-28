@@ -41,7 +41,7 @@ _BF16 = {"extends": "fp32", "precision": {"compute_dtype": "bf16"}}
 PRESETS = {
     "fp32": _BASE,
     "bf16": _BF16,
-    **{name: {"extends": "bf16", "precision": {"quant": name}} for name in ("fp8", "fp8-full", "fp8-backbone")},
+    "fp8": {"extends": "bf16", "precision": {"quant": "fp8"}},
 }
 
 SPEC = ModelSpec(
@@ -53,7 +53,6 @@ SPEC = ModelSpec(
     default_preset="fp8",
     quant_configs={name: preset.config for name, preset in quant.PRESETS.items() if preset.config is not None},
     calibrations={name: preset.calibration for name, preset in quant.PRESETS.items() if preset.config is not None},
-    fp8_fallbacks={name: "bf16" for name in ("fp8", "fp8-full", "fp8-backbone")},  # no INT8 preset (yet)
     protected=quant.PROTECTED,
     passes={
         "fuse_query_projections": Pass(
@@ -64,33 +63,3 @@ SPEC = ModelSpec(
     set_precision=_set_precision,
 )
 
-
-def legacy_overrides(
-    *,
-    engine: str = "eager",
-    device=None,
-    checkpoint=None,
-    calibration=None,
-    strict: bool = False,
-    config: RDDConfig | None = None,
-    compile_mode: str | None = "max-autotune-no-cudagraphs",
-    detector_dtype=None,
-) -> dict:
-    """``load_rdd`` keyword arguments -> a config overlay."""
-    from flashim.quant.calibration import CalibrationTable
-
-    overlay: dict = {"engine": {"kind": engine, "mode": compile_mode}, "optimize": {"strict": strict}}
-    if device is not None:
-        overlay["device"] = str(device)
-    if checkpoint is not None:
-        overlay["checkpoint"] = str(checkpoint)
-    if config is not None:
-        overlay["arch"] = dataclasses.asdict(config)
-    if isinstance(calibration, CalibrationTable):
-        overlay["optimize"]["options"] = {"calibration_table": calibration}
-    elif calibration is not None:
-        overlay["precision"] = {"calibration": str(calibration)}
-    if detector_dtype is not None:
-        name = {"float32": "fp32", "bfloat16": "bf16", "float16": "fp16"}[str(detector_dtype).removeprefix("torch.")]
-        overlay.setdefault("precision", {})["overrides"] = {"detector": name}
-    return overlay

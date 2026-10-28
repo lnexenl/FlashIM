@@ -67,7 +67,7 @@ def main() -> None:
             fa, fb = (model.extract(i, resize=a.resize, top_k=a.top_k) for i in (ia, ib))
             fn = lambda: model.match_features(fa, fb)
         else:
-            kw = {"resize": a.resize} | ({"top_k": a.top_k} if a.top_k > 0 else {})
+            kw = {"resize": a.resize} | ({"max_matches": a.top_k} if a.top_k > 0 else {})
             fn = lambda: model.match(ia, ib, **kw)
         for _ in range(4):
             fn()

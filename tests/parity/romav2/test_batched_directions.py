@@ -10,9 +10,9 @@ pytestmark = [pytest.mark.cuda, pytest.mark.weights, pytest.mark.slow]
 
 
 def test_stacked_directions_bit_exact(fp32_highest):
-    from flashim.models.romav2.build import load_romav2
+    import flashim
 
-    model = load_romav2("fp8", setting="mega1500", engine="eager")
+    model = flashim.load("romav2", "fp8", overrides={"arch.setting": "mega1500"})
     assert model.batched_directions
     inputs = model.prepare(ASSETS / "toronto_A.jpg", ASSETS / "toronto_B.jpg")
     with torch.inference_mode():

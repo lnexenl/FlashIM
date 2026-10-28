@@ -51,7 +51,7 @@ for engine in eager compile; do
     done
   done
   for p in fp32 bf16; do sparse aliked $p $engine; sparse raco-aliked $p $engine; done
-  for p in fp32 bf16 fp8 fp8-backbone fp8-full; do sparse rdd $p $engine; done
+  for p in fp32 bf16 fp8; do sparse rdd $p $engine; done
 done
 sparse sift fp32 eager
 sparse orb fp32 eager

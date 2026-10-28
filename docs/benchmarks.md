@@ -41,12 +41,9 @@ cell is a preset the model does not have.
 | aliked | 9.05 / 10.3 | 5.34 / **5.17** |  |  |
 | raco-aliked | 29.6 / 22.3 | 9.18 / **8.42** |  |  |
 | rdd | 69.0 / 61.4 | 34.8 / 25.6 |  | 29.4 / **22.5** |
-| rdd `fp8-backbone` | | | | 29.6 / **26.2** |
-| rdd `fp8-full` | | | | 28.8 / **22.9** |
 | sift | **26.0** / - |  |  |  |
 | orb | **10.4** / - |  |  |  |
 
-- RDD's `fp8-backbone` and `fp8-full` presets are in the fp8 column of their own rows.
 - SIFT and ORB are OpenCV (fp32, eager only).
 - `ripe` with `engine="compile"` fails in Inductor for `bf16`, `int8` and `fp8` (`InductorError: KeyError`); `fp32`
   compiles.

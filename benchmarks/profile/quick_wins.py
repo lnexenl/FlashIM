@@ -16,8 +16,8 @@ from pathlib import Path
 
 import torch
 
+import flashim
 from flashim.engines.compile import compile_regions
-from flashim.models.romav2.build import load_romav2
 from flashim.paths import IMAGE_A, IMAGE_B
 
 VARIANTS = {
@@ -46,7 +46,7 @@ def main() -> None:
     args = parser.parse_args()
     torch.set_float32_matmul_precision("highest")
     regions, fold = VARIANTS[args.variant]
-    model = load_romav2(args.preset, setting="mega1500", engine="compile")
+    model = flashim.load("romav2", args.preset, engine="compile", overrides={"arch.setting": "mega1500"})
     if fold:
         model.refiner_features.fold_batchnorm(channels_last=True)
     if regions:

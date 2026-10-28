@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 
 from flashim.models.rdd import RDD
-from flashim.models.rdd.quant import PRESETS
+from flashim.models.rdd.quant import CALIBRATED
 from flashim.quant.calibration import Calibrator
 
 
@@ -44,7 +44,7 @@ def main() -> None:
 
     model = RDD.from_pretrained(checkpoint=args.checkpoint)
     model.set_compute_dtype(torch.bfloat16)
-    scheme_config = PRESETS["fp8-full"].config
+    scheme_config = CALIBRATED
     targets = [
         name
         for name, module in model.named_modules()

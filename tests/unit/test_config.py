@@ -3,14 +3,28 @@
 import dataclasses
 import json
 import sys
+from collections.abc import Mapping
 
 import pytest
+import torch
 from torch import nn
 
 import flashim
-from flashim.build import EngineSpec, ModelSpec, Pass, build, get_spec, register_spec, resolve
+from flashim.build import (
+    NEAREST,
+    PRECISIONS,
+    EngineSpec,
+    ModelSpec,
+    Pass,
+    get_spec,
+    load,
+    register_spec,
+    resolve,
+)
 from flashim.config import RunConfig, merge, parse_overrides
+from flashim.models.base import ImageMatcher
 from flashim.platforms import Feature, Platform, Vendor
+from flashim.types import Matches
 
 
 def test_merge_replaces_lists_and_appends_with_plus():
@@ -53,8 +67,18 @@ def test_presets_resolve_and_are_not_mutated():
         assert json.dumps(spec.presets, sort_keys=True, default=str) == before, name
 
 
+def test_presets_are_the_four_precisions():
+    for name in flashim.available_models():
+        assert set(get_spec(name).presets) <= set(PRECISIONS), name
+    with pytest.raises(ValueError, match="presets must be among"):
+        dataclasses.replace(_toy_spec(), presets={"int8-full": {}}, default_preset="int8-full")
+    with pytest.raises(ValueError, match="unknown preset 'fp8-p8'"):
+        resolve("romav2", "fp8-p8")
+
+
 def test_romav2_presets_match_the_legacy_flags():
     from flashim.models.romav2.quant import PRESETS
+    from flashim.models.romav2.spec import ORACLE_OVERLAYS
 
     fast = resolve("romav2", "fp8")
     assert fast.precision.quant == "fp8" and PRESETS["fp8"].batched_directions
@@ -64,6 +88,8 @@ def test_romav2_presets_match_the_legacy_flags():
     assert resolve("romav2", "bf16").optimize.passes == ()
     with pytest.raises(ValueError, match="needs a quantized preset"):
         resolve("romav2", "bf16", overrides=["optimize.attention=sage"])
+    oracle = resolve("romav2", "bf16", config=ORACLE_OVERLAYS["fp8-s42"])  # the parity tests' configs
+    assert (oracle.precision.quant, oracle.optimize.passes) == ("fp8-s42", ("fold_refiners",))
 
 
 def test_pipeline_components_and_propagation(tmp_path):
@@ -76,6 +102,22 @@ def test_pipeline_components_and_propagation(tmp_path):
     assert "fused_ranker" in raco.optimize.passes and aliked.precision.compute_dtype == "bf16"
     assert {c.engine.kind for c in (matcher, raco, aliked)} == {"compile"}
     assert {c.device for c in (matcher, raco, aliked)} == {"cpu"}
+
+
+def test_pipeline_preset_is_every_components_nearest():
+    fallbacks = {}
+    config = resolve("aliked-lightglue", "int8", fallbacks=fallbacks)
+    assert (config.components["extractor"].preset, config.components["matcher"].preset) == ("bf16", "int8")
+    assert fallbacks == {"extractor": "int8 -> bf16 (aliked has no int8)"}
+    fallbacks = {}
+    config = resolve("raco-superpoint", "int8", fallbacks=fallbacks)
+    assert (config.components["raco"].preset, config.components["descriptor"].preset) == ("bf16", "int8")
+    assert list(fallbacks) == ["raco"]
+    assert resolve("romav2", "fp32").preset == "bf16" and resolve("sift", "fp8").preset == "fp32"
+    with pytest.raises(ValueError, match="no 'int8' preset"):
+        resolve("aliked-lightglue", "int8", overrides=["optimize.strict=true"])  # strict: components included
+    strict = resolve("rdd-lightglue", "fp8", overrides=["optimize.strict=true"])
+    assert all(c.optimize.strict for c in strict.components.values())
 
 
 # -- FP8 presets on a GPU without FP8 ----------------------------------------------------------------------
@@ -95,27 +137,30 @@ def _uses_fp8(config: RunConfig) -> bool:
 
 
 def test_fp8_presets_fall_back_only_on_a_gpu_without_fp8():
-    """Every preset of every model: untouched on the CPU and on a GPU with FP8; on a GPU without it the spec's fallback
-    is resolved instead and nothing FP8 is left, components included (so an FP8 preset without a fallback fails here)."""
+    """Every preset of every model: untouched on the CPU and on a GPU with FP8; on a GPU without it ``fp8`` is replaced
+    by the nearest other preset and nothing FP8 is left, components included."""
     for name in flashim.available_models():
         spec = get_spec(name)
         for preset in spec.presets:
             asked = resolve(name, preset)
             assert resolve(name, preset, platform=WITH_FP8) == asked == resolve(name, preset, platform=Platform("cpu"))
             built = resolve(name, preset, platform=NO_FP8)
-            assert built.preset == spec.fp8_fallbacks.get(preset, preset), (name, preset)
+            nearest = next(p for p in NEAREST["fp8"] if p in spec.presets) if preset == "fp8" else preset
+            assert built.preset == nearest, (name, preset)
             assert not _uses_fp8(built), (name, preset)
 
 
 def test_fp8_fallback_of_pipelines_and_explicit_requests():
     # a pipeline falls back as a whole, so the matcher gets the INT8 preset's own (variant) calibration table;
-    # naming the matcher's preset as well, as the keyword loaders do, changes nothing
+    # naming the matcher's preset as well changes nothing
     int8 = resolve("aliked-lightglue", "int8")
     assert resolve("aliked-lightglue", "fp8", platform=NO_FP8) == int8
     assert resolve("aliked-lightglue", "fp8", {"components": {"matcher": {"preset": "fp8"}}}, platform=NO_FP8) == int8
-    # RDD has no INT8 preset: BF16, whatever the pipeline's (= the matcher's) preset is
-    config = resolve("rdd-lightglue", "bf16", platform=NO_FP8)
-    assert (config.preset, config.components["extractor"].preset) == ("bf16", "bf16")
+    # RDD has no INT8 preset: the pipeline's int8 builds RDD bf16
+    config = resolve("rdd-lightglue", "fp8", platform=NO_FP8)
+    assert (config.preset, config.components["extractor"].preset, config.components["matcher"].preset) == (
+        "int8", "bf16", "int8",
+    )
     assert resolve("romav2", platform=NO_FP8).preset == "int8" and resolve("romav2").preset == "fp8"
     # explicit requests keep FP8 (emulated): strict, or a calibration table passed for an FP8 preset, anywhere in the
     # config and for all of it (a pipeline's preset and its matcher's table go together)
@@ -144,8 +189,8 @@ def _toy_spec():
         role="dense",
         description="test model",
         load=lambda config: _Toy(),
-        presets={"base": {"optimize": {"passes": ["late", "early", "gpu_only"]}}},
-        default_preset="base",
+        presets={"fp32": {"optimize": {"passes": ["late", "early", "gpu_only"]}}},
+        default_preset="fp32",
         passes={
             "early": Pass(mark("early"), stage="pre_quant"),
             "late": Pass(mark("late")),
@@ -159,41 +204,47 @@ def _toy_spec():
 
 def test_build_runs_stages_in_order_and_reports():
     register_spec("toy", _toy_spec())
-    model = build("toy", overrides=["inference.top_k=5"])
+    model = load("toy", overrides=["inference.top_k=5"])
     assert model.log == ["early", "precision:fp32", "late", "inference:['top_k']"]
     report = model.build_report
     assert set(report.passes) == {"early", "late"} and "gpu_only" in report.skipped
-    assert report.config_digest == model.run_config.digest() and model.preset == "base"
+    assert report.config_digest == model.run_config.digest() and model.preset == "fp32"
     with pytest.raises(RuntimeError, match="gpu_only"):
-        build("toy", overrides=["optimize.strict=true"])
+        load("toy", strict=True)
+    model = load("toy", "int8", device="cpu", engine="eager", overrides={"optimize.passes": ["early"]})
+    assert model.preset == "fp32" and model.build_report.fallbacks == {"toy": "int8 -> fp32 (toy has no int8)"}
+    assert (model.run_config.device, model.run_config.optimize.passes) == ("cpu", ("early",))
 
 
 def test_build_falls_back_for_the_target_platform_and_reports_it(monkeypatch):
     presets = {"fp8": {"inference": {"format": "fp8"}}, "int8": {"inference": {"format": "int8"}}}
-    spec = dataclasses.replace(_toy_spec(), name="toy-fp8", presets=presets, default_preset="fp8", fp8_fallbacks={"fp8": "int8"})
+    spec = dataclasses.replace(_toy_spec(), name="toy-fp8", presets=presets, default_preset="fp8")
     register_spec("toy-fp8", spec)
-    builder = sys.modules["flashim.build"]  # ``flashim.build`` itself is the function
+    builder = sys.modules["flashim.build"]
     monkeypatch.setattr(builder, "platform_for", lambda device: NO_FP8)
-    model = build("toy-fp8")
+    model = load("toy-fp8")
     assert (model.preset, model.run_config.inference) == ("int8", {"format": "int8"})
-    assert model.build_report.fallbacks == {"toy-fp8": "fp8 -> int8"}
+    assert model.build_report.fallbacks == {"toy-fp8": f"fp8 -> int8 (no FP8 on {NO_FP8.describe()})"}
     monkeypatch.setattr(builder, "platform_for", lambda device: WITH_FP8)
-    model = build("toy-fp8")
+    model = load("toy-fp8")
     assert model.preset == "fp8" and model.build_report.fallbacks == {}
 
 
-@pytest.mark.parametrize("name", ["aliked", "raco"])
-def test_keyword_api_matches_config_api(name):
-    """The shims translate keyword arguments into the same resolved config as the config API."""
-    from flashim.models.aliked.spec import legacy_overrides as aliked_overrides
+class _ToyMatcher(ImageMatcher, _Toy):
+    match_defaults: Mapping[str, int] = {"max_matches": 7}
 
-    if name == "aliked":
-        a = resolve("aliked", "bf16", config=aliked_overrides(engine="compile", channels_last=True))
-        b = resolve("aliked", "bf16", overrides=["engine.kind=compile", "optimize.passes+=channels_last"])
-        assert a.optimize.passes == b.optimize.passes == ("fold_batchnorm", "channels_last")
-        assert a.engine == b.engine
-    else:
-        from flashim.models.raco.build import raco_aliked_overlay
+    def _match(self, img_a, img_b, *, resize, max_matches, threshold):
+        self.log.append((resize, max_matches, threshold))
+        return Matches(torch.zeros(0, 2), torch.zeros(0, 2), torch.zeros(0))
 
-        a = resolve("raco-aliked", "bf16", config=raco_aliked_overlay("bf16", fused_ranker=False))
-        assert a.components["raco"].optimize.passes == ("fold_batchnorm",)
+
+def test_match_defaults_come_from_the_inference_section():
+    register_spec("toy-matcher", dataclasses.replace(_toy_spec(), name="toy-matcher", load=lambda config: _ToyMatcher()))
+    model = load("toy-matcher", overrides=["inference.resize=640", "inference.threshold=0.5", "inference.top_k=1"])
+    assert model.match_defaults == {"max_matches": 7, "resize": 640, "threshold": 0.5}
+    model.match(None, None)
+    model.match(None, None, resize=320, max_matches=3)
+    assert model.log[-2:] == [(640, 7, 0.5), (320, 3, 0.5)]
+    for bad in (0, -1, 2.5, True):
+        with pytest.raises(ValueError, match="max_matches"):
+            model.match(None, None, max_matches=bad)

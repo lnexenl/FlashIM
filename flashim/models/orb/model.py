@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 from flashim.models.sift.model import SIFT, gray_uint8, ratio_mutual_match
-from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.types import Matches, SparseFeatures
 
 _POPCOUNT = torch.tensor([i.bit_count() for i in range(256)], dtype=torch.uint8)
 
@@ -50,7 +50,7 @@ class ORB(SIFT):
         return xy, scores, torch.from_numpy(descriptors).to(image.device)
 
     @torch.inference_mode()
-    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> SparseMatchResult:
+    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
         dist = hamming_distances(a.descriptors[0], b.descriptors[0])
         ia, ib, conf = ratio_mutual_match(dist, self.ratio if threshold is None else threshold)
-        return SparseMatchResult(a.keypoints[0][ia], b.keypoints[0][ib], conf, ia, ib)
+        return Matches(a.keypoints[0][ia], b.keypoints[0][ib], conf, ia, ib)

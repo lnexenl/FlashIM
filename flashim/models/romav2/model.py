@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 from collections import OrderedDict
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ from PIL import Image
 from torch import Tensor, nn
 
 from flashim import ops
+from flashim.models.base import ImageMatcher
 from flashim.models.romav2 import weights
 from flashim.models.romav2.config import SETTINGS, RoMaV2Config, Setting
 from flashim.models.romav2.dinov3 import DinoV3
@@ -28,7 +30,7 @@ from flashim.models.romav2.geometry import (
 from flashim.models.romav2.matcher import Matcher
 from flashim.models.romav2.refiner import Refiners
 from flashim.platforms import default_device
-from flashim.types import DenseMatchResult
+from flashim.types import DenseMatchResult, Matches
 
 ImageLike = str | Path | Image.Image | np.ndarray | Tensor
 
@@ -114,12 +116,15 @@ def prepare_pair(
     return (*lr, resize(a, setting.h_hr, setting.w_hr), resize(b, setting.h_hr, setting.w_hr))
 
 
-class RoMaV2(nn.Module):
+class RoMaV2(ImageMatcher, nn.Module):
     """``f`` (DINOv3) -> ``matcher`` (MV-ViT + DPT) -> ``refiners`` at strides 4/2/1.
 
     Module paths match the RoMaV2 checkpoint, so ``state_dict`` loads strictly and
-    quantization recipes/calibrations address the same names.
+    quantization recipes/calibrations address the same names. ``match`` draws ``max_matches``
+    balanced matches (RoMaV2's 5000 by default) from the dense warp, attached as ``dense``.
     """
+
+    match_defaults: Mapping[str, int] = {"max_matches": 5000}
 
     def __init__(self, config: RoMaV2Config | None = None) -> None:
         super().__init__()
@@ -134,7 +139,7 @@ class RoMaV2(nn.Module):
         # sample(): fused FP32 KDE (no N x N matrix) and matches/precision built only for drawn
         # candidates. Same RNG calls in the same order; densities differ from RoMaV2's FP16 KDE.
         self.fast_sampling = True
-        # Filled in by ``load_romav2``.
+        # Filled in by the builder.
         self.preset: str | None = None
         self.engine: str | None = None
         self.quant_report = None
@@ -276,26 +281,26 @@ class RoMaV2(nn.Module):
         return result
 
     @torch.inference_mode()
-    def match(
-        self,
-        img_a: ImageLike,
-        img_b: ImageLike,
-        *,
-        num_samples: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> DenseMatchResult:
-        """Dense matching. With ``num_samples``, also draw that many balanced matches (see
-        :meth:`sample`) and return them as pixel keypoints of the *original* images in
-        ``result.keypoints_A`` / ``keypoints_B`` (``[N, 2]``, x/y, pixel-center convention)."""
+    def match_dense(self, img_a: ImageLike, img_b: ImageLike) -> DenseMatchResult:
+        """The dense prediction alone (``match`` samples it); :meth:`sample` draws balanced matches from it."""
+        return self.postprocess(self(*self.prepare(img_a, img_b)))
+
+    def _match(
+        self, img_a: ImageLike, img_b: ImageLike, *, resize: int | None, max_matches: int | None,
+        threshold: float | None, generator: torch.Generator | None = None,
+    ) -> Matches:
+        """``max_matches`` balanced matches (:meth:`sample`) as pixel keypoints of the *original* images (pixel-center
+        convention), their overlap as ``confidence``; ``generator`` drives the sampling."""
+        if resize is not None or threshold is not None:
+            raise ValueError("RoMaV2.match takes no resize / threshold: its resolutions are arch.setting's")
+        if max_matches is None:
+            raise ValueError("RoMaV2.match needs max_matches (samples of the dense warp); match_dense returns the warp")
         a, b = self.load_image(img_a), self.load_image(img_b)
-        result = self.postprocess(self(*prepare_pair(a, b, self.setting, self.device)))
-        if num_samples is not None:
-            matches, confidence, prec_a, prec_b = self.sample(result, num_samples, generator=generator)
-            (h_a, w_a), (h_b, w_b) = a.shape[-2:], b.shape[-2:]
-            result.keypoints_A, result.keypoints_B = self.to_pixel_coordinates(matches, h_a, w_a, h_b, w_b)
-            result.matches, result.match_confidence = matches, confidence
-            result.match_precision_A, result.match_precision_B = prec_a, prec_b
-        return result
+        dense = self.postprocess(self(*prepare_pair(a, b, self.setting, self.device)))
+        matches, confidence, _, _ = self.sample(dense, max_matches, generator=generator)
+        (h_a, w_a), (h_b, w_b) = a.shape[-2:], b.shape[-2:]
+        keypoints_a, keypoints_b = self.to_pixel_coordinates(matches, h_a, w_a, h_b, w_b)
+        return Matches(keypoints_a, keypoints_b, confidence, dense=dense)
 
     def sample(
         self, result: DenseMatchResult, num: int, *, generator: torch.Generator | None = None

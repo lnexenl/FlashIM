@@ -26,15 +26,15 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=4096)
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
-    parser.add_argument("--extra", default="", help="JSON dict of extra flashim.load kwargs")
+    parser.add_argument("--extra", default="", help="JSON dict of dotted config overrides")
     args = parser.parse_args()
 
-    rdd = flashim.load("rdd", preset="fp8")
+    rdd = flashim.load("rdd", "fp8")
     a, b = (rdd.extract(str(p), resize=1600, top_k=args.top_k) for p in (IMAGE_A, IMAGE_B))
     del rdd
     model = flashim.load(
-        "lightglue", preset=args.preset, engine=args.engine, attention=args.attention,
-        **(json.loads(args.extra) if args.extra else {}),
+        "lightglue", args.preset, engine=args.engine,
+        overrides={"optimize.attention": args.attention, **(json.loads(args.extra) if args.extra else {})},
     )
     for _ in range(args.warmups):
         model.match_features(a, b)

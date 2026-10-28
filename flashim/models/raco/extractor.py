@@ -10,15 +10,16 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from flashim.models.aliked.model import ALIKED
+from flashim.models.base import FeatureMatcher
 from flashim.models.raco.model import RaCo
 from flashim.models.romav2.model import ImageLike, load_image
-from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.types import Matches, SparseFeatures
 from flashim.utils import device_constant
 
 ALIGN = 32  # RaCo's stride
 
 
-class _RaCoBase(nn.Module):
+class _RaCoBase(FeatureMatcher, nn.Module):
     """``extract`` around a subclass' :meth:`_run` (``image -> keypoints [1, K, 2], scores [1, K], descriptors [1, K,
     C]``): load, resize to the working resolution, map the keypoints back to the original image."""
 
@@ -89,17 +90,8 @@ class RaCoExtractor(_RaCoBase):
         return keypoints, scores, descriptors[None]
 
     @torch.inference_mode()
-    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> SparseMatchResult:
+    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
         return self.descriptor.match_features(a, b, threshold)
-
-    @torch.inference_mode()
-    def match(
-        self, img_a: ImageLike, img_b: ImageLike, *, resize: int | None = None, top_k: int | None = None,
-        threshold: float | None = None,
-    ) -> SparseMatchResult:
-        return self.match_features(
-            self.extract(img_a, resize=resize, top_k=top_k), self.extract(img_b, resize=resize, top_k=top_k), threshold
-        )
 
 
 class RaCoALIKED(_RaCoBase):

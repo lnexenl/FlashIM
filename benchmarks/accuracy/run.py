@@ -124,7 +124,7 @@ def mega1500(model, data_root: Path, pool: PosePool, max_pairs: int, loader: dic
 
     count = 0
     for *_, K1, K2, R, t, img_a, img_b in tqdm(prefetch(jobs(), load, **loader), desc="mega1500", leave=False):
-        preds = model.match(img_a, img_b)
+        preds = model.match_dense(img_a, img_b)
         (h1, w1), (h2, w2) = img_a.shape[:2], img_b.shape[:2]
         s1, s2 = 1200 / max(w1, h1), 1200 / max(w2, h2)
         w1, h1, w2, h2 = s1 * w1, s1 * h1, s2 * w2, s2 * h2
@@ -160,7 +160,7 @@ def scannet1500(model, data_root: Path, pool: PosePool, max_pairs: int, loader: 
 
     for *_, K, R, t, img_a, img_b in tqdm(prefetch(jobs(), load, **loader), total=len(pairs), desc="scannet1500", leave=False):
         (h1, w1), (h2, w2) = img_a.shape[:2], img_b.shape[:2]
-        preds = model.match(img_a, img_b)
+        preds = model.match_dense(img_a, img_b)
         matches, *_ = model.sample(preds, 5000)
         s1, s2 = 480 / min(w1, h1), 480 / min(w2, h2)
         w1, h1, w2, h2 = s1 * w1, s1 * h1, s2 * w2, s2 * h2
@@ -213,7 +213,10 @@ def main() -> None:
     data_root = Path(args.data_root) if args.data_root else (
         DATA / "megadepth" if args.dataset == "mega1500" else DATA / "scannet" / "scans"
     )
-    model = flashim.load(args.model, preset=args.preset, setting=args.dataset, engine=args.engine, attention=args.attention)
+    model = flashim.load(
+        args.model, args.preset, engine=args.engine,
+        overrides={"arch.setting": args.dataset, "optimize.attention": args.attention},
+    )
     started = time.time()
     run = mega1500 if args.dataset == "mega1500" else scannet1500
     pool = PosePool(args.workers)

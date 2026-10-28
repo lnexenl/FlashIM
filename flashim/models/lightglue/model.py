@@ -13,7 +13,7 @@ from flashim.models.lightglue import weights
 from flashim.models.lightglue.config import LightGlueConfig
 from flashim.platforms import default_device
 from flashim.quant.methods.linear import StaticMXFP8Linear
-from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.types import Matches, SparseFeatures
 from flashim.utils import device_constant
 
 
@@ -289,12 +289,12 @@ class LightGlue(nn.Module):
     @torch.inference_mode()
     def match_features(
         self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None
-    ) -> SparseMatchResult:
+    ) -> Matches:
         if a.keypoints.shape[0] != 1 or b.keypoints.shape[0] != 1:
             raise ValueError("LightGlue matches one image pair at a time (batch size 1)")
         if a.keypoints.shape[1] == 0 or b.keypoints.shape[1] == 0:
             empty = a.keypoints.new_zeros(0, 2)
-            return SparseMatchResult(empty, empty, a.keypoints.new_zeros(0))
+            return Matches(empty, empty, a.keypoints.new_zeros(0))
         x0, x1, i = self.features(
             a.descriptors, b.descriptors, self.encode(a.keypoints, a.image_size), self.encode(b.keypoints, b.image_size)
         )
@@ -305,4 +305,4 @@ class LightGlue(nn.Module):
         threshold = self.config.filter_threshold if threshold is None else threshold
         ia = torch.nonzero(mutual & (conf > threshold))[:, 0]
         ib = index[ia]
-        return SparseMatchResult(a.keypoints[0][ia], b.keypoints[0][ib], conf[ia], ia, ib)
+        return Matches(a.keypoints[0][ia], b.keypoints[0][ib], conf[ia], ia, ib)

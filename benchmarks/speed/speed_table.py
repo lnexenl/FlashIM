@@ -86,17 +86,11 @@ def main() -> None:
 
     out += ["", "## Sparse extractors", "",
             ("`extract` of one MegaDepth image, 1200 px long side, 4096 keypoints; each cell is "
-             "`eager / compile`. RDD's `fp8-backbone` / `fp8-full` presets are in the fp8 column of their "
-             "own rows; SIFT and ORB are OpenCV (fp32, eager)."), "",
+             "`eager / compile`. SIFT and ORB are OpenCV (fp32, eager)."), "",
             "| model | " + " | ".join(PRESETS) + " |", "|---|" + "---|" * len(PRESETS)]
     for model in EXTRACTORS:
         if model in extract:
             out.append(f"| {model} | " + " | ".join(_cells(extract[model], PRESETS)) + " |")
-        if model == "rdd":
-            for variant in ("fp8-backbone", "fp8-full"):
-                times = {("fp8", e): extract[model].get((variant, e)) for e in ("eager", "compile")}
-                if any(times.values()):
-                    out.append(f"| rdd `{variant}` | | | | " + _cells(times, ("fp8",))[0] + " |")
 
     out += ["", "## Pair matching", "",
             ("One image pair at 1200 px: `*-lightglue` = 2 x `extract` + LightGlue `match_features` (4096 "

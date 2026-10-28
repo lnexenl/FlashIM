@@ -5,20 +5,19 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from flashim.models.base import FeatureMatcher
 from flashim.models.lightglue.model import LightGlue
 from flashim.models.romav2.model import ImageLike
-from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.types import Matches, SparseFeatures
 
 
-class SparsePipeline(nn.Module):
+class SparsePipeline(FeatureMatcher, nn.Module):
     """``extractor`` (e.g. RDD: ``extract(image, resize=, top_k=) -> SparseFeatures``) followed by ``matcher``
-    (:class:`LightGlue`). ``match`` accepts the extractor's ``resize`` / ``top_k`` and the matcher's ``threshold``;
-    ``defaults`` (a run config's ``inference`` section) fills the ones a call leaves ``None``."""
+    (:class:`LightGlue`): ``match``'s ``resize`` / ``max_matches`` go to the extractor, ``threshold`` to the matcher."""
 
     def __init__(self, extractor: nn.Module, matcher: LightGlue) -> None:
         super().__init__()
         self.extractor, self.matcher = extractor, matcher
-        self.defaults: dict = {}
 
     @property
     def device(self) -> torch.device:
@@ -46,22 +45,5 @@ class SparsePipeline(nn.Module):
     def extract(self, image: ImageLike, **kwargs) -> SparseFeatures:
         return self.extractor.extract(image, **kwargs)
 
-    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> SparseMatchResult:
+    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
         return self.matcher.match_features(a, b, threshold)
-
-    @torch.inference_mode()
-    def match(
-        self,
-        img_a: ImageLike,
-        img_b: ImageLike,
-        *,
-        resize: int | None = None,
-        top_k: int | None = None,
-        threshold: float | None = None,
-    ) -> SparseMatchResult:
-        resize = resize if resize is not None else self.defaults.get("resize")
-        top_k = top_k if top_k is not None else self.defaults.get("top_k")
-        threshold = threshold if threshold is not None else self.defaults.get("threshold")
-        a = self.extract(img_a, resize=resize, top_k=top_k)
-        b = self.extract(img_b, resize=resize, top_k=top_k)
-        return self.match_features(a, b, threshold)

@@ -48,7 +48,9 @@ def main() -> None:
         raise ValueError("empty calibration manifest")
 
     rdd = flashim.load(args.extractor, preset=args.rdd_preset or ("fp8" if args.extractor == "rdd" else "fp32"))
-    model = flashim.build("lightglue", "bf16", config={"variant": args.extractor, "checkpoint": args.checkpoint})
+    model = flashim.load(
+        "lightglue", "bf16", config={"variant": args.extractor, "checkpoint": args.checkpoint}
+    )
     config = PRESETS[args.format].config
     targets = [
         name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear) and config.scheme_for(name)

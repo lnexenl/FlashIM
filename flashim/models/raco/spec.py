@@ -86,10 +86,9 @@ DESCRIBERS = ("superpoint", "alike", "disk", "xfeat", "dedode", "dedode-g", "dad
 
 
 def described_spec(descriptor: str) -> ModelSpec:
-    """``raco-<descriptor>``: RaCo's detector + ranker pick the keypoints, ``descriptor`` describes them. The preset is
-    the descriptor model's (``fp32``, ``bf16``, ``int8``, ``fp8``, ...); RaCo runs in ``fp32`` for ``fp32`` and in
-    ``bf16`` for every other one. Components ``raco`` and ``descriptor`` take their own settings
-    (``components.descriptor.preset=bf16``)."""
+    """``raco-<descriptor>``: RaCo's detector + ranker pick the keypoints, ``descriptor`` describes them. The presets
+    are the descriptor model's; both components build the nearest one they have (RaCo: ``fp32`` / ``bf16``).
+    Components ``raco`` and ``descriptor`` take their own settings (``components.descriptor.preset=bf16``)."""
     from flashim.build import get_spec
 
     inner = get_spec(descriptor)
@@ -107,14 +106,13 @@ def described_spec(descriptor: str) -> ModelSpec:
         presets={
             preset: {
                 "components": {
-                    "raco": {"model": "raco", "preset": "fp32" if preset == "fp32" else "bf16"},
+                    "raco": {"model": "raco", "preset": preset},
                     "descriptor": {"model": descriptor, "preset": preset},
                 }
             }
             for preset in inner.presets
         },
         default_preset=inner.default_preset,
-        fp8_fallbacks=inner.fp8_fallbacks,
         compose=compose,
     )
 

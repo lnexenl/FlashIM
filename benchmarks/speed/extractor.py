@@ -47,14 +47,17 @@ def main() -> None:
     parser.add_argument("--tag", default="", help="copied to the JSON line (sparse_matrix.sh uses it to resume)")
     args = parser.parse_args()
 
-    model = flashim.load(args.model, args.preset, overrides=[f"engine.kind={args.engine}", *args.overrides])
+    model = flashim.load(args.model, args.preset, engine=args.engine, overrides=args.overrides)
     from flashim.models.romav2.model import load_image
 
     image = load_image(str(IMAGE), model.device)
     if not hasattr(model, "extract"):  # pair-level matchers (LoFTR): time ``match`` on the fixed pair
         image_b = load_image(str(IMAGE_B), model.device)
         top_k = args.top_k if args.top_k > 0 else None
-        times, result = timed(lambda: model.match(image, image_b, resize=args.resize, top_k=top_k), args.warmups, args.iterations)
+        times, result = timed(
+            lambda: model.match(image, image_b, resize=args.resize, max_matches=top_k),
+            args.warmups, args.iterations,
+        )
         print(json.dumps({
             "tag": args.tag, "model": args.model, "preset": model.preset, "engine": args.engine, "resize": args.resize, "pair_level": True,
             "match_median_ms": round(statistics.median(times), 3), "match_min_ms": round(min(times), 3),

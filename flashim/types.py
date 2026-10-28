@@ -1,4 +1,5 @@
-"""Result containers returned by FlashIM matchers."""
+"""Result containers returned by FlashIM models: :class:`Matches` from every model's ``match``, the per-image
+:class:`SparseFeatures` of detector/descriptor models and the full :class:`DenseMatchResult` of dense ones."""
 
 from __future__ import annotations
 
@@ -25,13 +26,6 @@ class DenseMatchResult:
     confidence_BA: Tensor | None = None
     overlap_BA: Tensor | None = None
     precision_BA: Tensor | None = None
-    # Filled by ``match(..., num_samples=N)``: balanced sparse matches.
-    keypoints_A: Tensor | None = None  # [N, 2] pixels in the original image A
-    keypoints_B: Tensor | None = None  # [N, 2] pixels in the original image B
-    matches: Tensor | None = None  # [N, 4] normalized (xA, yA, xB, yB)
-    match_confidence: Tensor | None = None  # [N]
-    match_precision_A: Tensor | None = None  # [N, 2, 2]
-    match_precision_B: Tensor | None = None  # [N, 2, 2]
 
     @property
     def bidirectional(self) -> bool:
@@ -57,11 +51,24 @@ class SparseFeatures:
 
 
 @dataclass
-class SparseMatchResult:
-    """Mutual-nearest-neighbour matches between two images: ``[N, 2]`` pixel coordinates and ``[N]`` confidence."""
+class Matches:
+    """Correspondences between images A and B: what every model's ``match`` returns.
+
+    ``keypoints_A`` / ``keypoints_B``: ``[N, 2]`` ``(x, y)`` in pixel coordinates of each *original* image (integer =
+    pixel center; RaCo-based extractors keep RaCo's pixel-edge convention, center + 0.5); ``confidence``: ``[N]``, the
+    model's own match score. Detector/descriptor models also return ``indices_A`` / ``indices_B`` into the keypoints
+    of ``features_A`` / ``features_B`` (every keypoint of each image; ``None`` from ``match_features``, whose caller
+    has them); dense models attach their full prediction as ``dense``.
+    """
 
     keypoints_A: Tensor
     keypoints_B: Tensor
     confidence: Tensor
     indices_A: Tensor | None = None
     indices_B: Tensor | None = None
+    features_A: SparseFeatures | None = None
+    features_B: SparseFeatures | None = None
+    dense: DenseMatchResult | None = None
+
+    def __len__(self) -> int:
+        return self.keypoints_A.shape[0]

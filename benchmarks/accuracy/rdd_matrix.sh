@@ -14,10 +14,9 @@ run() {  # tag, args...
   [ -f "$out" ] && return
   .venv/bin/python benchmarks/accuracy/run_sparse.py "$@" --out "$out.tmp" && mv "$out.tmp" "$out"
 }
-fast='{"compile_mode": null}'
+fast='{"engine.mode": null}'
 run fp32              --preset fp32
 run bf16              --preset bf16
 run fp8               --preset fp8
-run fp8-full          --preset fp8-full
 run bf16_compile      --preset bf16 --engine compile --extra "$fast"
 run fp8_compile       --preset fp8 --engine compile --extra "$fast"

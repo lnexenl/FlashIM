@@ -119,7 +119,6 @@ def extractor_spec(
         default_preset=default_preset,
         quant_configs=quant_configs,
         calibrations={q: Path(calibration_dir) / f"{name}_{q}.safetensors" for q in quant_configs},
-        fp8_fallbacks={"fp8": "int8"},
         protected=tuple(protected),
         passes=passes,
         engines={"eager": EngineSpec(), "compile": EngineSpec(tuple(compile_regions), recompile_limit=64)},

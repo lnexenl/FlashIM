@@ -75,7 +75,7 @@ def test_fp32_matches_reference(oracle):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("preset", ["bf16", "fp8", "fp8-full"])
+@pytest.mark.parametrize("preset", ["bf16", "fp8"])
 def test_reduced_precision_tracks_fp32(checkpoint, preset):
     import flashim
 

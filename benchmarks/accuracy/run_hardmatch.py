@@ -40,7 +40,7 @@ class FlashIMMatcher:
     def match(self, img_A_path, img_B_path) -> tuple[np.ndarray, np.ndarray]:
         torch.cuda.synchronize()
         start = time.perf_counter()
-        result = self.model.match(img_A_path, img_B_path, num_samples=self.num_samples)
+        result = self.model.match(img_A_path, img_B_path, max_matches=self.num_samples)
         kpts_a = result.keypoints_A.double().cpu().numpy()
         kpts_b = result.keypoints_B.double().cpu().numpy()
         self.seconds += time.perf_counter() - start
@@ -83,7 +83,9 @@ def main() -> None:
     except ImportError:
         pass
 
-    model = flashim.load(args.model, preset=args.preset, setting=args.setting, engine=args.engine)
+    model = flashim.load(
+        args.model, args.preset, engine=args.engine, overrides={"arch.setting": args.setting}
+    )
     matcher = FlashIMMatcher(model, args.num_samples, args.offset)
     benchmark = HardMatchBenchmark(HardMatchBenchmark.Cfg(data_root=args.data_root, split=args.split))
     started = time.time()

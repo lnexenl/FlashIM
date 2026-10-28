@@ -89,9 +89,10 @@ def main() -> None:
             if hasattr(model, "match_features"):
                 audit(f"{tag} match_features", lambda: model.match_features(fa, fb))
             if hasattr(model, "matcher"):  # pipeline: the whole pair
-                audit(f"{tag} match (pipeline)", lambda: model.match(ia, ib, resize=a.resize, top_k=a.top_k))
+                kw = {"resize": a.resize, "max_matches": a.top_k or None}
+                audit(f"{tag} match (pipeline)", lambda: model.match(ia, ib, **kw))
         else:
-            kw = {"resize": a.resize} | ({"top_k": a.top_k} if a.top_k > 0 else {})
+            kw = {"resize": a.resize} | ({"max_matches": a.top_k} if a.top_k > 0 else {})
             audit(f"{tag} match", lambda: model.match(ia, ib, **kw))
 
 

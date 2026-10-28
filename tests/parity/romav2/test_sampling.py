@@ -13,10 +13,10 @@ pytestmark = [pytest.mark.cuda, pytest.mark.weights, pytest.mark.slow]
 
 @pytest.mark.parametrize("setting", ["turbo", "mega1500"])
 def test_fast_sampling_matches_reference(setting, fp32_highest):
-    from flashim.models.romav2.build import load_romav2
+    import flashim
 
-    model = load_romav2("fp8", setting=setting, engine="eager")
-    result = model.match(ASSETS / "toronto_A.jpg", ASSETS / "toronto_B.jpg")
+    model = flashim.load("romav2", "fp8", overrides={"arch.setting": setting})
+    result = model.match_dense(ASSETS / "toronto_A.jpg", ASSETS / "toronto_B.jpg")
 
     def draw(fast: bool):
         model.fast_sampling = fast
@@ -32,16 +32,19 @@ def test_fast_sampling_matches_reference(setting, fp32_highest):
         assert (a is None and b is None) or torch.equal(a, b)
 
 
-def test_match_num_samples_returns_pixel_keypoints(fp32_highest):
+def test_match_returns_pixel_keypoints(fp32_highest):
     from PIL import Image
 
-    from flashim.models.romav2.build import load_romav2
+    import flashim
 
-    model = load_romav2("fp8", setting="turbo", engine="eager")
+    model = flashim.load("romav2", "fp8", overrides={"arch.setting": "turbo"})
     model.fast_sampling = True
     path_a, path_b = ASSETS / "toronto_A.jpg", ASSETS / "toronto_B.jpg"
-    result = model.match(path_a, path_b, num_samples=1000)
+    result = model.match(path_a, path_b, max_matches=1000)
     (w_a, h_a), (w_b, h_b) = Image.open(path_a).size, Image.open(path_b).size
-    assert result.keypoints_A.shape == result.keypoints_B.shape == (1000, 2)
+    assert result.keypoints_A.shape == result.keypoints_B.shape == (1000, 2) and result.confidence.shape == (1000,)
+    assert result.dense is not None and len(model.match(path_a, path_b)) == 5000  # RoMaV2's default sample count
+    with pytest.raises(ValueError, match="resize"):
+        model.match(path_a, path_b, resize=640)
     for kp, (w, h) in ((result.keypoints_A, (w_a, h_a)), (result.keypoints_B, (w_b, h_b))):
         assert (kp[:, 0] >= 0).all() and (kp[:, 0] <= w).all() and (kp[:, 1] >= 0).all() and (kp[:, 1] <= h).all()

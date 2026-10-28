@@ -12,7 +12,7 @@ import torch
 from torch import Tensor
 
 from flashim.models import sparse
-from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.types import Matches, SparseFeatures
 
 
 def gray_uint8(image: Tensor) -> np.ndarray:
@@ -69,7 +69,7 @@ class SIFT(sparse.SparseExtractor):
         return xy, scores, torch.nn.functional.normalize(desc, dim=-1)
 
     @torch.inference_mode()
-    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> SparseMatchResult:
+    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
         dist = torch.cdist(a.descriptors[0].float(), b.descriptors[0].float())
         ia, ib, conf = ratio_mutual_match(dist, self.ratio if threshold is None else threshold)
-        return SparseMatchResult(a.keypoints[0][ia], b.keypoints[0][ib], conf, ia, ib)
+        return Matches(a.keypoints[0][ia], b.keypoints[0][ib], conf, ia, ib)

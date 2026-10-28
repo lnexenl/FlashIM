@@ -1,6 +1,6 @@
 """Calibrate static activation scales for RoMaV2 with FlashIM's BF16 model.
 
-Runs ``match`` over manifest pairs with observers on every layer targeted by the static
+Runs ``match_dense`` over manifest pairs with observers on every layer targeted by the static
 transformer scheme (``--format mxfp8``: block-32 amax exponents; ``--format int8``:
 per-tensor 99.99th-percentile scales, RoMaV2's ``percentile`` observer) and writes a
 FlashIM calibration table (safetensors).
@@ -67,7 +67,7 @@ def main() -> None:
     root = Path(args.root).expanduser()
     with torch.inference_mode(), (Int8Calibrator if int8 else Calibrator)(model, targets) as calibrator:
         for index, item in enumerate(pairs, start=1):
-            model.match(root / item["image_a"], root / item["image_b"])
+            model.match_dense(root / item["image_a"], root / item["image_b"])
             print(f"calibrated {index}/{len(pairs)}", flush=True)
     manifest_sha = hashlib.sha256(Path(args.manifest).read_bytes()).hexdigest()
     table = calibrator.table(

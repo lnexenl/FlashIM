@@ -3,10 +3,10 @@
 Dense matcher: a native port of RoMa v2 (DINOv3 ViT-L/16, matcher ViT, DPT head, conv refiners).
 
 ```python
-model = flashim.load("romav2", preset="fp8", setting="mega1500", engine="compile-full")
-result = model.match("a.jpg", "b.jpg")                       # DenseMatchResult (warp, overlap, precision)
-matches, conf, prec_a, prec_b = model.sample(result, 5000)
-kpts_a, kpts_b = model.to_pixel_coordinates(matches, h_a, w_a, h_b, w_b)
+model = flashim.load("romav2", "fp8", engine="compile-full", overrides={"arch.setting": "mega1500"})
+m = model.match("a.jpg", "b.jpg", max_matches=5000)          # Matches: balanced samples, pixels of the originals
+dense = model.match_dense("a.jpg", "b.jpg")                  # DenseMatchResult (warp, overlap, precision) alone
+matches, conf, prec_a, prec_b = model.sample(dense, 5000)    # normalized matches + per-match precisions
 ```
 
 ## Presets
@@ -60,9 +60,9 @@ cost. HardMatch was not run for `int8`.
 ## Options
 
 - **Match sampling.** `sample()` (KDE-balanced) takes 0.86 ms, against 16 ms and 1.5 GiB of scratch memory in RoMaV2,
-  with the same pose AUC within noise. `FLASHIM_FAST_SAMPLING=0` restores RoMaV2's. `match(..., num_samples=N)` returns
+  with the same pose AUC within noise. `FLASHIM_FAST_SAMPLING=0` restores RoMaV2's. `match(..., max_matches=N)` returns
   pixel keypoints directly.
-- **INT8 attention.** `flashim.load("romav2", preset="int8", attention="sage-fp8")` runs the attention of every
+- **INT8 attention.** `flashim.load("romav2", "int8", overrides=["optimize.attention=sage-fp8"])` runs the attention of every
   quantized transformer block through [SageAttention](https://github.com/thu-ml/SageAttention) (INT8 Q/K with K
   smoothing, FP8 PV; `"sage"`: FP16 PV). It needs `sageattention` 2.x built for your GPU, which is not a project
   dependency (with GCC 16, build it with clang).

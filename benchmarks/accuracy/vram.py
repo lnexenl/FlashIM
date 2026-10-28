@@ -51,7 +51,7 @@ def main() -> None:
     weights = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
     for a, b in jobs:
-        model.match(_read_rgb(a), _read_rgb(b), resize=args.resize, top_k=args.top_k)
+        model.match(_read_rgb(a), _read_rgb(b), resize=args.resize, max_matches=args.top_k or None)
     torch.cuda.synchronize()
     mb = 1 / 2**20
     result = {

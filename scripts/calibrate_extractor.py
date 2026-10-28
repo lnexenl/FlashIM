@@ -47,7 +47,7 @@ def main() -> None:
     root = Path(args.root).expanduser()
     spec = get_spec(args.model)
     extra = json.loads(args.extra) if args.extra else {}
-    model = flashim.build(args.model, "bf16", config=extra)
+    model = flashim.load(args.model, "bf16", config=extra)
     for fmt in args.format:
         config = spec.quant_configs[fmt]
         targets = [

@@ -13,9 +13,9 @@ backend, a model or a platform, and how changes are verified) are in [AGENTS.md]
 | `flashim/layers/` | Building blocks the passes recognize by type (`TransformerBlock`, `SeparableConvBlock`, `DeformableEncoder`, ...). A model built from them gets quantization and fused kernels without model-specific code |
 | `flashim/quant/` | Formats (MX), `QuantizedTensor`, schemes (compressed-tensors vocabulary), calibration, methods (`StaticMXFP8Linear`, `StaticInt8Linear`) and fusion passes |
 | `flashim/config.py` | `RunConfig`: the typed, layered, serializable run configuration ([configuration.md](configuration.md)) |
-| `flashim/build.py` | `ModelSpec` (presets, passes, engines) and the generic builder every model goes through |
+| `flashim/build.py` | `ModelSpec` (presets, passes, engines), the generic builder every model goes through and `flashim.load`, the one loader |
 | `flashim/engines/` | Region `torch.compile` and an experimental CUDA-graph runner |
-| `flashim/models/` | One package per model, typically `model.py` (a pure `nn.Module` that only calls ops), `config.py`, `weights.py`, `quant.py`, `spec.py`. `sparse.py` and `sparse_spec.py` are the base class and spec factory shared by the sparse extractors |
+| `flashim/models/` | One package per model, typically `model.py` (a pure `nn.Module` that only calls ops), `config.py`, `weights.py`, `quant.py`, `spec.py`. `base.py` holds `ImageMatcher`, the `match(a, b) -> Matches` interface every image-pair model implements; `sparse.py` and `sparse_spec.py` are the base class and spec factory shared by the sparse extractors |
 | `flashim/geometry/` | Pose estimation and AUC metrics |
 | `flashim/log.py` | Logging (`FLASHIM_LOG`), dispatch tracing, profiler and NVTX ranges |
 | `benchmarks/` | `speed/`, `accuracy/` (MegaDepth-1500, ScanNet-1500, HardMatch), `profile/` |

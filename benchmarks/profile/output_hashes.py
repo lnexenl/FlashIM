@@ -36,8 +36,10 @@ def configs() -> list[tuple[str, str, str, list[str], str]]:
     out += [(f"{m}-lightglue-{p}", f"{m}-lightglue", p, [f"components.extractor.preset={p}"], "pipeline")
             for m in ("xfeat", "superpoint", "disk") for p in ("int8", "fp8")]
     out += [(f"loftr-{p}", "loftr", p, [], "pair") for p in ("bf16", "int8", "fp8")]
-    out += [(f"rdd-lightglue-{p}", "rdd-lightglue", p, [], "pipeline") for p in ("fp8", "int8")]
-    out += [("aliked-lightglue-int8", "aliked-lightglue", "int8", [], "pipeline")]
+    out += [(f"rdd-lightglue-{p}", "rdd-lightglue", p, ["components.extractor.preset=fp8"], "pipeline")
+            for p in ("fp8", "int8")]
+    out += [("aliked-lightglue-int8", "aliked-lightglue", "int8", ["components.extractor.preset=fp32"],
+             "pipeline")]
     out += [("raco-aliked-lightglue-bf16x", "raco-aliked-lightglue", "int8", ["components.extractor.preset=bf16"],
              "pipeline")]
     out += [(f"romav2-{p}", "romav2", p, [], "dense") for p in ("bf16", "fp8", "int8")]
@@ -64,12 +66,13 @@ def run(name: str, model_name: str, preset: str, overrides: list[str], kind: str
             fb = model.extract(b, resize=1200, top_k=4096)
             out |= tensors_of(fa, "A") | tensors_of(fb, "B") | tensors_of(model.match_features(fa, fb), "M")
         elif kind == "pipeline":
-            out |= tensors_of(model.match(a, b, resize=1200, top_k=4096), "M")
+            out |= tensors_of(model.match(a, b, resize=1200, max_matches=4096), "M")
         elif kind == "pair":
             out |= tensors_of(model.match(a, b, resize=1200), "M")
         else:
             generator = torch.Generator(device=model.device).manual_seed(0)
-            out |= tensors_of(model.match(a, b, num_samples=5000, generator=generator), "M")
+            result = model.match(a, b, max_matches=5000, generator=generator)
+            out |= tensors_of(result, "M") | tensors_of(result.dense, "M")
     return out
 
 

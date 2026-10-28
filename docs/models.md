@@ -3,12 +3,14 @@
 What each model is and which presets it has. Models with their own page link to it there (usage, presets, speed,
 accuracy). The latency of every model under one protocol is in the [inference benchmark](benchmarks.md).
 
-`flashim.available_models()` lists the registered names. The default preset is in bold.
+`flashim.available_models()` lists the registered names. The default preset is in bold. Every model accepts all four
+presets (`fp32`, `bf16`, `int8`, `fp8`) and builds the nearest one it has (`fp8` -> `int8` -> `bf16` -> `fp32`), and
+every model that matches images returns `Matches` from `match(a, b)` ([configuration](configuration.md#matching)).
 
 | model | what it is | presets |
 |---|---|---|
 | [`romav2`](models/romav2.md) | RoMa v2 dense matcher (DINOv3 ViT-L/16, MV-ViT, DPT head, conv refiners) | `bf16`, `int8`, **`fp8`** |
-| [`rdd`](models/rdd.md) | RDD sparse detector + descriptor (ConvNeXt-tiny, multi-scale deformable transformer) | `fp32`, `bf16`, **`fp8`**, `fp8-full`, `fp8-backbone` |
+| [`rdd`](models/rdd.md) | RDD sparse detector + descriptor (ConvNeXt-tiny, multi-scale deformable transformer) | `fp32`, `bf16`, **`fp8`** |
 | [`aliked`](models/aliked.md) | ALIKED sparse detector + descriptor (deformable-conv encoder, SDDH) | **`fp32`**, `bf16` |
 | [`raco`](models/raco-aliked-lightglue.md) | RaCo keypoint detector + ranker | **`fp32`**, `bf16` |
 | [`raco-aliked`](models/raco-aliked-lightglue.md) | RaCo keypoints + ALIKED descriptors | **`fp32`**, `bf16` |

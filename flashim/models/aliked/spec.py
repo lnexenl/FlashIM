@@ -8,7 +8,7 @@ from torch import nn
 
 from flashim.build import BuildContext, EngineSpec, ModelSpec, Pass, dtype
 from flashim.config import RunConfig
-from flashim.models.aliked.config import VARIANTS, ALIKEDConfig
+from flashim.models.aliked.config import VARIANTS
 from flashim.models.aliked.model import ALIKED
 
 DEFAULT_VARIANT = "aliked-n16"
@@ -77,27 +77,3 @@ SPEC = ModelSpec(
     set_precision=_set_precision,
 )
 
-
-def legacy_overrides(
-    *,
-    variant: str = DEFAULT_VARIANT,
-    engine: str = "eager",
-    device=None,
-    checkpoint=None,
-    config: ALIKEDConfig | None = None,
-    compile_mode: str | None = "max-autotune-no-cudagraphs",
-    channels_last: bool = False,
-    deform_int8_calibration=None,
-) -> dict:
-    """``load_aliked`` keyword arguments -> a config overlay."""
-    overlay: dict = {"variant": variant, "engine": {"kind": engine, "mode": compile_mode}}
-    if device is not None:
-        overlay["device"] = str(device)
-    if checkpoint is not None:
-        overlay["checkpoint"] = str(checkpoint)
-    if config is not None:
-        overlay["arch"] = dataclasses.asdict(config)
-    passes = [p for p, on in (("channels_last", channels_last), ("deform_int8", deform_int8_calibration is not None)) if on]
-    if passes:
-        overlay["optimize"] = {"passes+": passes, "options": {"deform_int8_calibration": deform_int8_calibration}}
-    return overlay

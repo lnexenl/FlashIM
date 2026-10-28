@@ -28,6 +28,8 @@ speedups come from quantization (MXFP8, INT8), fused kernels (Triton, TileLang, 
 - **Quantization with evidence.** FP8 / INT8 presets are accepted by task-level pose AUC (MegaDepth-1500, ScanNet-1500, HardMatch), not by
   tensor `allclose`.
 - **Multi-platform by design.** Device detection separates vendor, dispatch key and ISA features. NVIDIA from Ampere to Blackwell today; ROCm, NPU and XPU are planned.
+- **One interface.** Every model loads with `flashim.load(name, preset)`, where the preset is `fp32`, `bf16`, `int8` or `fp8`, and matches with
+  `model.match(a, b)`, which returns the same `Matches` for dense, detector-free and sparse models.
 - **One builder, declarative config.** A `RunConfig` (arch, precision, optimization passes, engine) is layered, hashable and reproducible.
 
 ## Quick start
@@ -41,16 +43,20 @@ uv sync --extra eval
 ```python
 import flashim
 
-model = flashim.load("romav2", preset="fp8", setting="mega1500", engine="compile-full")
-result = model.match("a.jpg", "b.jpg")                       # DenseMatchResult (warp, overlap, precision)
-matches, conf, prec_a, prec_b = model.sample(result, 5000)
-kpts_a, kpts_b = model.to_pixel_coordinates(matches, h_a, w_a, h_b, w_b)
+model = flashim.load("romav2", "fp8", engine="compile-full", overrides={"arch.setting": "mega1500"})
+m = model.match("a.jpg", "b.jpg", max_matches=5000)          # Matches: 5000 balanced samples of the dense warp
+m.keypoints_A, m.keypoints_B, m.confidence                   # [N, 2] pixels of each original image, [N]
+m.dense.warp_AB                                              # the full dense prediction (DenseMatchResult)
+
+pipeline = flashim.load("raco-aliked-lightglue", "bf16", engine="compile")
+m = pipeline.match("a.jpg", "b.jpg", resize=1024, max_matches=1024)   # Matches: 1024 keypoints per image
+m.indices_A, m.features_A                                    # match indices into each image's keypoints
 ```
 
-```python
-pipeline = flashim.load("raco-aliked-lightglue", preset="bf16", extractor_preset="bf16", engine="compile")
-m = pipeline.match("a.jpg", "b.jpg", resize=1024, top_k=1024)   # SparseMatchResult
-```
+`match(a, b, *, resize, max_matches, threshold)` is the same for every model: `resize` is the long side of the working
+resolution, `max_matches` bounds the matches the model's own way (keypoints per image, the most confident matches, or
+samples of a dense warp) and `threshold` is the model's match threshold. A model without the preset asked for builds the
+nearest one it has (`fp8` -> `int8` -> `bf16` -> `fp32`), and a pipeline's preset applies to each of its components.
 
 Weights download on first use and are checked against pinned SHA-256 hashes ([Checkpoints](#checkpoints)).
 
@@ -77,11 +83,13 @@ On the 900 deliberately hard HardMatch pairs `fp8` costs 0.0074 mAA@10px, the sa
 
 ## Configuring a run
 
-Presets are named partial configs; config files, dicts and dotted overrides layer on top.
+The four presets are named partial configs; config files, dicts, dotted overrides and `load`'s keyword arguments (`device`,
+`engine`, `strict`, `calibration`) layer on top.
 
 ```python
 model = flashim.load("romav2", "fp8", overrides=["engine.kind=compile-full"])
 model = flashim.load("raco-aliked-lightglue", "int8", config="run.toml")
+model = flashim.load("aliked-lightglue", "int8", overrides={"components.extractor.preset": "fp32"})
 flashim.resolve("rdd-lightglue", "fp8").to_dict()      # the config a build would use, without building
 model.run_config.digest(), model.build_report          # what was asked for / what was actually applied
 ```
@@ -100,13 +108,14 @@ Unknown keys, passes and engines are errors; a pass the platform cannot run is s
 | sm_100 | datacenter Blackwell | compile-checked only |
 | sm_80 / sm_86 | A100, RTX 30xx | not tuned; no FP8, so INT8 fallbacks apply |
 
-A GPU without FP8 builds the preset's INT8 counterpart instead, and says so in a warning and in `model.build_report.fallbacks`. Details in
+A GPU without FP8 builds the nearest other preset instead (`int8`, or `bf16` for a model without INT8), and says so in a warning and in
+`model.build_report.fallbacks`. Details in
 [docs/platforms.md](docs/platforms.md).
 
 ## Checkpoints
 
 Every model downloads its upstream release on first use into the torch hub checkpoint folder (`$TORCH_HOME/hub/checkpoints`) and verifies it
-against the SHA-256 pinned in `flashim/models/<model>/weights.py`. Pass `checkpoint=` or set `FLASHIM_<MODEL>_CHECKPOINT` to use a local file;
+against the SHA-256 pinned in `flashim/models/<model>/weights.py`. Override `checkpoint` or set `FLASHIM_<MODEL>_CHECKPOINT` to use a local file;
 copy the folder over for an offline machine. Calibration tables ship in the repository. More in [docs/checkpoints.md](docs/checkpoints.md).
 
 ## Development

@@ -13,10 +13,11 @@ from torch import Tensor, nn
 from flashim import ops
 from flashim.layers.conv import conv_relu
 from flashim.models import sparse
+from flashim.models.base import ImageMatcher
 from flashim.models.loftr import weights
 from flashim.models.romav2.model import ImageLike, load_image
 from flashim.platforms import default_device
-from flashim.types import SparseMatchResult
+from flashim.types import Matches
 from flashim.utils import device_constant
 
 
@@ -145,9 +146,9 @@ def _inner_cells(height: int, width: int, border: int, device: torch.device) -> 
     return mask.reshape(-1)
 
 
-class LoFTR(nn.Module):
+class LoFTR(ImageMatcher, nn.Module):
     """Module paths follow the official checkpoints (``backbone``, ``loftr_coarse``, ``fine_preprocess``, ``loftr_fine``);
-    loads strictly. ``match(img_a, img_b)`` -> :class:`SparseMatchResult` in each original image's pixel coordinates
+    loads strictly. ``match(img_a, img_b)`` -> :class:`Matches` in each original image's pixel coordinates
     (LoFTR's convention: coarse cell index x 8 plus the fine offset).
 
     Precision presets: the backbone and both transformers run in the compute dtype; the attention core, the coarse
@@ -267,11 +268,10 @@ class LoFTR(nn.Module):
         scale = h0 / f0.shape[2]
         return kpts0, kpts1 + coords * (W // 2) * scale, mconf
 
-    @torch.inference_mode()
-    def match(self, img_a: ImageLike, img_b: ImageLike, *, resize: int | None = None, top_k: int | None = None,
-              threshold: float | None = None) -> SparseMatchResult:
-        """``resize``: long side of the working resolution (sides floored to multiples of 8); ``top_k``: keep the best
-        ``top_k`` matches by confidence (``None`` / ``<= 0``: all); ``threshold``: coarse confidence threshold."""
+    def _match(self, img_a: ImageLike, img_b: ImageLike, *, resize: int | None, max_matches: int | None,
+               threshold: float | None) -> Matches:
+        """``resize``: long side of the working resolution (sides floored to multiples of 8); ``max_matches``: keep the
+        most confident matches (``None``: all); ``threshold``: coarse confidence threshold."""
         images = [load_image(im, self.device) for im in (img_a, img_b)]
         prepared, sizes = [], []
         for image in images:
@@ -287,9 +287,9 @@ class LoFTR(nn.Module):
             k0, k1, conf = self.match_prepared(*prepared)
         finally:
             self.threshold = previous
-        if top_k is not None and 0 < top_k < len(conf):
-            conf, index = conf.topk(top_k)
+        if max_matches is not None and max_matches < len(conf):
+            conf, index = conf.topk(max_matches)
             k0, k1 = k0[index], k1[index]
         k0 = k0 * device_constant([sizes[0][1], sizes[0][0]], k0)
         k1 = k1 * device_constant([sizes[1][1], sizes[1][0]], k1)
-        return SparseMatchResult(k0, k1, conf)
+        return Matches(k0, k1, conf)

@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from run import MEGA_SCENES, PosePool, _git, _read_rgb, prefetch
 
 import flashim
-import flashim.registry
+from flashim.config import parse_overrides
 from flashim.geometry.pose import (
     compute_pose_error,
     compute_relative_pose,
@@ -154,7 +154,7 @@ def main() -> None:
     parser.add_argument("--preset", default="fp8")
     parser.add_argument("--engine", default="eager")
     parser.add_argument("--resize", type=int, default=1200, help="long side fed to the model")
-    parser.add_argument("--top-k", type=int, default=4096)
+    parser.add_argument("--top-k", type=int, default=4096, help="max_matches (0 = all)")
     parser.add_argument("--estimator", choices=("poselib", "opencv"), default="poselib")
     parser.add_argument("--ransac-thr", type=float, default=1.0, help="inlier threshold in pixels of the original image")
     parser.add_argument("--bgr", action="store_true", help="feed BGR like RDD's / XFeat's own benchmark scripts")
@@ -166,7 +166,7 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 4), help="RANSAC threads")
     parser.add_argument("--loaders", type=int, default=4)
     parser.add_argument("--prefetch", type=int, default=16)
-    parser.add_argument("--extra", default="", help="JSON dict of extra flashim.load kwargs (legacy keyword API)")
+    parser.add_argument("--extra", default="", help="JSON dict of dotted config overrides")
     parser.add_argument("--overrides", nargs="*", default=[], help="dotted config overrides (config API)")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
@@ -176,17 +176,14 @@ def main() -> None:
     torch.set_num_threads(ncpu)
     torch.backends.cudnn.benchmark = False
     data_root = Path(args.data_root) if args.data_root else DATA / "megadepth"
-    # keyword API for models that have one, unless --overrides are given (it would drop them silently)
-    if args.extra or (args.model in flashim.registry.LEGACY_LOADERS and not args.overrides):
-        model = flashim.load(args.model, preset=args.preset, engine=args.engine, **(json.loads(args.extra) if args.extra else {}))
-    else:
-        model = flashim.load(args.model, args.preset, overrides=[f"engine.kind={args.engine}", *args.overrides])
+    extra = parse_overrides(json.loads(args.extra)) if args.extra else None
+    model = flashim.load(args.model, args.preset, engine=args.engine, config=extra, overrides=args.overrides)
     started = time.time()
     seeds = args.seeds or [args.seed]
     pool = MultiSeedPool(args.workers, seeds, args.estimator, args.ransac_thr)
     pairs = mega1500_sparse(
         model, data_root, pool, args.max_pairs, {"workers": args.loaders, "depth": args.prefetch},
-        {"resize": args.resize, "top_k": args.top_k}, args.bgr,
+        {"resize": args.resize, "max_matches": args.top_k or None}, args.bgr,
     )
     per_seed = [summarize(errors) for errors in pool.errors()]
     mean = {key: float(np.mean([s[key] for s in per_seed])) for key in per_seed[0]}

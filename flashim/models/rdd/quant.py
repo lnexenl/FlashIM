@@ -7,9 +7,11 @@ Presets:
   detector, attention softmax and all sampling/position math stay FP32.
 - ``fp8``         : ``bf16`` + the transformer's value/output projections and FFN linears as static MXFP8
   (E4M3 values, E8M0 block-32 scales), run by the fused deformable-encoder pass (default).
-- ``fp8-full``    : ``fp8`` + the deformable-attention sampling-offset and attention-weight projections.
-- ``fp8-backbone``: ``fp8`` + the ConvNeXt pointwise (MLP) linears. Slower than ``fp8``: these GEMMs are small-K
-  and memory-bound, so separate quantize passes cost more than FP8 saves (kept for experiments).
+
+Measured and dropped: the deformable-attention sampling-offset / attention-weight projections as MXFP8 as well (no
+faster, they share one BF16 GEMM in the fused pass; MegaDepth-1500 AUC@5 0.5242 against 0.5418), and the ConvNeXt
+pointwise (MLP) linears (slower: small-K, memory-bound GEMMs, so separate quantize passes cost more than FP8 saves).
+The calibration table still covers the deformable projections (:data:`CALIBRATED`).
 """
 
 from __future__ import annotations
@@ -35,7 +37,6 @@ ENCODER_LINEARS = (
     f"{_LAYERS}.linear1",
     f"{_LAYERS}.linear2",
 )
-CONVNEXT_LINEARS = ("backbone.stages.*.pwconv1", "backbone.stages.*.pwconv2")
 DEFORMABLE_LINEARS = (f"{_LAYERS}.self_attn.sampling_offsets", f"{_LAYERS}.self_attn.attention_weights")
 
 
@@ -63,16 +64,7 @@ PRESETS: dict[str, Preset] = {
         torch.bfloat16,
         description="bf16 + static MXFP8 transformer value/output/FFN linears (fused encoder)",
     ),
-    "fp8-full": Preset(
-        "fp8-full",
-        _config("fp8-full", *ENCODER_LINEARS, *DEFORMABLE_LINEARS),
-        torch.bfloat16,
-        description="fp8 + static MXFP8 sampling-offset and attention-weight projections",
-    ),
-    "fp8-backbone": Preset(
-        "fp8-backbone",
-        _config("fp8-backbone", *ENCODER_LINEARS, *CONVNEXT_LINEARS),
-        torch.bfloat16,
-        description="fp8 + static MXFP8 ConvNeXt MLP linears (slower; experiments only)",
-    ),
 }
+
+# The linears ``scripts/calibrate_rdd.py`` records (a superset of ``fp8``'s).
+CALIBRATED = _config("calibrated", *ENCODER_LINEARS, *DEFORMABLE_LINEARS)

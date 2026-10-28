@@ -24,8 +24,8 @@ from pathlib import Path
 
 import torch
 
+import flashim
 from flashim import ops
-from flashim.models.romav2.build import load_romav2
 from flashim.paths import IMAGE_A, IMAGE_B
 
 TOP_REGIONS = ("f", "matcher", "matcher.mv_vit", "matcher.head", "refiner_features", "refiners.4", "refiners.2", "refiners.1")
@@ -162,7 +162,7 @@ def main() -> None:
     args = parser.parse_args()
     torch.set_float32_matmul_precision("highest")
 
-    model = load_romav2(args.preset, setting=args.setting, engine=args.engine)
+    model = flashim.load("romav2", args.preset, engine=args.engine, overrides={"arch.setting": args.setting})
     inputs = model.prepare(IMAGE_A, IMAGE_B)
     patterns = [re.escape(r) for r in TOP_REGIONS]
     if args.engine == "eager":

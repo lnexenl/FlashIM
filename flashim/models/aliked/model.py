@@ -15,9 +15,10 @@ from flashim.models.aliked import weights
 from flashim.models.aliked.blocks import ConvBlock, ResBlock
 from flashim.models.aliked.config import VARIANTS, ALIKEDConfig
 from flashim.models.aliked.descriptor import SDDH
+from flashim.models.base import FeatureMatcher
 from flashim.models.romav2.model import ImageLike, load_image
 from flashim.platforms import default_device
-from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.types import Matches, SparseFeatures
 from flashim.utils import device_constant
 
 
@@ -45,7 +46,7 @@ def target_size(height: int, width: int, long_side: int | None) -> tuple[int, in
     return (height // 32) * 32, (width // 32) * 32
 
 
-class ALIKED(nn.Module):
+class ALIKED(FeatureMatcher, nn.Module):
     """``block1..4`` (conv / deformable-conv encoder, strides 1/2/8/32) -> multi-scale fusion -> ``score_head``
     (keypoint score map) and ``desc_head`` (``SDDH``, sampled at the detected keypoints).
 
@@ -199,10 +200,6 @@ class ALIKED(nn.Module):
         return SparseFeatures(pixel_kpts[None], scores[0][None], descriptors[None], (height, width))
 
     @torch.inference_mode()
-    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> SparseMatchResult:
+    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
         ia, ib, conf = kp.mutual_nn_match(a.descriptors[0], b.descriptors[0], self.config.match_threshold if threshold is None else threshold)
-        return SparseMatchResult(a.keypoints[0][ia], b.keypoints[0][ib], conf, ia, ib)
-
-    @torch.inference_mode()
-    def match(self, img_a: ImageLike, img_b: ImageLike, *, threshold: float | None = None) -> SparseMatchResult:
-        return self.match_features(self.extract(img_a), self.extract(img_b), threshold)
+        return Matches(a.keypoints[0][ia], b.keypoints[0][ib], conf, ia, ib)

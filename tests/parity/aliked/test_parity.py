@@ -83,11 +83,11 @@ def test_dense_maps_and_sparse_features_match_reference(oracle_module, variant):
 def test_bf16_feature_map_tracks_fp32(oracle_module):
     import torch.nn.functional as F
 
-    from flashim.models.aliked.build import load_aliked
+    import flashim
 
-    checkpoint = weights.find_checkpoint("aliked-n16")
-    reference = load_aliked("fp32", checkpoint=checkpoint, device="cpu")
-    model = load_aliked("bf16", checkpoint=checkpoint, device="cpu")
+    checkpoint = str(weights.find_checkpoint("aliked-n16"))
+    reference = flashim.load("aliked", "fp32", device="cpu", overrides={"checkpoint": checkpoint})
+    model = flashim.load("aliked", "bf16", device="cpu", overrides={"checkpoint": checkpoint})
 
     torch.manual_seed(1)
     image = torch.rand(1, 3, 176, 240)

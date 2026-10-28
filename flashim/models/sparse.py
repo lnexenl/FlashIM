@@ -3,7 +3,7 @@
 A subclass implements :meth:`SparseExtractor.detect` (``[1, 3, H, W]`` RGB in ``[0, 1]`` at the working resolution ->
 keypoints ``[K, 2]`` ``(x, y)`` in working-resolution pixel indices, scores ``[K]``, descriptors ``[K, C]``);
 the base class handles loading, resizing, mapping keypoints back to the original image and mutual-nearest-neighbour
-matching. Batch size is 1 (as for ALIKED / RDD).
+matching (``match``: :class:`~flashim.models.base.FeatureMatcher`). Batch size is 1 (as for ALIKED / RDD).
 """
 
 from __future__ import annotations
@@ -12,8 +12,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim.models.base import FeatureMatcher
 from flashim.models.romav2.model import ImageLike, load_image
-from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.types import Matches, SparseFeatures
 from flashim.utils import device_constant, set_submodule
 
 
@@ -87,7 +88,7 @@ def mutual_nn_match(desc0: Tensor, desc1: Tensor, threshold: float) -> tuple[Ten
     return idx0, nn01[idx0], best[idx0]
 
 
-class SparseExtractor(nn.Module):
+class SparseExtractor(FeatureMatcher, nn.Module):
     """Base class: ``extract`` / ``match_features`` / ``match`` over a subclass' :meth:`detect`."""
 
     div_by: int = 8
@@ -156,17 +157,8 @@ class SparseExtractor(nn.Module):
         return SparseFeatures(keypoints[None], scores.float()[None], descriptors[None], (height, width))
 
     @torch.inference_mode()
-    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> SparseMatchResult:
+    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
         ia, ib, conf = mutual_nn_match(
             a.descriptors[0], b.descriptors[0], self.match_threshold if threshold is None else threshold
         )
-        return SparseMatchResult(a.keypoints[0][ia], b.keypoints[0][ib], conf, ia, ib)
-
-    @torch.inference_mode()
-    def match(
-        self, img_a: ImageLike, img_b: ImageLike, *, resize: int | None = None, top_k: int | None = None,
-        threshold: float | None = None,
-    ) -> SparseMatchResult:
-        return self.match_features(
-            self.extract(img_a, resize=resize, top_k=top_k), self.extract(img_b, resize=resize, top_k=top_k), threshold
-        )
+        return Matches(a.keypoints[0][ia], b.keypoints[0][ib], conf, ia, ib)

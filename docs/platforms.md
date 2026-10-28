@@ -28,8 +28,8 @@ Other architectures (sm_103, sm_110, sm_121) use the default configs.
 
 ### GPUs without FP8
 
-A GPU without FP8 (Ampere, Jetson Orin) builds the preset's INT8 counterpart: `fp8` → `int8`. RDD has no INT8 preset,
-so its FP8 presets become `bf16`. A warning says so, and `model.preset` and `model.build_report.fallbacks` record it.
+A GPU without FP8 (Ampere, Jetson Orin) builds the nearest other preset: `fp8` → `int8`. RDD has no INT8 preset,
+so its `fp8` becomes `bf16`. A warning says so, and `model.preset` and `model.build_report.fallbacks` record it.
 
 The reason is speed. RoMaV2 on a Jetson AGX Orin, eager, per pair:
 

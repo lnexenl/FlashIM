@@ -10,7 +10,7 @@ from flashim.models.raco import RaCo, RaCoConfig
 from flashim.models.raco.extractor import RaCoExtractor
 from flashim.models.raco.spec import DESCRIBERS
 from flashim.paths import ASSETS
-from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.types import Matches, SparseFeatures
 
 
 class _Descriptor(nn.Module):
@@ -25,7 +25,7 @@ class _Descriptor(nn.Module):
         return torch.nn.functional.normalize(torch.ones(len(keypoints), 4), dim=-1)
 
     def match_features(self, a, b, threshold=None):
-        return SparseMatchResult(a.keypoints[0][:1], b.keypoints[0][:1], torch.ones(1), None, None)
+        return Matches(a.keypoints[0][:1], b.keypoints[0][:1], torch.ones(1), None, None)
 
 
 def _raco():

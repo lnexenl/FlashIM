@@ -13,7 +13,7 @@ from flashim import ops
 from flashim.models import sparse
 from flashim.models.dedode import blocks
 from flashim.platforms import default_device
-from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.types import Matches, SparseFeatures
 from flashim.utils import device_constant
 
 MEAN = (0.485, 0.456, 0.406)
@@ -119,7 +119,7 @@ class DeDoDe(sparse.SparseExtractor):
         return F.normalize(self.descriptor(self.normalize(image), points=keypoints.float()), dim=-1)
 
     @torch.inference_mode()
-    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> SparseMatchResult:
+    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
         corr = (a.descriptors[0].float() @ b.descriptors[0].float().t()) * self.inv_temperature
         # mutual maxima of softmax(corr, -2) * softmax(corr, -1) above the threshold, without the [M, N] probabilities:
         # measured 5.7 -> 0.74 ms for 4096 x 4096 keypoints (sm_120), identical match lists on 100 MegaDepth pairs
@@ -128,4 +128,4 @@ class DeDoDe(sparse.SparseExtractor):
         limit = self.match_threshold if threshold is None else threshold
         ia = torch.nonzero(mutual & (conf > limit))[:, 0]
         ib = index[ia]
-        return SparseMatchResult(a.keypoints[0][ia], b.keypoints[0][ib], conf[ia], ia, ib)
+        return Matches(a.keypoints[0][ia], b.keypoints[0][ib], conf[ia], ia, ib)

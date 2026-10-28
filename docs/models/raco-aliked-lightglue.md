@@ -3,8 +3,8 @@
 RaCo keypoints, ALIKED descriptors and LightGlue matching wired into one pipeline (`flashim/models/raco`).
 
 ```python
-pipeline = flashim.load("raco-aliked-lightglue", preset="bf16", extractor_preset="bf16", engine="compile")
-m = pipeline.match(a, b, top_k=1024, threshold=0.1)   # images must be 32-aligned, or pass resize=
+pipeline = flashim.load("raco-aliked-lightglue", "bf16", engine="compile")
+m = pipeline.match(a, b, max_matches=1024, threshold=0.1)   # images must be 32-aligned, or pass resize=
 ```
 
 ## How it works
@@ -24,10 +24,10 @@ In FP32, keypoints and ranker scores are bit-exact against their PyTorch modules
 |---|---|
 | `fp32` (default) | the checkpoint's own precision (TF32 convs) |
 | `bf16` | BF16 detector trunk, ranker and descriptors; the fastest, and the one to use with `engine="compile"` |
-| `int8`, `fp8` | LightGlue quantized ([LightGlue](lightglue.md)); the extractor stays at its own preset |
+| `int8`, `fp8` | LightGlue quantized ([LightGlue](lightglue.md)); RaCo + ALIKED, which have neither, run in `bf16` |
 
-The pipeline preset sets LightGlue only: pass `extractor_preset="bf16"` (or `components.extractor.preset=bf16`) to run
-the extractor in BF16, as in the example above.
+The pipeline preset is every component's (each builds the nearest it has); `components.extractor.preset=fp32` keeps
+the extractor in FP32 under a quantized LightGlue.
 
 ## Implementation
 
@@ -48,12 +48,12 @@ model's own (mutual NN, dual softmax, ...), or LightGlue with the model's weight
 `raco-disk-lightglue`, `raco-xfeat-lightglue` and `raco-rdd-lightglue`.
 
 ```python
-m = flashim.load("raco-dedode", "bf16").match(a, b, resize=1024, top_k=2048)
+m = flashim.load("raco-dedode", "bf16").match(a, b, resize=1024, max_matches=2048)
 pipeline = flashim.load("raco-superpoint-lightglue", overrides=["components.extractor.preset=bf16"])
 ```
 
-The preset is the descriptor model's (`fp32`, `bf16`, `int8`, `fp8`); RaCo runs in `fp32` for `fp32` and in `bf16`
-otherwise, and `components.raco` / `components.descriptor` take their own presets and settings. Images are resized to a
+The presets are the descriptor model's (`fp32`, `bf16`, `int8`, `fp8`); RaCo builds the nearest it has (`fp32` for
+`fp32`, `bf16` otherwise), and `components.raco` / `components.descriptor` take their own presets and settings. Images are resized to a
 multiple of 32 (224 for DeDoDe-G, whose ViT needs 56). Keypoints are in RaCo's pixel-edge convention, as in
 `raco-aliked`. These models never saw RaCo's keypoints in training, so a LightGlue checkpoint trained on their own
 detector is applied out of distribution, and DISK (whole-pixel descriptors) rounds RaCo's sub-pixel positions. MegaDepth-1500 AUC@5 (1200 px, 4096 keypoints, poselib 1.0 px, mean of 3 RANSAC seeds, BF16; RaCo runs at multiples of

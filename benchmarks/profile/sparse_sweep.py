@@ -115,8 +115,8 @@ def main() -> None:
             fb = model.extract(b, resize=args.resize, top_k=args.top_k)
             stages.append(stage("match", lambda: model.match_features(fa, fb)))
         else:
-            top_k = args.top_k if args.top_k > 0 else None
-            stages.append(stage("match (pair)", lambda: model.match(a, b, resize=args.resize, top_k=top_k)))
+            k = args.top_k if args.top_k > 0 else None
+            stages.append(stage("match (pair)", lambda: model.match(a, b, resize=args.resize, max_matches=k)))
     result = {
         "tag": args.tag or f"{args.model}-{args.preset}", "model": args.model, "preset": args.preset,
         "resize": args.resize, "top_k": args.top_k, "gpu": torch.cuda.get_device_name(), "stages": stages,

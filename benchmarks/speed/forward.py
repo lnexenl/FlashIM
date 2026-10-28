@@ -5,7 +5,11 @@ Method (RoMaV2 P8 benchmark): one fixed MegaDepth pair, preprocessed once; B=1;
 timed with CUDA events. Run each configuration in its own process.
 
     python benchmarks/speed/forward.py --impl flashim --preset fp8 --engine compile
-    python benchmarks/speed/forward.py --impl romav2 --preset fp8 --engine compile
+    python benchmarks/speed/forward.py --impl romav2 --oracle fp8-p8 --engine compile
+    python benchmarks/speed/forward.py --impl flashim --oracle fp8-p8 --engine compile  # bit-identical
+
+``--oracle`` selects one of the configs bit-identical to RoMaV2's FastFP8 variants (``ORACLE_OVERLAYS``)
+in place of ``--preset``.
 """
 
 from __future__ import annotations
@@ -19,15 +23,23 @@ from pathlib import Path
 
 import torch
 
+from flashim import PRECISIONS
 from flashim.paths import IMAGE_A, IMAGE_B, ORACLES, ROMAV2_CALIBRATION
 
 _ROMAV2_VARIANTS = {"fp8-p8": "none", "fp8-s4": "s4_fused", "fp8-s42": "s4_fused_s2_fused"}
 
 
 def _build_flashim(args):
-    from flashim.models.romav2.build import load_romav2
+    import flashim
+    from flashim.models.romav2.spec import ORACLE_OVERLAYS
 
-    model = load_romav2(args.preset, setting=args.setting, engine=args.engine, attention=args.attention)
+    overrides = {"arch.setting": args.setting, "optimize.attention": args.attention}
+    if args.oracle:
+        model = flashim.load(
+            "romav2", "bf16", engine=args.engine, config=ORACLE_OVERLAYS[args.oracle], overrides=overrides
+        )
+    else:
+        model = flashim.load("romav2", args.preset, engine=args.engine, overrides=overrides)
     inputs = model.prepare(args.image_a, args.image_b)
     return model, inputs, (model.quant_report.summary() if model.quant_report else None)
 
@@ -44,10 +56,10 @@ def _build_romav2(args):
     model = RoMaV2(RoMaV2.Cfg(compile=False)).eval()
     model.apply_setting(args.setting)
     runner, target = model, model
-    if args.preset != "bf16":
+    if args.oracle:
         cal = FullFP8Calibration.load(ROMAV2_CALIBRATION)
         runner = FastFP8Model(model, cal, keep_bf16_modules=("refiners",))
-        apply_refiner_variant(runner.model, cal, _ROMAV2_VARIANTS[args.preset])
+        apply_refiner_variant(runner.model, cal, _ROMAV2_VARIANTS[args.oracle])
         target = runner.model
         del model
     if args.engine == "compile":
@@ -72,7 +84,8 @@ def _build_romav2(args):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--impl", choices=("flashim", "romav2"), default="flashim")
-    parser.add_argument("--preset", default="fp8", choices=("bf16", "int8", "fp8", "fp8-p8", "fp8-s4", "fp8-s42"))
+    parser.add_argument("--preset", default="fp8", choices=PRECISIONS)
+    parser.add_argument("--oracle", default="", choices=("", *_ROMAV2_VARIANTS), help="replaces --preset")
     parser.add_argument("--engine", default="compile", choices=("eager", "compile", "compile-full"))
     parser.add_argument("--setting", default="mega1500")
     parser.add_argument("--image-a", default=str(IMAGE_A))
@@ -82,6 +95,8 @@ def main() -> None:
     parser.add_argument("--attention", default="sdpa", choices=("sdpa", "sage", "sage-fp8"))
     parser.add_argument("--out", default="")
     args = parser.parse_args()
+    if args.impl == "romav2" and not args.oracle and args.preset != "bf16":
+        parser.error("--impl romav2 runs --preset bf16 or an --oracle FastFP8 variant")
 
     torch.manual_seed(0)
     torch.set_float32_matmul_precision("highest")
@@ -108,7 +123,7 @@ def main() -> None:
     times.sort()
     result = {
         "impl": args.impl,
-        "preset": getattr(model, "preset", args.preset),  # FP8 presets are replaced on a GPU without FP8
+        "preset": args.oracle or getattr(model, "preset", args.preset),  # fp8 is replaced without FP8
         "engine": args.engine,
         "setting": args.setting,
         "gpu": torch.cuda.get_device_name(),

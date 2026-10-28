@@ -30,14 +30,16 @@ flashim/
                methods/ (StaticMXFP8Linear = ops.mxfp8_linear bound to its weight, StaticInt8Linear),
                passes/ (structural fusions matched by layer type), apply.py (quantize_model)
   config.py    RunConfig: arch / precision / optimize / engine / inference / components; layered and hashable
-  build.py     ModelSpec + the generic builder every model goes through
+  build.py     ModelSpec + the generic builder every model goes through; flashim.load (the one loader), PRECISIONS
+  models/base.py
+               ImageMatcher / FeatureMatcher: the one match(a, b, *, resize, max_matches, threshold) -> Matches
   models/<m>/  model.py (pure nn.Module, calls ops only), config.py, weights.py, quant.py (presets and their
-               accuracy evidence), spec.py (ModelSpec), build.py (load_* keyword API = shim over build)
+               accuracy evidence), spec.py (ModelSpec)
   models/sparse.py, sparse_spec.py, weights_util.py
                shared by the sparse extractors (superpoint, alike, disk, xfeat, dedode(-g), dad, ripe, loftr,
                sift, orb): `SparseExtractor` base (resize, coordinate mapping, MNN matching, BN folding, compute
                dtype), `extractor_spec()` (the fp32 / bf16 / int8 / fp8 presets from a list of quantizable globs),
-               checkpoint lookup (`checkpoint=` / env var / torch hub folder, else download of the release
+               checkpoint lookup (`checkpoint` config key / env var / torch hub folder, else download of the release
                pinned by URL + SHA-256 in each model's `weights.py`)
   engines/     region torch.compile, CUDA-graph runner
 benchmarks/    speed/, accuracy/ (MegaDepth-1500, ScanNet-1500, HardMatch), profile/
@@ -63,11 +65,18 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   a private `_*_kernels.py` imported on first call (backend loading must stay cheap).
 - **Models are built by the builder.** Add behaviour as a named `Pass` in the model's `spec.py` (stage
   `pre_quant` / `post_quant`, `requires=` a platform predicate, `exact=`), never as a flag flipped by hand in a
-  loader. Presets are config overlays (`extends` allowed). The resolved config is `model.run_config`
-  (`model.config` is the architecture config in several models); what happened is `model.build_report`.
-  An FP8 preset names the preset built in its place on a GPU without FP8 in the spec's `fp8_fallbacks` (its INT8
-  counterpart; `tests/unit/test_config.py` fails for an FP8 preset without one). `flashim.build` applies it,
-  `flashim.resolve` without `platform=` does not.
+  loader. Presets are config overlays (`extends` allowed) named only `fp32` / `bf16` / `int8` / `fp8`
+  (`build.PRECISIONS`; `ModelSpec` rejects anything else): no `int8-full`-style variants. Configs kept for parity
+  or experiments are internal overlays (RoMaV2's `ORACLE_OVERLAYS`), not presets. A model without the asked
+  preset, and `fp8` on a GPU without FP8, build the nearest one (`build.NEAREST`: fp8 -> int8 -> bf16 -> fp32);
+  a pipeline's preset is every component's, each degrading on its own. `flashim.load` applies the FP8 fallback,
+  `flashim.resolve` without `platform=` does not. The resolved config is `model.run_config` (`model.config` is
+  the architecture config in several models); what happened is `model.build_report` (`fallbacks` included).
+- **One interface.** Load with `flashim.load(name, preset, *, device, engine, strict, calibration, config,
+  overrides)`; anything model-specific is a config key, never a new loader keyword or a per-model `load_*`.
+  Every image-pair model is an `ImageMatcher` (implement `_match`; detector/descriptor models get it from
+  `FeatureMatcher` via `extract` + `match_features`) and returns `flashim.Matches`; per-call defaults come from the
+  config's `inference` section (`match_defaults`).
 - **New models**: build from `flashim.layers` where the pattern fits so quantization/fusion apply for free; keep
   upstream parameter names so checkpoints load with `strict=True`; add a parity test against the upstream code.
 - Keep comments/docstrings at the density of the surrounding code; record *measured* reasons for design choices
@@ -94,7 +103,7 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   `scripts/calibrate_lightglue.py --extractor m`), add `tests/parity/<m>/test_parity.py`. Convolutions are quantized as
   im2col + GEMM (`quant/methods/conv2d.py`; groups == 1 only): measured *slower* than BF16 on the small nets here.
 - **Add a model**: `models/<m>/` with `model.py`, `weights.py`, `quant.py`, `spec.py` (register it in
-  `flashim/registry.py` `SPECS`), a `load_<m>` shim in `build.py` if a keyword API is wanted, CPU unit tests and a
+  `flashim/registry.py` `SPECS`), the model class an `ImageMatcher` / `FeatureMatcher`, CPU unit tests and a
   parity test against the oracle. `weights.py` pins each release as `Checkpoint(filename, url, sha256)` and loads it
   through `find_weights` (auto-download; add the module to `tests/unit/test_weights.py`).
 
@@ -107,9 +116,9 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   (`ruff check --fix` on a directory rewrote the user's uncommitted files once); preview with `--diff`.
 - **Refactors must be bit-identical**: run the same inference in a `git worktree` of the previous commit and in the
   working tree (`PYTHONPATH=<tree>`), compare output hashes and `ops.call_counts()` for several configs (RoMaV2
-  fp8 / int8 / bf16, RDD+LightGlue fp8 / int8, ALIKED+LightGlue, RaCo+ALIKED+LightGlue with
-  `extractor_preset="bf16"`). Make sure the path under test actually runs (check call counts: e.g.
-  `raco-aliked-lightglue`'s `preset` only sets LightGlue).
+  fp8 / int8 / bf16, RDD+LightGlue fp8 / int8, ALIKED+LightGlue, RaCo+ALIKED+LightGlue bf16). Make sure the
+  path under test actually runs (check call counts and `model.build_report.fallbacks`: a component without the
+  pipeline's preset builds another one).
 - **Accuracy changes** are accepted by task-level AUC, not tensor allclose: MegaDepth-1500 / ScanNet-1500, 3 seeds
   (17, 29, 42), AUC@5 drop < 0.005 vs the BF16 compile baseline (`benchmarks/accuracy/matrix.sh`); HardMatch
   mAA@10px for hard pairs. Compare numerics in eager in one process: `compile-full` is not reproducible across
@@ -130,7 +139,7 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   editable install), so keep the code importable on 3.10 (`typing.Self`, `tomllib`,
   `logging.getLevelNamesMapping` are 3.11+). Triton comes from PyPI (the L4T wheel has no `ptxas`). CUDA needs the
   user in the `video` *and* `render` groups (`/dev/nvmap`, `/dev/dri/renderD*`; without `render`: "Error 801").
-  No FP8 below sm_89: fp8 presets are replaced by INT8 ones (`fp8_fallbacks`). CPU results differ from x86 in the
+  No FP8 below sm_89: `fp8` is replaced by the nearest other preset (`build.NEAREST`). CPU results differ from x86 in the
   last ulp (OpenBLAS / FMA). Test suite there: 34 min cold (INT8 conv autotuning is 3-4 min per shape on its
   CPU), 2 min warm, the same failures as on x86. No kernel profiler there (CUPTI needs privileges): time ops with
   CUDA events (`results/orin/op_breakdown.py`).
@@ -163,7 +172,5 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
 
 ## Git
 
-- Work on a branch (`refactor/architecture` for the architecture work); commit only when asked.
-- `benchmarks/accuracy/run.py` has the user's uncommitted edits (threaded RANSAC, per-job cv2 seed): never revert or
-  commit it unless asked.
+- Work on a branch cut from `main`; commit only when asked.
 - Commit messages: what changed and why, plus how it was verified (bit-identical configs, test counts, timings).

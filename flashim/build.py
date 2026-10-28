@@ -11,15 +11,17 @@ Every model goes through the same stages, in this order::
     engine                                 per-kind setup + torch.compile of the spec's regions
     spec.apply_inference                   per-call defaults
 
-A pass whose platform requirement is not met is skipped (logged; ``optimize.strict`` raises instead). On a GPU without
-FP8 (below sm_89: Ampere, Jetson Orin) :func:`build` replaces an FP8 preset by the spec's ``fp8_fallbacks`` entry, its
-INT8 counterpart (see :func:`resolve`). The returned model carries ``model.run_config`` (the resolved
-:class:`RunConfig`: what is built) and ``model.build_report`` (:class:`BuildReport`: what actually happened).
+A pass whose platform requirement is not met is skipped (logged; ``optimize.strict`` raises instead). Presets are the
+four :data:`PRECISIONS`; a model without the one asked for, or an FP8 one on a GPU without FP8 (below sm_89: Ampere,
+Jetson Orin), builds the nearest it has (:data:`NEAREST`, see :func:`resolve`). The returned model carries
+``model.run_config`` (the resolved :class:`RunConfig`: what is built) and ``model.build_report`` (:class:`BuildReport`:
+what actually happened, the replaced presets included).
 """
 
 from __future__ import annotations
 
 import importlib
+import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +37,14 @@ from flashim.platforms import Feature, Platform, default_device, platform_for
 logger = get_logger("build")
 
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+
+# The presets every model chooses from: checkpoint precision, BF16 compute, static INT8 / MXFP8 quantization.
+PRECISIONS = ("fp32", "bf16", "int8", "fp8")
+# The preset built in place of one a model does not have, or of ``fp8`` on a GPU without FP8: the first of these the
+# model has. INT8 MMA is native from sm_75 on; measured on a Jetson AGX Orin (sm_87), where FP8 runs on the torch
+# references: RoMaV2 fp8 3334 ms against int8 1122 ms (bf16 1981 ms), LightGlue 209 against 56 ms, RDD (no INT8) fp8
+# 1151 ms against bf16 398 ms.
+NEAREST = {"fp8": ("int8", "bf16", "fp32"), "int8": ("bf16", "fp32"), "bf16": ("fp32",), "fp32": ("bf16",)}
 
 
 @dataclass(frozen=True)
@@ -66,15 +76,10 @@ class ModelSpec:
     role: Literal["dense", "extractor", "matcher", "pipeline"]
     description: str
     load: Callable[[RunConfig], nn.Module] | None
-    presets: Mapping[str, Mapping[str, Any]]
+    presets: Mapping[str, Mapping[str, Any]]  # a subset of PRECISIONS -> config overlay
     default_preset: str
     quant_configs: Mapping[str, Any] = field(default_factory=dict)  # name -> QuantConfig
     calibrations: Mapping[str, Path] = field(default_factory=dict)  # quant name -> default table
-    # FP8 preset -> the preset built in its place on a GPU without FP8: its INT8 counterpart (INT8 MMA is native from
-    # sm_75 on), BF16 where the model has none. Measured on a Jetson AGX Orin (sm_87), where FP8 runs on the torch
-    # references: RoMaV2 fp8 3334 ms against int8 (then int8-full) 1122 ms (bf16 1981 ms), LightGlue 209 against 56 ms, RDD fp8
-    # 1151 ms against bf16 398 ms.
-    fp8_fallbacks: Mapping[str, str] = field(default_factory=dict)
     protected: tuple[str, ...] = ()
     passes: Mapping[str, Pass] = field(default_factory=dict)
     engines: Mapping[str, EngineSpec] = field(default_factory=lambda: {"eager": EAGER})
@@ -84,6 +89,12 @@ class ModelSpec:
     validate: Callable[[RunConfig], None] | None = None
     # Composite models: build the components (``config.components``, already resolved) and combine them.
     compose: Callable[[RunConfig, Callable[[RunConfig], nn.Module]], nn.Module] | None = None
+
+    def __post_init__(self) -> None:
+        unknown = sorted(set(self.presets) - set(PRECISIONS))
+        if unknown or self.default_preset not in self.presets:
+            raise ValueError(f"{self.name}: presets must be among {PRECISIONS} and include the default, got "
+                             f"{sorted(self.presets)} (default {self.default_preset!r})")
 
     def check(self, config: RunConfig) -> None:
         unknown = [p for p in config.optimize.passes if p not in self.passes]
@@ -107,7 +118,7 @@ class BuildReport:
     skipped: dict[str, str] = field(default_factory=dict)  # skipped pass -> reason
     quant: dict[str, Any] | None = None
     emulated_quant: bool = False
-    fallbacks: dict[str, str] = field(default_factory=dict)  # model / component path -> "asked -> built" preset
+    fallbacks: dict[str, str] = field(default_factory=dict)  # model / component path -> "asked -> built (why)" preset
     compiled_regions: list[str] = field(default_factory=list)
     components: dict[str, BuildReport] = field(default_factory=dict)
 
@@ -168,17 +179,34 @@ def _keeps_fp8(user: Mapping[str, Any]) -> str | None:
     return next(filter(None, map(_keeps_fp8, (user.get("components") or {}).values())), None)
 
 
-def _fp8_fallback(spec: ModelSpec, preset: str, platform: Platform, keep: str | None) -> str:
-    """``preset``, or ``spec.fp8_fallbacks[preset]`` when ``platform`` is a GPU without FP8. The CPU keeps FP8: it has
-    no INT8 kernels either, and FP8 emulation there is how the numerics are checked without a GPU."""
-    fallback = spec.fp8_fallbacks.get(preset)
-    if fallback is None or platform.device_type == "cpu" or platform.supports(Feature.FP8_E4M3):
-        return preset
-    if keep is not None:
-        logger.warning("%s: no FP8 on %s, preset %r kept (%s)", spec.name, platform.describe(), preset, keep)
-        return preset
-    logger.warning("%s: no FP8 on %s, preset %r replaced by %r", spec.name, platform.describe(), preset, fallback)
-    return fallback
+def _nearest(spec: ModelSpec, preset: str, skip: str | None = None) -> str:
+    return next(p for p in (preset, *NEAREST[preset]) if p in spec.presets and p != skip)
+
+
+def _choose_preset(
+    spec: ModelSpec, preset: str, platform: Platform | None, keep: str | None, strict: bool, component: bool
+) -> tuple[str, str | None]:
+    """The preset built for ``preset`` and why it differs (``None``: it does not): the nearest one ``spec`` has
+    (``optimize.strict`` raises instead; logged at info level for a pipeline's ``component``, where it is the rule),
+    and on a GPU without FP8 the nearest non-FP8 one, unless ``keep``. The CPU keeps FP8: it has no INT8 kernels
+    either, and FP8 emulation there is how the numerics are checked without a GPU."""
+    if preset not in PRECISIONS:
+        raise ValueError(f"{spec.name}: unknown preset {preset!r}; choose from {PRECISIONS}")
+    built, reason, level = _nearest(spec, preset), None, logging.WARNING
+    if built != preset:
+        if strict:
+            raise ValueError(f"{spec.name}: no {preset!r} preset (optimize.strict); available: {sorted(spec.presets)}")
+        reason, level = f"{spec.name} has no {preset}", logging.INFO if component else logging.WARNING
+    if built == "fp8" and platform is not None and platform.device_type != "cpu" and not platform.supports(
+        Feature.FP8_E4M3
+    ):
+        if keep is not None:
+            logger.warning("%s: no FP8 on %s, preset 'fp8' kept (%s)", spec.name, platform.describe(), keep)
+        else:
+            built, reason, level = _nearest(spec, "fp8", skip="fp8"), f"no FP8 on {platform.describe()}", logging.WARNING
+    if reason is not None:
+        logger.log(level, "%s: preset %r replaced by %r (%s)", spec.name, preset, built, reason)
+    return built, reason
 
 
 def resolve(
@@ -188,35 +216,45 @@ def resolve(
     overrides: Iterable[str] | Mapping[str, Any] = (),
     *,
     platform: Platform | None = None,
+    fallbacks: dict[str, str] | None = None,
 ) -> RunConfig:
-    """Resolve ``name``'s ``preset`` (default: the spec's) + ``config`` (a RunConfig, dict or file) + dotted
-    ``overrides`` into a validated :class:`RunConfig`.
+    """Resolve ``name``'s ``preset`` (one of :data:`PRECISIONS`; default: the spec's) + ``config`` (a RunConfig, dict
+    or file) + dotted ``overrides`` into a validated :class:`RunConfig`.
 
-    With ``platform`` (:func:`build` passes the target device's), a preset that needs FP8 is replaced by the spec's
-    ``fp8_fallbacks`` entry when that platform is a GPU without FP8, here and in every component, unless the config
-    sets ``optimize.strict`` or passes a calibration table anywhere (:func:`_keeps_fp8`); ``preset`` of the result names
-    the preset that is built. Without ``platform`` the result does not depend on the machine: build it with
-    :func:`build_config` to run an FP8 preset emulated on such a GPU."""
-    user: dict[str, Any] = {}
+    The model, and every component of a pipeline (the pipeline's preset is each component's), builds the nearest
+    preset it has (:data:`NEAREST`; ``optimize.strict`` raises instead). With ``platform`` (:func:`load` passes the
+    target device's), ``fp8`` is also replaced on a GPU without FP8, unless the config sets ``optimize.strict`` or
+    passes a calibration table anywhere (:func:`_keeps_fp8`). ``preset`` of the result names the preset that is built;
+    ``fallbacks`` (a dict) collects ``path -> "asked -> built (why)"``. Without ``platform`` the result does not depend
+    on the machine: build it with :func:`build_config` to run an FP8 preset emulated on such a GPU."""
+    user = merge(_user_overlay(config), parse_overrides(overrides))
+    keep = None if platform is None else _keeps_fp8(user)
+    return _resolve(name, preset, user, platform, keep, False, "", fallbacks)
+
+
+def _user_overlay(config: RunConfig | Mapping[str, Any] | str | Path | None) -> dict[str, Any]:
     if isinstance(config, RunConfig):
-        user = config.to_dict()
-    elif isinstance(config, (str, Path)):
-        user = load_file(config)
-    elif config is not None:
-        user = dict(config)
-    user = merge(user, parse_overrides(overrides))
-    return _resolve(name, preset, user, platform, None if platform is None else _keeps_fp8(user))
+        return config.to_dict()
+    if isinstance(config, (str, Path)):
+        return load_file(config)
+    return dict(config) if config is not None else {}
 
 
-def _resolve(name: str, preset: str | None, user: dict[str, Any], platform: Platform | None, keep: str | None) -> RunConfig:
-    """``user``: everything layered over the preset (for a component: the pipeline preset's entry + the user's)."""
+def _resolve(
+    name: str, preset: str | None, user: dict[str, Any], platform: Platform | None, keep: str | None, strict: bool,
+    path: str, fallbacks: dict[str, str] | None,
+) -> RunConfig:
+    """``user``: everything layered over the preset (for a component: the pipeline preset's entry + the user's);
+    ``strict``: the pipeline's ``optimize.strict``, which its components inherit unless they set their own."""
     spec = get_spec(name)
     user.pop("model", None)
     preset = preset or user.pop("preset", None) or spec.default_preset
     user.pop("preset", None)
-    if platform is not None:
-        preset = _fp8_fallback(spec, preset, platform, keep)
-    data = merge(resolve_preset(spec.presets, preset), user)
+    strict = bool((user.get("optimize") or {}).get("strict", strict))
+    built, reason = _choose_preset(spec, preset, platform, keep, strict, component=bool(path))
+    if reason is not None and fallbacks is not None:
+        fallbacks[path or spec.name] = f"{preset} -> {built} ({reason})"
+    data = merge(resolve_preset(spec.presets, built), user)
     user_components = user.get("components") or {}
     for component, sub in (data.get("components") or {}).items():
         sub = dict(sub)
@@ -224,8 +262,12 @@ def _resolve(name: str, preset: str | None, user: dict[str, Any], platform: Plat
             if key in user and key not in (user_components.get(component) or {}):
                 sub[key] = merge(sub.get(key) or {}, user[key]) if isinstance(user[key], Mapping) else user[key]
         sub_name = sub.pop("model")
-        data["components"][component] = _resolve(sub_name, sub.pop("preset", None), sub, platform, keep).to_dict()
-    data.update(model=spec.name, preset=preset)
+        data["components"][component] = _resolve(
+            sub_name, sub.pop("preset", None), sub, platform, keep, strict, f"{path}.{component}".lstrip("."), fallbacks
+        ).to_dict()
+    if strict:
+        data = merge(data, {"optimize": {"strict": True}})
+    data.update(model=spec.name, preset=built)
     resolved = RunConfig.from_dict(data)
     spec.check(resolved)
     return resolved
@@ -299,7 +341,7 @@ def _apply_engine(model: nn.Module, ctx: BuildContext) -> None:
 
 
 def build_config(config: RunConfig) -> nn.Module:
-    """Build a model from a resolved config (see :func:`resolve`)."""
+    """Build a model from a resolved config (see :func:`resolve`; no preset is replaced here)."""
     spec = get_spec(config.model)
     spec.check(config)
     if config.optimize.ops:
@@ -332,6 +374,12 @@ def build_config(config: RunConfig) -> nn.Module:
         _apply_engine(model, ctx)
     if spec.apply_inference is not None:
         spec.apply_inference(model, config.inference)
+    if hasattr(model, "match_defaults"):  # an ImageMatcher: per-call defaults from the inference section
+        from flashim.models.base import MATCH_OPTIONS
+
+        model.match_defaults = {
+            **type(model).match_defaults, **{k: v for k, v in config.inference.items() if k in MATCH_OPTIONS}
+        }
     model.run_config = config
     model.build_report = report
     for attr, value in (("preset", config.preset), ("engine", config.engine.kind)):
@@ -340,29 +388,45 @@ def build_config(config: RunConfig) -> nn.Module:
     return model
 
 
-def build(
+def load(
     name: str,
     preset: str | None = None,
     *,
+    device: torch.device | str | None = None,
+    engine: str | None = None,
+    strict: bool | None = None,
+    calibration: str | Path | Any | None = None,
     config: RunConfig | Mapping[str, Any] | str | Path | None = None,
     overrides: Iterable[str] | Mapping[str, Any] = (),
 ) -> nn.Module:
-    """``resolve`` for the target device's platform + ``build_config``: e.g. ``build("romav2", "fp8",
-    overrides=["engine.kind=compile-full"])``. Presets the platform replaced are in ``model.build_report.fallbacks``."""
-    overrides = overrides if isinstance(overrides, Mapping) else list(overrides)
-    asked = resolve(name, preset, config, overrides)
-    built = resolve(name, preset, config, overrides, platform=platform_for(asked.device or default_device()))
-    model = build_config(built)
-    model.build_report.fallbacks = _preset_changes(asked, built)
+    """Load a registered model: ``preset`` (``fp32`` / ``bf16`` / ``int8`` / ``fp8``; default: the model's) + ``config``
+    (a :class:`RunConfig`, dict or .toml / .json / .yaml file) + dotted ``overrides`` + these keyword arguments (later
+    layers win), resolved for the target device's platform (:func:`resolve`) and built (:func:`build_config`), e.g.
+    ``load("romav2", "fp8", engine="compile", overrides={"arch.setting": "mega1500"})``.
+
+    ``device`` / ``engine`` / ``strict`` apply to every component of a pipeline; ``calibration`` (a table path or a
+    loaded table) only to single models (a component's: ``components.<name>.precision.calibration``). Presets the model
+    or the platform replaced are in ``model.build_report.fallbacks``."""
+    overlay: dict[str, Any] = {}
+    if device is not None:
+        overlay["device"] = str(device)
+    if engine is not None:
+        overlay["engine"] = {"kind": engine}
+    if strict is not None:
+        overlay["optimize"] = {"strict": strict}
+    if calibration is not None:
+        if get_spec(name).compose is not None:
+            raise ValueError(f"{name}: pass a component's calibration (components.<name>.precision.calibration)")
+        if isinstance(calibration, (str, Path)):
+            overlay["precision"] = {"calibration": str(calibration)}
+        else:  # an already-loaded table
+            overlay = merge(overlay, {"optimize": {"options": {"calibration_table": calibration}}})
+    user = merge(merge(_user_overlay(config), parse_overrides(overrides)), overlay)
+    fallbacks: dict[str, str] = {}
+    platform = platform_for(user.get("device") or default_device())
+    model = build_config(resolve(name, preset, user, platform=platform, fallbacks=fallbacks))
+    model.build_report.fallbacks = fallbacks
     return model
-
-
-def _preset_changes(asked: RunConfig, built: RunConfig, path: str = "") -> dict[str, str]:
-    changes = {} if asked.preset == built.preset else {path or asked.model: f"{asked.preset} -> {built.preset}"}
-    for name, component in built.components.items():
-        if name in asked.components:
-            changes.update(_preset_changes(asked.components[name], component, f"{path}.{name}".lstrip(".")))
-    return changes
 
 
 def dtype(name: str) -> torch.dtype:

@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim.models.base import FeatureMatcher
 from flashim.models.rdd import keypoints as kp
 from flashim.models.rdd import weights
 from flashim.models.rdd.backbone import ConvNeXt
@@ -14,7 +15,7 @@ from flashim.models.rdd.detector import Detector
 from flashim.models.rdd.transformer import DeformableTransformer
 from flashim.models.romav2.model import ImageLike, load_image
 from flashim.platforms import default_device
-from flashim.types import SparseFeatures, SparseMatchResult
+from flashim.types import Matches, SparseFeatures
 from flashim.utils import device_constant
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -40,7 +41,7 @@ def target_size(height: int, width: int, long_side: int | None) -> tuple[int, in
     return (height // 32) * 32, (width // 32) * 32
 
 
-class RDD(nn.Module):
+class RDD(FeatureMatcher, nn.Module):
     """``detector`` (score map) and ``backbone`` -> ``input_proj`` -> ``transformer`` (descriptor map).
 
     Module paths follow the RDD checkpoint after :func:`weights.convert_state_dict`, so it loads strictly and
@@ -175,23 +176,9 @@ class RDD(nn.Module):
     @torch.inference_mode()
     def match_features(
         self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None
-    ) -> SparseMatchResult:
+    ) -> Matches:
         cfg = self.config
         ia, ib, conf = kp.dual_softmax_match(
             a.descriptors[0], b.descriptors[0], cfg.match_inv_temperature, cfg.match_threshold if threshold is None else threshold
         )
-        return SparseMatchResult(a.keypoints[0][ia], b.keypoints[0][ib], conf, ia, ib)
-
-    @torch.inference_mode()
-    def match(
-        self,
-        img_a: ImageLike,
-        img_b: ImageLike,
-        *,
-        resize: int | None = None,
-        top_k: int | None = None,
-        threshold: float | None = None,
-    ) -> SparseMatchResult:
-        a = self.extract(img_a, resize=resize, top_k=top_k)
-        b = self.extract(img_b, resize=resize, top_k=top_k)
-        return self.match_features(a, b, threshold)
+        return Matches(a.keypoints[0][ia], b.keypoints[0][ib], conf, ia, ib)

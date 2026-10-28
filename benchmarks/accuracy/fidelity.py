@@ -75,7 +75,7 @@ def evaluate(model_name: str, presets: list[str], image_pairs: list[tuple[str, s
         stats: dict[str, list[float]] = {"kp_overlap": [], "desc_cos": [], "match_agree": [], "match_ratio": []}
         for index, (pa, pb) in enumerate(image_pairs):
             if pair_level:
-                r = model.match(pa, pb, resize=resize, top_k=top_k or None)
+                r = model.match(pa, pb, resize=resize, max_matches=top_k or None)
                 ours = (r.keypoints_A, r.keypoints_B)
                 feats = None
             else:

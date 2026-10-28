@@ -47,7 +47,7 @@ def test_fp32_matches_cvg_lightglue(upstream, variant):
         extractor = flashim.load(extractor_name, "fp32")
         with torch.inference_mode():
             a, b = (extractor.extract(str(path), resize=1024, top_k=2048) for path in IMAGES)
-        ours = flashim.build("lightglue", "fp32", config={"variant": variant})
+        ours = flashim.load("lightglue", "fp32", config={"variant": variant})
         oracle = upstream(features=None, input_dim=input_dim, depth_confidence=-1, width_confidence=-1, flash=False)
         state = torch.load(checkpoint, map_location="cpu", weights_only=True)
         for i in range(oracle.conf.n_layers):  # upstream's renaming of pre-``transformers.N`` keys
