@@ -16,7 +16,7 @@ from flashim.log import set_verbosity
 from flashim.registry import SPECS as _SPECS  # noqa: F401  (registers the models)
 from flashim.types import DenseMatchResult, Matches, SparseFeatures
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 
 def available_models() -> dict[str, str]:

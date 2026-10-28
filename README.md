@@ -136,10 +136,17 @@ The layout and op dispatch are described in [docs/architecture.md](https://githu
 
 ## License
 
-FlashIM is released under the Apache License 2.0 ([LICENSE](https://github.com/lnexenl/FlashIM/blob/main/LICENSE)). Vendored third-party code and assets keep their own licenses
-([THIRD_PARTY_NOTICES.md](https://github.com/lnexenl/FlashIM/blob/main/THIRD_PARTY_NOTICES.md), `licenses/`, `tests/oracles/`). Model weights are downloaded, not distributed with FlashIM, and are
-covered by their upstream licenses, which can be more restrictive than Apache-2.0; for example, the DINOv3 weights inside the RoMaV2 checkpoint are
-covered by the DINOv3 License.
+FlashIM is released under the Apache License 2.0 ([LICENSE](https://github.com/lnexenl/FlashIM/blob/main/LICENSE)), with two exceptions inside the package:
+
+- code ported from [RoMaV2](https://github.com/Parskatt/RoMaV2) (the RoMaV2 model and several Triton kernels) is under
+  RoMaV2's MIT license ([`licenses/RoMaV2-MIT.txt`](https://github.com/lnexenl/FlashIM/blob/main/licenses/RoMaV2-MIT.txt));
+- `flashim/models/romav2/dinov3.py` and `dpt.py` follow DINOv3 / DPT code by Meta that RoMaV2 includes, under the
+  DINOv3 License Agreement ([`licenses/DINOv3-License.md`](https://github.com/lnexenl/FlashIM/blob/main/licenses/DINOv3-License.md)).
+
+The package's license expression is therefore `Apache-2.0 AND MIT AND LicenseRef-DINOv3`. Model weights are downloaded
+from their publishers, never shipped, and keep their upstream licenses, some more restrictive than Apache-2.0: the RoMaV2
+checkpoint contains DINOv3 weights (DINOv3 License), SuperPoint and RIPE are for non-commercial use only. Details, and
+the licenses of vendored test code and assets: [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl/FlashIM/blob/main/THIRD_PARTY_NOTICES.md).
 
 <p align="center">
   <img alt="" src="https://raw.githubusercontent.com/lnexenl/FlashIM/main/assets/brand/mark-pair.svg" width="64" height="64">&nbsp;&nbsp;

@@ -1,9 +1,11 @@
 [project]
 name = "flashim"
-version = "0.0.1"
+version = "0.1.0"
 description = "FlashIM: fast, quantized, multi-platform inference for image matching"
 readme = "README.md"
-license = "Apache-2.0"
+# FlashIM is Apache-2.0; code ported from RoMaV2 is MIT, the DINOv3 / DPT code it took from Meta is under the DINOv3
+# License (THIRD_PARTY_NOTICES.md, licenses/)
+license = "Apache-2.0 AND MIT AND LicenseRef-DINOv3"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*"]
 authors = [{ name = "lnexenl" }]
 keywords = ["image matching", "feature matching", "quantization", "fp8", "int8", "triton", "pytorch"]
