@@ -104,6 +104,10 @@ class RaCoALIKED(_RaCoBase):
         self.raco, self.aliked = raco, aliked
         self.concurrent = False  # overlap the independent CNNs on CUDA streams (measured no gain at 1024^2)
 
+    @torch.inference_mode()
+    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
+        return self.aliked.match_features(a, b, threshold)
+
     def _side_streams(self, device: torch.device) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
         streams = getattr(self, "_streams_", None)
         if streams is None:

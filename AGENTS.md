@@ -109,9 +109,11 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
 
 ## Verifying changes
 
-- Tests: `.venv/bin/python -m pytest -q -p no:cacheprovider tests` (~3.5 min on the RTX 5070 Ti). Known failing
-  before the refactor: `tests/parity/test_lightglue_parity.py::test_reduced_precision_tracks_fp32[fp8]`.
-  Markers: `cuda`, `sm120`, `weights`, `oracle`, `slow`.
+- Tests: `.venv/bin/python -m pytest -q -p no:cacheprovider tests` (~3.5 min on the RTX 5070 Ti; without a GPU:
+  `-m "not cuda"`). `tests/parity/test_lightglue_parity.py::test_reduced_precision_tracks_fp32[fp8]` is an xfail
+  (MXFP8 noise at its 0.9 threshold). The vendored LightGlue oracles turn off flash SDPA and set
+  `cudnn.deterministic` for the whole process; `tests/conftest.py` restores both after every test, so results do not
+  depend on test order. Markers: `cuda`, `sm120`, `weights`, `oracle`, `slow`.
 - Lint: `.venv/bin/ruff check flashim tests` (line length 110). **Only `--fix` files you changed**
   (`ruff check --fix` on a directory rewrote the user's uncommitted files once); preview with `--diff`.
 - **Refactors must be bit-identical**: run the same inference in a `git worktree` of the previous commit and in the

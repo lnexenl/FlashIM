@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from flashim.ops._registry import Op
+from flashim.utils import grid_sample
 
 
 def local_window(radius: int, h: int, w: int, device: torch.device) -> Tensor:
@@ -31,7 +32,7 @@ def _local_corr_reference(feature0: Tensor, feature1: Tensor, warp: Tensor, radi
     corr = torch.empty((batch, k, h, w), device=feature0.device, dtype=feature0.dtype)
     for b in range(batch):
         coords = (warp[b, :, :, None] + window[:, None, None]).reshape(1, h, w * k, 2)
-        sampled = F.grid_sample(
+        sampled = grid_sample(
             feature1[b : b + 1], coords, padding_mode="zeros", align_corners=False, mode="bilinear"
         ).reshape(channels, h, w, k)
         corr[b] = (feature0[b, ..., None] / channels**0.5 * sampled).sum(dim=0).permute(2, 0, 1)

@@ -14,10 +14,10 @@ Public presets (what ``flashim.load("romav2", preset)`` is documented to take):
   calibrated activation scales, fused MXFP8 stride-4 and stride-2 refiner blocks (dynamic MXFP8 pointwise) and
   the same FlashIM refiner kernels as ``int8``. Not RoMaV2-exact.
 
-Oracle presets (``ORACLE_PRESETS``: kept for the parity tests and the comparison with RoMaV2's own FastFP8
-runtime, not meant for use): ``fp8-p8`` is RoMaV2 "P8" (transformer linears only, SDPA attention and refiners
-BF16), ``fp8-s4`` adds fused stride-4 refiner blocks, ``fp8-s42`` stride-4 and stride-2 (RoMaV2's
-``s4_fused_s2_fused``); all bit-identical to the oracle.
+Oracle configs (``ORACLE_PRESETS``, loaded as ``spec.ORACLE_OVERLAYS`` config overlays, not presets: kept for the
+parity tests and the comparison with RoMaV2's own FastFP8 runtime): ``fp8-p8`` is RoMaV2 "P8" (transformer linears
+only, SDPA attention and refiners BF16), ``fp8-s4`` adds fused stride-4 refiner blocks, ``fp8-s42`` stride-4 and
+stride-2 (RoMaV2's ``s4_fused_s2_fused``); all bit-identical to the oracle.
 
 Accuracy evidence for these configurations (RoMaV2 P8 reports, RTX 5070 Ti,
 3 seeds, AUC@5 delta vs BF16): ``fp8-p8`` Mega -0.0025 / ScanNet -0.0011;

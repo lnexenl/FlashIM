@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from flashim.utils import device_constant
+from flashim.utils import device_constant, grid_sample
 
 
 def simple_nms(scores: Tensor, radius: int) -> Tensor:
@@ -84,7 +84,7 @@ def detect_keypoints(
         dispersity = (weight * dist2).sum(dim=1) / weight.sum(dim=1)
 
         xy = (nms_xy + residual) / wh * 2 - 1
-        score = F.grid_sample(score_map[b_idx : b_idx + 1], xy.view(1, 1, -1, 2), mode="bilinear", align_corners=True)[0, 0, 0]
+        score = grid_sample(score_map[b_idx : b_idx + 1], xy.view(1, 1, -1, 2), mode="bilinear", align_corners=True)[0, 0, 0]
 
         keypoints.append(xy)
         kptscores.append(score)

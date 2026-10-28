@@ -37,7 +37,7 @@ The reason is speed. RoMaV2 on a Jetson AGX Orin, eager, per pair:
 |---|---|
 | `fp8`, emulated | 3.3 s |
 | `bf16` | 2.0 s |
-| `int8-full` (an earlier preset; today's `int8` adds the fast refiner kernels) | 1.1 s |
+| `int8` (measured before the fast refiner kernels it has today) | 1.1 s |
 
 ### Keeping FP8
 

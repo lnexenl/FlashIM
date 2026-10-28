@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from flashim.utils import device_constant
+from flashim.utils import device_constant, grid_sample
 
 
 def simple_nms(scores: Tensor, radius: int) -> Tensor:
@@ -55,7 +55,7 @@ def detect_keypoints(
     keypoints = torch.stack((xs, ys), dim=-1).float() + residual
 
     norm = keypoints / device_constant([w - 1, h - 1], keypoints) * 2 - 1
-    scores = F.grid_sample(score_map, norm[:, None], mode="bilinear", align_corners=True)[:, 0, 0]
+    scores = grid_sample(score_map, norm[:, None], mode="bilinear", align_corners=True)[:, 0, 0]
     return keypoints, scores
 
 
@@ -64,7 +64,7 @@ def sample_descriptors(features: Tensor, keypoints: Tensor, height: int, width: 
     image, L2-normalized: ``[B, K, C]``."""
     scale = device_constant([width, height], keypoints)
     grid = ((2.0 * keypoints + 1.0) / scale - 1.0)[:, :, None].to(features.dtype)
-    sampled = F.grid_sample(features, grid, mode="bicubic", align_corners=False)
+    sampled = grid_sample(features, grid, mode="bicubic", align_corners=False)
     return F.normalize(sampled.permute(0, 2, 3, 1).squeeze(-2), dim=-1)
 
 

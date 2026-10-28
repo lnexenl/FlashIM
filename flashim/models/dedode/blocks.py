@@ -18,6 +18,7 @@ from flashim import ops
 from flashim.layers import IndexedSeparableConvBlock, fused_relu_end, sequential_forward
 from flashim.layers.conv import chains
 from flashim.layers.transformer import TransformerBlock
+from flashim.utils import grid_sample
 
 VGG_CUT = {"11": (tvm.vgg11_bn, 22), "13": (tvm.vgg13_bn, 28), "19": (tvm.vgg19_bn, 40)}
 
@@ -250,7 +251,7 @@ class DeDoDeNet(nn.Module):
         delta = out_conv(pixels[..., None])[0, :prototypes, :, 0].float()  # [P, 4K]
         grid = torch.stack(((xi + 0.5) * 2 / width - 1, (yi + 0.5) * 2 / height - 1), -1).reshape(1, 1, -1, 2)
         mode = self.config.interpolation
-        previous = F.grid_sample(
+        previous = grid_sample(
             previous, grid.to(previous.dtype), mode=mode, padding_mode="border", align_corners=False
         )[0, :, 0]  # [P, 4K]
         values = (previous + delta).reshape(prototypes, -1, 4)

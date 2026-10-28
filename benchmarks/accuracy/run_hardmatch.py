@@ -52,7 +52,7 @@ def _git(*args: str) -> str:
     try:
         return subprocess.run(["git", *args], cwd=Path(__file__).parent, capture_output=True, text=True,
                               check=True).stdout.strip()
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):
         return ""
 
 
@@ -61,7 +61,7 @@ def main() -> None:
     parser.add_argument("--model", default="romav2")
     parser.add_argument("--preset", default="fp8")
     parser.add_argument("--engine", default="compile-full", choices=("eager", "compile", "compile-full"))
-    parser.add_argument("--setting", default="wxbs", help="RoMaV2 resolution preset (wxbs: 800 LR + 1024 HR)")
+    parser.add_argument("--setting", default="wxbs", help="RoMaV2 resolution setting (wxbs: 800 LR + 1024 HR)")
     parser.add_argument("--num-samples", type=int, default=5000)
     parser.add_argument("--split", default="test", choices=("test", "val"))
     parser.add_argument("--data-root", default=str(DEFAULT_ROOT))

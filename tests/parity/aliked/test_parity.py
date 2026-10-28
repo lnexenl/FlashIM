@@ -55,8 +55,11 @@ def _oracle(oracle_module, variant: str):
 
 @torch.inference_mode()
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_dense_maps_and_sparse_features_match_reference(oracle_module, variant):
+def test_dense_maps_and_sparse_features_match_reference(oracle_module, variant, monkeypatch):
     from flashim.models.aliked import ALIKED
+
+    if not torch.cuda.is_available():  # the reference's forward times itself with torch.cuda.synchronize()
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
 
     oracle = _oracle(oracle_module, variant)
     ours = ALIKED.from_pretrained(variant=variant, checkpoint=weights.find_checkpoint(variant), device="cpu")

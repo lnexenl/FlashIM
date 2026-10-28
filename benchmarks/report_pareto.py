@@ -144,7 +144,7 @@ def main() -> None:
 
     frontier = pareto_frontier(points)
     if frontier:
-        fx, fy, flabels = zip(*frontier)
+        fx, fy, _flabels = zip(*frontier)
         ax.plot(fx, fy, color="black", linewidth=1.2, linestyle="--", zorder=2, label="Pareto frontier")
         if not args.label_all:
             for x, y, label in frontier:

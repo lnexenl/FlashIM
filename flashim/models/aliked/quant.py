@@ -6,9 +6,9 @@
 
 No quantized preset by default: investigated and not shipped as one. ALIKED has no ``nn.Linear`` layers,
 and the existing quantization infrastructure otherwise only targets 1x1 ``nn.Conv2d`` (INT8); ALIKED's 1x1
-convs (``conv1..4``, the ``downsample``s, ``desc_head.sf_conv``) are all K/N <= 128 — RDD's ``fp8-backbone``
-preset already measured that class of GEMM (small-K, memory-bound) *slower* to quantize than to leave in
-BF16 (see ``flashim/models/rdd/quant.py``); ALIKED's are smaller still, so this wasn't re-measured.
+convs (``conv1..4``, the ``downsample``s, ``desc_head.sf_conv``) are all K/N <= 128 — RDD's ConvNeXt MLPs (a
+former ``fp8-backbone`` preset) already measured that class of GEMM (small-K, memory-bound) *slower* to quantize
+than to leave in BF16 (see ``flashim/models/rdd/quant.py``); ALIKED's are smaller still, so this wasn't re-measured.
 
 ``deform_quant.QuantizedDeformableConv2d`` *was* built and measured: an INT8 GEMM over the deformable
 convs' gathered receptive-field patches (``ops.deform_patches_int8``, a fused Triton gather+quantize
@@ -22,10 +22,10 @@ strides across ``H*W``-sized planes (no coalescing at all). Converting ``x`` to 
 Triton kernel* (so a pixel's channels are contiguous) fixed most of it: on an RTX 5070 Ti, ``batch=1`` is
 now ~20% slower (was 35%; whole-model ``extract()`` difference is noise-level, ~2%), and it's a clear
 **win** at ``batch>=4`` (25-39% faster, growing with batch — FP32's `deform_conv2d` scales worse per-image
-than the now-coalesced INT8 path). Kept opt-in (``load_aliked``'s ``deform_int8_calibration``): worth it for
-batched workloads, not for ALIKED's typical single-image ``extract()``.
+than the now-coalesced INT8 path). Kept opt-in (the ``deform_int8`` pass, option ``deform_int8_calibration``):
+worth it for batched workloads, not for ALIKED's typical single-image ``extract()``.
 
-See ``fuse.fold_batchnorm`` and ``build.load_aliked`` for the optimizations that *did* measure faster
+See ``fuse.fold_batchnorm`` and the passes in ``spec.py`` for the optimizations that *did* measure faster
 (BatchNorm folding: ~30% faster; ``channels_last``: measured slower, kept opt-in only).
 """
 

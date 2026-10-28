@@ -53,7 +53,7 @@ def _pose_error(seed: int, kpts1, kpts2, K1, K2, R, t) -> float:
         R_est, t_est, _ = estimate_pose_cv2_ransac(kpts1, kpts2, K1, K2, norm_threshold, conf=0.99999)
         e_t, e_R = compute_pose_error(R_est, t_est[:, 0], R, t)
         return max(e_t, e_R)
-    except Exception as exc:  # degenerate geometry counts as a failure (90 degrees)
+    except Exception as exc:  # noqa: BLE001 -- degenerate geometry counts as a failure (90 degrees)
         logger.debug("pose estimation failed: %s", exc)
         return 90.0
 
@@ -179,7 +179,7 @@ def scannet1500(model, data_root: Path, pool: PosePool, max_pairs: int, loader: 
 def _git(cwd: Path, *args: str) -> str:
     try:
         return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):
         return ""
 
 
@@ -220,7 +220,7 @@ def main() -> None:
     started = time.time()
     run = mega1500 if args.dataset == "mega1500" else scannet1500
     pool = PosePool(args.workers)
-    pairs = run(model, data_root, pool, args.max_pairs, dict(workers=args.loaders, depth=args.prefetch))
+    pairs = run(model, data_root, pool, args.max_pairs, {"workers": args.loaders, "depth": args.prefetch})
     errors = pool.errors()  # drains the queue; GPU stage is already finished
     result = {
         "dataset": args.dataset,

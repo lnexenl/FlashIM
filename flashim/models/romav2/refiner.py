@@ -53,7 +53,7 @@ class ConvRefiner(nn.Module):
         self.disp_emb = nn.Conv2d(2, cfg.disp_emb_dim, 1)
         self.warp_head = nn.Conv2d(channels, 2, 1)
         self.confidence_head = nn.Conv2d(channels, cfg.confidence_dim, 1)
-        # Set by ``load_romav2`` with the BN fold (channels-last weights and block1 input).
+        # Set by the ``fold_refiners`` pass with the BN fold (channels-last weights and block1 input).
         self.channels_last = False
         # Build block1's input with one fused op (BF16 output; not RoMaV2-bit-exact).
         self.fused_input = False

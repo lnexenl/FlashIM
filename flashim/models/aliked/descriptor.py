@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from flashim.utils import device_constant
+from flashim.utils import device_constant, grid_sample
 
 
 def sample_patches(features: Tensor, corners: Tensor, size: int) -> Tensor:
@@ -62,7 +62,7 @@ class SDDH(nn.Module):
 
         pos = kpts_wh.unsqueeze(1) + offset  # [N, n_pos, 2]
         pos = (2.0 * pos / wh[None] - 1).reshape(1, num_kpts * self.n_pos, 1, 2)
-        sampled = F.grid_sample(features.unsqueeze(0), pos, mode="bilinear", align_corners=True)  # [1, C, N*n_pos, 1]
+        sampled = grid_sample(features.unsqueeze(0), pos, mode="bilinear", align_corners=True)  # [1, C, N*n_pos, 1]
         sampled = sampled.reshape(c, num_kpts, self.n_pos, 1).permute(1, 0, 2, 3)  # [N, C, n_pos, 1]
 
         sampled = torch.selu(self.sf_conv(sampled)).squeeze(-1)  # [N, C, n_pos]

@@ -45,9 +45,11 @@ Every learned model is a native PyTorch port that is checked against its upstrea
 | `int8` | INT8 with symmetric per-output-channel weights and one calibrated scale per activation tensor |
 | `fp8` | MXFP8: FP8 (E4M3) values with one power-of-two (E8M0) scale per 32 elements |
 
-**Engines** (`eager`, `compile`) are separate from presets: any preset runs with either ([configuration](configuration.md)).
+**Engines** (`eager`, `compile`; RoMaV2 also `compile-full`) are separate from presets: any preset runs with any of
+them ([configuration](configuration.md)).
 
-**Pipelines.** A pipeline's preset sets LightGlue's precision only. The extractor keeps its own default (`fp32`; `fp8`
-for RDD) unless you set `components.extractor.preset` ([configuration.md](configuration.md)).
+**Pipelines.** A pipeline's preset is every component's, and each builds the nearest one it has: `aliked-lightglue`
+`int8` runs ALIKED in `bf16` and LightGlue in `int8`. `components.extractor.preset` sets the extractor's on its own
+([configuration.md](configuration.md)).
 
-**GPUs without FP8** build the INT8 counterpart of an FP8 preset ([platforms.md](platforms.md)).
+**GPUs without FP8** build the nearest other preset in place of `fp8` (`int8`, else `bf16`) ([platforms.md](platforms.md)).

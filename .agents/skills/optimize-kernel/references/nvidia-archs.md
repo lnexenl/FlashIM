@@ -52,8 +52,9 @@ Run on a Jetson AGX Orin (sm_87, aarch64, JetPack 6.2, Triton 3.6; 2026-10-07): 
 kernels and the CUDA C++ `raco_resblock` pass their tests against the references there. `tl.dot` lowers to `mma.sync`
 m16n8k16 (BF16) and m16n8k32 (INT8). Triton refuses `tl.float8e4nv` outright ("not supported in this architecture"),
 so a kernel that only *writes* E4M3 (a quantize producer) needs `requires=[Feature.FP8_E4M3]` as much as an FP8 MMA
-does. FP8 presets are therefore replaced by their INT8 counterparts on such GPUs (`ModelSpec.fp8_fallbacks`): on the
-torch references RoMaV2 `fp8` took 3334 ms per pair there, `int8-full` 1122 ms, `bf16` 1981 ms.
+does. `fp8` is therefore replaced by the nearest other preset on such GPUs (`build.NEAREST`: `int8`, else `bf16`): on
+the torch references RoMaV2 `fp8` took 3334 ms per pair there, INT8 (the `int8-full` preset of the time) 1122 ms, `bf16`
+1981 ms.
 
 Launch choices measured there (timing with CUDA events only: CUPTI refuses unprivileged users, so no ncu and no
 `torch.profiler` kernel times; `results/orin/op_breakdown.py` times every dispatched op with a synchronize instead):
@@ -67,8 +68,8 @@ Launch choices measured there (timing with CUDA events only: CUPTI refuses unpri
   The conv kernels now keep their timings in Triton's cache (`cache_results`, keyed by architecture): first forward
   12.5 -> 2.7 s; `FLASHIM_AUTOTUNE_CACHE=0` re-times.
 - `engine=compile` works (Inductor warns "Not enough SMs to use max_autotune_gemm mode": 16 SMs) and buys little once
-  the fused kernels are in: RoMaV2 `int8-fast-vgg` 667 -> 655 ms (188 s of compilation), SuperPoint `bf16` 64.9 ->
-  58.9 ms, `int8` 48.5 -> 46.1 ms. `compile-full` was not run there.
+  the fused kernels are in: RoMaV2 INT8 (the `int8-fast-vgg` preset of the time) 667 -> 655 ms (188 s of
+  compilation), SuperPoint `bf16` 64.9 -> 58.9 ms, `int8` 48.5 -> 46.1 ms. `compile-full` was not run there.
 - Memory-bound elementwise chains are slow next to fused kernels (LPDDR5 shared with the CPU): DINOv3's upstream
   RoPE math 1.54 ms per call against 0.46 ms for the fused `rope_qk` kernel (RoMaV2's `fused_rope` pass).
 

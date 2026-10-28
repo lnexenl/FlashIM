@@ -82,7 +82,7 @@ def _sparse_pose_error(estimator: str, pixel_thr: float, seed: int, kpts1, kpts2
             R_est, t_est, _ = estimate_pose_cv2_ransac(kpts1, kpts2, K1, K2, norm, conf=0.99999)
         e_t, e_R = compute_pose_error(R_est, t_est[:, 0], R, t)
         return max(e_t, e_R)
-    except Exception as exc:  # degenerate geometry / no model found counts as a failure (90 degrees)
+    except Exception as exc:  # noqa: BLE001 -- degenerate geometry / no model found counts as a failure (90 degrees)
         logger.debug("pose estimation failed: %s", exc)
         return 90.0
 

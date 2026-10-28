@@ -28,6 +28,7 @@ from torch import Tensor
 
 from flashim.ops._registry import Op
 from flashim.ops.correlation import local_corr
+from flashim.utils import grid_sample
 
 # -- refiner input: [f_a, warp(f_b), disp_emb, local_corr] ---------------------------------------
 
@@ -52,7 +53,7 @@ def _refiner_input_reference(
     _, h, w, _ = f_a.shape
     f_a_nchw = f_a.permute(0, 3, 1, 2)
     f_b_nchw = f_b.permute(0, 3, 1, 2)
-    f_ba = F.grid_sample(f_b_nchw, warp, mode="bilinear", align_corners=False)
+    f_ba = grid_sample(f_b_nchw, warp, mode="bilinear", align_corners=False)
     grid_1d = [torch.linspace(-1 + 1 / n, 1 - 1 / n, n, device=f_a.device) for n in (h, w)]
     gy, gx = torch.meshgrid(*grid_1d, indexing="ij")
     displacement = (warp - torch.stack((gx, gy), dim=-1)[None]).permute(0, 3, 1, 2)

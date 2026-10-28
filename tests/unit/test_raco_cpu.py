@@ -72,3 +72,6 @@ def test_extractor_and_alignment_error():
         extractor.extract(torch.rand(1, 3, 50, 60))
     resized = extractor.extract(torch.rand(1, 3, 50, 60), resize=64, top_k=16)
     assert resized.image_size == (50, 60)
+    matches = extractor.match(torch.rand(1, 3, 64, 96), torch.rand(1, 3, 64, 96), max_matches=16)
+    assert matches.keypoints_A.shape == matches.keypoints_B.shape and len(matches) <= 16
+    assert matches.features_A.keypoints.shape == (1, 16, 2)

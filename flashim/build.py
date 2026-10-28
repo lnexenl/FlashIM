@@ -79,7 +79,7 @@ class ModelSpec:
     presets: Mapping[str, Mapping[str, Any]]  # a subset of PRECISIONS -> config overlay
     default_preset: str
     quant_configs: Mapping[str, Any] = field(default_factory=dict)  # name -> QuantConfig
-    calibrations: Mapping[str, Path] = field(default_factory=dict)  # quant name -> default table
+    calibrations: Mapping[str, Path] = field(default_factory=dict)  # quant (or "<variant>/<quant>") -> default table
     protected: tuple[str, ...] = ()
     passes: Mapping[str, Pass] = field(default_factory=dict)
     engines: Mapping[str, EngineSpec] = field(default_factory=lambda: {"eager": EAGER})
@@ -282,7 +282,8 @@ def _load_calibration(spec: ModelSpec, config: RunConfig, int8: bool):
     table = config.optimize.options.get("calibration_table")  # an already-loaded table (not serializable)
     if table is not None:
         return table
-    path = config.precision.calibration or spec.calibrations.get(config.precision.quant)
+    quant = config.precision.quant
+    path = config.precision.calibration or spec.calibrations.get(f"{config.variant}/{quant}") or spec.calibrations.get(quant)
     if path is None:
         raise ValueError(f"{spec.name}: quant config {config.precision.quant!r} needs a calibration table")
     return (Int8CalibrationTable if int8 else CalibrationTable).load(path)

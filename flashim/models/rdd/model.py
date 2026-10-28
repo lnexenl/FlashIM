@@ -71,7 +71,7 @@ class RDD(FeatureMatcher, nn.Module):
             nn.Sigmoid(),
         )
         self.detector = Detector(cfg.detector_dims)
-        # Filled in by ``load_rdd``.
+        # Filled in by the builder (``flashim.build``).
         self.preset: str | None = None
         self.engine: str | None = None
         self.quant_report = None

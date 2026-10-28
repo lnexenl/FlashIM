@@ -81,7 +81,12 @@ SPEC = ModelSpec(
     },
     default_preset="fp8",
     quant_configs={name: p.config for name, p in _QUANTIZED.items()},
-    calibrations={name: p.calibration for name, p in _QUANTIZED.items()},
+    calibrations={
+        **{name: p.calibration for name, p in _QUANTIZED.items()},
+        # a variant's own table where one ships next to the default (RDD's) one
+        **{f"{variant}/{name}": table for variant in VARIANTS for name in _QUANTIZED
+           if (table := quant.CALIBRATION_DIR / f"lightglue_{variant}_{name}_mega.safetensors").exists()},
+    },
     protected=quant.PROTECTED,
     engines={"eager": EngineSpec(), "compile": EngineSpec(_regions, recompile_limit=64)},
     set_precision=_set_precision,
@@ -98,12 +103,6 @@ def _compose(config: RunConfig, build) -> nn.Module:
     return SparsePipeline(build(config.components["extractor"]), build(config.components["matcher"]))
 
 
-def _matcher_precision(variant: str, preset: str) -> dict:
-    """Quantized presets use the variant's own calibration table when one ships next to the default (RDD's) one."""
-    table = quant.CALIBRATION_DIR / f"lightglue_{variant}_{preset}_mega.safetensors"
-    return {"precision": {"calibration": str(table)}} if preset in _QUANTIZED and table.exists() else {}
-
-
 def _pipeline(name: str, extractor: str, variant: str, default: str, description: str) -> ModelSpec:
     return ModelSpec(
         name=name,
@@ -114,7 +113,7 @@ def _pipeline(name: str, extractor: str, variant: str, default: str, description
             preset: {
                 "components": {
                     "extractor": {"model": extractor, "preset": preset},
-                    "matcher": {"model": "lightglue", "preset": preset, "variant": variant, **_matcher_precision(variant, preset)},
+                    "matcher": {"model": "lightglue", "preset": preset, "variant": variant},
                 }
             }
             for preset in PRECISIONS

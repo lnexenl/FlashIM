@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from flashim.utils import grid_sample
+
 _CONSTANTS: dict[tuple[torch.device, tuple[float, ...]], Tensor] = {}
 
 
@@ -46,7 +48,7 @@ def bhwc_interpolate(x: Tensor, size: tuple[int, int], mode: str = "bilinear", a
 
 
 def bhwc_grid_sample(x: Tensor, grid: Tensor, mode: str = "bilinear", align_corners=None) -> Tensor:
-    return F.grid_sample(x.permute(0, 3, 1, 2), grid, mode=mode, align_corners=align_corners).permute(
+    return grid_sample(x.permute(0, 3, 1, 2), grid, mode=mode, align_corners=align_corners).permute(
         0, 2, 3, 1
     )
 

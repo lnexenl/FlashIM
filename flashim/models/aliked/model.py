@@ -79,7 +79,7 @@ class ALIKED(FeatureMatcher, nn.Module):
             resnet.conv3x3(4, 1),
         )
         self.desc_head = SDDH(cfg.dim, cfg.K, cfg.M, gate)
-        # Filled in by ``load_aliked``.
+        # Filled in by the builder (``flashim.build``).
         self.preset: str | None = None
         self.engine: str | None = None
         self.compute_dtype = torch.float32

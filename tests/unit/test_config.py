@@ -170,6 +170,26 @@ def test_fp8_fallback_of_pipelines_and_explicit_requests():
         assert resolve("rdd-lightglue", "fp8", user, platform=NO_FP8) == resolve("rdd-lightglue", "fp8", user)
 
 
+
+def test_lightglue_variants_default_to_their_own_calibration_table(monkeypatch):
+    """A variant's table is the matcher spec's default, not a path in the pipeline preset: the resolved config (and
+    its digest) does not depend on where flashim is installed, and a standalone ``lightglue`` gets it too."""
+    from flashim import build
+    from flashim.quant.calibration import CalibrationTable, Int8CalibrationTable
+
+    for name in ("aliked-lightglue", "raco-aliked-lightglue", "rdd-lightglue"):
+        for preset in ("int8", "fp8"):
+            assert resolve(name, preset).components["matcher"].precision.calibration is None
+    loaded = []
+    for cls in (CalibrationTable, Int8CalibrationTable):
+        monkeypatch.setattr(cls, "load", classmethod(lambda cls, path: loaded.append(path.stem)))
+    spec = get_spec("lightglue")
+    for variant, preset in (("aliked", "int8"), ("raco-aliked", "fp8"), ("rdd", "fp8"), (None, "int8")):
+        build._load_calibration(spec, resolve("lightglue", preset, {"variant": variant}), int8=preset == "int8")
+    assert loaded == [
+        "lightglue_aliked_int8_mega", "lightglue_raco-aliked_fp8_mega", "lightglue_fp8_mega", "lightglue_int8_mega",
+    ]
+
 # -- builder stages on a fake model ------------------------------------------------------------------------
 
 

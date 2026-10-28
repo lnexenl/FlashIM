@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from flashim.ops._registry import Op
+from flashim.utils import grid_sample
 
 
 def _rope_qk_reference(q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> tuple[Tensor, Tensor]:
@@ -106,7 +107,7 @@ def _deformable_attention_reference(
             normalizer = offs.new_tensor([w, h])
             loc = ref + offs[:, :, :, level].permute(0, 2, 1, 3, 4).reshape(n, m, stop - start, points, 2) / normalizer
             grid = (2 * loc - 1).reshape(n * m, stop - start, points, 2)
-            sampled = torch.nn.functional.grid_sample(
+            sampled = grid_sample(
                 fmap, grid, mode="bilinear", padding_mode="zeros", align_corners=False
             )  # [N*M, D, Lc, P]
             term = (sampled * wts[:, :, :, level].reshape(n * m, 1, stop - start, points)).sum(-1)

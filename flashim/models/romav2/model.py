@@ -31,6 +31,7 @@ from flashim.models.romav2.matcher import Matcher
 from flashim.models.romav2.refiner import Refiners
 from flashim.platforms import default_device
 from flashim.types import DenseMatchResult, Matches
+from flashim.utils import grid_sample
 
 ImageLike = str | Path | Image.Image | np.ndarray | Tensor
 
@@ -387,7 +388,7 @@ class RoMaV2(ImageMatcher, nn.Module):
 
         def sample_at(prec: Tensor, points: Tensor) -> Tensor:
             grid_pts = points.reshape(1, 1, -1, 2)
-            out = F.grid_sample(prec.reshape(1, h, w, 4).permute(0, 3, 1, 2), grid_pts, mode="bilinear", align_corners=False)
+            out = grid_sample(prec.reshape(1, h, w, 4).permute(0, 3, 1, 2), grid_pts, mode="bilinear", align_corners=False)
             return out[0, :, 0].t().reshape(-1, 2, 2)
 
         own = torch.where(chosen_ab[:, None, None], prec_ab[chosen_pix], prec_ba[chosen_pix])

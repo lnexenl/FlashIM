@@ -215,7 +215,7 @@ class LightGlue(nn.Module):
             min(0.8 + 0.1 * math.exp(-4.0 * i / cfg.num_layers), 1.0) for i in range(cfg.num_layers)
         ]
         self.executed_layers = cfg.num_layers  # of the last match
-        # Filled in by ``load_lightglue``.
+        # Filled in by the builder (``flashim.build``).
         self.preset: str | None = None
         self.engine: str | None = None
         self.quant_report = None

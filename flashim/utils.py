@@ -1,10 +1,12 @@
-"""Small module-surgery helpers shared by quantization and fusion passes, and cached device constants."""
+"""Small module-surgery helpers shared by quantization and fusion passes, cached device constants, and a CPU-safe
+``grid_sample``."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 
@@ -39,3 +41,12 @@ def device_constant(values: Sequence[float], like: Tensor, dtype: torch.dtype | 
         with torch.inference_mode(False):
             constant = _CONSTANTS[key] = torch.tensor(list(values), dtype=dtype, device=like.device)
     return constant
+
+
+def grid_sample(input: Tensor, grid: Tensor, **kwargs) -> Tensor:
+    """``F.grid_sample``, computed in FP32 for BF16 / FP16 inputs on the CPU: torch 2.11's reduced-precision CPU kernel
+    segfaults on large inputs (measured: any ``[1, C, 704, 1024]`` BF16 or FP16 input, C = 16 or 128, crashes within a
+    few calls; FP32 does not). Other devices and dtypes call it unchanged."""
+    if input.device.type == "cpu" and input.dtype in (torch.bfloat16, torch.float16):
+        return F.grid_sample(input.float(), grid.float(), **kwargs).to(input.dtype)
+    return F.grid_sample(input, grid, **kwargs)
