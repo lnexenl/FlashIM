@@ -26,6 +26,13 @@ First public release.
 - Every learned model is checked against its vendored upstream code (`tests/parity`), and checkpoints download from
   their upstream releases, pinned by SHA-256.
 
+### Packaging
+
+- Python 3.10 or newer (3.10 for JetPack 6's torch); torch 2.11.x, torchvision 0.26.x, Triton 3.6.x.
+- Extras: `cv` (OpenCV, for SIFT / ORB), `eval` (accuracy benchmarks), `tilelang`. A model that needs a missing
+  extra says which one at load time.
+- The wheel ships the calibration tables, the CUDA C++ sources and the third-party license texts.
+
 ### Performance
 
 - MXFP8 and INT8 quantization with shipped calibration tables, fused Triton / TileLang / CUDA C++ kernels and

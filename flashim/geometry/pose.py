@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from flashim.utils import import_cv2
+
 
 def compute_relative_pose(R1, t1, R2, t2):
     rots = R2 @ R1.T
@@ -42,7 +44,7 @@ def pose_auc(errors, thresholds) -> list[float]:
 
 def estimate_pose_cv2_ransac(kpts0, kpts1, K0, K1, norm_thresh: float, conf: float = 0.99999):
     """Essential matrix (OpenCV RANSAC) on intrinsics-normalized points, best candidate by inliers."""
-    import cv2
+    cv2 = import_cv2()
 
     if len(kpts0) < 5:
         return None

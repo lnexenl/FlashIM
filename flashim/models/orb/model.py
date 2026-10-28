@@ -12,6 +12,7 @@ from torch import Tensor
 
 from flashim.models.sift.model import SIFT, gray_uint8, ratio_mutual_match
 from flashim.types import Matches, SparseFeatures
+from flashim.utils import import_cv2
 
 _POPCOUNT = torch.tensor([i.bit_count() for i in range(256)], dtype=torch.uint8)
 
@@ -34,10 +35,11 @@ class ORB(SIFT):
 
     def __init__(self, fast_threshold: int = 20, n_levels: int = 8, scale_factor: float = 1.2) -> None:
         super().__init__()
+        import_cv2()  # fail at load time, not at the first match
         self.fast_threshold, self.n_levels, self.scale_factor = fast_threshold, n_levels, scale_factor
 
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
-        import cv2
+        cv2 = import_cv2()
 
         orb = cv2.ORB_create(
             nfeatures=top_k or 500, scaleFactor=self.scale_factor, nlevels=self.n_levels, fastThreshold=self.fast_threshold

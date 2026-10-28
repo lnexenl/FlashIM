@@ -13,6 +13,7 @@ from torch import Tensor
 
 from flashim.models import sparse
 from flashim.types import Matches, SparseFeatures
+from flashim.utils import import_cv2
 
 
 def gray_uint8(image: Tensor) -> np.ndarray:
@@ -41,6 +42,7 @@ class SIFT(sparse.SparseExtractor):
 
     def __init__(self, contrast_threshold: float = 0.04, edge_threshold: float = 10.0, sigma: float = 1.6) -> None:
         super().__init__()
+        import_cv2()  # fail at load time, not at the first match
         self.contrast_threshold, self.edge_threshold, self.sigma = contrast_threshold, edge_threshold, sigma
         self.register_buffer("_device_anchor", torch.zeros(()), persistent=False)  # carries the device of matching
 
@@ -55,7 +57,7 @@ class SIFT(sparse.SparseExtractor):
         return self._device_anchor.device
 
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
-        import cv2
+        cv2 = import_cv2()
 
         sift = cv2.SIFT_create(
             nfeatures=top_k or 0, contrastThreshold=self.contrast_threshold, edgeThreshold=self.edge_threshold, sigma=self.sigma

@@ -50,3 +50,12 @@ def grid_sample(input: Tensor, grid: Tensor, **kwargs) -> Tensor:
     if input.device.type == "cpu" and input.dtype in (torch.bfloat16, torch.float16):
         return F.grid_sample(input.float(), grid.float(), **kwargs).to(input.dtype)
     return F.grid_sample(input, grid, **kwargs)
+
+
+def import_cv2():
+    """``cv2``, or an ImportError that names the extra installing it: OpenCV is optional (SIFT, ORB, pose estimation)."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError("OpenCV is needed here: pip install 'flashim[cv]' (or opencv-python)") from exc
+    return cv2

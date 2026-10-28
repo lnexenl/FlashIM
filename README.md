@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/lockup-dark@8x.png">
-    <img alt="FlashIM" src="assets/brand/lockup-light@8x.png" width="560">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/lnexenl/FlashIM/main/assets/brand/lockup-dark@8x.png">
+    <img alt="FlashIM" src="https://raw.githubusercontent.com/lnexenl/FlashIM/main/assets/brand/lockup-light@8x.png" width="560">
   </picture>
 </p>
 
@@ -11,12 +11,12 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE">Apache-2.0</a> ·
-  <a href="docs/models.md">Models and results</a> ·
-  <a href="docs/benchmarks.md">Inference benchmark</a> ·
-  <a href="docs/configuration.md">Configuration</a> ·
-  <a href="docs/platforms.md">Platforms</a> ·
-  <a href="docs/architecture.md">Architecture</a>
+  <a href="https://github.com/lnexenl/FlashIM/blob/main/LICENSE">Apache-2.0</a> ·
+  <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/models.md">Models and results</a> ·
+  <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/benchmarks.md">Inference benchmark</a> ·
+  <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/configuration.md">Configuration</a> ·
+  <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/platforms.md">Platforms</a> ·
+  <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/architecture.md">Architecture</a>
 </p>
 
 FlashIM runs image-matching models (dense RoMa v2; sparse RDD, ALIKED, RaCo, SuperPoint, DISK, DeDoDe, LoFTR and others; LightGlue matching) faster than their reference
@@ -34,11 +34,14 @@ speedups come from quantization (MXFP8, INT8), fused kernels (Triton, TileLang, 
 
 ## Quick start
 
-FlashIM is not on PyPI yet; install from source (Python 3.12, an NVIDIA GPU is recommended):
+FlashIM is not on PyPI yet; install from source (Linux, Python 3.10 or newer, an NVIDIA GPU is recommended):
 
 ```bash
-uv sync --extra eval
+pip install "flashim[cv] @ git+https://github.com/lnexenl/FlashIM"   # or, in a checkout: uv sync --extra eval
 ```
+
+The `cv` extra adds OpenCV (SIFT, ORB), `eval` the accuracy benchmarks' dependencies. Jetson (JetPack 6) installs from
+[`requirements-jetson.txt`](https://github.com/lnexenl/FlashIM/blob/main/requirements-jetson.txt) (NVIDIA's torch build).
 
 ```python
 import flashim
@@ -58,12 +61,12 @@ resolution, `max_matches` bounds the matches the model's own way (keypoints per 
 samples of a dense warp) and `threshold` is the model's match threshold. A model without the preset asked for builds the
 nearest one it has (`fp8` -> `int8` -> `bf16` -> `fp32`), and a pipeline's preset applies to each of its components.
 
-Weights download on first use and are checked against pinned SHA-256 hashes ([Checkpoints](#checkpoints)).
+Weights download on first use and are checked against pinned SHA-256 hashes ([Checkpoints](https://github.com/lnexenl/FlashIM#checkpoints)).
 
 ## Results
 
 All numbers are from an RTX 5070 Ti. The latency of every model, preset and engine is in the
-[inference benchmark](docs/benchmarks.md); models, presets and accuracy evidence are in [docs/models.md](docs/models.md) and the page of each model.
+[inference benchmark](https://github.com/lnexenl/FlashIM/blob/main/docs/benchmarks.md); models, presets and accuracy evidence are in [docs/models.md](https://github.com/lnexenl/FlashIM/blob/main/docs/models.md) and the page of each model.
 
 **RoMaV2** (dense; 800² + 1024², both directions, forward only, `compile-full`):
 
@@ -95,7 +98,7 @@ model.run_config.digest(), model.build_report          # what was asked for / wh
 ```
 
 Unknown keys, passes and engines are errors; a pass the platform cannot run is skipped with a warning (`optimize.strict=true` raises instead). See
-[docs/configuration.md](docs/configuration.md).
+[docs/configuration.md](https://github.com/lnexenl/FlashIM/blob/main/docs/configuration.md).
 
 ## Platforms
 
@@ -110,13 +113,13 @@ Unknown keys, passes and engines are errors; a pass the platform cannot run is s
 
 A GPU without FP8 builds the nearest other preset instead (`int8`, or `bf16` for a model without INT8), and says so in a warning and in
 `model.build_report.fallbacks`. Details in
-[docs/platforms.md](docs/platforms.md).
+[docs/platforms.md](https://github.com/lnexenl/FlashIM/blob/main/docs/platforms.md).
 
 ## Checkpoints
 
 Every model downloads its upstream release on first use into the torch hub checkpoint folder (`$TORCH_HOME/hub/checkpoints`) and verifies it
 against the SHA-256 pinned in `flashim/models/<model>/weights.py`. Override `checkpoint` or set `FLASHIM_<MODEL>_CHECKPOINT` to use a local file;
-copy the folder over for an offline machine. Calibration tables ship in the repository. More in [docs/checkpoints.md](docs/checkpoints.md).
+copy the folder over for an offline machine. Calibration tables ship in the repository. More in [docs/checkpoints.md](https://github.com/lnexenl/FlashIM/blob/main/docs/checkpoints.md).
 
 ## Development
 
@@ -128,18 +131,18 @@ uv run python benchmarks/speed/forward.py --preset fp8 --engine compile
 uv run python benchmarks/accuracy/run.py --dataset mega1500 --preset fp8 --seed 17
 ```
 
-Agents and contributors: start with [AGENTS.md](AGENTS.md) (layering rules, how to add an op, backend, model or platform, and how changes are verified).
-The layout and op dispatch are described in [docs/architecture.md](docs/architecture.md).
+Agents and contributors: start with [AGENTS.md](https://github.com/lnexenl/FlashIM/blob/main/AGENTS.md) (layering rules, how to add an op, backend, model or platform, and how changes are verified).
+The layout and op dispatch are described in [docs/architecture.md](https://github.com/lnexenl/FlashIM/blob/main/docs/architecture.md).
 
 ## License
 
-FlashIM is released under the Apache License 2.0 ([LICENSE](LICENSE)). Vendored third-party code and assets keep their own licenses
-([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), `licenses/`, `tests/oracles/`). Model weights are downloaded, not distributed with FlashIM, and are
+FlashIM is released under the Apache License 2.0 ([LICENSE](https://github.com/lnexenl/FlashIM/blob/main/LICENSE)). Vendored third-party code and assets keep their own licenses
+([THIRD_PARTY_NOTICES.md](https://github.com/lnexenl/FlashIM/blob/main/THIRD_PARTY_NOTICES.md), `licenses/`, `tests/oracles/`). Model weights are downloaded, not distributed with FlashIM, and are
 covered by their upstream licenses, which can be more restrictive than Apache-2.0; for example, the DINOv3 weights inside the RoMaV2 checkpoint are
 covered by the DINOv3 License.
 
 <p align="center">
-  <img alt="" src="assets/brand/mark-pair.svg" width="64" height="64">&nbsp;&nbsp;
-  <img alt="" src="assets/brand/mark-match-bolt.svg" width="64" height="64">&nbsp;&nbsp;
-  <img alt="" src="assets/brand/mark-monogram.svg" width="64" height="64">
+  <img alt="" src="https://raw.githubusercontent.com/lnexenl/FlashIM/main/assets/brand/mark-pair.svg" width="64" height="64">&nbsp;&nbsp;
+  <img alt="" src="https://raw.githubusercontent.com/lnexenl/FlashIM/main/assets/brand/mark-match-bolt.svg" width="64" height="64">&nbsp;&nbsp;
+  <img alt="" src="https://raw.githubusercontent.com/lnexenl/FlashIM/main/assets/brand/mark-monogram.svg" width="64" height="64">
 </p>
