@@ -76,7 +76,12 @@ def quantize_model(
                 build = StaticInt8Conv2d.from_conv
             else:
                 build = StaticInt8Linear.from_linear
-            packed = build(module, calibration[name])
+            if name in calibration.smooth:
+                if not isinstance(module, nn.Linear):
+                    raise ValueError(f"SmoothQuant factors for {name!r}: only linears take them")
+                packed = build(module, calibration[name], smooth=calibration.smooth[name])
+            else:
+                packed = build(module, calibration[name])
         else:
             if not isinstance(calibration, CalibrationTable):
                 raise TypeError(f"MXFP8 scheme for {name!r} needs a CalibrationTable")

@@ -87,8 +87,12 @@ quantize_mxfp8 = Op("quantize_mxfp8", _quantize_static_reference)
 # -- INT8 producers: static per-tensor FP32 scale ---------------------------------------------------
 
 
-def _quantize_int8_reference(value: Tensor, scale: Tensor) -> Int8Tensor:
-    """``round(value / scale)`` saturated to +-127; ``scale`` is a single FP32 value."""
+def _quantize_int8_reference(value: Tensor, scale: Tensor, *, channel_scale: Tensor | None = None) -> Int8Tensor:
+    """``round(value / scale)`` saturated to +-127; ``scale`` is a single FP32 value. ``channel_scale`` (FP32, one per
+    channel of the last dimension) multiplies ``value`` first: SmoothQuant's ``1 / s``, with ``s`` folded into the
+    consuming weight's columns."""
+    if channel_scale is not None:
+        value = value.float() * channel_scale.float()
     return quantize_int8_static(value, scale)
 
 

@@ -16,10 +16,13 @@ class StaticInt8Linear(nn.Module):
     Weights: symmetric int8, ``amax / 127`` per output row. Inputs: ``round(x / s)`` saturated
     to +-127 with a *static* calibrated ``s``. The GEMM accumulates in INT32; the epilogue
     applies ``s * w_scale[n]`` and the bias in FP32 and returns BF16 (cast to the input dtype).
+    With SmoothQuant factors (``from_linear(..., smooth=)``) the weight columns are multiplied by ``smooth`` before
+    quantization and the input quantization multiplies by ``channel_scale = 1 / smooth`` (unfused producers only).
     """
 
     def __init__(
-        self, weight_int8: Tensor, weight_scale: Tensor, bias: Tensor | None, input_scale: Tensor
+        self, weight_int8: Tensor, weight_scale: Tensor, bias: Tensor | None, input_scale: Tensor,
+        channel_scale: Tensor | None = None,
     ) -> None:
         super().__init__()
         self.out_features, self.in_features = weight_int8.shape
@@ -30,9 +33,14 @@ class StaticInt8Linear(nn.Module):
         self.register_buffer(
             "bias", None if bias is None else bias.detach().to(device=device, dtype=torch.bfloat16)
         )
+        self.register_buffer(
+            "channel_scale",
+            None if channel_scale is None else channel_scale.to(device=device, dtype=torch.float32).contiguous(),
+        )
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, input_scale: Tensor) -> StaticInt8Linear:
+    def from_linear(cls, linear: nn.Linear, input_scale: Tensor, smooth: Tensor | None = None) -> StaticInt8Linear:
+        """``smooth``: per-input-channel SmoothQuant factors ``s`` (``input_scale`` calibrated on ``x / s``)."""
         weight = linear.weight.detach()
         if not torch.isfinite(weight).all():
             raise ValueError("Cannot quantize non-finite weights")
@@ -42,8 +50,12 @@ class StaticInt8Linear(nn.Module):
             bias_mask = getattr(linear, "bias_mask", None)
             if bias_mask is not None:  # DINOv3 K-bias mask, folded once
                 bias = bias * bias_mask.to(bias.dtype)
+        channel_scale = None
+        if smooth is not None:
+            smooth = smooth.to(device=weight.device, dtype=torch.float32)
+            weight, channel_scale = weight.float() * smooth, 1 / smooth
         scale = weight_scales(weight)
-        return cls(quantize_symmetric(weight, scale[:, None]), scale, bias, input_scale)
+        return cls(quantize_symmetric(weight, scale[:, None]), scale, bias, input_scale, channel_scale)
 
     @classmethod
     def from_conv1x1(cls, conv: nn.Conv2d, input_scale: Tensor) -> StaticInt8Linear:
@@ -56,7 +68,13 @@ class StaticInt8Linear(nn.Module):
         return cls.from_linear(linear, input_scale)
 
     def quantize(self, x: Tensor) -> Int8Tensor:
+        if self.channel_scale is not None:
+            return ops.quantize_int8(x, self.input_scale, channel_scale=self.channel_scale)
         return ops.quantize_int8(x, self.input_scale)
+
+    def _unsmoothed(self, producer: str) -> None:
+        if self.channel_scale is not None:
+            raise NotImplementedError(f"{producer} has no per-channel scale: smoothed layers take quantize()")
 
     def quantize_layernorm(
         self, value: Tensor, residual: Tensor | None, norm: nn.LayerNorm, *, return_sum: bool = False,
@@ -64,12 +82,14 @@ class StaticInt8Linear(nn.Module):
     ) -> Int8Tensor | tuple[Int8Tensor, Tensor]:
         """``norm(value + residual)`` packed for this layer (``activation``: then GELU); ``return_sum`` also returns
         ``value + residual``."""
+        self._unsmoothed("layernorm_quantize_int8")
         return ops.layernorm_quantize_int8(
             value, residual, norm.weight, norm.bias, norm.eps, self.input_scale, return_sum=return_sum,
             activation=activation,
         )
 
     def quantize_gelu(self, value: Tensor, approximate: str) -> Int8Tensor:
+        self._unsmoothed("gelu_quantize_int8")
         return ops.gelu_quantize_int8(value, self.input_scale, approximate)
 
     def forward_prequantized(self, quantized: Int8Tensor, relu: bool = False) -> Tensor:
@@ -85,7 +105,7 @@ class StaticInt8Linear(nn.Module):
         return self.forward_prequantized(self.quantize(x)).to(x.dtype)
 
     def extra_repr(self) -> str:
-        return f"in={self.in_features}, out={self.out_features}, int8"
+        return f"in={self.in_features}, out={self.out_features}, int8" + (", smoothed" if self.channel_scale is not None else "")
 
 
 class StaticInt8Conv1x1(StaticInt8Linear):

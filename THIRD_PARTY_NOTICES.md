@@ -17,9 +17,10 @@ upstream code or licenses nevertheless apply.
 - **LightGlue**, https://github.com/cvg/LightGlue, Apache-2.0: `flashim/models/aliked/descriptor.py` ports its
   `get_patches` fallback; `flashim/models/lightglue/` follows it (and RDD's variant).
 
-Other models (ALIKED and ALIKE: BSD-3-Clause; DaD, DeDoDe: MIT, DeDoDe's DINOv2 parts Apache-2.0; RDD, XFeat, LoFTR,
-DISK, RaCo: Apache-2.0) are independent implementations of the published architectures; the license of each upstream
-is recorded in `flashim/models/<model>/weights.py` (`LICENSES`) next to the checkpoint it applies to.
+Other models (ALIKED and ALIKE: BSD-3-Clause; DaD, DeDoDe: MIT, DeDoDe's DINOv2 parts Apache-2.0; LoMa: MIT, its
+LightGlue-derived matcher Apache-2.0, built on `flashim/models/lightglue/`; RDD, XFeat, LoFTR, DISK, RaCo: Apache-2.0)
+are independent implementations of the published architectures; the license of each upstream is recorded in
+`flashim/models/<model>/weights.py` (`LICENSES`) next to the checkpoint it applies to.
 
 ## Weights (downloaded, never shipped)
 

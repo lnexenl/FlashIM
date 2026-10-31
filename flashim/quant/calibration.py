@@ -8,7 +8,7 @@ metadata; RoMaV2's ``romav2.full-fp8-calibration`` ``.pt`` files can be imported
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -172,10 +172,13 @@ INT8_FORMAT = "flashim.calibration.int8-tensor"
 
 @dataclass
 class Int8CalibrationTable:
-    """Per-module FP32 input scale (``percentile / 127``) of statically quantized INT8 layers."""
+    """Per-module FP32 input scale (``percentile / 127``) of statically quantized INT8 layers; ``smooth``: per-channel
+    SmoothQuant factors of the modules that have them (``input_scale`` is then the scale of ``x / smooth``), stored as
+    ``<name>::smooth``."""
 
     input_scale: dict[str, Tensor]
     metadata: dict[str, str] = field(default_factory=dict)
+    smooth: dict[str, Tensor] = field(default_factory=dict)
 
     def __contains__(self, name: str) -> bool:
         return name in self.input_scale
@@ -185,6 +188,7 @@ class Int8CalibrationTable:
 
     def save(self, path: str | Path) -> None:
         tensors = {name: scale.float().reshape(1).cpu().contiguous() for name, scale in self.input_scale.items()}
+        tensors.update({f"{name}::smooth": s.float().cpu().contiguous() for name, s in self.smooth.items()})
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         save_file(tensors, str(path), metadata={"format": INT8_FORMAT, "version": str(VERSION), **self.metadata})
 
@@ -197,18 +201,23 @@ class Int8CalibrationTable:
         if meta.get("format") != INT8_FORMAT or meta.get("version") != str(VERSION):
             raise ValueError(f"Unsupported INT8 calibration file {path}: {meta.get('format')} v{meta.get('version')}")
         meta.pop("format"), meta.pop("version")
-        return cls({name: value.reshape(()) for name, value in load_file(str(path)).items()}, meta)
+        tensors = load_file(str(path))
+        smooth = {key.rsplit("::", 1)[0]: value for key, value in tensors.items() if key.endswith("::smooth")}
+        scales = {name: value.reshape(()) for name, value in tensors.items() if "::" not in name}
+        return cls(scales, meta, smooth)
 
 
 class Int8Calibrator:
     """Record each targeted layer's input range (linears and 1x1 convs), RoMaV2 ``percentile`` observer.
 
     Per forward call the ``percentile`` quantile of ``|x|`` is taken (on at most ``max_samples``
-    random elements); the scale is the mean over calls divided by 127.
+    random elements); the scale is the mean over calls divided by 127. Modules in ``smooth`` (SmoothQuant factors,
+    :class:`SmoothingCalibrator`) observe ``x / smooth`` and keep the factors in the table.
     """
 
     def __init__(
-        self, model: nn.Module, names: Iterable[str], *, percentile: float = 0.9999, max_samples: int = 4_000_000
+        self, model: nn.Module, names: Iterable[str], *, percentile: float = 0.9999, max_samples: int = 4_000_000,
+        smooth: Mapping[str, Tensor] | None = None,
     ) -> None:
         modules = dict(model.named_modules())
         self._targets = {}
@@ -218,6 +227,10 @@ class Int8Calibrator:
                 raise TypeError(f"{name!r} is not an nn.Linear / nn.Conv2d")
             self._targets[name] = module
         self.percentile, self.max_samples = percentile, max_samples
+        self.smooth = {name: factors.float().cpu() for name, factors in (smooth or {}).items()}
+        unknown = sorted(set(self.smooth) - set(self._targets))
+        if unknown:
+            raise ValueError(f"Smoothing factors for modules that are not calibrated: {unknown}")
         self._calls: dict[str, list[float]] = {name: [] for name in self._targets}
         self._handles: list = []
 
@@ -225,7 +238,10 @@ class Int8Calibrator:
         for name, module in self._targets.items():
 
             def hook(mod, args, name=name):
-                flat = args[0].detach().float().abs().reshape(-1)
+                flat = args[0].detach().float()
+                if name in self.smooth:
+                    flat = flat / self.smooth[name].to(flat.device)
+                flat = flat.abs().reshape(-1)
                 if flat.numel() > self.max_samples:
                     flat = flat[torch.randperm(flat.numel(), device=flat.device)[: self.max_samples]]
                 k = max(1, int(flat.numel() * self.percentile))
@@ -247,4 +263,50 @@ class Int8Calibrator:
             name: safe_scale(torch.tensor(sum(calls) / len(calls) / INT8_MAX))
             for name, calls in self._calls.items()
         }
-        return Int8CalibrationTable(scales, {"observer": f"percentile{self.percentile}", **(metadata or {})})
+        return Int8CalibrationTable(
+            scales, {"observer": f"percentile{self.percentile}", **(metadata or {})}, dict(self.smooth)
+        )
+
+
+class SmoothingCalibrator:
+    """SmoothQuant factors ``s_j = amax(x_j)^alpha / amax(W_:,j)^(1 - alpha)`` of linears: records the per-channel input
+    amax over the forward passes it wraps; :meth:`factors` reads the weights as they are then (fold any rotation
+    first). ``alphas``: module name -> alpha."""
+
+    def __init__(self, model: nn.Module, alphas: Mapping[str, float]) -> None:
+        modules = dict(model.named_modules())
+        self.alphas = dict(alphas)
+        self._targets = {}
+        for name in self.alphas:
+            if not isinstance(modules.get(name), nn.Linear):
+                raise TypeError(f"{name!r} is not an nn.Linear")
+            self._targets[name] = modules[name]
+        self._amax: dict[str, Tensor] = {}
+        self._handles: list = []
+
+    def __enter__(self) -> Self:
+        for name, module in self._targets.items():
+
+            def hook(mod, args, name=name):
+                amax = args[0].detach().float().abs().reshape(-1, args[0].shape[-1]).amax(0)
+                self._amax[name] = amax if name not in self._amax else torch.maximum(self._amax[name], amax)
+
+            self._handles.append(module.register_forward_pre_hook(hook))
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def factors(self) -> dict[str, Tensor]:
+        missing = sorted(set(self._targets) - set(self._amax))
+        if missing:
+            raise RuntimeError(f"No activations recorded for: {missing}")
+        out = {}
+        for name, module in self._targets.items():
+            alpha = self.alphas[name]
+            w_amax = module.weight.detach().float().abs().amax(0).clamp_min(1e-5)
+            x_amax = self._amax[name].clamp_min(1e-5)
+            out[name] = (x_amax**alpha / w_amax ** (1 - alpha)).clamp_min(1e-5).cpu()
+        return out

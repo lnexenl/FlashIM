@@ -41,6 +41,10 @@ flashim/
                dtype), `extractor_spec()` (the fp32 / bf16 / int8 / fp8 presets from a list of quantizable globs),
                checkpoint lookup (`checkpoint` config key / env var / torch hub folder, else download of the release
                pinned by URL + SHA-256 in each model's `weights.py`)
+  models/loma/ LoMa: matcher.py (LightGlue's modules, DaD-normalized positions, last-layer dual softmax),
+               extractor.py (DaD + the variant's LoMa DeDoDe descriptor on upstream's PIL-bicubic resizes),
+               matcher_spec.py / extractor_spec.py (`loma-matcher`, `loma-extractor`), spec.py (pipelines
+               `loma-<variant>`, `loma` = `loma-b`), calibration/ (matcher per variant, extractor per descriptor)
   engines/     region torch.compile, CUDA-graph runner
 benchmarks/    speed/, accuracy/ (MegaDepth-1500, ScanNet-1500, HardMatch), profile/
 scripts/       calibration

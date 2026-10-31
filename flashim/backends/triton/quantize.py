@@ -348,19 +348,27 @@ def quantize_static(value: Tensor, scale_exponent: Tensor) -> QuantizedTensor:
 
 
 @triton.jit
-def _quantize_int8_kernel(value_ptr, scale_ptr, out_ptr, elements, BLOCK: tl.constexpr):
+def _quantize_int8_kernel(
+    value_ptr, scale_ptr, channel_scale_ptr, out_ptr, elements, channels, BLOCK: tl.constexpr,
+    CHANNEL_SCALE: tl.constexpr,
+):
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     valid = offsets < elements
     value = tl.load(value_ptr + offsets, mask=valid, other=0.0).to(tl.float32)
+    if CHANNEL_SCALE:
+        value = value * tl.load(channel_scale_ptr + offsets % channels, mask=valid, other=0.0)
     _store_quantized(out_ptr, 0, offsets, value, scale_ptr, elements, valid, True)
 
 
-def quantize_int8(value: Tensor, scale: Tensor) -> Int8Tensor:
+def quantize_int8(value: Tensor, scale: Tensor, *, channel_scale: Tensor | None = None) -> Int8Tensor:
     out = torch.empty(value.shape, device=value.device, dtype=torch.int8)
-    if _channels_first_view(value):
+    if channel_scale is None and _channels_first_view(value):
         _quantize_channels_first(value, scale, out, value.shape[-1], int8=True)
         return Int8Tensor(out, scale)
-    _quantize_int8_kernel[(triton.cdiv(value.numel(), 4096),)](value, scale, out, value.numel(), BLOCK=4096, num_warps=4)
+    _quantize_int8_kernel[(triton.cdiv(value.numel(), 4096),)](
+        value, scale, value if channel_scale is None else channel_scale, out, value.numel(), value.shape[-1],
+        BLOCK=4096, CHANNEL_SCALE=channel_scale is not None, num_warps=4,
+    )
     return Int8Tensor(out, scale)
 
 
@@ -461,8 +469,18 @@ def _quantize_mxfp8_impl(value: Tensor, scale_exponent: Tensor) -> QuantizedTens
     return quantize_static(value, scale_exponent.to(value.device, torch.int8))
 
 
+def _quantize_int8_eligible(value: Tensor, scale: Tensor, *, channel_scale: Tensor | None = None) -> bool:
+    """With ``channel_scale``: row-major input and a contiguous FP32 ``[C]`` vector on its device."""
+    if channel_scale is None:
+        return _quantize_eligible(value)
+    return (
+        _row_major(value) and channel_scale.dtype == torch.float32 and channel_scale.is_contiguous()
+        and channel_scale.shape == (value.shape[-1],) and channel_scale.device == value.device
+    )
+
+
 ops.quantize_int8.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_quantize_eligible
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_quantize_int8_eligible
 )(quantize_int8)
 ops.layernorm_quantize_int8.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_layernorm_eligible

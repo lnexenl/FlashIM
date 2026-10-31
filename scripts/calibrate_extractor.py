@@ -6,6 +6,11 @@ MegaDepth-1500) with observers on every layer its int8 / fp8 quant config target
 
     python scripts/calibrate_extractor.py --model superpoint --format fp8 --format int8 \\
         --manifest data/quantization/calibration_local.jsonl --root . --max-pairs 32
+
+``--variant`` builds that variant and writes the spec's ``"<variant>/<format>"`` table (LoMa: one per descriptor):
+
+    python scripts/calibrate_extractor.py --model loma-extractor --variant b --format fp8 --format int8 \\
+        --manifest data/quantization/calibration_local.jsonl --root . --max-pairs 32 --resize 1024 --top-k 2048
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=4096)
     parser.add_argument("--percentile", type=float, default=0.9999)
     parser.add_argument("--out-dir", default="", help="default: the spec's calibration path")
+    parser.add_argument("--variant", default=None, help="config variant; output: the spec's '<variant>/<format>' table")
     parser.add_argument("--extra", default="", help="JSON dict of config overrides (e.g. arch)")
     args = parser.parse_args()
 
@@ -47,6 +53,8 @@ def main() -> None:
     root = Path(args.root).expanduser()
     spec = get_spec(args.model)
     extra = json.loads(args.extra) if args.extra else {}
+    if args.variant:
+        extra["variant"] = args.variant
     model = flashim.load(args.model, "bf16", config=extra)
     for fmt in args.format:
         config = spec.quant_configs[fmt]
@@ -65,10 +73,13 @@ def main() -> None:
                 print(f"[{fmt}] calibrated {index}/{len(pairs)}", flush=True)
         table = observer.table({
             "model": args.model, "resize": str(args.resize), "top_k": str(args.top_k), "pairs": str(len(pairs)),
+            **({"variant": args.variant} if args.variant else {}),
             "manifest": Path(args.manifest).name,
             "manifest_sha256": hashlib.sha256(Path(args.manifest).expanduser().read_bytes()).hexdigest(),
         })
-        out = Path(args.out_dir) / f"{args.model}_{fmt}.safetensors" if args.out_dir else spec.calibrations[fmt]
+        name = f"{args.model}_{args.variant}" if args.variant else args.model
+        default = spec.calibrations.get(f"{args.variant}/{fmt}") or spec.calibrations[fmt]
+        out = Path(args.out_dir) / f"{name}_{fmt}.safetensors" if args.out_dir else default
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_suffix(".tmp.safetensors")
         table.save(tmp)

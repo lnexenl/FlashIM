@@ -4,7 +4,7 @@ criterion — that is task-level AUC, see ``sparse_matrix.sh``).
 For each of the first ``--pairs-per-scene`` MegaDepth-1500 pairs of every scene, and each model / preset:
 
 - ``kp_overlap``: fraction of the fp32 keypoints that the preset also detects within 1.5 px (extractors);
-- ``desc_cos``: median cosine between the two descriptors of such a keypoint pair;
+- ``desc_cos``: median cosine between the two descriptors of such a keypoint pair (LoMa's are not L2-normalized);
 - ``match_agree``: fraction of the fp32 mutual-NN matches (as coordinate pairs, within 2 px on both sides) that the preset
   reproduces, and ``match_ratio``: its match count over fp32's. For LoFTR (pair-level) the matches are compared directly.
 
@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).parent))
 from run import MEGA_SCENES
@@ -31,6 +32,8 @@ from flashim.paths import DATA
 PROTOCOL = {  # model -> (resize, top_k), as benchmarks/accuracy/sparse_matrix.sh
     "superpoint": (1600, 4096), "disk": (1600, 4096), "alike": (1600, 4096), "xfeat": (1600, 4096),
     "dedode": (1024, 8192), "dedode-g": (1024, 8192), "dad": (1024, 8192), "ripe": (1024, 4096), "loftr": (840, 0),
+    # LoMa: upstream's benchmark protocol (DaD at a 1024 px long side, 4096 keypoints)
+    **{f"loma-{variant}": (1024, 4096) for variant in ("b128", "b", "l", "g", "r")},
 }
 
 
@@ -94,7 +97,8 @@ def evaluate(model_name: str, presets: list[str], image_pairs: list[tuple[str, s
                     ok = d < 1.5
                     stats["kp_overlap"].append(float(ok.float().mean()))
                     if ok.any():
-                        cos = (rf.descriptors[0][ok].float() * f.descriptors[0][j[ok]].float()).sum(-1)
+                        ref_desc, desc = rf.descriptors[0][ok].float(), f.descriptors[0][j[ok]].float()
+                        cos = F.cosine_similarity(ref_desc, desc, dim=-1)
                         stats["desc_cos"].append(float(cos.median()))
         if preset != "fp32":
             rows.append({"model": model_name, "preset": preset, **{
