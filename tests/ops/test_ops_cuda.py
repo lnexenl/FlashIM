@@ -753,3 +753,50 @@ def test_upsample_concat_and_add(size, coarse_size, layout):
     fast, ref = _both(ops.upsample_add, "triton", coarse, delta)
     assert fast.dtype == torch.float32
     torch.testing.assert_close(fast, ref, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("size,coarse_size", [((37, 45), (19, 23)), ((112, 150), (56, 75)), ((64, 85), (37, 48))])
+@pytest.mark.parametrize("layout", ["nchw", "nhwc"])
+def test_upsample_concat_int8(size, coarse_size, layout):
+    """The INT8 refiner input: bit-identical to the BF16 Triton upsample-concat followed by the Triton static quantize
+    (the unfused path it replaces); within one INT8 step of the reference (reciprocal multiply vs division)."""
+    torch.manual_seed(0)
+    fmt = torch.channels_last if layout == "nhwc" else torch.contiguous_format
+    features = (torch.randn(1, 96, *size, device=DEV) * 2).bfloat16().contiguous(memory_format=fmt)
+    coarse = (torch.randn(1, 160, *coarse_size, device=DEV) * 2).contiguous(memory_format=fmt)
+    scale = torch.tensor(0.023, device=DEV)
+    fast, ref = _both(ops.upsample_concat_int8, "triton", features, coarse, scale)
+    unfused = ops.quantize_int8.get("triton")(ops.upsample_concat.get("triton")(features, coarse).permute(0, 2, 3, 1), scale)
+    assert fast.values.shape == (1, *size, 256) and fast.values.is_contiguous() and fast.scale is scale
+    assert torch.equal(fast.values, unfused.values)
+    assert (fast.values.int() - ref.values.int()).abs().max() <= 1 and _mismatch(fast.values, ref.values) < 1e-3
+
+
+@pytest.mark.parametrize("rows,k", [(5376, 1024), (777, 4096), (300, 1000), (5, 64)])
+def test_quantize_int8_rows(rows, k):
+    """Per-row dynamic INT8: bit-identical to the reference (scales and values), outlier rows and all-zero rows too."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, k, device=DEV, dtype=torch.bfloat16) * 3
+    x[rows // 2] *= 300  # a "massive activation" token
+    x[-1] = 0
+    fast, ref = _both(ops.quantize_int8_rows, "triton", x)
+    assert fast[1].shape == (rows, 1) and fast[1].dtype == torch.float32
+    assert torch.equal(fast[0], ref[0]) and torch.equal(fast[1], ref[1])
+    cpu = ops.quantize_int8_rows.reference(x.cpu())
+    assert torch.equal(cpu[0], ref[0].cpu()) and torch.equal(cpu[1], ref[1].cpu())
+
+
+@pytest.mark.parametrize("impl", ["triton", "cublas"])
+def test_int8_linear_per_row_scale(impl):
+    torch.manual_seed(0)
+    x = torch.randn(3000, 1024, device=DEV, dtype=torch.bfloat16)
+    x[17] *= 100
+    q, scale = ops.quantize_int8_rows(x)
+    w = torch.randint(-127, 128, (768, 1024), device=DEV, dtype=torch.int8)
+    w_scale, bias = torch.rand(768, device=DEV) * 1e-3, torch.randn(768, device=DEV, dtype=torch.bfloat16)
+    fast, ref = _both(ops.int8_linear, impl, q, w, scale, w_scale, bias)
+    fast, ref = fast.float(), ref.float()
+    assert ((fast - ref).abs() <= ref.abs() * 2**-7 + 1e-3).all()
+    # row 17's large scale is applied to row 17 only
+    plain = ops.int8_linear.get(impl)(q, w, scale.median(), w_scale, bias).float()
+    assert not torch.allclose(fast[17], plain[17]) and torch.allclose(fast[16], ref[16], rtol=2**-7, atol=1e-3)

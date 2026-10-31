@@ -421,6 +421,39 @@ def gelu_quantize_int8(value: Tensor, scale: Tensor, approximate: str) -> Int8Te
     )
     return Int8Tensor(out, scale)
 
+# -- INT8, dynamic per-row FP32 scale ----------------------------------------------------------------
+
+
+@triton.jit
+def _quantize_int8_rows_kernel(value_ptr, out_ptr, scale_ptr, rows, K: tl.constexpr, BLOCK_K: tl.constexpr,
+                               ROWS: tl.constexpr):
+    """``ROWS`` rows per program, each read once: amax, ``scale = amax * (1 / 127)`` (``safe_scale``'s eps floor), then
+    ``round(x / scale)`` with an exact (``div_rn``) division: the torch reference's arithmetic, bit for bit."""
+    row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    cols = tl.arange(0, BLOCK_K)
+    mask = (row < rows)[:, None] & (cols < K)[None, :]
+    offsets = row[:, None].to(tl.int64) * K + cols[None, :]
+    value = tl.load(value_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.max(tl.abs(value), 1) * (1.0 / 127.0)
+    scale = tl.where(scale > 1.1920928955078125e-07, scale, 1.1920928955078125e-07)
+    scaled = libdevice.rint(tl.math.div_rn(value, scale[:, None]))
+    tl.store(out_ptr + offsets, tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8), mask=mask)
+    tl.store(scale_ptr + row, scale, mask=row < rows)
+
+
+def quantize_int8_rows(value: Tensor) -> tuple[Tensor, Tensor]:
+    k = value.shape[-1]
+    rows = value.numel() // k
+    out = torch.empty(value.shape, device=value.device, dtype=torch.int8)
+    scale = torch.empty((*value.shape[:-1], 1), device=value.device, dtype=torch.float32)
+    block_k = triton.next_power_of_2(k)
+    per_program = max(1, 4096 // block_k)  # >= 4096 elements per program: 1024-wide rows 4 at a time
+    _quantize_int8_rows_kernel[(triton.cdiv(rows, per_program),)](
+        value, out, scale, rows, K=k, BLOCK_K=block_k, ROWS=per_program, num_warps=4 if block_k <= 2048 else 8
+    )
+    return out, scale
+
+
 # -- registrations ---------------------------------------------------------------------------------------
 
 def _row_major(value: Tensor) -> bool:
@@ -470,3 +503,7 @@ ops.layernorm_quantize_int8.register(
 ops.gelu_quantize_int8.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=lambda value, *a, **k: _row_major(value)
 )(gelu_quantize_int8)
+ops.quantize_int8_rows.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON],
+    when=lambda value: _row_major(value) and value.shape[-1] <= 8192,
+)(quantize_int8_rows)

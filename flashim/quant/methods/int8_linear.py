@@ -1,4 +1,5 @@
-"""Static INT8 linear: per-output-channel int8 weights, one calibrated per-tensor activation scale."""
+"""INT8 linears: per-output-channel int8 weights with one calibrated per-tensor activation scale (static) or one scale
+per token computed at run time (dynamic)."""
 
 from __future__ import annotations
 
@@ -105,3 +106,34 @@ class StaticInt8Conv1x1(StaticInt8Linear):
             pixels = pixels.contiguous()
         out = self.forward_prequantized(self.quantize(pixels), relu=relu).permute(0, 3, 1, 2)
         return out.to(x.dtype)
+
+
+class DynamicInt8Linear(nn.Module):
+    """Drop-in replacement for ``nn.Linear`` with per-token (per-row) dynamic INT8 activations: each row is quantized
+    with its own ``amax / 127`` at run time (``ops.quantize_int8_rows``) and the INT8 GEMM applies the row scale in its
+    epilogue; weights as :class:`StaticInt8Linear`. For activations whose outliers are whole tokens (DINOv2's
+    "massive activations"), which one static per-tensor scale cannot represent; needs no calibration."""
+
+    def __init__(self, weight_int8: Tensor, weight_scale: Tensor, bias: Tensor | None) -> None:
+        super().__init__()
+        self.out_features, self.in_features = weight_int8.shape
+        device = weight_int8.device
+        self.register_buffer("weight_int8", weight_int8.contiguous())
+        self.register_buffer("weight_scale", weight_scale.to(device=device, dtype=torch.float32))
+        self.register_buffer(
+            "bias", None if bias is None else bias.detach().to(device=device, dtype=torch.bfloat16)
+        )
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear) -> DynamicInt8Linear:
+        static = StaticInt8Linear.from_linear(linear, torch.ones((), device=linear.weight.device))
+        return cls(static.weight_int8, static.weight_scale, static.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        rows = x.reshape(-1, self.in_features)
+        values, scale = ops.quantize_int8_rows(rows if rows.is_contiguous() else rows.contiguous())
+        out = ops.int8_linear(values, self.weight_int8, scale, self.weight_scale, self.bias)
+        return out.reshape(*x.shape[:-1], self.out_features).to(x.dtype)
+
+    def extra_repr(self) -> str:
+        return f"in={self.in_features}, out={self.out_features}, int8, dynamic per-token"

@@ -119,9 +119,26 @@ class VGGDINOv2(nn.Module):
         return self.vgg.batchnorm_pairs(f"{prefix}vgg.")
 
 
+def refiner_input(features: Tensor, context: Tensor | None) -> Tensor:
+    """``cat(features, context)``; a coarser ``context`` is upsampled (bilinear, FP32) in the same pass."""
+    if context is None:
+        return features
+    if context.shape[-2:] != features.shape[-2:]:
+        return ops.upsample_concat(features, context)
+    return torch.cat((features, context.to(features.dtype)), dim=1)
+
+
 class ConvRefiner(nn.Module):
     """``block1`` (1x1) -> ``hidden_blocks`` (depthwise ``k x k`` -> BN -> ReLU -> 1x1, each) -> optional residual
-    ``(x + x0) / 1.4`` -> ``out_conv`` (1x1)."""
+    ``(x + x0) / 1.4`` -> ``out_conv`` (1x1), on the refiner input :func:`refiner_input` ``(features, context)``.
+
+    ``quantized_input`` (pass ``int8_refiner_input``; ``block1.0`` a static INT8 1x1 conv, BatchNorm folded): a coarser
+    context's upsample-concat writes ``block1.0``'s INT8 input directly (``ops.upsample_concat_int8``), not a BF16 map
+    and a quantize pass over it; same bits. ``residual_folded`` (:meth:`fold_residual_scale`): the residual's ``1 / 1.4``
+    lives in ``out_conv``'s weights instead of an elementwise pass over the hidden map."""
+
+    quantized_input = False
+    residual_folded = False
 
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, hidden_blocks: int = 5, kernel_size: int = 5,
                  residual: bool = True) -> None:
@@ -138,14 +155,32 @@ class ConvRefiner(nn.Module):
         conv1 = nn.Conv2d(cin, cout, kernel_size, 1, kernel_size // 2, bias=True)
         return nn.Sequential(conv1, nn.BatchNorm2d(cout), nn.ReLU(inplace=True), nn.Conv2d(cout, cout, 1, 1, 0))
 
-    def hidden(self, x: Tensor) -> Tensor:
+    def hidden(self, features: Tensor, context: Tensor | None = None) -> Tensor:
         """Everything before ``out_conv``."""
-        x0 = sequential_forward(self.block1, x)
+        if self.quantized_input and context is not None and context.shape[-2:] != features.shape[-2:]:
+            first = self.block1[0]
+            packed = ops.upsample_concat_int8(features, context, first.input_scale)
+            x0 = first.forward_prequantized(packed, relu=True).permute(0, 3, 1, 2)  # block1.0 -> folded BN -> ReLU
+            x0 = sequential_forward(self.block1[3:], x0)
+        else:
+            x0 = sequential_forward(self.block1, refiner_input(features, context))
         x = self.hidden_blocks(x0)
-        return (x + x0) / 1.4 if self.residual else x
+        if not self.residual:
+            return x
+        return x + x0 if self.residual_folded else (x + x0) / 1.4
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.out_conv(self.hidden(x))
+    def forward(self, features: Tensor, context: Tensor | None = None) -> Tensor:
+        return self.out_conv(self.hidden(features, context))
+
+    def fold_residual_scale(self) -> bool:
+        """``out_conv((x + x0) / 1.4)`` as ``(out_conv.weight / 1.4)`` applied to ``x + x0`` (bias unchanged); run
+        before the weights are cast or quantized. Returns whether anything was folded."""
+        if not self.residual or self.residual_folded:
+            return False
+        with torch.no_grad():
+            self.out_conv.weight.div_(1.4)
+        self.residual_folded = True
+        return True
 
 
 class Decoder(nn.Module):
@@ -154,17 +189,10 @@ class Decoder(nn.Module):
         self.layers = layers
         self.num_prototypes = num_prototypes
 
-    @staticmethod
-    def refiner_input(features: Tensor, context: Tensor | None) -> Tensor:
-        """``cat(features, context)``; a coarser ``context`` is upsampled (bilinear, FP32) in the same pass."""
-        if context is None:
-            return features
-        if context.shape[-2:] != features.shape[-2:]:
-            return ops.upsample_concat(features, context)
-        return torch.cat((features, context.to(features.dtype)), dim=1)
+    refiner_input = staticmethod(refiner_input)
 
     def forward(self, features: Tensor, context: Tensor | None, scale: str) -> tuple[Tensor, Tensor]:
-        out = self.layers[scale](self.refiner_input(features, context))
+        out = self.layers[scale](features, context)
         return out[:, : self.num_prototypes], out[:, self.num_prototypes :]
 
 
@@ -216,7 +244,7 @@ class DeDoDeNet(nn.Module):
         last = len(cfg.scales) - 1
         for idx, (feature_map, scale) in enumerate(zip(reversed(features), cfg.scales)):
             if points is not None and idx == last:
-                hidden = self.decoder.layers[scale].hidden(self.decoder.refiner_input(feature_map, context))
+                hidden = self.decoder.layers[scale].hidden(feature_map, context)
                 return self._read_last_scale(self.decoder.layers[scale].out_conv, hidden, out, points)
             delta, context = self.decoder(feature_map, context, scale)
             out = ops.upsample_add(out, delta) if coarse else out + delta.float()

@@ -38,10 +38,11 @@ from flashim.ops.quantize import (
     layernorm_quantize,
     layernorm_quantize_int8,
     quantize_int8,
+    quantize_int8_rows,
     quantize_mxfp8,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
-from flashim.ops.resample import upsample_add, upsample_concat
+from flashim.ops.resample import upsample_add, upsample_concat, upsample_concat_int8
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 
 __all__ = [
@@ -77,6 +78,7 @@ __all__ = [
     "mxfp8_linear",
     "mxfp8_scaled_mm",
     "quantize_int8",
+    "quantize_int8_rows",
     "quantize_mxfp8",
     "raco_head5x5",
     "raco_resblock",
@@ -89,6 +91,7 @@ __all__ = [
     "set_strict",
     "upsample_add",
     "upsample_concat",
+    "upsample_concat_int8",
 ]
 
 # Last: backends register their impls into the ops above.

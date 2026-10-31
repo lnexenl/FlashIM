@@ -7,8 +7,9 @@ ships, built from a model's list of quantizable convolution / linear globs.
   stay FP32.
 - ``int8`` / ``fp8``: ``bf16`` + the ``quantized`` convolutions / linears as static INT8 (per-channel weights, one
   calibrated per-tensor activation scale) or static MXFP8 (E4M3 + E8M0 block-32 scales), as im2col + GEMM for
-  convolutions (:mod:`flashim.quant.methods.conv2d`). ``int8_ignore`` removes layers from the INT8 preset only (e.g. a ViT
-  whose outlier activations one per-tensor scale cannot represent).
+  convolutions (:mod:`flashim.quant.methods.conv2d`). ``int8_ignore`` removes layers from the INT8 preset only;
+  ``int8_dynamic`` quantizes linears there with per-token dynamic activation scales instead of the static one (e.g. a
+  ViT whose outlier tokens one per-tensor scale cannot represent; no calibration entries).
 """
 
 from __future__ import annotations
@@ -22,7 +23,14 @@ from torch import nn
 
 from flashim.build import BuildContext, EngineSpec, ModelSpec, Pass, dtype
 from flashim.config import RunConfig
-from flashim.quant.scheme import INT8_ACTIVATIONS, INT8_WEIGHTS, MXFP8, QuantConfig, QuantScheme
+from flashim.quant.scheme import (
+    INT8_ACTIVATIONS,
+    INT8_TOKEN_ACTIVATIONS,
+    INT8_WEIGHTS,
+    MXFP8,
+    QuantConfig,
+    QuantScheme,
+)
 
 
 def _set_precision(model: nn.Module, config: RunConfig) -> None:
@@ -70,6 +78,7 @@ def extractor_spec(
     quantized: Sequence[str],
     protected: Sequence[str] = (),
     int8_ignore: Sequence[str] = (),
+    int8_dynamic: Sequence[str] = (),
     compile_regions: Sequence[str] = (),
     has_batchnorm: bool = True,
     extra_passes: Mapping[str, Pass] | None = None,
@@ -99,7 +108,11 @@ def extractor_spec(
     fp32 = {"optimize": {"passes": always}} if always else {}
     quant_configs = {
         "int8": QuantConfig(
-            {"conv": QuantScheme(tuple(quantized), INT8_WEIGHTS, INT8_ACTIVATIONS)}, ignore=tuple(int8_ignore), name="int8"
+            {  # first match wins: the dynamic group before the static one
+                **({"dynamic": QuantScheme(tuple(int8_dynamic), INT8_WEIGHTS, INT8_TOKEN_ACTIVATIONS)} if int8_dynamic else {}),
+                "conv": QuantScheme(tuple(quantized), INT8_WEIGHTS, INT8_ACTIVATIONS),
+            },
+            ignore=tuple(int8_ignore), name="int8",
         ),
         "fp8": QuantConfig({"conv": QuantScheme(tuple(quantized), MXFP8, MXFP8)}, ignore=(), name="fp8"),
     }

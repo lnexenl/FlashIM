@@ -163,3 +163,73 @@ def test_int8_block_kernels_match_reference(impl, channels, width):
         got = ops.depthwise5x5_relu_pointwise_int8.get("triton_fused")(*args).float()
         want = ops.depthwise5x5_relu_pointwise_int8.get("reference")(*args).float()
         assert ((got - want).norm() / want.norm()) < 5e-3
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)])
+def test_dynamic_linear_handles_outlier_tokens(device):
+    """Per-token scales keep ordinary tokens accurate next to a token 1000x larger; one static scale cannot."""
+    from flashim.quant.methods.int8_linear import DynamicInt8Linear
+
+    torch.manual_seed(0)
+    linear = nn.Linear(256, 192).to(device)
+    x = torch.randn(2, 50, 256, device=device)
+    x[0, 3] *= 1000
+    packed = DynamicInt8Linear.from_linear(linear)
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    with torch.no_grad():
+        out, want = packed(x.to(dtype)).float(), linear(x.to(dtype).float())
+        static = StaticInt8Linear.from_linear(linear, x.abs().max() / 127)(x.to(dtype)).float()
+    assert out.shape == (2, 50, 192) and out.dtype == torch.float32
+    normal = torch.ones(2, 50, dtype=torch.bool)
+    normal[0, 3] = False
+    err = ((out - want)[normal].norm() / want[normal].norm()).item()
+    assert err < 0.02 and ((static - want)[normal].norm() / want[normal].norm()) > 5 * err
+    assert ((out - want)[0, 3].norm() / want[0, 3].norm()) < 0.02
+
+
+def test_quantize_model_token_scheme_needs_no_calibration():
+    from flashim.quant import scheme
+    from flashim.quant.apply import quantize_model
+    from flashim.quant.calibration import Int8CalibrationTable
+    from flashim.quant.methods.int8_linear import DynamicInt8Linear
+
+    model = nn.Sequential(nn.Linear(32, 64), nn.GELU(), nn.Linear(64, 16))
+    config = scheme.QuantConfig({
+        "dynamic": scheme.QuantScheme(("0",), scheme.INT8_WEIGHTS, scheme.INT8_TOKEN_ACTIVATIONS),
+        "static": scheme.QuantScheme(("0", "2"), scheme.INT8_WEIGHTS, scheme.INT8_ACTIVATIONS),  # "0": first group wins
+    })
+    report = quantize_model(model, config, Int8CalibrationTable({"2": torch.tensor(0.01)}))
+    assert isinstance(model[0], DynamicInt8Linear) and isinstance(model[2], StaticInt8Linear)
+    assert report.linears == {"0": "int8_linear_dynamic", "2": "int8_linear"}
+    assert model(torch.randn(3, 32)).shape == (3, 16)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("channels,width", [(512, 33), (256, 40), (32, 20), (256, 12)])
+def test_int8_producer_separable_block(channels, width):
+    """The depthwise conv as the packed pointwise conv's INT8 producer: same function as the unfused block (BF16
+    depthwise, ReLU, quantize, INT8 GEMM); shapes without a producer kernel run that block itself."""
+    from flashim.layers import IndexedSeparableConvBlock
+    from flashim.quant.methods.int8_linear import StaticInt8Conv1x1
+    from flashim.quant.passes.separable_conv_block import Int8ProducerSeparableConvBlock, fold_block_batchnorm
+
+    torch.manual_seed(0)
+    block = IndexedSeparableConvBlock(channels).cuda().eval()
+    block.norm.running_mean.normal_(), block.norm.running_var.uniform_(0.5, 2)
+    x = (torch.randn(1, channels, 24, width, device="cuda") * 2).bfloat16().contiguous(memory_format=torch.channels_last)
+    with torch.no_grad():
+        fold_block_batchnorm(torch.nn.ModuleList([block]))
+        hidden = torch.relu(block.conv_depthwise(x.float()))
+        block.conv_pointwise = StaticInt8Conv1x1.from_conv(block.conv_pointwise, hidden.abs().quantile(0.9999) / 127)
+        block.conv_depthwise.to(torch.bfloat16, memory_format=torch.channels_last)  # the packed conv keeps FP32 scales
+        unfused = block(x).float()
+        fused = Int8ProducerSeparableConvBlock(block)
+        ops.reset_call_counts()
+        out = fused(x)
+    assert out.shape == unfused.shape and out.dtype == torch.bfloat16
+    counts = ops.call_counts().get("depthwise5x5_relu_int8", {})
+    if ops.depthwise5x5_relu_int8.supports(x, fused.depthwise_weight, fused.depthwise_bias, block.conv_pointwise.input_scale):
+        assert "reference" not in counts and sum(counts.values()) == 1
+        assert ((out.float() - unfused).norm() / unfused.norm()) < 0.01  # BF16 depthwise rounding vs FP32 accumulation
+    else:
+        assert not counts and torch.equal(out.float(), unfused)

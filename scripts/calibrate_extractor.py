@@ -52,7 +52,8 @@ def main() -> None:
         config = spec.quant_configs[fmt]
         targets = [
             name for name, m in model.named_modules()
-            if isinstance(m, (nn.Conv2d, nn.Linear)) and config.scheme_for(name) and getattr(m, "groups", 1) == 1
+            if isinstance(m, (nn.Conv2d, nn.Linear)) and getattr(m, "groups", 1) == 1
+            and (match := config.scheme_for(name)) and not match[1].input_activations.dynamic  # dynamic: no table
         ]
         observer = Int8Calibrator(model, targets, percentile=args.percentile) if fmt == "int8" else Calibrator(model, targets)
         with torch.inference_mode(), observer:

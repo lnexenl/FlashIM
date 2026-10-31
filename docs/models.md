@@ -42,7 +42,7 @@ Every learned model is a native PyTorch port that is checked against its upstrea
 |---|---|
 | `fp32` | the checkpoint's own precision |
 | `bf16` | BF16 compute; keypoint selection, softmaxes and sampling / position math stay FP32 |
-| `int8` | INT8 with symmetric per-output-channel weights and one calibrated scale per activation tensor |
+| `int8` | INT8 with symmetric per-output-channel weights and one calibrated scale per activation tensor (DeDoDe-G's DINOv2 ViT: one scale per token, computed at run time) |
 | `fp8` | MXFP8: FP8 (E4M3) values with one power-of-two (E8M0) scale per 32 elements |
 
 **Engines** (`eager`, `compile`; RoMaV2 also `compile-full`) are separate from presets: any preset runs with any of

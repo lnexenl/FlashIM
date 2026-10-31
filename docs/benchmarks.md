@@ -34,8 +34,8 @@ cell is a preset the model does not have.
 | disk | 14.2 / 11.2 | 8.35 / 7.27 | 9.79 / **7.04** | 7.82 / 7.07 |
 | alike | 6.71 / 5.84 | 3.96 / **3.06** | 4.70 / 4.56 | 4.92 / 4.82 |
 | xfeat | 2.22 / 2.19 | 2.27 / 1.86 | 2.72 / **1.81** | 2.62 / 2.04 |
-| dedode | 197.9 / 125.0 | 56.9 / 61.9 | 46.4 / 50.7 | **41.0** / 51.7 |
-| dedode-g | 543.7 / 468.8 | 130.9 / 132.1 | 139.9 / 120.5 | **87.2** / 100.9 |
+| dedode | 197.9 / 125.0 | 56.9 / 61.9 | **33.9**¹ / 50.7 | 41.0 / 51.7 |
+| dedode-g | 543.7 / 468.8 | 130.9 / 132.1 | 87.1¹ / 120.5 | **87.2** / 100.9 |
 | dad | 520.2 / 420.1 | 113.2 / 120.9 | 102.4 / 108.5 | **75.1** / 88.7 |
 | ripe | 114.4 / 72.5 | 33.6 / fail | **24.5** / fail | 25.1 / fail |
 | aliked | 9.05 / 10.3 | 5.34 / **5.17** |  |  |
@@ -45,6 +45,9 @@ cell is a preset the model does not have.
 | orb | **10.4** / - |  |  |  |
 
 - SIFT and ORB are OpenCV (fp32, eager only).
+- ¹ Remeasured 2026-11-01 (same protocol) after the DeDoDe int8 decoder fusions and, for `dedode-g`, the per-token
+  INT8 ViT (were 46.4 and 139.9). Their compile cells are the old run's: the int8 sparse extractors do not compile at
+  the moment (Dynamo rejects the autotuned INT8 conv kernels).
 - `ripe` with `engine="compile"` fails in Inductor for `bf16`, `int8` and `fp8` (`InductorError: KeyError`); `fp32`
   compiles.
 
@@ -87,6 +90,9 @@ fail it are in bold.
 | superpoint-lightglue | **-0.0085** | **-0.0226** |
 | disk-lightglue | +0.0011 | -0.0022 |
 | xfeat-lightglue | **-0.0244** | **-0.1366** |
+
+`dedode` / `dedode-g` int8 after the 2026-11-01 changes (decoder fusions, per-token INT8 ViT), 3 seeds against a `bf16`
+run of the same tree: +0.0004 / +0.0025.
 
 RoMaV2, RDD and the ALIKED pipelines were not part of that run. Their accuracy is on their model pages ([models.md](models.md)).
 

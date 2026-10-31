@@ -71,14 +71,16 @@ def _mxfp8_linear_reference(activation: QuantizedTensor, bias: Tensor | None, we
 mxfp8_linear = Op("mxfp8_linear", _mxfp8_linear_reference, weights=1)
 
 
-# -- static INT8 GEMM (per-channel weights, per-tensor activations) ---------------------------------
+# -- INT8 GEMM (per-channel weights, per-tensor or per-row activation scales) -------------------------
 
 
 def _int8_linear_reference(
     a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, *, relu: bool = False
 ) -> Tensor:
     """``[M, K] int8 x [N, K] int8^T`` in INT32, then ``acc * (a_scale * w_scale) + bias`` (``relu``: then ReLU) -> BF16.
-    ReLU commutes with the BF16 rounding, so ``relu=True`` equals ``F.relu`` of the ``relu=False`` result bit for bit."""
+    ``a_scale``: one static FP32 value, or ``[M, 1]`` per-row scales (dynamic per-token activations,
+    :func:`~flashim.ops.quantize_int8_rows`). ReLU commutes with the BF16 rounding, so ``relu=True`` equals ``F.relu``
+    of the ``relu=False`` result bit for bit."""
     acc = a.long() @ weight.long().t() if a.device.type == "cpu" else a.double() @ weight.double().t()
     out = acc.float() * (a_scale.float() * w_scale.float())
     if bias is not None:

@@ -8,7 +8,7 @@ from torch import nn
 
 from flashim.quant.calibration import CalibrationTable, Int8CalibrationTable
 from flashim.quant.methods.conv2d import StaticInt8Conv2d, StaticMXFP8Conv2d
-from flashim.quant.methods.int8_linear import StaticInt8Conv1x1, StaticInt8Linear
+from flashim.quant.methods.int8_linear import DynamicInt8Linear, StaticInt8Conv1x1, StaticInt8Linear
 from flashim.quant.methods.linear import StaticMXFP8Linear
 from flashim.quant.passes.deformable_encoder import QuantizedDeformableEncoder, is_deformable_encoder
 from flashim.quant.passes.separable_conv_block import (
@@ -29,7 +29,8 @@ def quantize_model(
     protected: Iterable[str] = (),
 ) -> PackingReport:
     """In place. Linears targeted by a static scheme become :class:`StaticMXFP8Linear`
-    (or :class:`StaticInt8Linear` for INT8 schemes, which need an :class:`Int8CalibrationTable`);
+    (or :class:`StaticInt8Linear` for INT8 schemes, which need an :class:`Int8CalibrationTable`), by a dynamic
+    per-token INT8 scheme :class:`DynamicInt8Linear` (no calibration);
     transformer blocks whose attention projections were packed get fused boundaries;
     separable conv blocks whose ``conv_pointwise`` is targeted by a dynamic MXFP8 scheme become
     :class:`MXFP8SeparableConvBlock`, by a static INT8 scheme :class:`Int8SeparableConvBlock`
@@ -63,7 +64,17 @@ def quantize_model(
         is_conv = isinstance(module, nn.Conv2d) and module.groups == 1 and name not in block_pointwise
         if not (isinstance(module, nn.Linear) or is_conv1x1 and scheme.weights.type == "int" or is_conv):
             continue
-        if scheme.input_activations is None or scheme.input_activations.dynamic:
+        act = scheme.input_activations
+        if scheme.weights.type == "int" and act is not None and act.dynamic and act.strategy == "token":
+            if not isinstance(module, nn.Linear):
+                raise ValueError(f"Dynamic per-token INT8 targets linears only, not {name!r}")
+            packed = DynamicInt8Linear.from_linear(module)
+            report.bytes_before += nbytes(module)
+            report.bytes_after += nbytes(packed)
+            set_submodule(model, name, packed)
+            report.linears[name] = "int8_linear_dynamic"
+            continue
+        if act is None or act.dynamic:
             continue
         if calibration is None or name not in calibration:
             raise RuntimeError(f"No calibration for static-activation linear {name!r}")

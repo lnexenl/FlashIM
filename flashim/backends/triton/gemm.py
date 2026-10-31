@@ -286,13 +286,15 @@ def _int8_gemm_kernel(
     K: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     RELU: tl.constexpr,
+    ROW_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
     """``int8[M,K] x int8[N,K]^T`` with INT32 accumulation; epilogue ``acc * (a_scale * w_scale[n]) + bias`` (then ReLU
-    with ``RELU``: it commutes with the BF16 rounding, so it equals a separate ReLU pass bit for bit)."""
+    with ``RELU``: it commutes with the BF16 rounding, so it equals a separate ReLU pass bit for bit). ``ROW_SCALE``:
+    ``a_scale`` holds one scale per row (dynamic per-token activations) instead of one value."""
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(rows, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -316,13 +318,17 @@ def _int8_gemm_kernel(
         accumulator = tl.dot(a, b, accumulator, out_dtype=tl.int32)
         a_ptrs += BLOCK_K
         b_ptrs += BLOCK_K
-    scale = tl.load(a_scale_ptr) * tl.load(w_scale_ptr + offs_n, mask=mask_n, other=0.0)
+    if ROW_SCALE:
+        scale = (tl.load(a_scale_ptr + offs_m, mask=mask_m, other=0.0)[:, None]
+                 * tl.load(w_scale_ptr + offs_n, mask=mask_n, other=0.0)[None, :])
+    else:
+        scale = (tl.load(a_scale_ptr) * tl.load(w_scale_ptr + offs_n, mask=mask_n, other=0.0))[None, :]
     if HAS_BIAS:  # explicit FMA: the compiler contracted `acc * scale + bias` for most tile configs but not all,
         # so the output bits depended on which config autotuning picked; one rounding for every config instead
         bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
-        out = tl.fma(accumulator.to(tl.float32), scale[None, :], bias[None, :])
+        out = tl.fma(accumulator.to(tl.float32), scale, bias[None, :])
     else:
-        out = accumulator.to(tl.float32) * scale[None, :]
+        out = accumulator.to(tl.float32) * scale
     if RELU:
         out = tl.maximum(out, 0.0)
     tl.store(
@@ -355,7 +361,8 @@ def _int8_gemm_config(
 def int8_gemm_bf16(
     a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, config=None, *, relu: bool = False
 ) -> Tensor:
-    """``[rows, K] int8 x [N, K] int8^T`` -> BF16 ``[rows, N]`` with the dequantizing epilogue fused."""
+    """``[rows, K] int8 x [N, K] int8^T`` -> BF16 ``[rows, N]`` with the dequantizing epilogue fused; ``a_scale``: one
+    FP32 value or ``[rows, 1]`` (contiguous) per-row scales."""
     rows, k = a.shape
     n = weight.shape[0]
     out = torch.empty(rows, n, device=a.device, dtype=torch.bfloat16)
@@ -374,6 +381,7 @@ def int8_gemm_bf16(
         K=k,
         HAS_BIAS=bias is not None,
         RELU=relu,
+        ROW_SCALE=a_scale.numel() != 1,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from flashim.ops._registry import Op
+from flashim.quant.tensor import Int8Tensor, quantize_int8_static
 
 
 def _upsample_concat_reference(features: Tensor, coarse: Tensor) -> Tensor:
@@ -18,6 +19,16 @@ def _upsample_concat_reference(features: Tensor, coarse: Tensor) -> Tensor:
 
 
 upsample_concat = Op("upsample_concat", _upsample_concat_reference)
+
+
+def _upsample_concat_int8_reference(features: Tensor, coarse: Tensor, scale: Tensor) -> Int8Tensor:
+    """:func:`upsample_concat` (BF16) statically quantized for the INT8 1x1 convolution it feeds: ``round(x / scale)``
+    saturated to +-127 -> :class:`Int8Tensor` ``[B, H, W, Cf + Cc]`` (channels-last, the convolution's GEMM rows)."""
+    dense = _upsample_concat_reference(features.to(torch.bfloat16), coarse)
+    return quantize_int8_static(dense.permute(0, 2, 3, 1), scale)
+
+
+upsample_concat_int8 = Op("upsample_concat_int8", _upsample_concat_int8_reference)
 
 
 def _upsample_add_reference(coarse: Tensor, delta: Tensor) -> Tensor:

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from flashim.ops._registry import Op
+from flashim.quant.formats.int8 import INT8_MAX, quantize_symmetric, safe_scale
 from flashim.quant.tensor import Int8Tensor, QuantizedTensor, quantize_int8_static, quantize_static
 
 # -- LayerNorm (+ residual) -> static quantize ------------------------------------------
@@ -124,3 +125,18 @@ def _gelu_quantize_int8_reference(value: Tensor, scale: Tensor, approximate: str
 
 
 gelu_quantize_int8 = Op("gelu_quantize_int8", _gelu_quantize_int8_reference)
+
+
+# -- INT8 producer: dynamic per-row FP32 scale --------------------------------------------------------
+
+
+def _quantize_int8_rows_reference(value: Tensor) -> tuple[Tensor, Tensor]:
+    """Per-row (per-token) dynamic INT8: ``scale = amax(|row|) * (1 / 127)`` (FP32, ``safe_scale``; the reciprocal
+    product, which is what torch's CUDA division by a scalar computes, spelled out so every device agrees),
+    ``round(value / scale)`` saturated to +-127. Returns int8 values of ``value``'s shape and the FP32 scales
+    ``[*leading, 1]`` (the ``a_scale`` :func:`~flashim.ops.int8_linear` takes per row)."""
+    scale = safe_scale(value.float().abs().amax(-1, keepdim=True) * (1 / INT8_MAX))
+    return quantize_symmetric(value, scale), scale
+
+
+quantize_int8_rows = Op("quantize_int8_rows", _quantize_int8_rows_reference)
