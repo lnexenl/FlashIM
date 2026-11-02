@@ -127,6 +127,17 @@ def _gelu_quantize_int8_reference(value: Tensor, scale: Tensor, approximate: str
 gelu_quantize_int8 = Op("gelu_quantize_int8", _gelu_quantize_int8_reference)
 
 
+def _bias_relu_quantize_int8_reference(raw: Tensor, bias: Tensor, scale: Tensor) -> Int8Tensor:
+    """``quantize_int8(relu(raw + bias))`` for the bias-free output of a convolution: ``raw`` NCHW ``[B, C, H, W]``
+    (BF16, as cuDNN returns it), ``bias`` ``[C]`` added in ``raw``'s dtype (``Tensor.add_``'s rounding, which is what
+    ``nn.Conv2d`` does after the cuDNN call), then ReLU and the static quantize. Returns the INT8 NHWC
+    :class:`Int8Tensor` ``[B, H, W, C]`` the next quantized convolution reads."""
+    return quantize_int8_static(F.relu(raw + bias.view(1, -1, 1, 1)).permute(0, 2, 3, 1), scale)
+
+
+bias_relu_quantize_int8 = Op("bias_relu_quantize_int8", _bias_relu_quantize_int8_reference)
+
+
 # -- INT8 producer: dynamic per-row FP32 scale --------------------------------------------------------
 
 
@@ -140,3 +151,16 @@ def _quantize_int8_rows_reference(value: Tensor) -> tuple[Tensor, Tensor]:
 
 
 quantize_int8_rows = Op("quantize_int8_rows", _quantize_int8_rows_reference)
+
+
+def _layernorm_quantize_int8_rows_reference(
+    value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+) -> tuple[Tensor, Tensor]:
+    """``quantize_int8_rows(nn.LayerNorm(value))``: the normalization is torch's own (rounded to ``value.dtype``, the
+    tensor a separate LayerNorm module hands to the next layer), then per-row dynamic INT8 as
+    :func:`quantize_int8_rows`. Returns int8 values of ``value``'s shape and FP32 scales ``[*leading, 1]``."""
+    normalized = F.layer_norm(value, (value.shape[-1],), weight, bias, eps)
+    return _quantize_int8_rows_reference(normalized)
+
+
+layernorm_quantize_int8_rows = Op("layernorm_quantize_int8_rows", _layernorm_quantize_int8_rows_reference)

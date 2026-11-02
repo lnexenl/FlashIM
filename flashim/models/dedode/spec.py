@@ -49,6 +49,17 @@ def _fold_layer_scale(model: nn.Module, ctx: BuildContext) -> list[str] | str:
     return fold_layer_scale(model)
 
 
+def _fused_dynamic_vit_blocks(model: nn.Module, ctx: BuildContext) -> list[str] | str:
+    """int8: DINOv2 blocks with dynamic INT8 linears (dedode-g) with LayerNorm + per-row quantize in one kernel and the
+    GELU / residual add in the GEMM epilogues (``DynamicInt8TransformerBlock``); bit-identical. Pieces without a kernel
+    for the platform keep running as the unfused modules."""
+    if ctx.config.precision.quant != "int8":
+        return "skipped: not int8"
+    from flashim.quant.passes.dynamic_transformer_block import fuse_dynamic_blocks
+
+    return fuse_dynamic_blocks(model) or "skipped: no dynamic INT8 transformer blocks"
+
+
 def _fused_block_epilogues(model: nn.Module, ctx: BuildContext) -> list[str] | str:
     """The ViT's biases and residual adds inside neighbouring kernels (``QuantizedTransformerBlock.fused_epilogues``):
     measured as separate elementwise passes of 8.7 ms per DaD fp8 extract (benchmarks/profile/timeline_audit.py)."""
@@ -130,11 +141,55 @@ DECODER_FUSION_PASSES = {
 }
 
 
+def fused_pool_epilogue(model: nn.Module, ctx: BuildContext) -> list[str] | str:
+    """int8: every ``INT8 conv -> ReLU -> MaxPool2d(2) -> INT8 conv`` of the VGG encoders as one kernel
+    (``VGG.pooled_convs``, ``ops.int8_conv2d_maxpool``); bit-identical."""
+    if ctx.config.precision.quant != "int8":
+        return "skipped: not int8"
+    found = []
+    for name, module in model.named_modules():
+        if isinstance(module, blocks.VGG):
+            module.pooled_convs = module.find_pooled_convs()
+            found += [f"{name}.layers.{i}" for i in sorted(module.pooled_convs)]
+    return found
+
+
+def fused_first_conv_epilogue(model: nn.Module, ctx: BuildContext) -> list[str] | str:
+    """int8: the first VGG conv (BF16, 3 -> 64) feeding an INT8 conv: cuDNN without the bias, then bias, ReLU and the
+    next conv's quantize as one pass (``VGG.first_conv_relu``, ``ops.bias_relu_quantize_int8``); bit-identical to the
+    cuDNN path, which rounds the convolution to BF16 before adding the bias (a CPU BF16 conv adds it in FP32)."""
+    if ctx.config.precision.quant != "int8":
+        return "skipped: not int8"
+    if ctx.platform.device_type != "cuda":
+        return "skipped: the bias is added after the BF16 rounding of the convolution only by cuDNN"
+    found = []
+    for name, module in model.named_modules():
+        if isinstance(module, blocks.VGG):
+            module.first_conv_relu = module.find_first_conv_relu()
+            if module.first_conv_relu is not None:
+                found.append(f"{name}.layers.0")
+    return found
+
+
+# The VGG encoders' stem for the int8 preset (bit-identical, see ``blocks.VGG``).
+STEM_EXACT_PASSES = {
+    "fused_pool_epilogue": Pass(
+        fused_pool_epilogue, description="int8: max pool + next conv's quantize in the INT8 conv's epilogue"
+    ),
+    "fused_first_conv_epilogue": Pass(
+        fused_first_conv_epilogue, description="int8: first conv's bias + ReLU + quantize as one pass"
+    ),
+}
+
+
 # For the DINOv2 descriptor (dedode-g, dad).
 VIT_EPILOGUE_PASSES = {
     "fold_layer_scale": Pass(
         _fold_layer_scale, stage="pre_quant", exact=False,
         description="ViT LayerScale folded into proj / fc2 (when quantized)",
+    ),
+    "fused_dynamic_vit_blocks": Pass(
+        _fused_dynamic_vit_blocks, description="int8: ViT LayerNorm + row quantize, GELU and residual in one kernel each",
     ),
     "fused_block_epilogues": Pass(
         _fused_block_epilogues, stage="post_quant", exact=False,
@@ -171,8 +226,10 @@ def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ..
         # ConvRefiner hidden blocks with 32 / 64 / 128 channels as one BF16 kernel each (26 blocks). BF16 extract at
         # 1200 px, pass off vs on in one process (sm_120): dedode 101.8 -> 77.8 ms, dedode-g 174.5 -> 151.0 ms.
         fused_bf16_blocks=_DECODERS,
-        extra_passes={**DECODER_UPSAMPLE_PASS, **DECODER_FUSION_PASSES, **(VIT_EPILOGUE_PASSES if vit else {})},
-        structural_passes=(*DECODER_UPSAMPLE_PASS, *DECODER_FUSION_PASSES, *(VIT_EPILOGUE_PASSES if vit else ())),
+        extra_passes={**DECODER_UPSAMPLE_PASS, **DECODER_FUSION_PASSES, **STEM_EXACT_PASSES, **(VIT_EPILOGUE_PASSES if vit else {})},
+        structural_passes=(
+            *DECODER_UPSAMPLE_PASS, *DECODER_FUSION_PASSES, *STEM_EXACT_PASSES, *(VIT_EPILOGUE_PASSES if vit else ())
+        ),
     )
 
 
