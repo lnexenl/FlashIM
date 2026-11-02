@@ -11,8 +11,15 @@ poselib, 2.0px), so each published number needs its own setting to be reproduced
 summed mean focal lengths, so ``--estimator opencv --ransac-thr 0.5`` is RDD's ``0.5`` exactly) and
 ``--bgr`` (RDD and XFeat feed OpenCV's BGR arrays to the network; FlashIM feeds RGB by default).
 
+The images reach the model as PIL arrays decoded by the loader threads (the published numbers); ``--decoder`` instead
+passes each file through ``load_image(decoder=...)`` on the main thread, as ``match(path_a, path_b)`` does, to measure a
+decoder's effect on accuracy (``nvjpeg`` vs ``pil``). ``--save-errors`` keeps the per-pair pose errors ``[seed, pair]``
+for paired bootstraps between runs.
+
     python benchmarks/accuracy/run_sparse.py --model xfeat --preset fp32 --seed 17
     python benchmarks/accuracy/run_sparse.py --model rdd --resize 1600 --estimator opencv --ransac-thr 0.5 --bgr
+    python benchmarks/accuracy/run_sparse.py --model aliked-lightglue --preset bf16 --seeds 17 29 42 \
+        --decoder nvjpeg --save-errors e.npy
 """
 
 from __future__ import annotations
