@@ -10,6 +10,8 @@ tried, 0 mismatches). The combine is symmetric because every level merges equal 
 of 512. Measured and discarded: emulating the tree level by level with reshapes (also exact, 4-7x slower than torch's
 LayerNorm), 256 threads (1e-5 of the outputs differ).
 
+Re-expression of ATen's arithmetic (PyTorch, BSD-3-Clause; see THIRD_PARTY_NOTICES.md), no source copied.
+
 Kernels using these must launch with ``enable_fp_fusion=False`` (the FMAs are explicit).
 """
 
