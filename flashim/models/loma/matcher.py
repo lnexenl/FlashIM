@@ -42,18 +42,30 @@ def normalize_keypoints(keypoints: Tensor, image_size: tuple[int, int]) -> Tenso
 
 class DualSoftmaxAssignment(MatchAssignment):
     """LoMa's inference assignment: ``log_softmax(sim, -1) + log_softmax(sim, -2)``; ``matchability`` is kept
-    for the checkpoint (strict loading) but unused."""
+    for the checkpoint (strict loading) but unused.
+
+    ``low_precision_similarity`` (the ``low_precision_similarity`` pass of the reduced-precision presets): ``sim`` is
+    ``ops.matmul_nt_fp32`` of ``final_proj``'s low-precision outputs (tensor cores, FP32 accumulation and output)
+    instead of upstream's FP32 SGEMM of their FP32 casts; same inputs, only the accumulation differs."""
+
+    low_precision_similarity = False
+
+    def similarity(self, x0: Tensor, x1: Tensor) -> Tensor:
+        """``[B, M, N]`` FP32 similarity ``final_proj(x0) final_proj(x1)^T / sqrt(dim)``."""
+        dim = x0.shape[-1]
+        if self.low_precision_similarity:
+            m0, m1 = self.final_proj(x0), self.final_proj(x1)
+            sims = [ops.matmul_nt_fp32(a, b, dim**-0.5) for a, b in zip(m0, m1)]
+            return sims[0][None] if len(sims) == 1 else torch.stack(sims)
+        m0, m1 = (self.final_proj(x).float() / dim**0.25 for x in (x0, x1))
+        return m0 @ m1.transpose(-1, -2)
 
     def forward(self, x0: Tensor, x1: Tensor) -> Tensor:
-        dim = x0.shape[-1]
-        m0, m1 = (self.final_proj(x).float() / dim**0.25 for x in (x0, x1))
-        sim = m0 @ m1.transpose(-1, -2)
+        sim = self.similarity(x0, x1)
         return sim.log_softmax(-1) + sim.log_softmax(-2)
 
     def matches(self, x0: Tensor, x1: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        dim = x0.shape[-1]
-        m0, m1 = (self.final_proj(x).float() / dim**0.25 for x in (x0, x1))
-        return ops.dual_softmax_mutual((m0 @ m1.transpose(-1, -2))[0])
+        return ops.dual_softmax_mutual(self.similarity(x0, x1)[0])
 
 
 class LoMaMatcher(LightGlue):
