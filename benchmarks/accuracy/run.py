@@ -40,6 +40,7 @@ from flashim.geometry.pose import (
     estimate_pose_cv2_ransac,
     summarize,
 )
+from flashim.models.romav2.model import IMAGE_DECODERS, load_image
 from flashim.paths import DATA
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,17 @@ def _read_rgb(path) -> np.ndarray:
     return np.asarray(Image.open(path).convert("RGB"))
 
 
-def mega1500(model, data_root: Path, pool: PosePool, max_pairs: int, loader: dict) -> int:
+def _reader(model, decoder: str):
+    """``path -> image`` for the main thread (``load_image(decoder=...)``, GPU decoders need the model's device), or
+    ``None``: PIL arrays decoded by the loader threads (the same pixels as ``decoder="pil"``)."""
+    return (lambda path: load_image(path, model.device, decoder)) if decoder else None
+
+
+def _hw(image) -> tuple[int, int]:
+    return tuple(image.shape[-2:]) if isinstance(image, torch.Tensor) else image.shape[:2]
+
+
+def mega1500(model, data_root: Path, pool: PosePool, max_pairs: int, loader: dict, decoder: str = "") -> int:
     def jobs():
         for scene_name in MEGA_SCENES:
             scene = np.load(data_root / scene_name, allow_pickle=True)
@@ -119,13 +130,17 @@ def mega1500(model, data_root: Path, pool: PosePool, max_pairs: int, loader: dic
                 yield (f"{data_root}/{paths[idx1]}", f"{data_root}/{paths[idx2]}",
                        intrinsics[idx1].copy(), intrinsics[idx2].copy(), R, t)
 
+    read = _reader(model, decoder)
+
     def load(job):
-        return (*job, _read_rgb(job[0]), _read_rgb(job[1]))
+        return (*job, *((None, None) if read else (_read_rgb(job[0]), _read_rgb(job[1]))))
 
     count = 0
-    for *_, K1, K2, R, t, img_a, img_b in tqdm(prefetch(jobs(), load, **loader), desc="mega1500", leave=False):
+    for path_a, path_b, K1, K2, R, t, img_a, img_b in tqdm(prefetch(jobs(), load, **loader), desc="mega1500", leave=False):
+        if read:
+            img_a, img_b = read(path_a), read(path_b)
         preds = model.match_dense(img_a, img_b)
-        (h1, w1), (h2, w2) = img_a.shape[:2], img_b.shape[:2]
+        (h1, w1), (h2, w2) = _hw(img_a), _hw(img_b)
         s1, s2 = 1200 / max(w1, h1), 1200 / max(w2, h2)
         w1, h1, w2, h2 = s1 * w1, s1 * h1, s2 * w2, s2 * h2
         K1[:2] *= s1
@@ -140,7 +155,7 @@ def mega1500(model, data_root: Path, pool: PosePool, max_pairs: int, loader: dic
     return count
 
 
-def scannet1500(model, data_root: Path, pool: PosePool, max_pairs: int, loader: dict) -> int:
+def scannet1500(model, data_root: Path, pool: PosePool, max_pairs: int, loader: dict, decoder: str = "") -> int:
     data = np.load(osp.join(data_root, "test.npz"))
     pairs, rel_pose = data["name"], data["rel_pose"]
     if max_pairs > 0:
@@ -155,11 +170,17 @@ def scannet1500(model, data_root: Path, pool: PosePool, max_pairs: int, loader: 
             yield (osp.join(scene_dir, "color", f"{scene[2]}.jpg"), osp.join(scene_dir, "color", f"{scene[3]}.jpg"),
                    K, T[:3, :3], T[:3, 3])
 
-    def load(job):
-        return (*job, _read_rgb(job[0]), _read_rgb(job[1]))
+    read = _reader(model, decoder)
 
-    for *_, K, R, t, img_a, img_b in tqdm(prefetch(jobs(), load, **loader), total=len(pairs), desc="scannet1500", leave=False):
-        (h1, w1), (h2, w2) = img_a.shape[:2], img_b.shape[:2]
+    def load(job):
+        return (*job, *((None, None) if read else (_read_rgb(job[0]), _read_rgb(job[1]))))
+
+    for path_a, path_b, K, R, t, img_a, img_b in tqdm(
+        prefetch(jobs(), load, **loader), total=len(pairs), desc="scannet1500", leave=False
+    ):
+        if read:
+            img_a, img_b = read(path_a), read(path_b)
+        (h1, w1), (h2, w2) = _hw(img_a), _hw(img_b)
         preds = model.match_dense(img_a, img_b)
         matches, *_ = model.sample(preds, 5000)
         s1, s2 = 480 / min(w1, h1), 480 / min(w2, h2)
@@ -197,6 +218,10 @@ def main() -> None:
     parser.add_argument("--loaders", type=int, default=4, help="image decode threads")
     parser.add_argument("--prefetch", type=int, default=16, help="pairs decoded ahead of the GPU")
     parser.add_argument("--cv-threads", type=int, default=0, help="OpenCV/OMP/torch CPU threads (0 = all cores)")
+    parser.add_argument("--decoder", default="", choices=("", *IMAGE_DECODERS),
+                        help="decode the image files with load_image(decoder=...) on the main thread (default: PIL "
+                        "arrays from the loader threads, the same pixels as 'pil')")
+    parser.add_argument("--save-errors", default="", help=".npy of the pose errors, [pair x 5 RANSAC runs]")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
@@ -220,8 +245,10 @@ def main() -> None:
     started = time.time()
     run = mega1500 if args.dataset == "mega1500" else scannet1500
     pool = PosePool(args.workers)
-    pairs = run(model, data_root, pool, args.max_pairs, {"workers": args.loaders, "depth": args.prefetch})
+    pairs = run(model, data_root, pool, args.max_pairs, {"workers": args.loaders, "depth": args.prefetch}, args.decoder)
     errors = pool.errors()  # drains the queue; GPU stage is already finished
+    if args.save_errors:
+        np.save(args.save_errors, np.asarray(errors, dtype=np.float32))
     result = {
         "dataset": args.dataset,
         "model": args.model,
@@ -231,6 +258,7 @@ def main() -> None:
         "seed": args.seed,
         "workers": args.workers,
         "loaders": args.loaders,
+        "decoder": args.decoder or "pil",
         "pairs": pairs,
         **summarize(errors),
         "seconds": time.time() - started,

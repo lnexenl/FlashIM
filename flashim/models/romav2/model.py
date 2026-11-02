@@ -15,6 +15,7 @@ from PIL import Image
 from torch import Tensor, nn
 
 from flashim import ops
+from flashim.image_io import JPEG_SUFFIXES, decode_jpeg_cuda
 from flashim.models.base import ImageMatcher
 from flashim.models.romav2 import weights
 from flashim.models.romav2.config import SETTINGS, RoMaV2Config, Setting
@@ -61,10 +62,14 @@ def _is_hr_entry(stages: list, stage: int, stride: int) -> bool:
     return len(stages) > 1 and stage == 1 and stride == 4
 
 
-# Decoder for image *paths*: "pil" (libjpeg on the CPU, then a host -> device copy) or "nvjpeg" (JPEG files decoded on
-# the GPU, torchvision.io.decode_jpeg). Measured for a 1600x1199 MegaDepth JPEG on sm_120: 15.7 ms -> 2.2 ms (+ the file
-# read); the decoded pixels differ from libjpeg's (max 15 levels, mean 0.19), so "pil" stays the default and the
-# benchmarks use it. Override per call (``decoder=``) or with FLASHIM_IMAGE_DECODER.
+# Decoder for image *paths*: "pil" (libjpeg on the CPU, then a host -> device copy), "nvjpeg" (JPEG files decoded on
+# the GPU by torchvision.io.decode_jpeg, chroma upsampled libjpeg's way by flashim.image_io), "nvjpeg-raw" (nvJPEG's
+# own pixel-replicated chroma). The GPU decoders apply to .jpg / .jpeg paths when ``device`` is CUDA (anything else, and
+# JPEGs nvJPEG would not decode like libjpeg, e.g. CMYK, go to PIL). Override per call (``decoder=``) or with
+# FLASHIM_IMAGE_DECODER. load_image per MegaDepth-1500 image (median 1.2 MP, decode + copy + float, page cache warm;
+# benchmarks/speed/image_decode.py), L20 / H20: pil 12.4 / 12.8 ms, nvjpeg 2.0 / 2.4 ms, nvjpeg-raw 1.9 / 2.3 ms.
+# Pixels vs PIL over all 806 images: nvjpeg 0.0008 levels apart on average (max 6), nvjpeg-raw 0.18 (max 43).
+IMAGE_DECODERS = ("pil", "nvjpeg", "nvjpeg-raw")
 IMAGE_DECODER = os.environ.get("FLASHIM_IMAGE_DECODER", "pil")
 
 
@@ -72,17 +77,17 @@ def load_image(img: ImageLike, device: torch.device, decoder: str | None = None)
     """Path / PIL / HWC numpy / ``[B,3,H,W]`` tensor -> float ``[B,3,H,W]`` in [0, 1] on ``device`` (``decoder``: see
     ``IMAGE_DECODER``)."""
     decoder = decoder or IMAGE_DECODER
-    if decoder not in ("pil", "nvjpeg"):
-        raise ValueError(f"Unknown image decoder {decoder!r}: 'pil' or 'nvjpeg'")
+    if decoder not in IMAGE_DECODERS:
+        raise ValueError(f"Unknown image decoder {decoder!r}: one of {IMAGE_DECODERS}")
     if (
-        decoder == "nvjpeg"
+        decoder != "pil"
         and isinstance(img, (str, Path))
-        and Path(img).suffix.lower() in (".jpg", ".jpeg")
+        and Path(img).suffix.lower() in JPEG_SUFFIXES
         and torch.device(device).type == "cuda"
     ):
-        from torchvision.io import ImageReadMode, decode_jpeg, read_file
-
-        return decode_jpeg(read_file(str(img)), mode=ImageReadMode.RGB, device=device)[None].float() / 255.0
+        rgb = decode_jpeg_cuda(img, torch.device(device), fancy=decoder == "nvjpeg")
+        if rgb is not None:
+            return rgb[None].float() / 255.0
     if isinstance(img, (str, Path)):
         pil = Image.open(img)
         if pil.mode == "I;16":
