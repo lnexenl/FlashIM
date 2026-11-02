@@ -23,11 +23,14 @@ from flashim.paths import ASSETS
 
 def test_pil_resize_matches_pillow():
     pil = Image.open(ASSETS / "toronto_A.jpg").convert("RGB").resize((400, 300))
-    image = torch.from_numpy(np.array(pil)).permute(2, 0, 1)[None].float() / 255
+    raw = torch.from_numpy(np.array(pil)).permute(2, 0, 1)[None]
+    image = raw.float() / 255
     for w, h in ((200, 144), (112, 112), (520, 384)):  # down in both, aspect changed, up
         ref = torch.from_numpy(np.array(pil.resize((w, h)))).permute(2, 0, 1)[None].float() / 255
-        diff = (pil_resize(image, (h, w)) - ref).abs() * 255
+        out = pil_resize(image, (h, w))
+        diff = (out - ref).abs() * 255
         assert diff.max() <= 1.0001 and (diff < 1e-3).float().mean() > 0.995, (w, h)
+        assert torch.equal(pil_resize(raw, (h, w)), out)  # uint8 input: converted as load_image does
 
 
 def test_detector_size_is_upstreams():

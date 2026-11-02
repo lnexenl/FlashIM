@@ -8,11 +8,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from flashim import ops
 from flashim.models import sparse
 from flashim.models.dedode import blocks
 from flashim.models.dedode.model import DeDoDe, SamplerConfig, sample_keypoints
 from flashim.models.loma import weights
-from flashim.models.romav2.model import ImageLike, load_image
+from flashim.models.romav2.model import ImageLike, load_image_raw
 from flashim.types import Matches, SparseFeatures
 from flashim.utils import device_constant
 
@@ -28,21 +29,10 @@ DESCRIPTORS = {"b128": DESCRIPTOR_B128, "b": blocks.DESCRIPTOR_G, "l": blocks.DE
                "r": blocks.DESCRIPTOR_G}
 
 
-def _quantize8(image: Tensor) -> Tensor:
-    return (image * 255).round().clamp(0, 255) / 255
-
-
 def pil_resize(image: Tensor, size: tuple[int, int]) -> Tensor:
-    """``PIL.Image.resize(size)`` (BICUBIC) of an 8-bit image, in torch: PIL resamples width first, then height, with
-    an antialiased bicubic (a = -0.5, torch's ``antialias=True`` kernel) and rounds to 8 bits after each pass. Measured
-    against Pillow 12.3 on two MegaDepth / toronto images, 1024 px and 784 x 784, CPU and CUDA: at most 1/255 apart,
-    >= 99.95% of the values equal (one bicubic pass without the rounding: up to 6/255, 86% equal; bilinear: 31/255)."""
-    height, width = size
-    if image.shape[-1] != width:
-        image = _quantize8(F.interpolate(image, size=(image.shape[-2], width), mode="bicubic", antialias=True))
-    if image.shape[-2] != height:
-        image = _quantize8(F.interpolate(image, size=(height, width), mode="bicubic", antialias=True))
-    return image
+    """``PIL.Image.resize(size)`` (BICUBIC) of an 8-bit image (uint8, or float in [0, 1]): ``ops.pil_bicubic_resize``
+    to one size."""
+    return ops.pil_bicubic_resize(image, [size])[0]
 
 
 def detector_size(height: int, width: int, long_side: int) -> tuple[int, int]:
@@ -56,8 +46,9 @@ class LoMaExtractor(DeDoDe):
     sides floored to 8) and ImageNet-normalized; the descriptor on a separate ``descriptor_size`` resize (784 x 784,
     aspect not kept) of the original, *not* normalized (upstream feeds the [0, 1] image to VGG19 / DINOv2), sampled
     bilinearly at the detector's keypoints (the same [-1, 1] frame of the full image). Both resizes reproduce PIL's
-    bicubic (:func:`pil_resize`), as upstream's path API that its benchmarks use. Descriptors are not L2-normalized
-    (the matcher's input; mean norms measured on upstream's 0015_A.jpg: 19 for B128, 40 for B / L / G, 32 for R).
+    bicubic (``ops.pil_bicubic_resize``, both sizes in one call), as upstream's path API that its benchmarks use.
+    Descriptors are not L2-normalized (the matcher's input; mean norms measured on upstream's 0015_A.jpg: 19 for B128,
+    40 for B / L / G, 32 for R).
     Keypoints are FlashIM's (original pixels, integer = pixel center); upstream's normalized ones are
     ``(k + 0.5) * 2 / (W, H) - 1`` of these.
 
@@ -97,14 +88,14 @@ class LoMaExtractor(DeDoDe):
 
     @torch.inference_mode()
     def extract(self, image: ImageLike, *, resize: int | None = None, top_k: int | None = None) -> SparseFeatures:
-        image = load_image(image, self.device)
+        image = load_image_raw(image, self.device)  # 8-bit images stay uint8: the resize kernel converts them
         if image.shape[0] != 1:
             raise ValueError(f"{type(self).__name__}.extract processes one image at a time (batch size 1)")
         height, width = image.shape[-2:]
         new_h, new_w = detector_size(height, width, self.resize if resize is None else resize)
+        detector_image, descriptor_image = ops.pil_bicubic_resize(image, [(new_h, new_w), self.descriptor_size])
         keypoints, scores, descriptors = self._detect(
-            pil_resize(image, (new_h, new_w)), pil_resize(image, self.descriptor_size),
-            self.default_top_k if top_k is None else top_k,
+            detector_image, descriptor_image, self.default_top_k if top_k is None else top_k
         )
         keypoints = (keypoints + 0.5) * device_constant([width / new_w, height / new_h], keypoints) - 0.5
         return SparseFeatures(keypoints[None], scores.float()[None], descriptors[None], (height, width))

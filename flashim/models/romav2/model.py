@@ -68,9 +68,8 @@ def _is_hr_entry(stages: list, stage: int, stride: int) -> bool:
 IMAGE_DECODER = os.environ.get("FLASHIM_IMAGE_DECODER", "pil")
 
 
-def load_image(img: ImageLike, device: torch.device, decoder: str | None = None) -> Tensor:
-    """Path / PIL / HWC numpy / ``[B,3,H,W]`` tensor -> float ``[B,3,H,W]`` in [0, 1] on ``device`` (``decoder``: see
-    ``IMAGE_DECODER``)."""
+def load_image_raw(img: ImageLike, device: torch.device, decoder: str | None = None) -> Tensor:
+    """:func:`load_image` before the conversion to float: 8-bit images stay uint8 ``[B,3,H,W]`` on ``device``."""
     decoder = decoder or IMAGE_DECODER
     if decoder not in ("pil", "nvjpeg"):
         raise ValueError(f"Unknown image decoder {decoder!r}: 'pil' or 'nvjpeg'")
@@ -82,7 +81,7 @@ def load_image(img: ImageLike, device: torch.device, decoder: str | None = None)
     ):
         from torchvision.io import ImageReadMode, decode_jpeg, read_file
 
-        return decode_jpeg(read_file(str(img)), mode=ImageReadMode.RGB, device=device)[None].float() / 255.0
+        return decode_jpeg(read_file(str(img)), mode=ImageReadMode.RGB, device=device)[None]
     if isinstance(img, (str, Path)):
         pil = Image.open(img)
         if pil.mode == "I;16":
@@ -98,7 +97,13 @@ def load_image(img: ImageLike, device: torch.device, decoder: str | None = None)
         img = img[None]
     if img.shape[1] != 3:
         raise ValueError(f"Expected 3 channels, got {tuple(img.shape)}")
-    img = img.to(device)
+    return img.to(device)
+
+
+def load_image(img: ImageLike, device: torch.device, decoder: str | None = None) -> Tensor:
+    """Path / PIL / HWC numpy / ``[B,3,H,W]`` tensor -> float ``[B,3,H,W]`` in [0, 1] on ``device`` (``decoder``: see
+    ``IMAGE_DECODER``)."""
+    img = load_image_raw(img, device, decoder)
     return img.float() / 255.0 if img.dtype == torch.uint8 else img
 
 
