@@ -53,7 +53,7 @@ def decode_jpeg_cuda(path: str | Path, device: torch.device, fancy: bool = True)
         return None
     try:
         rgb = decode_jpeg(torch.frombuffer(bytearray(data), dtype=torch.uint8), mode=ImageReadMode.RGB, device=device)
-    except RuntimeError as exc:  # e.g. arithmetic coding, 12-bit samples
+    except (RuntimeError, NotImplementedError) as exc:  # e.g. arithmetic coding, 12-bit, torchvision without nvJPEG
         warn_once(logger, "nvjpeg-fallback", "nvJPEG cannot decode %s (%s); using PIL", path, str(exc).splitlines()[0])
         return None
     return ops.jpeg_fancy_upsample(rgb, layout) if fancy and layout else rgb

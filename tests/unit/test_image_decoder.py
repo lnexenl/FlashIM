@@ -1,6 +1,7 @@
 """The image-path decoder switch of ``load_image`` (CPU): CPU loads are PIL's whatever the decoder, unknown decoders
 are rejected, ``IMAGE_DECODER`` is the default, and ``chroma_layout`` routes each JPEG kind."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,10 @@ def test_cpu_loads_are_pil(decoder):
 def test_unknown_decoder():
     with pytest.raises(ValueError, match="Unknown image decoder"):
         load_image(ASSET, CPU, "libjpeg")
+
+
+def test_default_is_nvjpeg():
+    assert romav2_model.IMAGE_DECODER == os.environ.get("FLASHIM_IMAGE_DECODER", "nvjpeg")
 
 
 def test_default_decoder(monkeypatch):

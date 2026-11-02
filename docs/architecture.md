@@ -8,7 +8,7 @@ backend, a model or a platform, and how changes are verified) are in [AGENTS.md]
 | path | what it holds |
 |---|---|
 | `flashim/platforms/` | Device detection: vendor, dispatch key, arch, ISA features (TMA, WGMMA, TCGEN05, FP8, MXFP8 `scaled_mm`, ...) and toolchains (Triton, TileLang, nvcc). Pluggable per device type |
-| `flashim/ops/` | Op declarations: a signature and a torch reference. Files are named by computation (`attention`, `conv`, `correlation`, `density`, `gemm`, `quantize`). An op only one model can use lives in a file named after that model (`romav2.py`, `aliked.py`) |
+| `flashim/ops/` | Op declarations: a signature and a torch reference. Files are named by computation (`attention`, `conv`, `correlation`, `density`, `gemm`, `image`, `quantize`). An op only one model can use lives in a file named after that model (`romav2.py`, `aliked.py`) |
 | `flashim/backends/` | Optimized implementations, one package per kernel language or library, with the same file names as `ops/`: `triton/`, `tilelang/`, `cuda/` (JIT CUDA C++), `torch_native/` (cuBLAS), `external/` (sageattention). Out-of-tree backends register through the `flashim.backends` entry point |
 | `flashim/layers/` | Building blocks the passes recognize by type (`TransformerBlock`, `SeparableConvBlock`, `DeformableEncoder`, ...). A model built from them gets quantization and fused kernels without model-specific code |
 | `flashim/quant/` | Formats (MX), `QuantizedTensor`, schemes (compressed-tensors vocabulary), calibration, methods (`StaticMXFP8Linear`, `StaticInt8Linear`) and fusion passes |
@@ -17,6 +17,7 @@ backend, a model or a platform, and how changes are verified) are in [AGENTS.md]
 | `flashim/engines/` | Region `torch.compile` and an experimental CUDA-graph runner |
 | `flashim/models/` | One package per model, typically `model.py` (a pure `nn.Module` that only calls ops), `config.py`, `weights.py`, `quant.py`, `spec.py`. `base.py` holds `ImageMatcher`, the `match(a, b) -> Matches` interface every image-pair model implements; `sparse.py` and `sparse_spec.py` are the base class and spec factory shared by the sparse extractors |
 | `flashim/geometry/` | Pose estimation and AUC metrics |
+| `flashim/image_io.py` | GPU (nvJPEG) decoding of JPEG paths for `load_image`, with libjpeg's chroma upsampling (`ops.jpeg_fancy_upsample`) |
 | `flashim/log.py` | Logging (`FLASHIM_LOG`), dispatch tracing, profiler and NVTX ranges |
 | `benchmarks/` | `speed/`, `accuracy/` (MegaDepth-1500, ScanNet-1500, HardMatch), `profile/` |
 | `scripts/` | Calibration: `calibrate_romav2.py`, `calibrate_rdd.py`, `calibrate_extractor.py`, `calibrate_lightglue.py` |
@@ -53,3 +54,4 @@ reference, in that order.
 | `FLASHIM_OPS="rope_qk:reference,-local_corr"` | comma-separated overrides: `name:impl` forces an implementation, `-name` disables the optimized ones |
 | `FLASHIM_STRICT_OPS=1` | raises when a GPU call falls back to a torch reference |
 | `FLASHIM_NVTX=1` | wraps op calls in NVTX ranges for `nsys` / `ncu --nvtx` (eager only) |
+| `FLASHIM_IMAGE_DECODER=pil` | decoder of image *paths* (`load_image`): `nvjpeg` (default; JPEGs on CUDA decoded on the GPU, chroma upsampled libjpeg's way), `pil`, `nvjpeg-raw` (nvJPEG's own chroma) |
