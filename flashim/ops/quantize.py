@@ -140,3 +140,16 @@ def _quantize_int8_rows_reference(value: Tensor) -> tuple[Tensor, Tensor]:
 
 
 quantize_int8_rows = Op("quantize_int8_rows", _quantize_int8_rows_reference)
+
+
+def _layernorm_quantize_int8_rows_reference(
+    value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+) -> tuple[Tensor, Tensor]:
+    """``quantize_int8_rows(nn.LayerNorm(value))``: the normalization is torch's own (rounded to ``value.dtype``, the
+    tensor a separate LayerNorm module hands to the next layer), then per-row dynamic INT8 as
+    :func:`quantize_int8_rows`. Returns int8 values of ``value``'s shape and FP32 scales ``[*leading, 1]``."""
+    normalized = F.layer_norm(value, (value.shape[-1],), weight, bias, eps)
+    return _quantize_int8_rows_reference(normalized)
+
+
+layernorm_quantize_int8_rows = Op("layernorm_quantize_int8_rows", _layernorm_quantize_int8_rows_reference)

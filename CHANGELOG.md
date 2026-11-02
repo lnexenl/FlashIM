@@ -12,6 +12,16 @@
   AUC@5 vs `bf16` +0.0004 / +0.0025.
   `extractor_spec(int8_dynamic=...)` and the `INT8_TOKEN_ACTIVATIONS` scheme make per-token INT8 available to other
   models; `Op.supports(...)` tells whether a call would run a kernel rather than the reference.
+- `dedode-g` `int8`: the ViT's glue ops are fused, bit-identically (`DynamicInt8TransformerBlock`, pass
+  `fused_dynamic_vit_blocks`): LayerNorm and the per-row INT8 quantize in one kernel (`ops.layernorm_quantize_int8_rows`,
+  whose statistics replicate ATen's LayerNorm reduction tree), GELU in `fc1`'s GEMM epilogue and the residual adds in
+  `proj`'s / `fc2`'s (`ops.int8_linear(gelu=True, residual=...)`; GELU only where a `libdevice` with torch's `erf` is
+  installed, probed once per process). 16 kernels per block become 9. Extract at 1200 px (eager, interleaved): L20
+  104.9 -> 102.6 ms, H20 93.5 -> 90.1 ms (with the next item); ViT alone in a CUDA graph 49.6 -> 47.4 ms (L20),
+  40.1 -> 38.4 ms (H20). The layer-norm kernel is registered for sm_89 / sm_90 only (the architectures it was checked
+  on); other GPUs run the unfused modules.
+- INT8 GEMM on sm_90: 64 x 64 / 4-warp tiles for the decoders' small-N 1x1 convolutions (`n < 512`), exact under INT32
+  accumulation; dedode-g's decoder GEMMs take 0.82 ms less per extract on an H20.
 
 ## 0.1.0 (2026-10-28)
 
