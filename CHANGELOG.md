@@ -29,6 +29,12 @@
   architectures keep the tile kernel. Per extract at 1200 px, 4096 keypoints (CUDA graph, DRAM-bound), `dedode`:
   L20 upsample-concat 2.97 -> 1.54 ms, upsample-add 1.12 -> 0.89 ms; H20 3.76 -> 0.44 ms and 0.29 -> 0.25 ms; int8 pair
   (2 x extract + match) L20 68.8 -> 66.4 ms, H20 62.0 -> 57.5 ms.
+- DeDoDe `int8` encoders (bit-identical): each `INT8 conv -> ReLU -> MaxPool2d -> INT8 conv` runs as one kernel that
+  also writes the pooled map's INT8 input (`ops.int8_conv2d_maxpool`, pass `fused_pool_epilogue`), the BF16 first
+  conv's bias + ReLU + quantize are one pass after cuDNN (`ops.bias_relu_quantize_int8`, pass
+  `fused_first_conv_epilogue`), and `blocks.VGG` no longer runs its last max pool, whose output is never read (every
+  model built on it). Extract at 1200 px, 4096 keypoints (eager, interleaved): L20 `dedode` 33.9 -> 30.5 ms,
+  `dedode-g` 83.9 -> 80.6 ms; H20 30.5 -> 29.2 ms, 71.6 -> 70.4 ms.
 
 ## 0.1.0 (2026-10-28)
 

@@ -27,12 +27,14 @@ from flashim.ops.conv import (
     depthwise5x5_relu_pointwise_mxfp8,
     im2col_gather,
     int8_conv2d,
+    int8_conv2d_maxpool,
     mxfp8_conv2d,
 )
 from flashim.ops.correlation import dual_softmax_mutual, local_corr
 from flashim.ops.density import kde_density
 from flashim.ops.gemm import int8_linear, linear_fp32, mxfp8_gelu_mlp, mxfp8_linear, mxfp8_scaled_mm
 from flashim.ops.quantize import (
+    bias_relu_quantize_int8,
     gelu_quantize,
     gelu_quantize_int8,
     layernorm_quantize,
@@ -51,6 +53,7 @@ __all__ = [
     "BoundOp",
     "DeviceSpec",
     "Op",
+    "bias_relu_quantize_int8",
     "call_counts",
     "configure",
     "conv2d_at_points",
@@ -67,6 +70,7 @@ __all__ = [
     "gelu_quantize_int8",
     "im2col_gather",
     "int8_conv2d",
+    "int8_conv2d_maxpool",
     "int8_linear",
     "kde_density",
     "layernorm_quantize",
