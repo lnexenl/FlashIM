@@ -35,6 +35,14 @@
   `fused_first_conv_epilogue`), and `blocks.VGG` no longer runs its last max pool, whose output is never read (every
   model built on it). Extract at 1200 px, 4096 keypoints (eager, interleaved): L20 `dedode` 33.9 -> 30.5 ms,
   `dedode-g` 83.9 -> 80.6 ms; H20 30.5 -> 29.2 ms, 71.6 -> 70.4 ms.
+- CUDA C++ depthwise 5x5 kernels on sm_89 / sm_90 (`backends/cuda/csrc/depthwise.cu`): the INT8 producer of the
+  fused ConvRefiner blocks (`ops.depthwise5x5_relu_int8`, any `C % 64 == 0`, so the 256 / 768-channel blocks fuse on
+  Ada too) and the fused BF16 depthwise + pointwise block (`ops.depthwise5x5_relu_pointwise`, 32 / 64 / 128 channels),
+  bit-identical to the Triton kernels they replace. Extract at 1200 px, 4096 keypoints (eager, interleaved): `dedode`
+  int8 L20 33.9 -> 31.2 ms, H20 30.5 -> 25.7 ms; `dedode-g` int8 L20 84.0 -> 81.0 ms, H20 71.4 -> 66.4 ms; bf16
+  (fused block only) L20 -0.6 ms, H20 -4 ms.
+  Outputs are bit-identical except `dedode` / `dedode-g` `int8` on the L20, where the 256 / 768-channel blocks were
+  unfused before: MegaDepth-1500 AUC@5 there vs `bf16` +0.19 / -0.27 points (-0.06 / -0.11 vs the previous `int8`).
 
 ## 0.1.0 (2026-10-28)
 
