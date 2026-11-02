@@ -51,6 +51,17 @@ def _fold_layer_scale(model: nn.Module, ctx: BuildContext) -> list[str] | str:
     return fold_layer_scale(model)
 
 
+def _fused_dynamic_vit_blocks(model: nn.Module, ctx: BuildContext) -> list[str] | str:
+    """int8: DINOv2 blocks with dynamic INT8 linears (dedode-g) with LayerNorm + per-row quantize in one kernel and the
+    GELU / residual add in the GEMM epilogues (``DynamicInt8TransformerBlock``); bit-identical. Pieces without a kernel
+    for the platform keep running as the unfused modules."""
+    if ctx.config.precision.quant != "int8":
+        return "skipped: not int8"
+    from flashim.quant.passes.dynamic_transformer_block import fuse_dynamic_blocks
+
+    return fuse_dynamic_blocks(model) or "skipped: no dynamic INT8 transformer blocks"
+
+
 def _fused_block_epilogues(model: nn.Module, ctx: BuildContext) -> list[str] | str:
     """The ViT's biases and residual adds inside neighbouring kernels (``QuantizedTransformerBlock.fused_epilogues``):
     measured as separate elementwise passes of 8.7 ms per DaD fp8 extract (benchmarks/profile/timeline_audit.py)."""
@@ -234,9 +245,69 @@ VIT_EPILOGUE_PASSES = {
         _fold_layer_scale, stage="pre_quant", exact=False,
         description="ViT LayerScale folded into proj / fc2 (when quantized)",
     ),
+    "fused_dynamic_vit_blocks": Pass(
+        _fused_dynamic_vit_blocks, description="int8: ViT LayerNorm + row quantize, GELU and residual in one kernel each",
+    ),
     "fused_block_epilogues": Pass(
         _fused_block_epilogues, stage="post_quant", exact=False,
         description="ViT biases / residual adds fused into GEMM epilogues and quantize kernels (fp8)",
+    ),
+}
+
+
+# SageAttention impl per architecture (``flashim.backends.external.sageattention``): QK INT8 with per-warp scales, PV FP8.
+# sm_89 kernel on Ada, the WGMMA kernel on Hopper (the sm_89 kernel on an H20 is slower than cuDNN SDPA).
+_SAGE_IMPLS = {(8, 9): "sage-fp8-warp", (9, 0): "sage-fp8-sm90-warp"}
+VIT_SAGE_LAYERS = "2-23"
+
+
+def parse_layers(spec: str, depth: int = 24) -> list[int]:
+    """``"all"``, ``"2-23"``, ``"0,3,5"`` or ``"!0-1"`` (every layer but those) -> sorted 0-based block indices."""
+    if spec.startswith("!"):
+        excluded = set(parse_layers(spec[1:], depth))
+        return [i for i in range(depth) if i not in excluded]
+    if spec == "all":
+        return list(range(depth))
+    layers: set[int] = set()
+    for item in filter(None, spec.split(",")):
+        first, _, last = item.partition("-")
+        layers.update(range(int(first), int(last or first) + 1))
+    if not all(0 <= i < depth for i in layers):
+        raise ValueError(f"vit_attention layers {spec!r} outside 0..{depth - 1}")
+    return sorted(layers)
+
+
+def _sage_platform(platform) -> bool:
+    import importlib.util
+
+    return platform.capability in _SAGE_IMPLS and importlib.util.find_spec("sageattention") is not None
+
+
+def _vit_sage_attention(model: nn.Module, ctx: BuildContext) -> list[str] | str:
+    """int8: SageAttention (QK INT8, PV FP8) on a subset of the DINOv2 blocks, the rest stay on torch SDPA. Option
+    ``optimize.options.vit_attention = {"layers": "2-23", "impl": "auto"}`` (``layers``: see :func:`parse_layers`, ``""``
+    = none; ``impl``: an ``ops.sdpa`` impl name, ``auto`` = :data:`_SAGE_IMPLS` of the platform). Layers 0 and 1 stay
+    out by default. Relative L2 error of the ViT output against the same ViT with FP32 attention in every layer (10
+    MegaDepth images at 1200 px; the INT8 ViT with torch SDPA sits at 7.1e-2): sage on all 24 layers 8.2e-2 (L20) / 8.6e-2
+    (H20), on layers 2-23 7.5e-2 / 7.4e-2; layers 0 and 1 alone give 8.0e-2 and 7.7e-2 on L20, any single later layer
+    7.1-7.5e-2. Per-warp QK scales measured faster than per-thread at the same error class."""
+    if ctx.config.precision.quant != "int8":
+        return "skipped: not int8"
+    options = ctx.option("vit_attention", {})
+    layers = parse_layers(options.get("layers", VIT_SAGE_LAYERS))
+    impl = options.get("impl", "auto")
+    impl = _SAGE_IMPLS[ctx.platform.capability] if impl == "auto" else impl
+    blocks_ = model.descriptor.encoder.dinov2.blocks
+    for i in layers:
+        blocks_[i].attn.sdpa_impl = impl
+    return {"impl": impl, "layers": layers}
+
+
+# dedode-g only (dad shares the ViT but keeps its BF16 numerics).
+VIT_ATTENTION_PASSES = {
+    "vit_sage_attention": Pass(
+        _vit_sage_attention, requires=_sage_platform, exact=False,
+        description="int8: SageAttention (QK INT8 per warp, PV FP8) on DINOv2 blocks 2-23 (sm_89, sm_90)",
     ),
 }
 
@@ -254,7 +325,7 @@ def _loader(variant: str):
     return load
 
 
-def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ...] = (), vit: bool = False):
+def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ...] = (), vit: str | None = None):
     return extractor_spec(
         name=name,
         description=description,
@@ -272,10 +343,12 @@ def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ..
         extra_passes={
             **DECODER_UPSAMPLE_PASS, **DECODER_FUSION_PASSES, **STEM_EXACT_PASSES, **STEM_TC_PASSES,
             **(VIT_EPILOGUE_PASSES | PATCH_EMBED_PASS if vit else {}),
+            **(VIT_ATTENTION_PASSES if vit == "dedode-g" else {}),
         },
         structural_passes=(
             *DECODER_UPSAMPLE_PASS, *DECODER_FUSION_PASSES, *STEM_EXACT_PASSES, *STEM_TC_PASSES,
             *((*VIT_EPILOGUE_PASSES, *PATCH_EMBED_PASS) if vit else ()),
+            *(VIT_ATTENTION_PASSES if vit == "dedode-g" else ()),
         ),
     )
 
@@ -284,5 +357,5 @@ def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ..
 SPEC = _spec("dedode", "B", "DeDoDe v2 detector (L) + descriptor B (VGG19), dual-softmax matching")
 SPEC_G = _spec(
     "dedode-g", "G", "DeDoDe v2 detector (L) + descriptor G (VGG19 + DINOv2 ViT-L/14), dual-softmax matching",
-    int8_dynamic=VIT_LINEARS, vit=True,
+    int8_dynamic=VIT_LINEARS, vit="dedode-g",
 )
