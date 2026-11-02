@@ -18,6 +18,12 @@
   `fused_first_conv_epilogue`), and `blocks.VGG` no longer runs its last max pool, whose output is never read (every
   model built on it). Extract at 1200 px, 4096 keypoints (eager, interleaved): L20 `dedode` 33.9 -> 30.5 ms,
   `dedode-g` 83.9 -> 80.6 ms; H20 30.5 -> 29.2 ms, 71.6 -> 70.4 ms.
+- DeDoDe `int8` on sm_89 / sm_90 (L20 / H20; numerics, MegaDepth-1500 AUC@5 within 0.5 of `bf16`): the 3 -> 64 first
+  conv of both VGG encoders runs on tensor cores with the bias / ReLU / quantize epilogue
+  (`ops.conv2d_small_cin_quantize_int8`, pass `tensor_core_first_conv`; 1.46 -> 0.06 ms per encoder on an L20) and
+  `dedode-g`'s DINOv2 patch embedding is one GEMM into the token buffer (`ops.patch_embed_tokens`, pass
+  `patch_embed_gemm`). Extract at 1200 px: L20 `dedode` 30.5 -> 29.2 ms, `dedode-g` 80.8 -> 79.4 ms; H20 29.3 -> 28.4 ms,
+  70.4 -> 69.0 ms.
 
 ## 0.1.0 (2026-10-28)
 

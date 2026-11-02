@@ -12,10 +12,17 @@ from torch import Tensor
 
 from flashim.ops._registry import Op
 from flashim.ops.gemm import int8_linear, mxfp8_linear, mxfp8_scaled_mm
+from flashim.ops.quantize import bias_relu_quantize_int8
 from flashim.platforms import Feature, Platform
 from flashim.quant.formats.int8 import quantize_symmetric
 from flashim.quant.formats.mx import quantize_dynamic_2d, swizzle_scales
-from flashim.quant.tensor import QuantizedTensor, QuantizedWeight, quantize_int8_static, quantize_static
+from flashim.quant.tensor import (
+    Int8Tensor,
+    QuantizedTensor,
+    QuantizedWeight,
+    quantize_int8_static,
+    quantize_static,
+)
 
 # -- depthwise 5x5 + bias + ReLU -> dynamic MXFP8 ----------------------------------------------
 
@@ -213,6 +220,19 @@ def _int8_conv2d_maxpool_reference(
 
 
 int8_conv2d_maxpool = Op("int8_conv2d_maxpool", _int8_conv2d_maxpool_reference, composite=True)
+
+
+def _conv2d_small_cin_quantize_int8_reference(x: Tensor, scale: Tensor, weight: Tensor, bias: Tensor) -> Int8Tensor:
+    """First convolution of a VGG encoder with its epilogue: ``quantize_int8(relu(conv3x3(x) + bias))``. ``x`` NCHW
+    BF16 ``[B, Cin, H, W]`` with ``Cin <= 8``, ``weight`` ``[Cout, Cin, 3, 3]`` (stride 1, padding 1), ``bias`` ``[Cout]``;
+    the convolution is rounded to BF16 before the bias is added (cuDNN's order, :func:`bias_relu_quantize_int8`).
+    Returns the INT8 NHWC ``[B, H, W, Cout]`` input of the next quantized convolution."""
+    return bias_relu_quantize_int8(F.conv2d(x, weight, None, padding=1), bias, scale)
+
+
+conv2d_small_cin_quantize_int8 = Op(
+    "conv2d_small_cin_quantize_int8", _conv2d_small_cin_quantize_int8_reference, composite=True, weights=2
+)
 
 
 # -- static MXFP8 nn.Conv2d (groups == 1) as one fused implicit GEMM ---------------------------

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import torch
 from torch import nn
 
+from flashim import ops
 from flashim.build import BuildContext, Pass
 from flashim.config import RunConfig
 from flashim.models.dedode import blocks, weights
@@ -171,6 +173,61 @@ STEM_EXACT_PASSES = {
 }
 
 
+def tensor_core_first_conv(model: nn.Module, ctx: BuildContext) -> list[str] | str:
+    """int8: the first VGG conv (BF16, 3 -> 64, 3x3) feeding an INT8 conv as one tensor-core kernel with the bias / ReLU /
+    quantize epilogue (``ops.conv2d_small_cin_quantize_int8``) instead of cuDNN's SIMT kernel; FP32 summation order
+    differs (measured 1 BF16 ulp on ~2e-7 of the outputs). Only where the op has a kernel (sm_89 / sm_90, the
+    architectures it was measured on)."""
+    if ctx.config.precision.quant != "int8":
+        return "skipped: not int8"
+    found = []
+    for name, module in model.named_modules():
+        if not isinstance(module, blocks.VGG) or (relu := module.find_first_conv_relu()) is None:
+            continue
+        conv = module.layers[0]
+        if (conv.in_channels, conv.kernel_size, conv.stride, conv.padding, conv.dilation, conv.groups) != (
+            3, (3, 3), (1, 1), (1, 1), (1, 1), 1
+        ):
+            continue
+        bound = ops.conv2d_small_cin_quantize_int8.bind(conv.weight, conv.bias).warmup()
+        if bound.primary == "reference":
+            return f"skipped: no kernel on {ctx.platform.describe()}"
+        module.tensor_core_first_conv = (relu, bound)
+        found.append(f"{name}.layers.0")
+    return found
+
+
+def patch_embed_gemm(model: nn.Module, ctx: BuildContext) -> list[str] | str:
+    """int8: DINOv2's patch convolution + class token + positional embedding as one GEMM into the token buffer
+    (``ops.patch_embed_tokens``; FP32 summation order differs from cuDNN's convolution). Only where the op has a kernel
+    (sm_89 / sm_90)."""
+    if ctx.config.precision.quant != "int8":
+        return "skipped: not int8"
+    found = []
+    for name, module in model.named_modules():
+        if isinstance(module, blocks.DinoV2) and module.patch_embed.proj.weight.dtype == torch.bfloat16:
+            proj = module.patch_embed.proj
+            bound = ops.patch_embed_tokens.bind(proj.weight, proj.bias).warmup()
+            if bound.primary == "reference":
+                return f"skipped: no kernel on {ctx.platform.describe()}"
+            module.patch_embed_op = bound
+            found.append(name)
+    return found
+
+
+# Numerics-changing stem passes (int8, accuracy-gated on MegaDepth-1500, see the PR).
+STEM_TC_PASSES = {
+    "tensor_core_first_conv": Pass(
+        tensor_core_first_conv, exact=False, description="int8: 3 -> 64 first conv on tensor cores (sm_89 / sm_90)"
+    ),
+}
+PATCH_EMBED_PASS = {
+    "patch_embed_gemm": Pass(
+        patch_embed_gemm, exact=False, description="int8: DINOv2 patch embedding as one GEMM (sm_89 / sm_90)"
+    ),
+}
+
+
 # For the DINOv2 descriptor (dedode-g, dad).
 VIT_EPILOGUE_PASSES = {
     "fold_layer_scale": Pass(
@@ -212,9 +269,13 @@ def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ..
         # ConvRefiner hidden blocks with 32 / 64 / 128 channels as one BF16 kernel each (26 blocks). BF16 extract at
         # 1200 px, pass off vs on in one process (sm_120): dedode 101.8 -> 77.8 ms, dedode-g 174.5 -> 151.0 ms.
         fused_bf16_blocks=_DECODERS,
-        extra_passes={**DECODER_UPSAMPLE_PASS, **DECODER_FUSION_PASSES, **STEM_EXACT_PASSES, **(VIT_EPILOGUE_PASSES if vit else {})},
+        extra_passes={
+            **DECODER_UPSAMPLE_PASS, **DECODER_FUSION_PASSES, **STEM_EXACT_PASSES, **STEM_TC_PASSES,
+            **(VIT_EPILOGUE_PASSES | PATCH_EMBED_PASS if vit else {}),
+        },
         structural_passes=(
-            *DECODER_UPSAMPLE_PASS, *DECODER_FUSION_PASSES, *STEM_EXACT_PASSES, *(VIT_EPILOGUE_PASSES if vit else ())
+            *DECODER_UPSAMPLE_PASS, *DECODER_FUSION_PASSES, *STEM_EXACT_PASSES, *STEM_TC_PASSES,
+            *((*VIT_EPILOGUE_PASSES, *PATCH_EMBED_PASS) if vit else ()),
         ),
     )
 

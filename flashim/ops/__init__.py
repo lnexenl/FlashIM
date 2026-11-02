@@ -20,6 +20,7 @@ from flashim.ops.attention import deformable_attention, rope_qk, rope_qk_interle
 from flashim.ops.conv import (
     conv2d_at_points,
     conv2d_single_output,
+    conv2d_small_cin_quantize_int8,
     depthwise5x5_relu_int8,
     depthwise5x5_relu_mxfp8,
     depthwise5x5_relu_pointwise,
@@ -33,6 +34,7 @@ from flashim.ops.conv import (
 from flashim.ops.correlation import dual_softmax_mutual, local_corr
 from flashim.ops.density import kde_density
 from flashim.ops.gemm import int8_linear, linear_fp32, mxfp8_gelu_mlp, mxfp8_linear, mxfp8_scaled_mm
+from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
     bias_relu_quantize_int8,
     gelu_quantize,
@@ -57,6 +59,7 @@ __all__ = [
     "configure",
     "conv2d_at_points",
     "conv2d_single_output",
+    "conv2d_small_cin_quantize_int8",
     "deform_patches_int8",
     "deformable_attention",
     "depthwise5x5_relu_int8",
@@ -81,6 +84,7 @@ __all__ = [
     "mxfp8_gelu_mlp",
     "mxfp8_linear",
     "mxfp8_scaled_mm",
+    "patch_embed_tokens",
     "quantize_int8",
     "quantize_int8_rows",
     "quantize_mxfp8",
