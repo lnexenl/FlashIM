@@ -143,5 +143,39 @@ def test_rotated_residual_stream_keeps_the_function(input_dim):
 def test_int8_preset_rotates_the_residual_stream():
     for variant in VARIANTS:
         config = flashim.resolve("loma-matcher", "int8", config={"variant": variant})
-        assert config.optimize.passes == ("rotate_residual_stream",)
-    assert flashim.resolve("loma-matcher", "fp8").optimize.passes == ()
+        assert config.optimize.passes == ("low_precision_similarity", "rotate_residual_stream")
+    assert flashim.resolve("loma-matcher", "fp8").optimize.passes == ("low_precision_similarity",)
+
+
+def test_low_precision_similarity_only_in_the_reduced_precision_presets():
+    passes = {preset: flashim.resolve("loma-matcher", preset).optimize.passes for preset in ("fp32", "bf16", "fp8")}
+    assert passes == {"fp32": (), "bf16": ("low_precision_similarity",), "fp8": ("low_precision_similarity",)}
+    for preset, expected in passes.items():  # the pipelines' matcher component resolves the same way
+        assert flashim.resolve("loma-l", preset).components["matcher"].optimize.passes == expected
+
+
+def test_low_precision_similarity_is_the_product_of_the_bf16_projections():
+    from flashim.models.loma.matcher_spec import PASSES
+
+    torch.manual_seed(0)
+    model = LoMaMatcher(SMALL).eval()
+    model.set_compute_dtype(torch.bfloat16)
+    assert not any(head.low_precision_similarity for head in model.log_assignment)
+    assert PASSES["low_precision_similarity"].apply(model, None) == len(model.log_assignment)
+    head = model.log_assignment[-1]
+    assert head.low_precision_similarity
+    x0, x1 = torch.randn(2, 6, 32).bfloat16(), torch.randn(2, 9, 32).bfloat16()
+    with torch.inference_mode():
+        m0, m1 = head.final_proj(x0).double(), head.final_proj(x1).double()
+        expected = m0 @ m1.transpose(-1, -2) / 32**0.5
+        sim = head.similarity(x0, x1)
+        assert sim.dtype == torch.float32 and sim.shape == (2, 6, 9)
+        torch.testing.assert_close(sim.double(), expected, atol=1e-5, rtol=1e-5)
+        head.low_precision_similarity = False  # upstream's FP32 path: the same inputs, another rounding of the scale
+        torch.testing.assert_close(head.similarity(x0, x1), sim, atol=1e-5, rtol=1e-5)
+        head.low_precision_similarity = True
+        log_conf, index, mutual = head.matches(x0[:1], x1[:1])
+        scores = head(x0[:1], x1[:1])[0]
+    torch.testing.assert_close(log_conf, scores.max(1).values)
+    assert torch.equal(index, scores.argmax(1))
+    assert torch.equal(mutual, scores.argmax(0)[index] == torch.arange(6))
