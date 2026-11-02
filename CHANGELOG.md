@@ -12,6 +12,49 @@
   AUC@5 vs `bf16` +0.0004 / +0.0025.
   `extractor_spec(int8_dynamic=...)` and the `INT8_TOKEN_ACTIVATIONS` scheme make per-token INT8 available to other
   models; `Op.supports(...)` tells whether a call would run a kernel rather than the reference.
+- `dedode-g` `int8`: the ViT's glue ops are fused, bit-identically (`DynamicInt8TransformerBlock`, pass
+  `fused_dynamic_vit_blocks`): LayerNorm and the per-row INT8 quantize in one kernel (`ops.layernorm_quantize_int8_rows`,
+  whose statistics replicate ATen's LayerNorm reduction tree), GELU in `fc1`'s GEMM epilogue and the residual adds in
+  `proj`'s / `fc2`'s (`ops.int8_linear(gelu=True, residual=...)`; GELU only where a `libdevice` with torch's `erf` is
+  installed, probed once per process). 16 kernels per block become 9. Extract at 1200 px (eager, interleaved): L20
+  104.9 -> 102.6 ms, H20 93.5 -> 90.1 ms (with the next item); ViT alone in a CUDA graph 49.6 -> 47.4 ms (L20),
+  40.1 -> 38.4 ms (H20). The layer-norm kernel is registered for sm_89 / sm_90 only (the architectures it was checked
+  on); other GPUs run the unfused modules.
+- INT8 GEMM on sm_90: 64 x 64 / 4-warp tiles for the decoders' small-N 1x1 convolutions (`n < 512`), exact under INT32
+  accumulation; dedode-g's decoder GEMMs take 0.82 ms less per extract on an H20.
+- Decoder upsampling at the memory roofline on sm_89 / sm_90 (bit-identical): `ops.upsample_concat_int8` has a second
+  Triton impl, `triton_rows` (one program per pair of output rows, constexpr channel counts, vectorized loads, shared taps
+  and horizontal lerps), chosen for exact 2x upsampling of BF16 maps; `ops.upsample_add` has a row kernel for wide
+  channels-last maps. Other ratios (the DINOv2 descriptor's 56 -> 98 map), FP32 taps, narrow or NCHW maps and other
+  architectures keep the tile kernel. Per extract at 1200 px, 4096 keypoints (CUDA graph, DRAM-bound), `dedode`:
+  L20 upsample-concat 2.97 -> 1.54 ms, upsample-add 1.12 -> 0.89 ms; H20 3.76 -> 0.44 ms and 0.29 -> 0.25 ms; int8 pair
+  (2 x extract + match) L20 68.8 -> 66.4 ms, H20 62.0 -> 57.5 ms.
+- DeDoDe `int8` encoders (bit-identical): each `INT8 conv -> ReLU -> MaxPool2d -> INT8 conv` runs as one kernel that
+  also writes the pooled map's INT8 input (`ops.int8_conv2d_maxpool`, pass `fused_pool_epilogue`), the BF16 first
+  conv's bias + ReLU + quantize are one pass after cuDNN (`ops.bias_relu_quantize_int8`, pass
+  `fused_first_conv_epilogue`), and `blocks.VGG` no longer runs its last max pool, whose output is never read (every
+  model built on it). Extract at 1200 px, 4096 keypoints (eager, interleaved): L20 `dedode` 33.9 -> 30.5 ms,
+  `dedode-g` 83.9 -> 80.6 ms; H20 30.5 -> 29.2 ms, 71.6 -> 70.4 ms.
+- CUDA C++ depthwise 5x5 kernels on sm_89 / sm_90 (`backends/cuda/csrc/depthwise.cu`): the INT8 producer of the
+  fused ConvRefiner blocks (`ops.depthwise5x5_relu_int8`, any `C % 64 == 0`, so the 256 / 768-channel blocks fuse on
+  Ada too) and the fused BF16 depthwise + pointwise block (`ops.depthwise5x5_relu_pointwise`, 32 / 64 / 128 channels),
+  bit-identical to the Triton kernels they replace. Extract at 1200 px, 4096 keypoints (eager, interleaved): `dedode`
+  int8 L20 33.9 -> 31.2 ms, H20 30.5 -> 25.7 ms; `dedode-g` int8 L20 84.0 -> 81.0 ms, H20 71.4 -> 66.4 ms; bf16
+  (fused block only) L20 -0.6 ms, H20 -4 ms.
+  Outputs are bit-identical except `dedode` / `dedode-g` `int8` on the L20, where the 256 / 768-channel blocks were
+  unfused before: MegaDepth-1500 AUC@5 there vs `bf16` +0.19 / -0.27 points (-0.06 / -0.11 vs the previous `int8`).
+- `dedode-g` `int8` on sm_89 / sm_90: SageAttention (QK INT8 with per-warp scales, PV FP8) on DINOv2 blocks 2-23 (pass
+  `vit_sage_attention`; `optimize.options.vit_attention = {"layers": "2-23", "impl": "auto"}` picks the layers and the
+  `ops.sdpa` impl, blocks 0 and 1 stay on torch SDPA because the ViT output is most sensitive there). New `ops.sdpa` impls
+  `sage-fp8-warp` and, for the H20, `sage-fp8-sm90` / `sage-fp8-sm90-warp` (the WGMMA kernel; `sage-fp8` keeps running the
+  sm_89 kernel everywhere). Extract at 1200 px (eager): L20 105.0 -> 93.7 ms, H20 93.5 -> 87.8 ms; MegaDepth-1500 AUC@5 vs
+  `bf16` -0.12 (L20) / +0.23 (H20) points, +0.05 / +0.07 vs the unchanged `int8`.
+- DeDoDe `int8` on sm_89 / sm_90 (L20 / H20; numerics, MegaDepth-1500 AUC@5 within 0.5 of `bf16`): the 3 -> 64 first
+  conv of both VGG encoders runs on tensor cores with the bias / ReLU / quantize epilogue
+  (`ops.conv2d_small_cin_quantize_int8`, pass `tensor_core_first_conv`; 1.46 -> 0.06 ms per encoder on an L20) and
+  `dedode-g`'s DINOv2 patch embedding is one GEMM into the token buffer (`ops.patch_embed_tokens`, pass
+  `patch_embed_gemm`). Extract at 1200 px: L20 `dedode` 30.5 -> 29.2 ms, `dedode-g` 80.8 -> 79.4 ms; H20 29.3 -> 28.4 ms,
+  70.4 -> 69.0 ms.
 - Triton INT8 depthwise producer (`ops.depthwise5x5_relu_int8`) accepts any channel count `% 32 == 0` (was 32 / 128 /
   512), so the 256 / 768-channel ConvRefiner blocks of the DeDoDe `int8` presets fuse on architectures whose only
   producer is Triton (no TileLang / TMA, no CUDA C++ impl). Measured on L20 / H20 against the unfused block only; draft.

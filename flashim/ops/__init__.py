@@ -20,6 +20,7 @@ from flashim.ops.attention import deformable_attention, rope_qk, rope_qk_interle
 from flashim.ops.conv import (
     conv2d_at_points,
     conv2d_single_output,
+    conv2d_small_cin_quantize_int8,
     depthwise5x5_relu_int8,
     depthwise5x5_relu_mxfp8,
     depthwise5x5_relu_pointwise,
@@ -27,16 +28,20 @@ from flashim.ops.conv import (
     depthwise5x5_relu_pointwise_mxfp8,
     im2col_gather,
     int8_conv2d,
+    int8_conv2d_maxpool,
     mxfp8_conv2d,
 )
 from flashim.ops.correlation import dual_softmax_mutual, local_corr
 from flashim.ops.density import kde_density
 from flashim.ops.gemm import int8_linear, linear_fp32, mxfp8_gelu_mlp, mxfp8_linear, mxfp8_scaled_mm
+from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
+    bias_relu_quantize_int8,
     gelu_quantize,
     gelu_quantize_int8,
     layernorm_quantize,
     layernorm_quantize_int8,
+    layernorm_quantize_int8_rows,
     quantize_int8,
     quantize_int8_rows,
     quantize_mxfp8,
@@ -50,10 +55,12 @@ __all__ = [
     "BoundOp",
     "DeviceSpec",
     "Op",
+    "bias_relu_quantize_int8",
     "call_counts",
     "configure",
     "conv2d_at_points",
     "conv2d_single_output",
+    "conv2d_small_cin_quantize_int8",
     "deform_patches_int8",
     "deformable_attention",
     "depthwise5x5_relu_int8",
@@ -66,10 +73,12 @@ __all__ = [
     "gelu_quantize_int8",
     "im2col_gather",
     "int8_conv2d",
+    "int8_conv2d_maxpool",
     "int8_linear",
     "kde_density",
     "layernorm_quantize",
     "layernorm_quantize_int8",
+    "layernorm_quantize_int8_rows",
     "linear_fp32",
     "local_corr",
     "multiscale_fuse",
@@ -77,6 +86,7 @@ __all__ = [
     "mxfp8_gelu_mlp",
     "mxfp8_linear",
     "mxfp8_scaled_mm",
+    "patch_embed_tokens",
     "quantize_int8",
     "quantize_int8_rows",
     "quantize_mxfp8",

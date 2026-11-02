@@ -113,24 +113,51 @@ class StaticInt8Conv2d(StaticInt8Linear):
         """``relu(conv(x) [+ residual])`` with the ReLU and the residual (``[B, Cout, Ho, Wo]``) in the epilogue.
         ``x`` may be the :class:`Int8Tensor` a previous layer produced for this one (``quantize_for``, as in
         ``StaticMXFP8Conv2d.forward``)."""
-        if isinstance(x, Int8Tensor):
-            if x.scale is not self.input_scale:
-                raise ValueError("prequantized input was not produced for this layer")
-            q, dtype = x, torch.bfloat16
-        else:
-            q, dtype = ops.quantize_int8(_pixels(x), self.input_scale), x.dtype
-        (kh, kw), (sh, sw), (ph, pw), (dh, dw) = (
-            self.geometry["kernel"], self.geometry["stride"], self.geometry["padding"], self.geometry["dilation"],
-        )
+        q, dtype = self._quantized_input(x)
         chained = quantize_for is not None and dtype == torch.bfloat16 and self.feeds(quantize_for)
         out = ops.int8_conv2d(
-            q.values, self.weight_int8, self.input_scale, self.weight_scale, self.bias,
-            kh, kw, sh, sw, ph, pw, dh, dw, relu=relu, residual=None if residual is None else residual.permute(0, 2, 3, 1),
+            q.values, self.weight_int8, self.input_scale, self.weight_scale, self.bias, *self._geometry_args(),
+            relu=relu, residual=None if residual is None else residual.permute(0, 2, 3, 1),
             **({"out_scale": quantize_for.input_scale} if chained else {}),
         )
         if chained:
             return Int8Tensor(out, quantize_for.input_scale)
         return out.permute(0, 3, 1, 2).to(dtype)
+
+    def _quantized_input(self, x: Tensor | Int8Tensor) -> tuple[Int8Tensor, torch.dtype]:
+        if isinstance(x, Int8Tensor):
+            if x.scale is not self.input_scale:
+                raise ValueError("prequantized input was not produced for this layer")
+            return x, torch.bfloat16
+        return ops.quantize_int8(_pixels(x), self.input_scale), x.dtype
+
+    def _geometry_args(self) -> tuple[int, ...]:
+        (kh, kw), (sh, sw), (ph, pw), (dh, dw) = (
+            self.geometry["kernel"], self.geometry["stride"], self.geometry["padding"], self.geometry["dilation"],
+        )
+        return kh, kw, sh, sw, ph, pw, dh, dw
+
+    def pools_into(self, pool: nn.Module, consumer: nn.Module) -> bool:
+        """Whether ``forward_pooled(x, consumer)`` stands for this layer, the ``MaxPool2d`` ``pool`` and ``consumer``
+        (a 2x2 / stride-2 pool directly feeding a quantized conv of this layer's output width)."""
+        return (
+            isinstance(pool, nn.MaxPool2d) and isinstance(consumer, StaticInt8Conv2d)
+            and pool.kernel_size in (2, (2, 2)) and pool.stride in (2, (2, 2)) and pool.padding in (0, (0, 0))
+            and pool.dilation in (1, (1, 1)) and not pool.ceil_mode and not pool.return_indices
+            and consumer.in_channels == self.out_features
+        )
+
+    def forward_pooled(self, x: Tensor | Int8Tensor, consumer: StaticInt8Conv2d, relu: bool = False):
+        """``(y, consumer's input)`` for ``y = forward(x, relu)`` followed by ``MaxPool2d(2)`` and the quantize of
+        ``consumer`` (:meth:`pools_into`): ``y`` is this layer's usual output (``[B, Cout, Ho, Wo]``, read at full
+        resolution by whoever needs it) and the :class:`Int8Tensor` is the quantized pool of it, from the conv's
+        epilogue (``ops.int8_conv2d_maxpool``) instead of a pool pass and a quantize pass over ``y``; same bits."""
+        q, dtype = self._quantized_input(x)
+        out, pooled = ops.int8_conv2d_maxpool(
+            q.values, self.weight_int8, self.input_scale, self.weight_scale, self.bias, *self._geometry_args(),
+            relu=relu, out_scale=consumer.input_scale,
+        )
+        return out.permute(0, 3, 1, 2).to(dtype), Int8Tensor(pooled, consumer.input_scale)
 
     def extra_repr(self) -> str:
         return f"{self.in_channels}->{self.out_features}, {self.geometry['kernel']}, int8"

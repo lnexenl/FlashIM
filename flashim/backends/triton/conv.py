@@ -30,6 +30,7 @@ from flashim.ops.conv import (
     fused_mxfp8_conv2d_worthwhile,
 )
 from flashim.platforms import Feature, platform_for
+from flashim.quant.tensor import Int8Tensor
 
 
 @triton.jit
@@ -699,12 +700,12 @@ def _int8_conv2d_block_k(configs, named_args, **kwargs):
 
 
 @triton.autotune(
-    configs=_INT8_CONV2D_CONFIGS, key=["ROWS_BUCKET", "COUT", "CIN", "TAPS"],
+    configs=_INT8_CONV2D_CONFIGS, key=["ROWS_BUCKET", "COUT", "CIN", "TAPS", "POOL"],
     prune_configs_by={"early_config_prune": _int8_conv2d_block_k}, cache_results=_CACHE_AUTOTUNE,
 )
 @triton.jit(do_not_specialize=_SIZE_ARGS)
 def _int8_conv2d_kernel(
-    x_ptr, w_ptr, bias_ptr, out_ptr, out_scale_ptr,
+    x_ptr, w_ptr, bias_ptr, out_ptr, out_scale_ptr, pool_ptr,
     a_scale_ptr, w_scale_ptr,
     B, H, W, HO, WO, rows, ROWS_BUCKET,
     res_ptr, res_channels, rs_b, rs_h, rs_w, rs_c,
@@ -712,7 +713,7 @@ def _int8_conv2d_kernel(
     KH: tl.constexpr, KW: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
     PH: tl.constexpr, PW: tl.constexpr, DH: tl.constexpr, DW: tl.constexpr,
     HAS_BIAS: tl.constexpr, RELU: tl.constexpr, HAS_RESIDUAL: tl.constexpr, QUANT_OUT: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    POOL: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     """Implicit-GEMM INT8 ``nn.Conv2d`` (``groups == 1``): per filter tap, INT32 ``tl.dot``s over ``BLOCK_K``-channel
     chunks gathered straight from ``x_ptr`` ``[B, H, W, CIN]`` with the tap's spatial offset folded into the address
@@ -721,18 +722,35 @@ def _int8_conv2d_kernel(
     ``_int8_conv2d_block_k``). Epilogue matches ``_int8_gemm_kernel`` (scales, bias, optional ReLU). ``QUANT_OUT``:
     the output is stored as the next layer's INT8 input (``out_scale_ptr``: its activation scale): rounded to BF16,
     then quantized exactly as ``quantize_int8`` does on the BF16 tensor (same bytes as the separate pass).
+    ``POOL``: the BF16 output is stored as usual and the next conv's INT8 input of its 2x2 / stride-2 max pool is
+    stored to ``pool_ptr`` (``out_scale_ptr``'s scale, ``[B, HO / 2, WO / 2, COUT]``; HO, WO even): the M tile is two
+    output rows x ``BLOCK_M // 2`` columns, so each pooling window lies in one tile. The accumulation and the epilogue
+    are per element, so ``out`` is the bits of the unpooled kernel.
     """
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(COUT, BLOCK_N)
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    mask_m = offs_m < rows
-    b = offs_m // (HO * WO)
-    rem = offs_m % (HO * WO)
-    oh = rem // WO
-    ow = rem % WO
+    if POOL:
+        SEG: tl.constexpr = BLOCK_M // 2
+        segs = tl.cdiv(WO, SEG)
+        pb = pid_m // ((HO // 2) * segs)
+        b = pb + tl.zeros((BLOCK_M,), dtype=tl.int32)
+        py = (pid_m // segs) % (HO // 2)
+        seg = pid_m % segs
+        m = tl.arange(0, BLOCK_M)
+        oh = 2 * py + m // SEG
+        ow = seg * SEG + m % SEG
+        mask_m = (ow < WO) & (b < B)
+        offs_m = (b * HO + oh) * WO + ow
+    else:
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        mask_m = offs_m < rows
+        b = offs_m // (HO * WO)
+        rem = offs_m % (HO * WO)
+        oh = rem // WO
+        ow = rem % WO
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_n = offs_n < COUT
@@ -777,6 +795,14 @@ def _int8_conv2d_kernel(
         tl.store(out_ptrs, quantized, mask=mask_m[:, None] & mask_n[None, :])
     else:
         tl.store(out_ptrs, out.to(tl.bfloat16), mask=mask_m[:, None] & mask_n[None, :])
+    if POOL:  # max over each 2x2 window of the BF16 values, quantized as ``_store_quantized`` does
+        pooled = tl.max(tl.reshape(out.to(tl.bfloat16).to(tl.float32), (2, SEG // 2, 2, BLOCK_N)), axis=2)
+        pooled = tl.max(pooled, axis=0)  # [SEG // 2, BLOCK_N]
+        qx = seg * (SEG // 2) + tl.arange(0, SEG // 2)
+        scaled = libdevice.rint(pooled * (1.0 / tl.load(out_scale_ptr)))
+        pooled_ptrs = pool_ptr + ((pb * (HO // 2) + py) * (WO // 2) + qx).to(tl.int64)[:, None] * COUT + offs_n[None, :]
+        tl.store(pooled_ptrs, tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8),
+                 mask=(qx < WO // 2)[:, None] & mask_n[None, :])
 
 
 def _residual_args(residual: Tensor | None, out: Tensor) -> tuple:
@@ -799,12 +825,32 @@ def _int8_conv2d_triton(
     rows = b * ho * wo
     grid = lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]) * triton.cdiv(cout, meta["BLOCK_N"]),)
     _int8_conv2d_kernel[grid](
-        x, weight, bias, out, out_scale if quantize else a_scale, a_scale, w_scale,
+        x, weight, bias, out, out_scale if quantize else a_scale, out, a_scale, w_scale,
         b, h, w, ho, wo, rows, triton.next_power_of_2(rows), *_residual_args(residual, out),
         CIN=cin, COUT=cout, TAPS=kh * kw, KH=kh, KW=kw, SH=sh, SW=sw, PH=ph, PW=pw, DH=dh, DW=dw,
-        HAS_BIAS=bias is not None, RELU=relu, HAS_RESIDUAL=residual is not None, QUANT_OUT=quantize,
+        HAS_BIAS=bias is not None, RELU=relu, HAS_RESIDUAL=residual is not None, QUANT_OUT=quantize, POOL=False,
     )
     return out
+
+
+def _int8_conv2d_maxpool_triton(
+    x, weight, a_scale, w_scale, bias, kh, kw, sh, sw, ph, pw, dh, dw, *, relu=False, out_scale
+) -> tuple[Tensor, Tensor]:
+    b, h, w, cin = x.shape
+    cout = weight.shape[0]
+    ho = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+    wo = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+    out = torch.empty(b, ho, wo, cout, device=x.device, dtype=torch.bfloat16)
+    pooled = torch.empty(b, ho // 2, wo // 2, cout, device=x.device, dtype=torch.int8)
+    rows = b * ho * wo
+    grid = lambda meta: (b * (ho // 2) * triton.cdiv(wo, meta["BLOCK_M"] // 2) * triton.cdiv(cout, meta["BLOCK_N"]),)
+    _int8_conv2d_kernel[grid](
+        x, weight, bias, out, out_scale, pooled, a_scale, w_scale,
+        b, h, w, ho, wo, rows, triton.next_power_of_2(rows), *_residual_args(None, out),
+        CIN=cin, COUT=cout, TAPS=kh * kw, KH=kh, KW=kw, SH=sh, SW=sw, PH=ph, PW=pw, DH=dh, DW=dw,
+        HAS_BIAS=bias is not None, RELU=relu, HAS_RESIDUAL=False, QUANT_OUT=False, POOL=True,
+    )
+    return out, pooled
 
 
 def _int8_conv2d_eligible(x, weight, a_scale, w_scale, bias, kh, kw, sh, sw, ph, pw, dh, dw, **_) -> bool:
@@ -821,6 +867,86 @@ ops.int8_conv2d.register(
     "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON],
     when=_int8_conv2d_eligible,
 )(_int8_conv2d_triton)
+
+
+def _int8_conv2d_maxpool_eligible(x, weight, a_scale, w_scale, bias, kh, kw, sh, sw, ph, pw, dh, dw, **_) -> bool:
+    ho = (x.shape[1] + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+    wo = (x.shape[2] + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+    return _int8_conv2d_eligible(x, weight, a_scale, w_scale, bias, kh, kw, sh, sw, ph, pw, dh, dw) and ho % 2 == 0 and wo % 2 == 0
+
+
+ops.int8_conv2d_maxpool.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON],
+    when=_int8_conv2d_maxpool_eligible,
+)(_int8_conv2d_maxpool_triton)
+
+
+# -- 3-channel first conv on tensor cores + bias / ReLU / INT8 quantize ---------------------------------
+
+
+@triton.jit
+def _conv3x3_cin3_quantize_kernel(x_ptr, w_ptr, bias_ptr, scale_ptr, q_ptr, H, W, COUT: tl.constexpr, SEG: tl.constexpr):
+    """3x3 / pad 1 conv of a 3-channel NCHW BF16 image as one ``tl.dot`` per tile: the M tile is ``SEG`` consecutive
+    pixels of one row, K = (c, ky, kx) = 27 padded to 32 and gathered from the image, ``w`` ``[32, COUT]`` (rows 27..31
+    zero). The epilogue rounds as the unfused chain does: ``bf16(conv) -> + bias -> bf16 -> ReLU -> static INT8``
+    (``bias_relu_quantize_int8``). The FP32 accumulation order differs from cuDNN's SIMT kernel."""
+    row = tl.program_id(0)  # b * H + y
+    b = row // H
+    oh = row - b * H
+    k = tl.arange(0, 32)
+    ci, r = k // 9, k % 9
+    ky, kx = r // 3 - 1, r % 3 - 1
+    ow = tl.program_id(1) * SEG + tl.arange(0, SEG)
+    ih = oh + ky[None, :]
+    iw = ow[:, None] + kx[None, :]
+    ow_ok = ow < W
+    ok = ow_ok[:, None] & (k < 27)[None, :] & (ih >= 0) & (ih < H) & (iw >= 0) & (iw < W)
+    a = tl.load(x_ptr + ((b * 3 + ci[None, :]).to(tl.int64) * H + ih) * W + iw, mask=ok, other=0.0)
+    n = tl.arange(0, COUT)
+    acc = tl.dot(a, tl.load(w_ptr + k[:, None] * COUT + n[None, :]))
+    value = (acc.to(tl.bfloat16).to(tl.float32) + tl.load(bias_ptr + n).to(tl.float32)[None, :]).to(tl.bfloat16)
+    value = tl.maximum(value, 0.0).to(tl.float32)
+    scaled = libdevice.rint(value * (1.0 / tl.load(scale_ptr)))
+    quantized = tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8)
+    tl.store(q_ptr + (row * W + ow[:, None]).to(tl.int64) * COUT + n[None, :], quantized, mask=ow_ok[:, None])
+
+
+def _conv3x3_cin3_prepare(weight: Tensor, bias: Tensor) -> tuple[Tensor, Tensor]:
+    cout = weight.shape[0]
+    packed = torch.nn.functional.pad(weight.detach().reshape(cout, 27), (0, 5)).t().contiguous()  # [32, COUT]
+    return packed, bias.detach()
+
+
+def _conv3x3_cin3_quantize(x: Tensor, scale: Tensor, packed: Tensor, bias: Tensor) -> Int8Tensor:
+    batch, _, height, width = x.shape
+    cout = packed.shape[1]
+    out = torch.empty(batch, height, width, cout, device=x.device, dtype=torch.int8)
+    # Kernel alone on the 3 x 896 x 1200 stem (CUDA graph, L20 / H20 ms): 64 columns x 4 warps 0.097 / 0.155, 128 x 4
+    # 0.076 / 0.107 (picked), 128 x 8 0.105 / 0.185, 256 x 4 0.075 / 0.117, 256 x 8 -- / 0.131.
+    seg = 128
+    _conv3x3_cin3_quantize_kernel[(batch * height, triton.cdiv(width, seg))](
+        x, packed, bias, scale, out, height, width, COUT=cout, SEG=seg, num_warps=4
+    )
+    return Int8Tensor(out, scale)
+
+
+def _conv3x3_cin3_accepts(weight: Tensor, bias: Tensor) -> bool:
+    cout = weight.shape[0]
+    return weight.shape[1:] == (3, 3, 3) and cout & (cout - 1) == 0 and cout <= 128 and bias.shape == (cout,)
+
+
+def _conv3x3_cin3_eligible(x: Tensor, scale: Tensor, weight: Tensor, bias: Tensor) -> bool:
+    return (
+        x.ndim == 4 and x.shape[1] == 3 and x.dtype == torch.bfloat16 and x.is_contiguous()
+        and weight.dtype == torch.bfloat16 and bias.dtype == torch.bfloat16
+    )
+
+
+# sm_89 and sm_90 only: the two architectures it was measured on (the reference chain is the fallback elsewhere).
+ops.conv2d_small_cin_quantize_int8.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)), requires=[Feature.TRITON],
+    when=_conv3x3_cin3_eligible, accepts=_conv3x3_cin3_accepts, prepare=_conv3x3_cin3_prepare,
+)(_conv3x3_cin3_quantize)
 
 
 # -- fused static MXFP8 conv2d (implicit GEMM) --------------------------------------------------

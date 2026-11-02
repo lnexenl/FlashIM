@@ -25,7 +25,7 @@ class Backend:
 
 
 BACKENDS: tuple[Backend, ...] = (
-    Backend("torch_native", ("torch_native.gemm",)),
+    Backend("torch_native", ("torch_native.gemm", "torch_native.patchify")),
     Backend(
         "triton",
         tuple(f"triton.{m}" for m in ("aliked", "attention", "conv", "correlation", "density", "gemm", "quantize", "raco", "resample", "romav2")),
