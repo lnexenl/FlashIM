@@ -819,6 +819,92 @@ def test_upsample_concat_int8(size, coarse_size, layout):
     assert (fast.values.int() - ref.values.int()).abs().max() <= 1 and _mismatch(fast.values, ref.values) < 1e-3
 
 
+# The row kernels of ``backends/triton/resample.py`` (sm_89 / sm_90 only): bit-identical to the tile kernel they replace.
+_needs_rows = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in {(8, 9), (9, 0)},
+    reason="the upsample row kernels are registered for sm_89 / sm_90",
+)
+
+
+def _channels(layout):
+    return torch.channels_last if layout == "nhwc" else torch.contiguous_format
+
+
+@_needs_rows
+@pytest.mark.parametrize("coarse_size", [(1, 1), (3, 5), (19, 23), (112, 150), (7, 70)])
+@pytest.mark.parametrize("channels", [(256, 256), (128, 128), (64, 32), (24, 40), (512, 512)])
+@pytest.mark.parametrize("layout", ["nchw", "nhwc"])
+def test_upsample_concat_int8_rows_is_bit_identical_to_the_tile_kernel(coarse_size, channels, layout):
+    """Exact 2x, BF16 taps: every product of the bilinear weights (1/4, 3/4) is exact, so the row-pair kernel gives the
+    tile kernel's INT8 bytes. Batch 2, widths that are not a multiple of any tile, non-power-of-two channel counts."""
+    torch.manual_seed(0)
+    fmt = _channels(layout)
+    (c_features, c_coarse), (h, w) = channels, coarse_size
+    features = (torch.randn(2, c_features, 2 * h, 2 * w, device=DEV) * 2).bfloat16().contiguous(memory_format=fmt)
+    coarse = (torch.randn(2, c_coarse, h, w, device=DEV) * 2).bfloat16().contiguous(memory_format=fmt)
+    features[0, 0, 0, 0] = 1e4  # saturates the +-127 clamp
+    scale = torch.tensor(0.023, device=DEV)
+    assert ops.upsample_concat_int8.explain(features, coarse, scale)["triton_rows"] == "selected"
+    ops.reset_call_counts()
+    got = ops.upsample_concat_int8(features, coarse, scale)
+    assert ops.call_counts()["upsample_concat_int8"] == {"triton_rows": 1}
+    want = ops.upsample_concat_int8.get("triton")(features, coarse, scale)
+    assert got.values.shape == (2, 2 * h, 2 * w, c_features + c_coarse) and got.values.is_contiguous()
+    assert got.scale is scale and torch.equal(got.values, want.values)
+
+
+@_needs_rows
+def test_upsample_concat_int8_rows_declines_what_it_does_not_reproduce():
+    """Other ratios (the descriptor's 56 -> 98 map) and FP32 taps stay on the tile kernel."""
+    features = torch.randn(1, 32, 98, 98, device=DEV).bfloat16().contiguous(memory_format=torch.channels_last)
+    scale = torch.tensor(0.05, device=DEV)
+    not_2x = torch.randn(1, 32, 56, 56, device=DEV).bfloat16().contiguous(memory_format=torch.channels_last)
+    fp32_taps = torch.randn(1, 32, 49, 49, device=DEV).contiguous(memory_format=torch.channels_last)
+    for coarse in (not_2x, fp32_taps):
+        assert ops.upsample_concat_int8.explain(features, coarse, scale)["triton_rows"] == "when() rejected the arguments"
+        ops.reset_call_counts()
+        ops.upsample_concat_int8(features, coarse, scale)
+        assert ops.call_counts()["upsample_concat_int8"] == {"triton": 1}
+
+
+@_needs_rows
+@pytest.mark.parametrize("channels", [1, 3, 16, 48, 64])
+def test_upsample_add_rows_declines_narrow_maps(channels):
+    """RIPE's 1-channel logit map (and other narrow ones) stay on the tile kernel: the row kernel is slower there and
+    not bit-identical."""
+    coarse = torch.randn(1, channels, 112, 150, device=DEV)
+    delta = torch.randn(1, channels, 224, 300, device=DEV).bfloat16()
+    ops.reset_call_counts()
+    ops.upsample_add(coarse, delta)
+    assert ops.call_counts()["upsample_add"] == {"triton": 1}
+
+
+@_needs_rows
+@pytest.mark.parametrize(
+    "size,coarse_size",
+    [((224, 300), (112, 150)), ((448, 600), (224, 300)), ((112, 147), (64, 84)), ((37, 45), (19, 23)), ((6, 11), (2, 3))],
+)
+@pytest.mark.parametrize("coarse_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("channels", [256, 96, 128, 512])
+def test_upsample_add_rows_is_bit_identical_to_the_tile_kernel(size, coarse_size, coarse_dtype, channels):
+    """The FP32 sum is not exact (FP32 taps, arbitrary ratios): the row kernel's contraction must match the tile
+    kernel's bit for bit. That is codegen-dependent, so it is checked at the real call shapes (channels-last) and odd
+    ones, and the kernel declines NCHW operands (where the tile kernel's codegen differs in the last bit)."""
+    torch.manual_seed(0)
+    coarse = torch.randn(2, channels, *coarse_size, device=DEV).to(coarse_dtype).contiguous(memory_format=torch.channels_last)
+    delta = torch.randn(2, channels, *size, device=DEV).bfloat16().contiguous(memory_format=torch.channels_last)
+    ops.reset_call_counts()
+    got = ops.upsample_add(coarse, delta)
+    assert ops.call_counts()["upsample_add"] == {"triton_rows": 1}
+    want = ops.upsample_add.get("triton")(coarse, delta)
+    assert got.dtype == torch.float32 and got.is_contiguous(memory_format=torch.channels_last)
+    assert torch.equal(got, want)
+    torch.testing.assert_close(got, ops.upsample_add.get("reference")(coarse, delta), atol=1e-5, rtol=1e-5)
+    ops.reset_call_counts()
+    ops.upsample_add(coarse.contiguous(), delta.contiguous())
+    assert ops.call_counts()["upsample_add"] == {"triton": 1}
+
+
 @pytest.mark.parametrize("rows,k", [(5376, 1024), (777, 4096), (300, 1000), (5, 64)])
 def test_quantize_int8_rows(rows, k):
     """Per-row dynamic INT8: bit-identical to the reference (scales and values), outlier rows and all-zero rows too."""
@@ -847,3 +933,62 @@ def test_int8_linear_per_row_scale(impl):
     # row 17's large scale is applied to row 17 only
     plain = ops.int8_linear.get(impl)(q, w, scale.median(), w_scale, bias).float()
     assert not torch.allclose(fast[17], plain[17]) and torch.allclose(fast[16], ref[16], rtol=2**-7, atol=1e-3)
+
+
+# -- ViT glue: LayerNorm + per-row INT8, and the GELU / residual epilogues of the INT8 GEMM -------------------------------
+_EXACT_LN_ARCH = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((8, 9), (9, 0)),
+    reason="the torch-exact LayerNorm kernel is registered for sm_89 / sm_90 (the archs it was checked on)",
+)
+
+
+@_EXACT_LN_ARCH
+@pytest.mark.parametrize("rows,n", [(1, 1024), (7, 512), (333, 1024), (5376, 1024), (100, 2048), (64, 1536)])
+def test_layernorm_quantize_int8_rows(rows, n):
+    """Bit-identical to ``quantize_int8_rows(nn.LayerNorm(x))`` (torch's own kernel, BF16 in / out): values, scales."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, n, device=DEV, dtype=torch.bfloat16) * 3 + 0.5
+    x[rows // 2] *= 300  # a massive-activation token
+    x[:, 5] += 40  # an outlier channel
+    w = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    b = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    assert ops.layernorm_quantize_int8_rows.supports(x, w, b, 1e-6)
+    fast, ref = _both(ops.layernorm_quantize_int8_rows, "triton", x, w, b, 1e-6)
+    assert torch.equal(fast[0], ref[0]) and torch.equal(fast[1], ref[1])
+    norm = torch.nn.LayerNorm(n, eps=1e-6).to(DEV, torch.bfloat16)
+    norm.weight.data.copy_(w)
+    norm.bias.data.copy_(b)
+    unfused = ops.quantize_int8_rows(norm(x))
+    assert torch.equal(fast[0], unfused[0]) and torch.equal(fast[1], unfused[1])
+
+
+@pytest.mark.parametrize("rows,k,n", [(5376, 1024, 4096), (300, 1024, 1024), (17, 256, 96), (3000, 4096, 1024)])
+def test_int8_linear_residual_epilogue(rows, k, n):
+    """``residual=`` adds a BF16 tensor to the BF16-rounded GEMM output: equal to the separate add, bit for bit."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, k, device=DEV, dtype=torch.bfloat16)
+    q, scale = ops.quantize_int8_rows(x)
+    w = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    w_scale, bias = torch.rand(n, device=DEV) * 1e-3, torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    residual = torch.randn(rows, n, device=DEV, dtype=torch.bfloat16) * 4
+    plain = ops.int8_linear.get("triton")(q, w, scale, w_scale, bias)
+    fused = ops.int8_linear.get("triton")(q, w, scale, w_scale, bias, residual=residual)
+    assert torch.equal(fused, residual + plain)
+    assert ops.int8_linear.select(q, w, scale, w_scale, bias, residual=residual)[0] == "triton"
+
+
+@pytest.mark.parametrize("rows,k,n", [(5376, 1024, 4096), (300, 1024, 1024), (17, 256, 96)])
+def test_int8_linear_gelu_epilogue(rows, k, n):
+    """``gelu=True``: ``F.gelu`` of the BF16 GEMM output, bit for bit, wherever a libdevice matching torch's erf exists
+    (otherwise the Triton impl is not eligible and the op falls back)."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, k, device=DEV, dtype=torch.bfloat16)
+    q, scale = ops.quantize_int8_rows(x)
+    w = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    w_scale, bias = torch.rand(n, device=DEV) * 3e-3, torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    plain = ops.int8_linear.get("triton")(q, w, scale, w_scale, bias)
+    if not ops.int8_linear.supports(q, w, scale, w_scale, bias, gelu=True):
+        pytest.skip("no libdevice reproduces torch's erf on this machine")
+    fused = ops.int8_linear.get("triton")(q, w, scale, w_scale, bias, gelu=True)
+    assert torch.equal(fused, F.gelu(plain))
+    assert ops.int8_linear.get("reference")(q, w, scale, w_scale, bias, gelu=True).shape == plain.shape
