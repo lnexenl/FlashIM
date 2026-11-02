@@ -41,7 +41,7 @@ from flashim.ops.quantize import (
     quantize_mxfp8,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
-from flashim.ops.resample import upsample_add, upsample_concat
+from flashim.ops.resample import pil_bicubic_resize, upsample_add, upsample_concat
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 
 __all__ = [
@@ -76,6 +76,7 @@ __all__ = [
     "mxfp8_gelu_mlp",
     "mxfp8_linear",
     "mxfp8_scaled_mm",
+    "pil_bicubic_resize",
     "quantize_int8",
     "quantize_mxfp8",
     "raco_head5x5",
