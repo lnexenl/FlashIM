@@ -520,8 +520,22 @@ def _depthwise_eligible(value: Tensor, weight: Tensor, bias: Tensor, *_) -> bool
 ops.depthwise5x5_relu_mxfp8.register(  # an E4M3 producer: see ``backends/triton/quantize.py``
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3], when=_depthwise_eligible
 )(depthwise5x5_relu_mxfp8)
+def _depthwise_int8_eligible(value: Tensor, weight: Tensor, bias: Tensor, *_) -> bool:
+    """Any channel count % 32 (the MXFP8 producer stays at 32 / 128 / 512). The fused producer beats the unfused block
+    (cuDNN depthwise, ReLU, quantize, GEMM; whole ``Int8ProducerSeparableConvBlock``, DeDoDe's real shapes, CUDA-graph
+    replay) at the 256 and 768 channels it newly covers: L20 256 x 224 x 300 0.245 -> 0.139 ms, 768 x 64 x 84 0.083 ->
+    0.059; H20 0.328 -> 0.203, 0.100 -> 0.072 (512 channels: 0.137 -> 0.096 / 0.177 -> 0.136). Unmeasured on sm_80 /
+    86 / 87 / 100 / 120."""
+    return (
+        value.ndim == 4
+        and value.shape[1] % 32 == 0
+        and value.is_contiguous(memory_format=torch.channels_last)
+        and tuple(weight.shape) == (25, value.shape[1])
+    )
+
+
 ops.depthwise5x5_relu_int8.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_depthwise_eligible
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_depthwise_int8_eligible
 )(depthwise5x5_relu_int8)
 
 
