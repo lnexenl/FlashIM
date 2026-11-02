@@ -364,6 +364,39 @@ def quantize_int8(value: Tensor, scale: Tensor) -> Int8Tensor:
     return Int8Tensor(out, scale)
 
 
+@triton.jit
+def _bias_relu_quantize_int8_kernel(
+    raw_ptr, bias_ptr, scale_ptr, out_ptr, H, W, C: tl.constexpr, BLOCK_W: tl.constexpr
+):
+    """One program: all ``C`` channels of ``BLOCK_W`` pixels of one image row. ``raw`` NCHW BF16 (loaded along the
+    pixels, which are contiguous), ``out`` NHWC INT8 (stored along the channels): ``+ bias`` rounded to BF16
+    (``Tensor.add_``), ReLU, then ``_store_quantized``'s INT8 math."""
+    row = tl.program_id(0)  # b * H + y
+    b = row // H
+    x = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)
+    x_ok = x < W
+    c = tl.arange(0, C)
+    plane = (b * C + c.to(tl.int64))[:, None] * H * W + (row - b * H).to(tl.int64) * W
+    value = tl.load(raw_ptr + plane + x[None, :], mask=x_ok[None, :], other=0.0).to(tl.float32)
+    value = (value + tl.load(bias_ptr + c).to(tl.float32)[:, None]).to(tl.bfloat16)
+    value = tl.maximum(value, 0.0).to(tl.float32)
+    scaled = libdevice.rint(value * (1.0 / tl.load(scale_ptr)))
+    quantized = tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8)
+    tl.store(out_ptr + (row * W + x[None, :]).to(tl.int64) * C + c[:, None], quantized, mask=x_ok[None, :])
+
+
+def bias_relu_quantize_int8(raw: Tensor, bias: Tensor, scale: Tensor) -> Int8Tensor:
+    batch, channels, height, width = raw.shape
+    out = torch.empty(batch, height, width, channels, device=raw.device, dtype=torch.int8)
+    # Epilogue alone on the 3 x 896 x 1200 first conv (CUDA graph, L20 / H20 ms): 32 columns 0.50 / 0.10, 64 0.40 / 0.09,
+    # 128 0.36 / 0.08; 256 and 512 columns 0.34 on L20 but not faster on H20; 8 warps no better.
+    block_w = 128
+    _bias_relu_quantize_int8_kernel[(batch * height, triton.cdiv(width, block_w))](
+        raw, bias, scale, out, height, width, C=channels, BLOCK_W=block_w, num_warps=4
+    )
+    return Int8Tensor(out, scale)
+
+
 def layernorm_quantize_int8(
     value: Tensor, residual: Tensor | None, weight: Tensor | None, bias: Tensor | None, eps: float, scale: Tensor,
     *, return_sum: bool = False, activation: str | None = None,
@@ -497,6 +530,13 @@ def _quantize_mxfp8_impl(value: Tensor, scale_exponent: Tensor) -> QuantizedTens
 ops.quantize_int8.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_quantize_eligible
 )(quantize_int8)
+ops.bias_relu_quantize_int8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON],
+    when=lambda raw, bias, scale: (
+        raw.ndim == 4 and raw.dtype == torch.bfloat16 and raw.is_contiguous() and bias.dtype == torch.bfloat16
+        and bias.shape == (raw.shape[1],) and raw.shape[1] == triton.next_power_of_2(raw.shape[1])
+    ),
+)(bias_relu_quantize_int8)
 ops.layernorm_quantize_int8.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_layernorm_eligible
 )(layernorm_quantize_int8)

@@ -12,6 +12,12 @@
   AUC@5 vs `bf16` +0.0004 / +0.0025.
   `extractor_spec(int8_dynamic=...)` and the `INT8_TOKEN_ACTIVATIONS` scheme make per-token INT8 available to other
   models; `Op.supports(...)` tells whether a call would run a kernel rather than the reference.
+- DeDoDe `int8` encoders (bit-identical): each `INT8 conv -> ReLU -> MaxPool2d -> INT8 conv` runs as one kernel that
+  also writes the pooled map's INT8 input (`ops.int8_conv2d_maxpool`, pass `fused_pool_epilogue`), the BF16 first
+  conv's bias + ReLU + quantize are one pass after cuDNN (`ops.bias_relu_quantize_int8`, pass
+  `fused_first_conv_epilogue`), and `blocks.VGG` no longer runs its last max pool, whose output is never read (every
+  model built on it). Extract at 1200 px, 4096 keypoints (eager, interleaved): L20 `dedode` 33.9 -> 30.5 ms,
+  `dedode-g` 83.9 -> 80.6 ms; H20 30.5 -> 29.2 ms, 71.6 -> 70.4 ms.
 
 ## 0.1.0 (2026-10-28)
 

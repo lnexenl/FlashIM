@@ -500,6 +500,53 @@ def test_int8_conv2d(cin, cout, kh, kw, sh, sw, ph, pw, dh, dw, has_bias):
     assert torch.equal(fused, F.relu(fast))
 
 
+@pytest.mark.parametrize("batch,height,width", [(1, 18, 22), (2, 36, 70), (1, 6, 130), (1, 2, 2)])
+@pytest.mark.parametrize("cin,cout,k", [(64, 64, 3), (64, 128, 3), (32, 48, 3), (96, 64, 1)])
+@pytest.mark.parametrize("relu", [True, False])
+def test_int8_conv2d_maxpool(batch, height, width, cin, cout, k, relu):
+    """The conv's epilogue pool: ``out`` is the plain conv's bits and ``pooled`` the Triton quantize of its 2x2 max
+    pool, whichever tile the autotuner picks (sizes that are not multiples of the tile's column segment included)."""
+    torch.manual_seed(0)
+    x = torch.randint(-127, 127, (batch, height, width, cin), dtype=torch.int8, device=DEV)
+    weight = torch.randint(-127, 127, (cout, k * k * cin), dtype=torch.int8, device=DEV)
+    a_scale, out_scale = torch.tensor(0.017, device=DEV), torch.tensor(0.9, device=DEV)
+    w_scale = torch.rand(cout, device=DEV) * 0.01 + 0.001
+    bias = torch.randn(cout, device=DEV, dtype=torch.bfloat16)
+    args = (x, weight, a_scale, w_scale, bias, k, k, 1, 1, k // 2, k // 2, 1, 1)
+    out, pooled = ops.int8_conv2d_maxpool.get("triton")(*args, relu=relu, out_scale=out_scale)
+    plain = ops.int8_conv2d.get("triton")(*args, relu=relu)
+    unfused = ops.quantize_int8.get("triton")(F.max_pool2d(plain.permute(0, 3, 1, 2), 2).permute(0, 2, 3, 1), out_scale)
+    assert out.dtype == torch.bfloat16 and pooled.dtype == torch.int8 and pooled.shape == (batch, height // 2, width // 2, cout)
+    assert torch.equal(out, plain) and torch.equal(pooled, unfused.values)
+    ref_out, ref_pooled = ops.int8_conv2d_maxpool.get("reference")(*args, relu=relu, out_scale=out_scale)
+    assert torch.equal(out, ref_out) and (pooled.int() - ref_pooled.int()).abs().max() <= 1  # reciprocal vs division
+
+
+def test_int8_conv2d_maxpool_odd_size_takes_the_reference():
+    x = torch.randint(-127, 127, (1, 9, 10, 32), dtype=torch.int8, device=DEV)
+    weight = torch.randint(-127, 127, (32, 9 * 32), dtype=torch.int8, device=DEV)
+    args = (x, weight, torch.tensor(0.017, device=DEV), torch.rand(32, device=DEV) * 0.01, None, 3, 3, 1, 1, 1, 1, 1, 1)
+    assert not ops.int8_conv2d_maxpool.supports(*args, relu=True, out_scale=torch.tensor(0.9, device=DEV))
+    out, pooled = ops.int8_conv2d_maxpool(*args, relu=True, out_scale=torch.tensor(0.9, device=DEV))
+    assert out.shape == (1, 9, 10, 32) and pooled.shape == (1, 4, 5, 32)
+
+
+@pytest.mark.parametrize("batch,height,width", [(1, 8, 40), (2, 13, 37), (1, 120, 160)])
+@pytest.mark.parametrize("channels", [64, 32])
+def test_bias_relu_quantize_int8(batch, height, width, channels):
+    """cuDNN's bias-free output -> bias (BF16 rounding), ReLU, quantize: the reference's bits (a BF16 add, ReLU and the
+    static quantize with the same reciprocal multiply)."""
+    torch.manual_seed(0)
+    raw = (torch.randn(batch, channels, height, width, device=DEV) * 3).bfloat16()
+    bias = torch.randn(channels, device=DEV).bfloat16()
+    scale = torch.tensor(0.05, device=DEV)
+    fast, ref = _both(ops.bias_relu_quantize_int8, "triton", raw, bias, scale)
+    assert fast.values.shape == (batch, height, width, channels) and fast.scale is scale
+    assert (fast.values.int() - ref.values.int()).abs().max() <= 1 and _mismatch(fast.values, ref.values) < 1e-3
+    unfused = ops.quantize_int8.get("triton")(F.relu(raw + bias.view(1, -1, 1, 1)).permute(0, 2, 3, 1), scale)
+    assert torch.equal(fast.values, unfused.values)  # the layer-by-layer path it replaces
+
+
 @pytest.mark.sm120
 @pytest.mark.parametrize(
     "cin,cout,kh,kw,sh,sw,ph,pw,dh,dw",
