@@ -176,3 +176,5 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
 
 - Work on a branch cut from `main`; commit only when asked.
 - Commit messages: what changed and why, plus how it was verified (bit-identical configs, test counts, timings).
+- Pull requests: fill `.github/pull_request_template.md`. Keep the sections the change needs and say what was not
+  verified.
