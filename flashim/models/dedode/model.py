@@ -78,6 +78,7 @@ class DeDoDe(sparse.SparseExtractor):
     default_top_k = 10_000
     inv_temperature = 20.0
     match_threshold = 0.01
+    low_precision_similarity = False  # spec pass ``low_precision_similarity``: see :meth:`similarity`
 
     def __init__(self, detector: blocks.NetConfig, descriptor: blocks.NetConfig, sampler: SamplerConfig) -> None:
         super().__init__()
@@ -118,9 +119,18 @@ class DeDoDe(sparse.SparseExtractor):
     def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
         return F.normalize(self.descriptor(self.normalize(image), points=keypoints.float()), dim=-1)
 
+    def similarity(self, a: Tensor, b: Tensor) -> Tensor:
+        """``inv_temperature * a @ b^T`` in FP32 for the normalized descriptors ``a [M, D]``, ``b [N, D]``. With
+        ``low_precision_similarity`` the descriptors are rounded to BF16 and multiplied on tensor cores
+        (``ops.matmul_nt_fp32``: FP32 accumulation and output, the temperature as the GEMM's alpha) instead of an FP32
+        SGEMM on CUDA cores."""
+        if self.low_precision_similarity:
+            return ops.matmul_nt_fp32(a.bfloat16(), b.bfloat16(), self.inv_temperature)
+        return (a.float() @ b.float().t()) * self.inv_temperature
+
     @torch.inference_mode()
     def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
-        corr = (a.descriptors[0].float() @ b.descriptors[0].float().t()) * self.inv_temperature
+        corr = self.similarity(a.descriptors[0], b.descriptors[0])
         # mutual maxima of softmax(corr, -2) * softmax(corr, -1) above the threshold, without the [M, N] probabilities:
         # measured 5.7 -> 0.74 ms for 4096 x 4096 keypoints (sm_120), identical match lists on 100 MegaDepth pairs
         log_conf, index, mutual = ops.dual_softmax_mutual(corr)

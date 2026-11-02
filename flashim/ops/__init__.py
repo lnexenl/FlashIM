@@ -31,7 +31,14 @@ from flashim.ops.conv import (
 )
 from flashim.ops.correlation import dual_softmax_mutual, local_corr
 from flashim.ops.density import kde_density
-from flashim.ops.gemm import int8_linear, linear_fp32, mxfp8_gelu_mlp, mxfp8_linear, mxfp8_scaled_mm
+from flashim.ops.gemm import (
+    int8_linear,
+    linear_fp32,
+    matmul_nt_fp32,
+    mxfp8_gelu_mlp,
+    mxfp8_linear,
+    mxfp8_scaled_mm,
+)
 from flashim.ops.quantize import (
     gelu_quantize,
     gelu_quantize_int8,
@@ -72,6 +79,7 @@ __all__ = [
     "layernorm_quantize_int8",
     "linear_fp32",
     "local_corr",
+    "matmul_nt_fp32",
     "multiscale_fuse",
     "mxfp8_conv2d",
     "mxfp8_gelu_mlp",

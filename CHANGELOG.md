@@ -12,6 +12,12 @@
   AUC@5 vs `bf16` +0.0004 / +0.0025.
   `extractor_spec(int8_dynamic=...)` and the `INT8_TOKEN_ACTIVATIONS` scheme make per-token INT8 available to other
   models; `Op.supports(...)` tells whether a call would run a kernel rather than the reference.
+- DeDoDe's `match_features` computes its 4096 x 4096 x D similarity on BF16 tensor cores in the `bf16` / `int8` / `fp8`
+  presets (`low_precision_similarity` pass; `ops.matmul_nt_fp32`: cuBLAS BF16 GEMM, FP32 accumulation and output, the
+  temperature as alpha), instead of an FP32 SGEMM on the FP32 descriptors. The descriptors are rounded to BF16 (logits move
+  by < 0.02), so this is a numerics change: `fp32` is unchanged. Per match, `dedode` int8: L20 0.64 -> 0.41 ms, H20 0.73 ->
+  0.45 ms. MegaDepth-1500 AUC@5 vs `bf16` of the base commit (paired): `dedode` int8 +0.34 / -0.03 (L20 / H20), `dedode-g`
+  int8 -0.34 / +0.13.
 
 ## 0.1.0 (2026-10-28)
 

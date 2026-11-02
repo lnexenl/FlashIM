@@ -73,6 +73,26 @@ DECODER_UPSAMPLE_PASS = {
 }
 
 
+def low_precision_similarity(model: nn.Module, ctx: BuildContext) -> list[str] | str:
+    """The 4096 x 4096 x D similarity of ``match_features`` on BF16 tensor cores (``DeDoDe.similarity``); skipped for
+    ``fp32`` (the reference numerics)."""
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    matchers = [name or "<root>" for name, module in model.named_modules() if isinstance(module, DeDoDe)]
+    for module in model.modules():
+        if isinstance(module, DeDoDe):
+            module.low_precision_similarity = True
+    return matchers
+
+
+SIMILARITY_PASS = {
+    "low_precision_similarity": Pass(
+        low_precision_similarity, exact=False,
+        description="match_features' similarity GEMM on BF16 tensor cores (FP32 accumulate / output)",
+    ),
+}
+
+
 _DECODERS = ("detector.decoder.", "descriptor.decoder.")
 
 
@@ -171,8 +191,10 @@ def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ..
         # ConvRefiner hidden blocks with 32 / 64 / 128 channels as one BF16 kernel each (26 blocks). BF16 extract at
         # 1200 px, pass off vs on in one process (sm_120): dedode 101.8 -> 77.8 ms, dedode-g 174.5 -> 151.0 ms.
         fused_bf16_blocks=_DECODERS,
-        extra_passes={**DECODER_UPSAMPLE_PASS, **DECODER_FUSION_PASSES, **(VIT_EPILOGUE_PASSES if vit else {})},
-        structural_passes=(*DECODER_UPSAMPLE_PASS, *DECODER_FUSION_PASSES, *(VIT_EPILOGUE_PASSES if vit else ())),
+        extra_passes={**DECODER_UPSAMPLE_PASS, **DECODER_FUSION_PASSES, **SIMILARITY_PASS,
+                      **(VIT_EPILOGUE_PASSES if vit else {})},
+        structural_passes=(*DECODER_UPSAMPLE_PASS, *DECODER_FUSION_PASSES, *SIMILARITY_PASS,
+                           *(VIT_EPILOGUE_PASSES if vit else ())),
     )
 
 

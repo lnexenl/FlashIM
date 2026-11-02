@@ -1,4 +1,5 @@
-"""GEMMs: block-scaled MXFP8, static MXFP8 / INT8 linears, and FP32 linear of low-precision inputs.
+"""GEMMs: block-scaled MXFP8, static MXFP8 / INT8 linears, FP32 linear of low-precision inputs and FP32 ``a @ b^T`` of
+low-precision matrices.
 
 ``linear_fp32``: the reference runs an FP32 GEMM; the ``triton`` path covers small outputs
 (``N <= 16``) exactly; ``triton_split`` covers larger ones on tensor cores with the FP32 weight split
@@ -102,6 +103,19 @@ def _linear_fp32_reference(x: Tensor, weight: Tensor, bias: Tensor) -> Tensor:
 
 
 linear_fp32 = Op("linear_fp32", _linear_fp32_reference)
+
+
+# -- FP32 product of two low-precision matrices --------------------------------------------------
+
+
+def _matmul_nt_fp32_reference(a: Tensor, b: Tensor, scale: float) -> Tensor:
+    """``scale * a @ b^T`` in FP32 of two (typically BF16) matrices ``a [M, K]``, ``b [N, K]`` -> ``[M, N]``: the
+    inputs are exact in FP32, so impls differ from this only in the accumulation (order, tensor-core FP32 adds).
+    A similarity matrix ahead of a softmax (``ops.dual_softmax_mutual``), where BF16 output would be too coarse."""
+    return torch.mm(a.float(), b.float().t()).mul_(scale)
+
+
+matmul_nt_fp32 = Op("matmul_nt_fp32", _matmul_nt_fp32_reference)
 
 
 # -- fused MXFP8 GELU MLP -------------------------------------------------------------------------------
