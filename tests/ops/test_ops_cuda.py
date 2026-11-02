@@ -531,6 +531,64 @@ def test_int8_conv2d_maxpool_odd_size_takes_the_reference():
     assert out.shape == (1, 9, 10, 32) and pooled.shape == (1, 4, 5, 32)
 
 
+_needs_stem_tc = pytest.mark.skipif(
+    not torch.cuda.is_available() or platform_for(DEV).capability not in ((8, 9), (9, 0)),
+    reason="the tensor-core stem and the cuBLAS patch embedding are registered for sm_89 / sm_90 only",
+)
+
+
+@_needs_stem_tc
+@pytest.mark.parametrize("batch,height,width", [(1, 17, 50), (2, 40, 129), (1, 224, 300)])
+@pytest.mark.parametrize("cout", [64, 32])
+def test_conv2d_small_cin_quantize_int8(batch, height, width, cout):
+    """3-channel first conv on tensor cores: the INT8 maps of the reference chain (cuDNN + bias + ReLU + quantize) up to
+    the FP32 summation order, which flips a conv output by one BF16 ulp on ~2e-7 of the elements (one INT8 step)."""
+    torch.manual_seed(0)
+    x = torch.randn(batch, 3, height, width, device=DEV).bfloat16()
+    weight = (torch.randn(cout, 3, 3, 3, device=DEV) * 0.3).bfloat16()
+    bias = torch.randn(cout, device=DEV).bfloat16()
+    scale = torch.tensor(0.04, device=DEV)
+    fast = ops.conv2d_small_cin_quantize_int8.get("triton")(x, scale, weight, bias)
+    ref = ops.conv2d_small_cin_quantize_int8.get("reference")(x, scale, weight, bias)
+    assert fast.values.shape == (batch, height, width, cout) and fast.scale is scale
+    assert (fast.values.int() - ref.values.int()).abs().max() <= 1 and _mismatch(fast.values, ref.values) < 1e-4
+    bound = ops.conv2d_small_cin_quantize_int8.bind(weight, bias).warmup()
+    assert bound.primary == "triton" and torch.equal(bound(x, scale).values, fast.values)
+
+
+@_needs_stem_tc
+@pytest.mark.parametrize("hw", [(28, 42), (56, 28), (14, 14)])
+def test_patch_embed_tokens(hw):
+    """Patch embedding as a GEMM into the token buffer: the reference's tokens up to the summation order (1 BF16 ulp)."""
+    torch.manual_seed(0)
+    h, w = hw
+    image = torch.randn(1, 3, h * 14, w * 14, device=DEV).bfloat16()
+    weight = (torch.randn(1024, 3, 14, 14, device=DEV) * 0.03).bfloat16()
+    bias, cls = (torch.randn(1024, device=DEV) * 0.5).bfloat16(), torch.randn(1, 1, 1024, device=DEV).bfloat16()
+    pos = (torch.randn(1, 1 + h * w, 1024, device=DEV) * 0.5).bfloat16()
+    fast = ops.patch_embed_tokens.get("cublas")(image, cls, pos, weight, bias)
+    ref = ops.patch_embed_tokens.get("reference")(image, cls, pos, weight, bias)
+    assert fast.shape == ref.shape == (1, 1 + h * w, 1024) and fast.dtype == torch.bfloat16
+    assert torch.equal(fast[:, 0], ref[:, 0])
+    err = (fast.float() - ref.float()).abs()
+    assert err.max() <= 0.04 and (err > 0).float().mean() < 1e-2  # a BF16 ulp or two of the intermediate sums (|x| < 4)
+    bound = ops.patch_embed_tokens.bind(weight, bias).warmup()
+    assert bound.primary == "cublas" and torch.equal(bound(image, cls, pos), fast)
+    batch2 = ops.patch_embed_tokens(image.expand(2, -1, -1, -1).contiguous(), cls, pos, weight, bias)
+    assert batch2.shape == (2, 1 + h * w, 1024)  # batch > 1 takes the reference
+
+
+@_needs_stem_tc
+def test_patch_embed_tokens_compiles():
+    torch.manual_seed(0)
+    image = torch.randn(1, 3, 56, 84, device=DEV).bfloat16()
+    weight, bias = (torch.randn(1024, 3, 14, 14, device=DEV) * 0.05).bfloat16(), torch.randn(1024, device=DEV).bfloat16()
+    cls, pos = torch.randn(1, 1, 1024, device=DEV).bfloat16(), torch.randn(1, 1 + 4 * 6, 1024, device=DEV).bfloat16()
+    bound = ops.patch_embed_tokens.bind(weight, bias).warmup()
+    compiled = torch.compile(lambda x: bound(x, cls, pos), fullgraph=True)
+    torch.testing.assert_close(compiled(image), bound(image, cls, pos), atol=0.04, rtol=0)  # Inductor fuses the BF16 adds
+
+
 @pytest.mark.parametrize("batch,height,width", [(1, 8, 40), (2, 13, 37), (1, 120, 160)])
 @pytest.mark.parametrize("channels", [64, 32])
 def test_bias_relu_quantize_int8(batch, height, width, channels):

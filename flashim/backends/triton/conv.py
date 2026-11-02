@@ -30,6 +30,7 @@ from flashim.ops.conv import (
     fused_mxfp8_conv2d_worthwhile,
 )
 from flashim.platforms import Feature, platform_for
+from flashim.quant.tensor import Int8Tensor
 
 
 @triton.jit
@@ -864,6 +865,74 @@ ops.int8_conv2d_maxpool.register(
     "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON],
     when=_int8_conv2d_maxpool_eligible,
 )(_int8_conv2d_maxpool_triton)
+
+
+# -- 3-channel first conv on tensor cores + bias / ReLU / INT8 quantize ---------------------------------
+
+
+@triton.jit
+def _conv3x3_cin3_quantize_kernel(x_ptr, w_ptr, bias_ptr, scale_ptr, q_ptr, H, W, COUT: tl.constexpr, SEG: tl.constexpr):
+    """3x3 / pad 1 conv of a 3-channel NCHW BF16 image as one ``tl.dot`` per tile: the M tile is ``SEG`` consecutive
+    pixels of one row, K = (c, ky, kx) = 27 padded to 32 and gathered from the image, ``w`` ``[32, COUT]`` (rows 27..31
+    zero). The epilogue rounds as the unfused chain does: ``bf16(conv) -> + bias -> bf16 -> ReLU -> static INT8``
+    (``bias_relu_quantize_int8``). The FP32 accumulation order differs from cuDNN's SIMT kernel."""
+    row = tl.program_id(0)  # b * H + y
+    b = row // H
+    oh = row - b * H
+    k = tl.arange(0, 32)
+    ci, r = k // 9, k % 9
+    ky, kx = r // 3 - 1, r % 3 - 1
+    ow = tl.program_id(1) * SEG + tl.arange(0, SEG)
+    ih = oh + ky[None, :]
+    iw = ow[:, None] + kx[None, :]
+    ow_ok = ow < W
+    ok = ow_ok[:, None] & (k < 27)[None, :] & (ih >= 0) & (ih < H) & (iw >= 0) & (iw < W)
+    a = tl.load(x_ptr + ((b * 3 + ci[None, :]).to(tl.int64) * H + ih) * W + iw, mask=ok, other=0.0)
+    n = tl.arange(0, COUT)
+    acc = tl.dot(a, tl.load(w_ptr + k[:, None] * COUT + n[None, :]))
+    value = (acc.to(tl.bfloat16).to(tl.float32) + tl.load(bias_ptr + n).to(tl.float32)[None, :]).to(tl.bfloat16)
+    value = tl.maximum(value, 0.0).to(tl.float32)
+    scaled = libdevice.rint(value * (1.0 / tl.load(scale_ptr)))
+    quantized = tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8)
+    tl.store(q_ptr + (row * W + ow[:, None]).to(tl.int64) * COUT + n[None, :], quantized, mask=ow_ok[:, None])
+
+
+def _conv3x3_cin3_prepare(weight: Tensor, bias: Tensor) -> tuple[Tensor, Tensor]:
+    cout = weight.shape[0]
+    packed = torch.nn.functional.pad(weight.detach().reshape(cout, 27), (0, 5)).t().contiguous()  # [32, COUT]
+    return packed, bias.detach()
+
+
+def _conv3x3_cin3_quantize(x: Tensor, scale: Tensor, packed: Tensor, bias: Tensor) -> Int8Tensor:
+    batch, _, height, width = x.shape
+    cout = packed.shape[1]
+    out = torch.empty(batch, height, width, cout, device=x.device, dtype=torch.int8)
+    # Kernel alone on the 3 x 896 x 1200 stem (CUDA graph, L20 / H20 ms): 64 columns x 4 warps 0.097 / 0.155, 128 x 4
+    # 0.076 / 0.107 (picked), 128 x 8 0.105 / 0.185, 256 x 4 0.075 / 0.117, 256 x 8 -- / 0.131.
+    seg = 128
+    _conv3x3_cin3_quantize_kernel[(batch * height, triton.cdiv(width, seg))](
+        x, packed, bias, scale, out, height, width, COUT=cout, SEG=seg, num_warps=4
+    )
+    return Int8Tensor(out, scale)
+
+
+def _conv3x3_cin3_accepts(weight: Tensor, bias: Tensor) -> bool:
+    cout = weight.shape[0]
+    return weight.shape[1:] == (3, 3, 3) and cout & (cout - 1) == 0 and cout <= 128 and bias.shape == (cout,)
+
+
+def _conv3x3_cin3_eligible(x: Tensor, scale: Tensor, weight: Tensor, bias: Tensor) -> bool:
+    return (
+        x.ndim == 4 and x.shape[1] == 3 and x.dtype == torch.bfloat16 and x.is_contiguous()
+        and weight.dtype == torch.bfloat16 and bias.dtype == torch.bfloat16
+    )
+
+
+# sm_89 and sm_90 only: the two architectures it was measured on (the reference chain is the fallback elsewhere).
+ops.conv2d_small_cin_quantize_int8.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)), requires=[Feature.TRITON],
+    when=_conv3x3_cin3_eligible, accepts=_conv3x3_cin3_accepts, prepare=_conv3x3_cin3_prepare,
+)(_conv3x3_cin3_quantize)
 
 
 # -- fused static MXFP8 conv2d (implicit GEMM) --------------------------------------------------

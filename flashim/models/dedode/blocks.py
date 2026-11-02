@@ -36,10 +36,15 @@ class VGG(nn.Module):
       from one kernel (:meth:`StaticInt8Conv2d.forward_pooled`), not a pool pass and a quantize pass.
     - ``first_conv_relu`` (``fused_first_conv_epilogue``): index of the ReLU after a BF16 first conv feeding an INT8
       conv: cuDNN's bias-free output goes through bias, ReLU and the quantize in one pass
-      (``ops.bias_relu_quantize_int8``), not three."""
+      (``ops.bias_relu_quantize_int8``), not three.
+
+    A third, numerics-changing fusion (``tensor_core_first_conv``, pass ``tensor_core_first_conv``): ``(ReLU index,
+    bound ops.conv2d_small_cin_quantize_int8)``, the 3 -> 64 first conv itself on tensor cores with the same epilogue
+    (cuDNN's SIMT kernel replaced; FP32 summation order differs)."""
 
     pooled_convs: frozenset[int] = frozenset()
     first_conv_relu: int | None = None
+    tensor_core_first_conv: tuple[int, ops.BoundOp] | None = None
 
     def __init__(self, size: str = "19") -> None:
         super().__init__()
@@ -92,6 +97,12 @@ class VGG(nn.Module):
                 x = layer(x)
                 i += 1
                 continue
+            if i == 0 and self.tensor_core_first_conv is not None and x.dtype == layer.weight.dtype and x.is_contiguous():
+                relu, fused_conv = self.tensor_core_first_conv
+                scale = layers[relu + 1].input_scale
+                x = Int8Tensor(fused_conv(x, scale).values, scale)
+                i = relu + 1
+                continue
             if i == 0 and self.first_conv_relu is not None and x.dtype == layer.weight.dtype and x.is_contiguous():
                 relu = self.first_conv_relu
                 raw = F.conv2d(x, layer.weight, None, layer.stride, layer.padding, layer.dilation, layer.groups)
@@ -126,6 +137,8 @@ class DinoV2(nn.Module):
     """DINOv2 ViT-L/14 patch features (``x_norm_patchtokens``) as ``[B, C, H/14, W/14]``; upstream's positional
     embedding interpolation (bicubic, ``scale_factor`` with the ``+0.1`` guard) is reproduced exactly."""
 
+    patch_embed_op: ops.BoundOp | None = None  # ``ops.patch_embed_tokens`` bound to the patch convolution (pass ``patch_embed_gemm``)
+
     def __init__(self, dim: int = 1024, depth: int = 24, heads: int = 16, patch: int = 14, img_size: int = 518) -> None:
         super().__init__()
         self.patch = patch
@@ -159,9 +172,13 @@ class DinoV2(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         b, _, height, width = x.shape
         h, w = height // self.patch, width // self.patch
-        tokens = self.patch_embed.proj(x.to(self.patch_embed.proj.weight.dtype)).flatten(2).transpose(1, 2)
-        tokens = torch.cat([self.cls_token.to(tokens.dtype).expand(b, -1, -1), tokens], 1)
-        tokens = tokens + self.positions(h, w, tokens.dtype).to(tokens.device)
+        if self.patch_embed_op is not None:  # patch convolution + class token + positional embedding as one GEMM
+            dtype = self.patch_embed.proj.weight.dtype
+            tokens = self.patch_embed_op(x, self.cls_token, self.positions(h, w, dtype).to(x.device))
+        else:
+            tokens = self.patch_embed.proj(x.to(self.patch_embed.proj.weight.dtype)).flatten(2).transpose(1, 2)
+            tokens = torch.cat([self.cls_token.to(tokens.dtype).expand(b, -1, -1), tokens], 1)
+            tokens = tokens + self.positions(h, w, tokens.dtype).to(tokens.device)
         for block in self.blocks:
             tokens = block(tokens)
         return self.norm(tokens)[:, 1:].transpose(1, 2).reshape(b, -1, h, w)

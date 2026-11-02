@@ -49,6 +49,12 @@
   `sage-fp8-warp` and, for the H20, `sage-fp8-sm90` / `sage-fp8-sm90-warp` (the WGMMA kernel; `sage-fp8` keeps running the
   sm_89 kernel everywhere). Extract at 1200 px (eager): L20 105.0 -> 93.7 ms, H20 93.5 -> 87.8 ms; MegaDepth-1500 AUC@5 vs
   `bf16` -0.12 (L20) / +0.23 (H20) points, +0.05 / +0.07 vs the unchanged `int8`.
+- DeDoDe `int8` on sm_89 / sm_90 (L20 / H20; numerics, MegaDepth-1500 AUC@5 within 0.5 of `bf16`): the 3 -> 64 first
+  conv of both VGG encoders runs on tensor cores with the bias / ReLU / quantize epilogue
+  (`ops.conv2d_small_cin_quantize_int8`, pass `tensor_core_first_conv`; 1.46 -> 0.06 ms per encoder on an L20) and
+  `dedode-g`'s DINOv2 patch embedding is one GEMM into the token buffer (`ops.patch_embed_tokens`, pass
+  `patch_embed_gemm`). Extract at 1200 px: L20 `dedode` 30.5 -> 29.2 ms, `dedode-g` 80.8 -> 79.4 ms; H20 29.3 -> 28.4 ms,
+  70.4 -> 69.0 ms.
 
 ## 0.1.0 (2026-10-28)
 
