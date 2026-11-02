@@ -78,9 +78,12 @@ def _mxfp8_linear_cublas(
     )
 
 
-def _int_mm_eligible(a, weight, a_scale, w_scale, bias, **_) -> bool:
-    # torch._int_mm: M > 16, K and N multiples of 8 (cuBLASLt IMMA).
-    return a.shape[0] > 16 and a.shape[1] % 8 == 0 and weight.shape[0] % 8 == 0 and a.is_contiguous()
+def _int_mm_eligible(a, weight, a_scale, w_scale, bias, *, gelu=False, residual=None, **_) -> bool:
+    # torch._int_mm: M > 16, K and N multiples of 8 (cuBLASLt IMMA); no GELU / residual epilogue.
+    return (
+        a.shape[0] > 16 and a.shape[1] % 8 == 0 and weight.shape[0] % 8 == 0 and a.is_contiguous()
+        and not gelu and residual is None
+    )
 
 
 @ops.int8_linear.register("cublas", device=DeviceSpec("cuda", min_capability=(7, 5)), when=_int_mm_eligible)

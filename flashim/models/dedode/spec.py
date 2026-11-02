@@ -49,6 +49,17 @@ def _fold_layer_scale(model: nn.Module, ctx: BuildContext) -> list[str] | str:
     return fold_layer_scale(model)
 
 
+def _fused_dynamic_vit_blocks(model: nn.Module, ctx: BuildContext) -> list[str] | str:
+    """int8: DINOv2 blocks with dynamic INT8 linears (dedode-g) with LayerNorm + per-row quantize in one kernel and the
+    GELU / residual add in the GEMM epilogues (``DynamicInt8TransformerBlock``); bit-identical. Pieces without a kernel
+    for the platform keep running as the unfused modules."""
+    if ctx.config.precision.quant != "int8":
+        return "skipped: not int8"
+    from flashim.quant.passes.dynamic_transformer_block import fuse_dynamic_blocks
+
+    return fuse_dynamic_blocks(model) or "skipped: no dynamic INT8 transformer blocks"
+
+
 def _fused_block_epilogues(model: nn.Module, ctx: BuildContext) -> list[str] | str:
     """The ViT's biases and residual adds inside neighbouring kernels (``QuantizedTransformerBlock.fused_epilogues``):
     measured as separate elementwise passes of 8.7 ms per DaD fp8 extract (benchmarks/profile/timeline_audit.py)."""
@@ -135,6 +146,9 @@ VIT_EPILOGUE_PASSES = {
     "fold_layer_scale": Pass(
         _fold_layer_scale, stage="pre_quant", exact=False,
         description="ViT LayerScale folded into proj / fc2 (when quantized)",
+    ),
+    "fused_dynamic_vit_blocks": Pass(
+        _fused_dynamic_vit_blocks, description="int8: ViT LayerNorm + row quantize, GELU and residual in one kernel each",
     ),
     "fused_block_epilogues": Pass(
         _fused_block_epilogues, stage="post_quant", exact=False,

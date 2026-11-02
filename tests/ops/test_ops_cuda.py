@@ -886,3 +886,62 @@ def test_int8_linear_per_row_scale(impl):
     # row 17's large scale is applied to row 17 only
     plain = ops.int8_linear.get(impl)(q, w, scale.median(), w_scale, bias).float()
     assert not torch.allclose(fast[17], plain[17]) and torch.allclose(fast[16], ref[16], rtol=2**-7, atol=1e-3)
+
+
+# -- ViT glue: LayerNorm + per-row INT8, and the GELU / residual epilogues of the INT8 GEMM -------------------------------
+_EXACT_LN_ARCH = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((8, 9), (9, 0)),
+    reason="the torch-exact LayerNorm kernel is registered for sm_89 / sm_90 (the archs it was checked on)",
+)
+
+
+@_EXACT_LN_ARCH
+@pytest.mark.parametrize("rows,n", [(1, 1024), (7, 512), (333, 1024), (5376, 1024), (100, 2048), (64, 1536)])
+def test_layernorm_quantize_int8_rows(rows, n):
+    """Bit-identical to ``quantize_int8_rows(nn.LayerNorm(x))`` (torch's own kernel, BF16 in / out): values, scales."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, n, device=DEV, dtype=torch.bfloat16) * 3 + 0.5
+    x[rows // 2] *= 300  # a massive-activation token
+    x[:, 5] += 40  # an outlier channel
+    w = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    b = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    assert ops.layernorm_quantize_int8_rows.supports(x, w, b, 1e-6)
+    fast, ref = _both(ops.layernorm_quantize_int8_rows, "triton", x, w, b, 1e-6)
+    assert torch.equal(fast[0], ref[0]) and torch.equal(fast[1], ref[1])
+    norm = torch.nn.LayerNorm(n, eps=1e-6).to(DEV, torch.bfloat16)
+    norm.weight.data.copy_(w)
+    norm.bias.data.copy_(b)
+    unfused = ops.quantize_int8_rows(norm(x))
+    assert torch.equal(fast[0], unfused[0]) and torch.equal(fast[1], unfused[1])
+
+
+@pytest.mark.parametrize("rows,k,n", [(5376, 1024, 4096), (300, 1024, 1024), (17, 256, 96), (3000, 4096, 1024)])
+def test_int8_linear_residual_epilogue(rows, k, n):
+    """``residual=`` adds a BF16 tensor to the BF16-rounded GEMM output: equal to the separate add, bit for bit."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, k, device=DEV, dtype=torch.bfloat16)
+    q, scale = ops.quantize_int8_rows(x)
+    w = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    w_scale, bias = torch.rand(n, device=DEV) * 1e-3, torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    residual = torch.randn(rows, n, device=DEV, dtype=torch.bfloat16) * 4
+    plain = ops.int8_linear.get("triton")(q, w, scale, w_scale, bias)
+    fused = ops.int8_linear.get("triton")(q, w, scale, w_scale, bias, residual=residual)
+    assert torch.equal(fused, residual + plain)
+    assert ops.int8_linear.select(q, w, scale, w_scale, bias, residual=residual)[0] == "triton"
+
+
+@pytest.mark.parametrize("rows,k,n", [(5376, 1024, 4096), (300, 1024, 1024), (17, 256, 96)])
+def test_int8_linear_gelu_epilogue(rows, k, n):
+    """``gelu=True``: ``F.gelu`` of the BF16 GEMM output, bit for bit, wherever a libdevice matching torch's erf exists
+    (otherwise the Triton impl is not eligible and the op falls back)."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, k, device=DEV, dtype=torch.bfloat16)
+    q, scale = ops.quantize_int8_rows(x)
+    w = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
+    w_scale, bias = torch.rand(n, device=DEV) * 3e-3, torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    plain = ops.int8_linear.get("triton")(q, w, scale, w_scale, bias)
+    if not ops.int8_linear.supports(q, w, scale, w_scale, bias, gelu=True):
+        pytest.skip("no libdevice reproduces torch's erf on this machine")
+    fused = ops.int8_linear.get("triton")(q, w, scale, w_scale, bias, gelu=True)
+    assert torch.equal(fused, F.gelu(plain))
+    assert ops.int8_linear.get("reference")(q, w, scale, w_scale, bias, gelu=True).shape == plain.shape
