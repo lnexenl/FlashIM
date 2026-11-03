@@ -55,6 +55,9 @@
   `dedode-g`'s DINOv2 patch embedding is one GEMM into the token buffer (`ops.patch_embed_tokens`, pass
   `patch_embed_gemm`). Extract at 1200 px: L20 `dedode` 30.5 -> 29.2 ms, `dedode-g` 80.8 -> 79.4 ms; H20 29.3 -> 28.4 ms,
   70.4 -> 69.0 ms.
+- Triton INT8 depthwise producer (`ops.depthwise5x5_relu_int8`) accepts any channel count `% 32 == 0` (was 32 / 128 /
+  512), so the 256 / 768-channel ConvRefiner blocks of the DeDoDe `int8` presets fuse on architectures whose only
+  producer is Triton (no TileLang / TMA, no CUDA C++ impl). Measured on L20 / H20 against the unfused block only; draft.
 
 ## 0.1.0 (2026-10-28)
 
