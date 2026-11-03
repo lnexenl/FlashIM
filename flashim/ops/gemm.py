@@ -101,6 +101,21 @@ def _int8_linear_reference(
 int8_linear = Op("int8_linear", _int8_linear_reference)
 
 
+def _int8_linear_quantize_reference(
+    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, out_scale: Tensor, out: Tensor
+) -> Tensor:
+    """``out[...] = quantize_int8(int8_linear(a, ...), out_scale).values``: the BF16 output quantized again, statically,
+    for the next INT8 consumer, written into ``out`` (INT8 ``[M, N]``, unit column stride, any row stride: e.g. the right
+    half of a ``cat`` buffer). Returns ``out``."""
+    from flashim.quant.tensor import quantize_int8_static
+
+    out.copy_(quantize_int8_static(_int8_linear_reference(a, weight, a_scale, w_scale, bias), out_scale).values)
+    return out
+
+
+int8_linear_quantize = Op("int8_linear_quantize", _int8_linear_quantize_reference)
+
+
 # -- FP32 linear of a BF16 input ----------------------------------------------------------------
 
 

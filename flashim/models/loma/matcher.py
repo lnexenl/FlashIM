@@ -11,17 +11,22 @@ Differences from :class:`~flashim.models.lightglue.model.LightGlue` (upstream ``
 
 from __future__ import annotations
 
+import logging
+from collections import OrderedDict
 from dataclasses import replace
 
 import torch
 from torch import Tensor, nn
 
 from flashim import ops
+from flashim.log import warn_once
 from flashim.models.lightglue import weights as lightglue_weights
 from flashim.models.lightglue.config import LightGlueConfig
 from flashim.models.lightglue.model import LightGlue, MatchAssignment
 from flashim.models.loma import weights
 from flashim.utils import device_constant
+
+logger = logging.getLogger(__name__)
 
 _B = LightGlueConfig(input_dim=256, dim=256, num_heads=4, num_layers=9, filter_threshold=0.1)
 VARIANTS = {
@@ -94,3 +99,33 @@ class LoMaMatcher(LightGlue):
 
     def normalized(self, keypoints: Tensor, image_size: tuple[int, int]) -> Tensor:
         return normalize_keypoints(keypoints, image_size)
+
+    # ``cuda_graph`` pass: :meth:`best_matches` (all layers + the last assignment head; LoMa runs every layer, so no host
+    # synchronization) replayed from one CUDA graph per input shape, the ``graphs`` most recent shapes kept; the
+    # mutual-match filtering stays eager. 0 = eager.
+    graphs = 0
+
+    def best_matches(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        if not self.graphs or not desc0.is_cuda or torch.is_grad_enabled():
+            return super().best_matches(desc0, desc1, enc0, enc1)
+        from flashim.engines.cuda_graph import CudaGraphRunner
+
+        cache = self.__dict__.setdefault("_graph_runners", OrderedDict())
+        key = tuple((t.shape, t.dtype, t.device) for t in (desc0, desc1, enc0, enc1))
+        runner = cache.get(key)
+        if runner is not None:
+            cache.move_to_end(key)
+            return runner(desc0, desc1, enc0, enc1)
+        runner = CudaGraphRunner(super().best_matches)
+        try:
+            outputs = runner(desc0, desc1, enc0, enc1)
+        except RuntimeError as exc:  # e.g. a kernel launched on the legacy default stream (unpatched SageAttention)
+            warn_once(logger, f"loma-graph-{id(self)}", "LoMa matcher: CUDA graph capture failed, running eagerly "
+                      "from now on (%s)", exc)
+            self.graphs = 0
+            torch.cuda.synchronize()
+            return super().best_matches(desc0, desc1, enc0, enc1)
+        cache[key] = runner
+        while len(cache) > self.graphs:
+            cache.popitem(last=False)
+        return outputs

@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+from triton.language.extra import libdevice
 
 from flashim import ops
 from flashim.backends.triton._libdevice import gelu_erf, gelu_launch_kwargs, torch_gelu_libdevice
@@ -417,6 +418,105 @@ def int8_gemm_bf16(
     return out
 
 
+# Store modes of :func:`int8_gemm_store` (the INT8 transformer glue of LightGlue, models/lightglue/int8_glue.py).
+STORE_QUANTIZE, STORE_SWAPPED, STORE_BOTH, STORE_QKV_ROPE = 1, 2, 3, 4
+
+
+@triton.jit
+def _int8_gemm_store_kernel(
+    a_ptr, b_ptr, a_scale_ptr, w_scale_ptr, bias_ptr, out_ptr, out2_ptr, aux_ptr, aux2_ptr, rows, N,
+    K: tl.constexpr, HAS_BIAS: tl.constexpr, MODE: tl.constexpr, LDO: tl.constexpr, HALF, HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
+):
+    """:func:`_int8_gemm_kernel`'s ``y = bf16(acc * a_scale * w_scale[n] + bias)`` (static ``a_scale``), stored by
+    ``MODE``: ``STORE_QUANTIZE`` static INT8 of ``y`` (scale at ``aux``: reciprocal multiply, half to even, +-127, as
+    ``quantize_int8``) into ``out`` with row stride ``LDO``; ``STORE_SWAPPED`` ``y`` at row ``(m + HALF) % (2 HALF)``
+    of ``out2`` (``y.view(2, HALF, N).flip(0)``), ``STORE_BOTH`` that and ``y`` into ``out``; ``STORE_QKV_ROPE`` the
+    columns ``[q | k | v]`` (``HEADS * HEAD_DIM`` each) with interleaved RoPE on q / k (``aux`` / ``aux2``: cos / sin,
+    ``[rows, HEAD_DIM]``; ``t * cos + rotate_pairs(t) * sin`` with separately rounded products, as
+    ``rope_qk_interleaved``'s kernel) scattered into ``out [3, rows / HALF, HEADS, HALF, HEAD_DIM]``."""
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(rows, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    group = pid // (GROUP_M * num_pid_n)
+    first_m = group * GROUP_M
+    group_size = min(num_pid_m - first_m, GROUP_M)
+    pid_m = first_m + (pid % group_size)
+    pid_n = (pid % (GROUP_M * num_pid_n)) // group_size
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_m = offs_m < rows
+    mask_n = offs_n < N
+    a_ptrs = a_ptr + offs_m[:, None].to(tl.int64) * K + offs_k[None, :]
+    b_ptrs = b_ptr + offs_n[None, :].to(tl.int64) * K + offs_k[:, None]
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for k0 in range(0, K, BLOCK_K):
+        k_mask = offs_k < K - k0
+        a = tl.load(a_ptrs, mask=mask_m[:, None] & k_mask[None, :], other=0)
+        b = tl.load(b_ptrs, mask=mask_n[None, :] & k_mask[:, None], other=0)
+        accumulator = tl.dot(a, b, accumulator, out_dtype=tl.int32)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K
+    scale = (tl.load(a_scale_ptr) * tl.load(w_scale_ptr + offs_n, mask=mask_n, other=0.0))[None, :]
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        out = tl.fma(accumulator.to(tl.float32), scale, bias[None, :])
+    else:
+        out = accumulator.to(tl.float32) * scale
+    out = out.to(tl.bfloat16).to(tl.float32)
+    mask = mask_m[:, None] & mask_n[None, :]
+    rows64 = offs_m[:, None].to(tl.int64)
+    if MODE == 1:
+        quantized = libdevice.rint(out * (1.0 / tl.load(aux_ptr)))
+        tl.store(out_ptr + rows64 * LDO + offs_n[None, :], tl.maximum(tl.minimum(quantized, 127.0), -127.0).to(tl.int8),
+                 mask=mask)
+    elif MODE == 2 or MODE == 3:
+        swapped = ((offs_m + HALF) % (2 * HALF)).to(tl.int64)[:, None] * N + offs_n[None, :]
+        if MODE == 3:
+            tl.store(out_ptr + rows64 * N + offs_n[None, :], out.to(tl.bfloat16), mask=mask)
+        tl.store(out2_ptr + swapped, out.to(tl.bfloat16), mask=mask)
+    else:
+        C: tl.constexpr = HEADS * HEAD_DIM
+        d = offs_n % HEAD_DIM
+        table = rows64 * HEAD_DIM + d[None, :]
+        cos = tl.load(aux_ptr + table, mask=mask, other=0.0).to(tl.float32)
+        sin = tl.load(aux2_ptr + table, mask=mask, other=0.0).to(tl.float32)
+        even, odd = tl.split(tl.reshape(out, (BLOCK_M, BLOCK_N // 2, 2)))
+        rotated = tl.reshape(tl.join(-odd, even), (BLOCK_M, BLOCK_N))  # (-x1, x0, -x3, x2, ...)
+        roped = libdevice.add_rn(libdevice.mul_rn(out, cos), libdevice.mul_rn(rotated, sin))
+        out = tl.where((offs_n < 2 * C)[None, :], roped, out)
+        which = offs_n // C
+        head = (offs_n % C) // HEAD_DIM
+        image = offs_m // HALF
+        token = offs_m % HALF
+        num_images = rows // HALF
+        dst = ((((which[None, :] * num_images + image[:, None]) * HEADS + head[None, :]).to(tl.int64) * HALF
+                + token[:, None]) * HEAD_DIM + d[None, :])
+        tl.store(out_ptr + dst, out.to(tl.bfloat16), mask=mask)
+
+
+def int8_gemm_store(
+    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, mode: int, *, out: Tensor,
+    out2: Tensor | None = None, aux: Tensor | None = None, aux2: Tensor | None = None, half: int = 1, heads: int = 1,
+    head_dim: int = 1,
+) -> None:
+    """:func:`_int8_gemm_store_kernel` with :func:`int8_gemm_bf16`'s tiles (exact INT32 accumulation and the same
+    epilogue rounding, so the stored values do not depend on them)."""
+    rows, k = a.shape
+    n = weight.shape[0]
+    block_m, block_n, block_k, num_warps, num_stages = _int8_gemm_config(
+        rows, n, _is_sm89(a.device) or _is_sm90(a.device), platform_for(a.device).capability == (8, 7), k=k,
+        sm90=_is_sm90(a.device),
+    )
+    _int8_gemm_store_kernel[(triton.cdiv(rows, block_m) * triton.cdiv(n, block_n),)](
+        a, weight, a_scale, w_scale, bias if bias is not None else out, out, out2 if out2 is not None else out,
+        aux if aux is not None else out, aux2 if aux2 is not None else out, rows, n, K=k, HAS_BIAS=bias is not None,
+        MODE=mode, LDO=out.stride(0) if mode == STORE_QUANTIZE else 0, HALF=half, HEADS=heads, HEAD_DIM=head_dim,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, GROUP_M=8, num_warps=num_warps, num_stages=num_stages,
+    )
+
+
 @triton.jit
 def _linear_fp32_split_kernel(
     x_ptr, w_ptr, b_ptr, out_ptr, rows, N, K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
@@ -676,6 +776,30 @@ def _int8_linear_eligible(a, weight, a_scale, w_scale, bias, *, relu=False, gelu
 )
 def _int8_linear_impl(a, weight, a_scale, w_scale, bias, *, relu: bool = False, gelu: bool = False, residual=None):
     return int8_gemm_bf16(a.contiguous(), weight, a_scale, w_scale, bias, relu=relu, gelu=gelu, residual=residual)
+
+
+def _static_gemm_eligible(a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None) -> bool:
+    return (
+        a.dtype == weight.dtype == torch.int8 and a.ndim == 2 and a.is_contiguous() and weight.is_contiguous()
+        and a_scale.numel() == 1 and w_scale.dtype == torch.float32
+        and (bias is None or bias.dtype == torch.bfloat16)
+    )
+
+
+def _int8_linear_quantize_eligible(a, weight, a_scale, w_scale, bias, out_scale, out) -> bool:
+    return (
+        _static_gemm_eligible(a, weight, a_scale, w_scale, bias) and out.dtype == torch.int8
+        and out.shape == (a.shape[0], weight.shape[0]) and out.stride(1) == 1 and out_scale.numel() == 1
+    )
+
+
+@ops.int8_linear_quantize.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON],
+    when=_int8_linear_quantize_eligible,
+)
+def _int8_linear_quantize_impl(a, weight, a_scale, w_scale, bias, out_scale, out):
+    int8_gemm_store(a, weight, a_scale, w_scale, bias, STORE_QUANTIZE, out=out, aux=out_scale)
+    return out
 
 
 def _linear_fp32_small_n_eligible(x: Tensor, weight: Tensor, bias: Tensor) -> bool:

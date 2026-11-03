@@ -4,6 +4,26 @@
 
 ### Performance
 
+- LoMa `int8` (`loma-*` pipelines, sm_89 / sm_90), from the LoMa tuning prototypes:
+  - extractor: the DINOv2 ViT as per-token dynamic INT8 and every DeDoDe int8 pass (decoder fusions, encoder stem,
+    fused ViT glue, patch-embedding GEMM, SageAttention on ViT blocks 2-23); `loma-l` keeps the bit-exact stem and runs
+    SageAttention on blocks 4-23 only;
+  - matcher: SageAttention (pass `sage_attention`: `sage-fp8` on sm_89, `sage-fp8-sm90` on sm_90), the INT8
+    transformer glue fused (pass `fused_int8_glue`, `models/lightglue/int8_glue.py`, bit-identical: one residual stream
+    for both images, one-read multi-quantize, RoPE / head scatter and the image swap in the GEMM epilogues, the attention
+    output quantized from its head layout, the message quantized into the FFN input, LayerNorm + GELU + INT8 in one
+    kernel; new ops `quantize_int8_multi`, `quantize_int8_heads`, `layernorm_gelu_quantize_int8`,
+    `int8_linear_quantize`, `lightglue_qkv_rope`, `lightglue_swapped_linear`) and the transformer + assignment head
+    replayed from one CUDA graph per keypoint-count pair (pass `cuda_graph`, eager engine; it falls back to eager with a
+    warning if capture fails, e.g. with a SageAttention build that launches on the legacy default stream).
+  Pair (2 extracts from the JPEG at 1024 px, 4096 keypoints, + match; eager, interleaved best of 3), int8 before ->
+  after: L20 b / l / g / r / b128 115.5 / 123.1 / 148.2 / 115.3 / 49.2 -> 74.0 / 82.5 / 99.0 / 74.1 / 35.3 ms
+  (1.68-1.77x faster than bf16); H20 102.4 / 106.6 / 126.8 / 101.7 / 46.8 -> 69.9 / 77.0 / 91.4 / 69.8 / 33.0 ms
+  (1.53-1.65x). MegaDepth-1500 AUC@5 vs bf16 (OpenCV RANSAC 0.5 px, 10 seeds, paired bootstrap): L20 -0.22 / -0.30 /
+  -0.10 / -0.25 / -0.27, H20 -0.09 / +0.23 / -0.03 / +0.12 / -0.05.
+- `CudaGraphRunner.capture` replays the graph once before returning: its outputs held nothing (capture only records
+  the kernels).
+
 - DeDoDe `int8` (ported from the LoMa experiments): `dedode-g` quantizes its DINOv2 ViT with per-token dynamic INT8
   (`DynamicInt8Linear`: `ops.quantize_int8_rows` + `ops.int8_linear` with per-row scales) instead of leaving it in BF16,
   and both models fuse their ConvRefiner decoders (depthwise 5x5 + ReLU as the INT8 producer of the 1x1 conv,
