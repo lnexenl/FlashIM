@@ -293,11 +293,14 @@ def _vit_sage_attention(model: nn.Module, ctx: BuildContext) -> list[str] | str:
     7.1-7.5e-2. Per-warp QK scales measured faster than per-thread at the same error class."""
     if ctx.config.precision.quant != "int8":
         return "skipped: not int8"
+    dinov2 = getattr(getattr(model.descriptor, "encoder", None), "dinov2", None)
+    if dinov2 is None:  # a VGG-only descriptor (LoMa-B128)
+        return "skipped: no ViT"
     options = ctx.option("vit_attention", {})
-    layers = parse_layers(options.get("layers", VIT_SAGE_LAYERS))
+    blocks_ = dinov2.blocks
+    layers = parse_layers(options.get("layers", VIT_SAGE_LAYERS), len(blocks_))
     impl = options.get("impl", "auto")
     impl = _SAGE_IMPLS[ctx.platform.capability] if impl == "auto" else impl
-    blocks_ = model.descriptor.encoder.dinov2.blocks
     for i in layers:
         blocks_[i].attn.sdpa_impl = impl
     return {"impl": impl, "layers": layers}

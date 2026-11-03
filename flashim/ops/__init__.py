@@ -35,21 +35,26 @@ from flashim.ops.correlation import dual_softmax_mutual, local_corr
 from flashim.ops.density import kde_density
 from flashim.ops.gemm import (
     int8_linear,
+    int8_linear_quantize,
     linear_fp32,
     matmul_nt_fp32,
     mxfp8_gelu_mlp,
     mxfp8_linear,
     mxfp8_scaled_mm,
 )
+from flashim.ops.lightglue import lightglue_qkv_rope, lightglue_swapped_linear
 from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
     bias_relu_quantize_int8,
     gelu_quantize,
     gelu_quantize_int8,
+    layernorm_gelu_quantize_int8,
     layernorm_quantize,
     layernorm_quantize_int8,
     layernorm_quantize_int8_rows,
     quantize_int8,
+    quantize_int8_heads,
+    quantize_int8_multi,
     quantize_int8_rows,
     quantize_mxfp8,
 )
@@ -82,10 +87,14 @@ __all__ = [
     "int8_conv2d",
     "int8_conv2d_maxpool",
     "int8_linear",
+    "int8_linear_quantize",
     "kde_density",
+    "layernorm_gelu_quantize_int8",
     "layernorm_quantize",
     "layernorm_quantize_int8",
     "layernorm_quantize_int8_rows",
+    "lightglue_qkv_rope",
+    "lightglue_swapped_linear",
     "linear_fp32",
     "local_corr",
     "matmul_nt_fp32",
@@ -97,6 +106,8 @@ __all__ = [
     "patch_embed_tokens",
     "pil_bicubic_resize",
     "quantize_int8",
+    "quantize_int8_heads",
+    "quantize_int8_multi",
     "quantize_int8_rows",
     "quantize_mxfp8",
     "raco_head5x5",

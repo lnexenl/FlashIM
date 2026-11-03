@@ -143,8 +143,40 @@ def test_rotated_residual_stream_keeps_the_function(input_dim):
 def test_int8_preset_rotates_the_residual_stream():
     for variant in VARIANTS:
         config = flashim.resolve("loma-matcher", "int8", config={"variant": variant})
-        assert config.optimize.passes == ("low_precision_similarity", "rotate_residual_stream")
+        assert config.optimize.passes == (
+            "low_precision_similarity", "rotate_residual_stream", "sage_attention", "fused_int8_glue", "cuda_graph"
+        )
     assert flashim.resolve("loma-matcher", "fp8").optimize.passes == ("low_precision_similarity",)
+
+
+def test_int8_pipelines_extractor_passes():
+    """Every int8 pipeline runs all of loma-extractor's passes but loma-l, which keeps the bit-exact stem and runs
+    SageAttention on ViT blocks 4-23 only (its MegaDepth gate on the L20)."""
+    from flashim.models.loma.extractor_spec import PASSES
+
+    for variant in VARIANTS:
+        extractor = flashim.resolve(f"loma-{variant}", "int8").components["extractor"]
+        if variant == "l":
+            assert set(PASSES) - set(extractor.optimize.passes) == {"tensor_core_first_conv", "patch_embed_gemm"}
+            assert extractor.optimize.options == {"vit_attention": {"layers": "4-23"}}
+        else:
+            assert extractor.optimize.passes == PASSES and not extractor.optimize.options
+        assert flashim.resolve(f"loma-{variant}", "bf16").components["extractor"].optimize.passes == PASSES
+
+
+def test_cuda_graph_and_glue_passes_skip_outside_int8_eager():
+    from types import SimpleNamespace
+
+    from flashim.models.loma.matcher_spec import PASSES
+
+    model = LoMaMatcher(SMALL).eval()
+    bf16 = SimpleNamespace(config=flashim.resolve("loma-matcher", "bf16"))
+    compiled = SimpleNamespace(config=flashim.resolve("loma-matcher", "int8", overrides=["engine.kind=compile"]),
+                               option=lambda name, default=None: default)
+    assert PASSES["cuda_graph"].apply(model, bf16) == "skipped: not int8"
+    assert PASSES["cuda_graph"].apply(model, compiled) == "skipped: engine compile"
+    assert PASSES["fused_int8_glue"].apply(model, bf16) == "skipped: not int8"
+    assert model.graphs == 0 and not model.int8_glue
 
 
 def test_low_precision_similarity_only_in_the_reduced_precision_presets():

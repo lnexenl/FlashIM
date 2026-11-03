@@ -168,3 +168,42 @@ def _layernorm_quantize_int8_rows_reference(
 
 
 layernorm_quantize_int8_rows = Op("layernorm_quantize_int8_rows", _layernorm_quantize_int8_rows_reference)
+
+
+# -- static INT8 for several consumers / from other layouts ------------------------------------------
+
+
+def _quantize_int8_multi_reference(value: Tensor, scales: list[Tensor], outs: list[Tensor]) -> list[Tensor]:
+    """``out[...] = quantize_int8(value, scale).values`` for every ``(scale, out)``: one activation ``[rows, C]`` quantized
+    for several INT8 consumers with their own static scales. Each ``out`` is an INT8 ``[rows, C]`` with unit column
+    stride and any row stride (e.g. the left half of a ``[rows, 2C]`` buffer whose right half another producer writes:
+    a ``cat`` never materialized). Returns ``outs``."""
+    for scale, out in zip(scales, outs):
+        out.copy_(quantize_int8_static(value, scale).values)
+    return outs
+
+
+quantize_int8_multi = Op("quantize_int8_multi", _quantize_int8_multi_reference)
+
+
+def _quantize_int8_heads_reference(value: Tensor, scale: Tensor) -> Int8Tensor:
+    """``quantize_int8(value.transpose(1, 2).reshape(B * N, H * D), scale)`` of an attention output ``[B, H, N, D]``:
+    the token-major INT8 input of the output projection, without the transposed BF16 copy."""
+    batch, heads, tokens, dim = value.shape
+    return quantize_int8_static(value.transpose(1, 2).reshape(batch * tokens, heads * dim), scale)
+
+
+quantize_int8_heads = Op("quantize_int8_heads", _quantize_int8_heads_reference)
+
+
+def _layernorm_gelu_quantize_int8_reference(
+    value: Tensor, weight: Tensor, bias: Tensor, eps: float, scale: Tensor, *, channel_scale: Tensor | None = None
+) -> Int8Tensor:
+    """``quantize_int8(GELU(nn.LayerNorm(value)), scale, channel_scale=)``: torch's LayerNorm and exact GELU, each in
+    ``value.dtype``, then the static INT8 quantization of the next linear (SmoothQuant ``channel_scale`` first): the middle
+    of a ``Linear -> LayerNorm -> GELU -> Linear`` FFN whose last linear is INT8."""
+    normalized = F.layer_norm(value, (value.shape[-1],), weight, bias, eps)
+    return _quantize_int8_reference(F.gelu(normalized), scale, channel_scale=channel_scale)
+
+
+layernorm_gelu_quantize_int8 = Op("layernorm_gelu_quantize_int8", _layernorm_gelu_quantize_int8_reference)
