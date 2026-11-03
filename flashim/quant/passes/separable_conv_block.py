@@ -7,7 +7,8 @@ kernel (BF16 depthwise + bias + ReLU + *dynamic* per-row MXFP8 quantization) fee
 block-scaled MXFP8 pointwise GEMM, with BF16 channels-last output;
 :class:`BF16SeparableConvBlock` runs the whole BF16 block as one kernel.
 :class:`Int8SeparableConvBlock` swaps the dynamic MXFP8 for a *static* per-tensor INT8 activation
-feeding an INT8 pointwise GEMM.
+feeding an INT8 pointwise GEMM; :class:`Int8ProducerSeparableConvBlock` does the same around a pointwise conv that
+quantization already packed (:class:`StaticInt8Conv1x1`, any channel count with a producer kernel).
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from torch import Tensor, nn
 from flashim import ops
 from flashim.layers import SeparableConvBlock
 from flashim.quant.formats import int8, mx
+from flashim.quant.methods.int8_linear import StaticInt8Conv1x1
+from flashim.quant.tensor import Int8Tensor
 from flashim.utils import set_submodule
 
 
@@ -136,6 +139,59 @@ class Int8SeparableConvBlock(nn.Module):
 
     def extra_repr(self) -> str:
         return f"channels={self.channels}, dwconv5x5+relu->int8 static, pointwise int8"
+
+
+class Int8ProducerSeparableConvBlock(nn.Module):
+    """A folded separable block whose pointwise conv is a packed :class:`StaticInt8Conv1x1`, with the depthwise conv,
+    bias, ReLU and that conv's static INT8 quantization as one producer kernel (``ops.depthwise5x5_relu_int8``,
+    channels-last) feeding the pointwise GEMM: replaces cuDNN's BF16 depthwise conv, the ReLU pass and the separate
+    quantize pass. The producer rounds to BF16 before quantizing, as the unfused block. Calls the producer has no
+    kernel for (``Op.supports``: e.g. channel counts without a TileLang / TMA kernel) run the original block."""
+
+    def __init__(self, block: nn.Module) -> None:
+        super().__init__()
+        depthwise, pointwise = block.conv_depthwise, block.conv_pointwise
+        self.channels = channels = depthwise.in_channels
+        if not isinstance(block.norm, nn.Identity):
+            raise TypeError("Fold BatchNorm first (fold_block_batchnorm)")
+        if not isinstance(pointwise, StaticInt8Conv1x1) or pointwise.in_features != channels:
+            raise TypeError(f"Expected a packed {channels}-channel StaticInt8Conv1x1 pointwise conv, got {pointwise}")
+        if not (
+            depthwise.groups == channels and depthwise.kernel_size == (5, 5) and depthwise.padding == (2, 2)
+            and depthwise.stride == (1, 1) and depthwise.bias is not None
+        ):
+            raise ValueError(f"Unsupported depthwise conv: {depthwise}")
+        self.block = block
+        self.register_buffer("depthwise_weight", _packed_depthwise_weight(depthwise))
+        self.register_buffer("depthwise_bias", depthwise.bias.detach().float().contiguous())
+
+    def forward(self, x: Tensor) -> Tensor:
+        pointwise = self.block.conv_pointwise
+        if not x.is_contiguous(memory_format=torch.channels_last):
+            x = x.contiguous(memory_format=torch.channels_last)
+        args = (x, self.depthwise_weight, self.depthwise_bias, pointwise.input_scale)
+        if x.dtype != torch.bfloat16 or not ops.depthwise5x5_relu_int8.supports(*args):
+            return self.block(x)
+        batch, channels, height, width = x.shape
+        quantized = ops.depthwise5x5_relu_int8(*args).view(batch, height, width, channels)
+        return pointwise.forward_prequantized(Int8Tensor(quantized, pointwise.input_scale)).permute(0, 3, 1, 2)
+
+    def extra_repr(self) -> str:
+        return f"channels={self.channels}, dwconv5x5+relu->int8 static producer, pointwise int8"
+
+
+def fuse_int8_producers(model: nn.Module, prefixes: tuple[str, ...]) -> list[str]:
+    """Replace folded separable conv blocks under ``prefixes`` whose pointwise conv was packed as
+    :class:`StaticInt8Conv1x1` with :class:`Int8ProducerSeparableConvBlock` (run after quantization)."""
+    replaced = []
+    for name, module in list(model.named_modules()):
+        if (
+            is_separable_conv_block(module) and any(name.startswith(p) for p in prefixes)
+            and isinstance(module.norm, nn.Identity) and isinstance(module.conv_pointwise, StaticInt8Conv1x1)
+        ):
+            set_submodule(model, name, Int8ProducerSeparableConvBlock(module))
+            replaced.append(name)
+    return replaced
 
 
 class BF16SeparableConvBlock(nn.Module):

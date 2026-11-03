@@ -49,6 +49,10 @@ INT8_WEIGHTS = QuantArgs(type="int", format="int8", strategy="channel", group_si
 INT8_ACTIVATIONS = QuantArgs(
     type="int", format="int8", strategy="tensor", group_size=None, scale_format="fp32", observer="percentile"
 )
+# Dynamic per-token INT8 activations (linears only): one scale per row, computed at run time.
+INT8_TOKEN_ACTIVATIONS = QuantArgs(
+    type="int", format="int8", strategy="token", group_size=None, scale_format="fp32", dynamic=True, observer="none"
+)
 
 
 @dataclass(frozen=True)

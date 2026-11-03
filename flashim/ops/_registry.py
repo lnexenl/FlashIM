@@ -246,10 +246,11 @@ class Op:
         return impl
 
     def _choose(
-        self, args: tuple, kwargs: dict, pin: str | None = None, accepted: dict[str, bool] | None = None
+        self, args: tuple, kwargs: dict, pin: str | None = None, accepted: dict[str, bool] | None = None,
+        strict: bool = True,
     ) -> Impl | None:
         """The impl to run (``None`` = the reference). Global overrides first; a pinned impl that does not apply
-        falls back to the reference, not to other impls."""
+        falls back to the reference, not to other impls. ``strict=False``: no strict-mode error on a fallback."""
         forced = _CONFIG.forced.get(self.name)
         if forced == REFERENCE or self.name in _CONFIG.disabled:
             return None
@@ -271,9 +272,14 @@ class Op:
                     continue
             if impl.when is None or impl.when(*args, **kwargs):
                 return impl
-        if pin is None and _CONFIG.strict and platform.device_type != "cpu":
+        if pin is None and strict and _CONFIG.strict and platform.device_type != "cpu":
             raise RuntimeError(f"Op {self.name!r} fell back to the reference on {platform.describe()}")
         return None
+
+    def supports(self, *args, **kwargs) -> bool:
+        """Whether a call with these arguments would run an impl rather than the reference (never raises in strict
+        mode): for callers with a faster fallback of their own than the reference."""
+        return self._choose(args, kwargs, strict=False) is not None
 
     def select(self, *args, **kwargs) -> tuple[str, Callable]:
         impl = self._choose(args, kwargs)

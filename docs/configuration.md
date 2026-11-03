@@ -90,6 +90,7 @@ max_matches = 1024
 | `optimize.passes+=x` | appends to a list (a plain `=` replaces the list) |
 | `components.matcher.optimize.attention=sage` | reaches into a pipeline component |
 | `components.extractor.preset=bf16` | picks a component's preset (the pipeline's preset is every component's otherwise) |
+| `optimize.options.vit_attention={"layers":"4-23"}` | a pass option: `dedode-g` `int8` on sm_89 / sm_90 runs SageAttention on these DINOv2 blocks (default `2-23`; `""` = none; `"impl"` picks another `ops.sdpa` impl) |
 
 ## Errors and warnings
 
