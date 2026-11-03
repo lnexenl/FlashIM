@@ -16,11 +16,18 @@ matches with the seed instead (LoMa's / RoMa's MegaDepth benchmarks shuffle befo
 before this were one RANSAC draw whatever ``--seeds`` said. ``--save-matches`` keeps every pair's matches;
 ``--from-matches`` re-runs pose estimation alone on them (no GPU), e.g. with more seeds.
 
+The images reach the model as PIL arrays decoded by the loader threads (the published numbers); ``--decoder`` instead
+passes each file through ``load_image(decoder=...)`` on the main thread, as ``match(path_a, path_b)`` does, to measure a
+decoder's effect on accuracy (``nvjpeg`` vs ``pil``). ``--save-errors`` keeps the per-pair pose errors ``[seed, pair]``
+for paired bootstraps between runs.
+
     python benchmarks/accuracy/run_sparse.py --model xfeat --preset fp32 --seed 17
     python benchmarks/accuracy/run_sparse.py --model rdd --resize 1600 --estimator opencv --ransac-thr 0.5 --bgr
     python benchmarks/accuracy/run_sparse.py --model loma-b --preset bf16 --resize 1024 --estimator opencv \
         --ransac-thr 0.5 --save-matches m.npz
     python benchmarks/accuracy/run_sparse.py --from-matches m.npz --estimator opencv --ransac-thr 0.5 --seeds 17 29 42
+    python benchmarks/accuracy/run_sparse.py --model aliked-lightglue --preset bf16 --seeds 17 29 42 \
+        --decoder nvjpeg --save-errors e.npy
 """
 
 from __future__ import annotations
@@ -53,6 +60,7 @@ from flashim.geometry.pose import (
     estimate_pose_cv2_ransac,
     summarize,
 )
+from flashim.models.romav2.model import IMAGE_DECODERS, load_image
 from flashim.paths import DATA
 
 logger = logging.getLogger(__name__)
@@ -132,7 +140,10 @@ class MultiSeedPool:
         return [pool.errors() for pool in self.pools]
 
 
-def mega1500_sparse(model, data_root: Path, pool: PosePool, max_pairs: int, loader: dict, match_kwargs: dict, bgr: bool) -> int:
+def mega1500_sparse(
+    model, data_root: Path, pool: PosePool, max_pairs: int, loader: dict, match_kwargs: dict, bgr: bool,
+    decoder: str = "",
+) -> int:
     def jobs():
         for scene_name in MEGA_SCENES:
             scene = np.load(data_root / scene_name, allow_pickle=True)
@@ -145,14 +156,19 @@ def mega1500_sparse(model, data_root: Path, pool: PosePool, max_pairs: int, load
                 yield (f"{data_root}/{paths[idx1]}", f"{data_root}/{paths[idx2]}", intrinsics[idx1].copy(), intrinsics[idx2].copy(), R, t)
 
     def read(path):
+        if decoder:  # decoded on the caller's thread by load_image (GPU decoders need the model's device)
+            image = load_image(path, model.device, decoder)
+            return image.flip(1) if bgr else image
         image = _read_rgb(path)
         return np.ascontiguousarray(image[..., ::-1]) if bgr else image
 
     def load(job):
-        return (*job, read(job[0]), read(job[1]))
+        return (*job, *((None, None) if decoder else (read(job[0]), read(job[1]))))
 
     count = 0
-    for *_, K1, K2, R, t, img_a, img_b in tqdm(prefetch(jobs(), load, **loader), desc="mega1500", leave=False):
+    for path_a, path_b, K1, K2, R, t, img_a, img_b in tqdm(prefetch(jobs(), load, **loader), desc="mega1500", leave=False):
+        if decoder:
+            img_a, img_b = read(path_a), read(path_b)
         result = model.match(img_a, img_b, **match_kwargs)
         pool.submit(result.keypoints_A.cpu().numpy(), result.keypoints_B.cpu().numpy(), K1, K2, R, t)
         count += 1
@@ -217,6 +233,9 @@ def main() -> None:
     parser.add_argument("--from-matches", default="", help="pose estimation only, on a --save-matches file (no model)")
     parser.add_argument("--keypoint-offset", type=float, default=0.0,
                         help="added to --from-matches keypoints (0.5: pixel-edge convention, as LoMa's own benchmark)")
+    parser.add_argument("--decoder", default="", choices=("", *IMAGE_DECODERS),
+                        help="decode the image files with load_image(decoder=...) on the main thread (default: PIL "
+                        "arrays from the loader threads, the same pixels as 'pil')")
     parser.add_argument("--save-errors", default="", help=".npy of the pose errors, [seed, pair] (paired comparisons)")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
@@ -238,7 +257,7 @@ def main() -> None:
         recorder = MatchRecorder(pool) if args.save_matches else pool
         pairs = mega1500_sparse(
             model, data_root, recorder, args.max_pairs, {"workers": args.loaders, "depth": args.prefetch},
-            {"resize": args.resize, "max_matches": args.top_k or None}, args.bgr,
+            {"resize": args.resize, "max_matches": args.top_k or None}, args.bgr, args.decoder,
         )
         if args.save_matches:
             recorder.save(args.save_matches)
@@ -259,6 +278,7 @@ def main() -> None:
         "bgr": args.bgr,
         "from_matches": args.from_matches or None,
         "keypoint_offset": args.keypoint_offset,
+        "decoder": args.decoder or "pil",
         "seed": seeds[0] if len(seeds) == 1 else None,
         "seeds": seeds,
         "pairs": pairs,

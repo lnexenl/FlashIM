@@ -63,6 +63,8 @@ m = loma.match("a.jpg", "b.jpg", max_matches=4096)           # 4096 keypoints pe
 resolution, `max_matches` bounds the matches the model's own way (keypoints per image, the most confident matches, or
 samples of a dense warp) and `threshold` is the model's match threshold. A model without the preset asked for builds the
 nearest one it has (`fp8` -> `int8` -> `bf16` -> `fp32`), and a pipeline's preset applies to each of its components.
+Image paths given to a model on CUDA are decoded on the GPU when they are JPEGs (nvJPEG, with libjpeg's chroma
+upsampling: 0.0008 levels from PIL on average, ~10 ms less per MegaDepth image); `FLASHIM_IMAGE_DECODER=pil` decodes with PIL.
 
 Weights download on first use and are checked against pinned SHA-256 hashes ([Checkpoints](https://github.com/lnexenl/FlashIM#checkpoints)).
 

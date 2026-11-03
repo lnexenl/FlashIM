@@ -28,8 +28,8 @@ BACKENDS: tuple[Backend, ...] = (
     Backend("torch_native", ("torch_native.gemm", "torch_native.patchify")),
     Backend(
         "triton",
-        tuple(f"triton.{m}" for m in ("aliked", "attention", "conv", "correlation", "density", "gemm", "lightglue", "quantize", "raco", "resample",
-                                      "romav2")),
+        tuple(f"triton.{m}" for m in ("aliked", "attention", "conv", "correlation", "density", "gemm", "image", "lightglue",
+                                      "quantize", "raco", "resample", "romav2")),
         packages=("triton",),
     ),
     Backend("tilelang", ("tilelang.conv", "tilelang.gemm"), packages=("tilelang",)),

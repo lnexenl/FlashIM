@@ -42,6 +42,7 @@ from flashim.ops.gemm import (
     mxfp8_linear,
     mxfp8_scaled_mm,
 )
+from flashim.ops.image import jpeg_fancy_upsample
 from flashim.ops.lightglue import lightglue_qkv_rope, lightglue_swapped_linear
 from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
@@ -88,6 +89,7 @@ __all__ = [
     "int8_conv2d_maxpool",
     "int8_linear",
     "int8_linear_quantize",
+    "jpeg_fancy_upsample",
     "kde_density",
     "layernorm_gelu_quantize_int8",
     "layernorm_quantize",
