@@ -215,6 +215,7 @@ class LightGlue(nn.Module):
             min(0.8 + 0.1 * math.exp(-4.0 * i / cfg.num_layers), 1.0) for i in range(cfg.num_layers)
         ]
         self.executed_layers = cfg.num_layers  # of the last match
+        self.int8_glue = False  # fused INT8 layers (``int8_glue``; a pass sets it)
         # Filled in by the builder (``flashim.build``).
         self.preset: str | None = None
         self.engine: str | None = None
@@ -266,6 +267,10 @@ class LightGlue(nn.Module):
 
     def features(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> tuple[Tensor, Tensor, int]:
         """Point features after the last executed layer and its index (``executed_layers`` records how many ran)."""
+        if self.int8_glue and desc0.shape == desc1.shape and desc0.shape[0] == 1 and enc0.shape == enc1.shape:
+            from flashim.models.lightglue import int8_glue
+
+            return int8_glue.features(self, desc0, desc1, enc0, enc1)
         # contiguous: SuperPoint's descriptors are a transposed view, and `.to` keeps that layout for the whole residual
         # stream, so every quantized linear reading it fell back to the torch quantize (54 calls / match, 1.8-3.2 ms)
         x0, x1 = (
@@ -286,6 +291,14 @@ class LightGlue(nn.Module):
         x0, x1, i = self.features(desc0, desc1, enc0, enc1)
         return self.log_assignment[i](x0, x1)
 
+    def best_matches(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Per point of image A: the best log assignment over image B's points, its index and whether it is mutual
+        (:meth:`MatchAssignment.matches` of the last executed layer)."""
+        x0, x1, i = self.features(desc0, desc1, enc0, enc1)
+        # same matches as ``filter_matches(self.scores(...))`` (identical lists on 200 MegaDepth pairs); the fused op
+        # measured 4.2 to 4.8 ms less per 4096 x 4096 pair on sm_120 (SuperPoint 18.8 -> 14.6 ms, XFeat 8.8 -> 4.0 ms)
+        return self.log_assignment[i].matches(x0, x1)
+
     @torch.inference_mode()
     def match_features(
         self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None
@@ -295,12 +308,9 @@ class LightGlue(nn.Module):
         if a.keypoints.shape[1] == 0 or b.keypoints.shape[1] == 0:
             empty = a.keypoints.new_zeros(0, 2)
             return Matches(empty, empty, a.keypoints.new_zeros(0))
-        x0, x1, i = self.features(
+        log_conf, index, mutual = self.best_matches(
             a.descriptors, b.descriptors, self.encode(a.keypoints, a.image_size), self.encode(b.keypoints, b.image_size)
         )
-        # same matches as ``filter_matches(self.scores(...))`` (identical lists on 200 MegaDepth pairs); the fused op
-        # measured 4.2 to 4.8 ms less per 4096 x 4096 pair on sm_120 (SuperPoint 18.8 -> 14.6 ms, XFeat 8.8 -> 4.0 ms)
-        log_conf, index, mutual = self.log_assignment[i].matches(x0, x1)
         conf = log_conf.exp()
         threshold = self.config.filter_threshold if threshold is None else threshold
         ia = torch.nonzero(mutual & (conf > threshold))[:, 0]

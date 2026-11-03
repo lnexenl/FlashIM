@@ -1,4 +1,5 @@
-"""GEMMs: block-scaled MXFP8, static MXFP8 / INT8 linears, and FP32 linear of low-precision inputs.
+"""GEMMs: block-scaled MXFP8, static MXFP8 / INT8 linears, FP32 linear of low-precision inputs and FP32 ``a @ b^T`` of
+low-precision matrices.
 
 ``linear_fp32``: the reference runs an FP32 GEMM; the ``triton`` path covers small outputs
 (``N <= 16``) exactly; ``triton_split`` covers larger ones on tensor cores with the FP32 weight split
@@ -71,24 +72,48 @@ def _mxfp8_linear_reference(activation: QuantizedTensor, bias: Tensor | None, we
 mxfp8_linear = Op("mxfp8_linear", _mxfp8_linear_reference, weights=1)
 
 
-# -- static INT8 GEMM (per-channel weights, per-tensor activations) ---------------------------------
+# -- INT8 GEMM (per-channel weights, per-tensor or per-row activation scales) -------------------------
 
 
 def _int8_linear_reference(
-    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, *, relu: bool = False
+    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, *, relu: bool = False,
+    gelu: bool = False, residual: Tensor | None = None,
 ) -> Tensor:
-    """``[M, K] int8 x [N, K] int8^T`` in INT32, then ``acc * (a_scale * w_scale) + bias`` (``relu``: then ReLU) -> BF16.
-    ReLU commutes with the BF16 rounding, so ``relu=True`` equals ``F.relu`` of the ``relu=False`` result bit for bit."""
+    """``[M, K] int8 x [N, K] int8^T`` in INT32, then ``acc * (a_scale * w_scale) + bias`` rounded to BF16, then the
+    epilogue in the order ``relu`` (ReLU commutes with the BF16 rounding, so ``relu=True`` equals ``F.relu`` of the plain
+    result bit for bit), ``gelu`` (``F.gelu`` of the BF16 result, exact erf form, rounded to BF16: ``nn.GELU`` after an
+    ``nn.Linear``), ``residual`` (``[M, N]`` BF16 added in BF16: ``x + linear(...)``). ``a_scale``: one static FP32
+    value, or ``[M, 1]`` per-row scales (dynamic per-token activations, :func:`~flashim.ops.quantize_int8_rows`)."""
     acc = a.long() @ weight.long().t() if a.device.type == "cpu" else a.double() @ weight.double().t()
     out = acc.float() * (a_scale.float() * w_scale.float())
     if bias is not None:
         out = out + bias.float()
     if relu:
         out = out.relu()
-    return out.to(torch.bfloat16)
+    out = out.to(torch.bfloat16)
+    if gelu:
+        out = F.gelu(out)
+    if residual is not None:
+        out = residual + out
+    return out
 
 
 int8_linear = Op("int8_linear", _int8_linear_reference)
+
+
+def _int8_linear_quantize_reference(
+    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, out_scale: Tensor, out: Tensor
+) -> Tensor:
+    """``out[...] = quantize_int8(int8_linear(a, ...), out_scale).values``: the BF16 output quantized again, statically,
+    for the next INT8 consumer, written into ``out`` (INT8 ``[M, N]``, unit column stride, any row stride: e.g. the right
+    half of a ``cat`` buffer). Returns ``out``."""
+    from flashim.quant.tensor import quantize_int8_static
+
+    out.copy_(quantize_int8_static(_int8_linear_reference(a, weight, a_scale, w_scale, bias), out_scale).values)
+    return out
+
+
+int8_linear_quantize = Op("int8_linear_quantize", _int8_linear_quantize_reference)
 
 
 # -- FP32 linear of a BF16 input ----------------------------------------------------------------
@@ -100,6 +125,19 @@ def _linear_fp32_reference(x: Tensor, weight: Tensor, bias: Tensor) -> Tensor:
 
 
 linear_fp32 = Op("linear_fp32", _linear_fp32_reference)
+
+
+# -- FP32 product of two low-precision matrices --------------------------------------------------
+
+
+def _matmul_nt_fp32_reference(a: Tensor, b: Tensor, scale: float) -> Tensor:
+    """``scale * a @ b^T`` in FP32 of two (typically BF16) matrices ``a [M, K]``, ``b [N, K]`` -> ``[M, N]``: the
+    inputs are exact in FP32, so impls differ from this only in the accumulation (order, tensor-core FP32 adds).
+    A similarity matrix ahead of a softmax (``ops.dual_softmax_mutual``), where BF16 output would be too coarse."""
+    return torch.mm(a.float(), b.float().t()).mul_(scale)
+
+
+matmul_nt_fp32 = Op("matmul_nt_fp32", _matmul_nt_fp32_reference)
 
 
 # -- fused MXFP8 GELU MLP -------------------------------------------------------------------------------

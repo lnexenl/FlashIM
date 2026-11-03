@@ -46,6 +46,7 @@ class CudaGraphRunner:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph), torch.inference_mode():
             self._outputs = self.fn(*static_args)
+        self.graph.replay()  # capture only records the kernels: the outputs hold nothing until a replay
         return self._outputs
 
     def __call__(self, *args):

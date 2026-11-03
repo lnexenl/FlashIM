@@ -8,8 +8,10 @@ import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+from triton.language.extra import libdevice
 
 from flashim import ops
+from flashim.backends.triton._libdevice import gelu_erf, gelu_launch_kwargs, torch_gelu_libdevice
 from flashim.backends.triton.quantize import gelu_quantize, to_e4m3
 from flashim.ops._registry import DeviceSpec
 from flashim.platforms import Feature, platform_for
@@ -281,18 +283,26 @@ def _int8_gemm_kernel(
     w_scale_ptr,
     bias_ptr,
     out_ptr,
+    res_ptr,
     rows,
     N,
     K: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     RELU: tl.constexpr,
+    GELU: tl.constexpr,
+    RESIDUAL: tl.constexpr,
+    ROW_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
 ):
     """``int8[M,K] x int8[N,K]^T`` with INT32 accumulation; epilogue ``acc * (a_scale * w_scale[n]) + bias`` (then ReLU
-    with ``RELU``: it commutes with the BF16 rounding, so it equals a separate ReLU pass bit for bit)."""
+    with ``RELU``: it commutes with the BF16 rounding, so it equals a separate ReLU pass bit for bit). ``ROW_SCALE``:
+    ``a_scale`` holds one scale per row (dynamic per-token activations) instead of one value. ``GELU`` / ``RESIDUAL``
+    (the reference's order): round to BF16 first, as the separate ``nn.Linear`` output would be, then ``nn.GELU`` (FP32
+    math, launch with the libdevice of :mod:`flashim.backends.triton._libdevice`) and / or ``res + out`` (BF16
+    ``res`` ``[rows, N]``), each rounded once more: the unfused ops' rounding points."""
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(rows, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -316,24 +326,32 @@ def _int8_gemm_kernel(
         accumulator = tl.dot(a, b, accumulator, out_dtype=tl.int32)
         a_ptrs += BLOCK_K
         b_ptrs += BLOCK_K
-    scale = tl.load(a_scale_ptr) * tl.load(w_scale_ptr + offs_n, mask=mask_n, other=0.0)
+    if ROW_SCALE:
+        scale = (tl.load(a_scale_ptr + offs_m, mask=mask_m, other=0.0)[:, None]
+                 * tl.load(w_scale_ptr + offs_n, mask=mask_n, other=0.0)[None, :])
+    else:
+        scale = (tl.load(a_scale_ptr) * tl.load(w_scale_ptr + offs_n, mask=mask_n, other=0.0))[None, :]
     if HAS_BIAS:  # explicit FMA: the compiler contracted `acc * scale + bias` for most tile configs but not all,
         # so the output bits depended on which config autotuning picked; one rounding for every config instead
         bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
-        out = tl.fma(accumulator.to(tl.float32), scale[None, :], bias[None, :])
+        out = tl.fma(accumulator.to(tl.float32), scale, bias[None, :])
     else:
-        out = accumulator.to(tl.float32) * scale[None, :]
+        out = accumulator.to(tl.float32) * scale
     if RELU:
         out = tl.maximum(out, 0.0)
-    tl.store(
-        out_ptr + offs_m[:, None].to(tl.int64) * N + offs_n[None, :],
-        out.to(tl.bfloat16),
-        mask=mask_m[:, None] & mask_n[None, :],
-    )
+    offsets = offs_m[:, None].to(tl.int64) * N + offs_n[None, :]
+    mask = mask_m[:, None] & mask_n[None, :]
+    if GELU or RESIDUAL:
+        out = out.to(tl.bfloat16).to(tl.float32)
+        if GELU:
+            out = gelu_erf(out).to(tl.bfloat16).to(tl.float32)
+        if RESIDUAL:
+            out = tl.load(res_ptr + offsets, mask=mask, other=0.0).to(tl.float32) + out
+    tl.store(out_ptr + offsets, out.to(tl.bfloat16), mask=mask)
 
 
 def _int8_gemm_config(
-    rows: int, n: int, small_tiles: bool = False, four_warps: bool = False
+    rows: int, n: int, small_tiles: bool = False, four_warps: bool = False, *, k: int = 0, sm90: bool = False
 ) -> tuple[int, int, int, int, int]:
     """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages). ``small_tiles`` (sm_89, sm_90): 4-warp 64-row tiles
     measured faster than 128 x 128 with 8 warps on an L20 (exact INT32 accumulation: bit-identical), e.g. 2505 x 1024
@@ -342,7 +360,15 @@ def _int8_gemm_config(
     -> 512 0.314 -> 0.286. ``four_warps`` (sm_87): on a Jetson AGX Orin the 128 x 128 tile wins, with 4 warps instead
     of 8 (the 64-row picks above are 7-25% slower there): 2505 x 1024 -> 1024 0.126 -> 0.121 ms, 2505 x 1024 -> 4096
     0.489 -> 0.451, 2505 x 4096 -> 1024 0.410 -> 0.368, 10020 x 1024 -> 1024 0.480 -> 0.440, 131072 x 512 -> 512 1.734 ->
-    1.693."""
+    1.693. ``sm90`` (an H20) adds the small-N rule for the decoders' 1x1 convolutions (``n < 512``, which the default
+    tile below runs as 128 x 128 x 8 warps: mostly idle columns): 64 x 64 x 64 with 4 warps, and for ``n <= 32``
+    128 x 64 (K block 128 when ``k >= 96``). In situ (CUDA graph, L2-warm, real call sites at 1200 px) dedode-g's
+    decoder GEMMs take 0.82 ms less per extract (65856 x 256 -> 256 0.057 -> 0.043 ms, 263424 x 64 -> 256
+    0.104 -> 0.048, 1053696 x 32 -> 96 0.262 -> 0.100, 1053696 x 64 -> 64 0.163 -> 0.090); on an L20 the same rule is
+    within noise (-0.02 ms), so it stays H20-only. Exact (INT32 accumulation: bit-identical)."""
+    if sm90 and rows >= 2048 and n < 512:
+        tiny = n <= 32
+        return 128 if tiny else 64, 64, 128 if tiny and k >= 96 else 64, 4, 3
     if small_tiles and rows >= 2048 and n >= 512:
         return 64, 128 if rows >= 32768 else 64, 64, 4, 3
     if rows >= 512:
@@ -353,14 +379,17 @@ def _int8_gemm_config(
 
 
 def int8_gemm_bf16(
-    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, config=None, *, relu: bool = False
+    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, config=None, *, relu: bool = False,
+    gelu: bool = False, residual: Tensor | None = None,
 ) -> Tensor:
-    """``[rows, K] int8 x [N, K] int8^T`` -> BF16 ``[rows, N]`` with the dequantizing epilogue fused."""
+    """``[rows, K] int8 x [N, K] int8^T`` -> BF16 ``[rows, N]`` with the dequantizing epilogue fused; ``a_scale``: one
+    FP32 value or ``[rows, 1]`` (contiguous) per-row scales; ``gelu`` / ``residual``: see :func:`_int8_gemm_kernel`."""
     rows, k = a.shape
     n = weight.shape[0]
     out = torch.empty(rows, n, device=a.device, dtype=torch.bfloat16)
     block_m, block_n, block_k, num_warps, num_stages = config or _int8_gemm_config(
-        rows, n, _is_sm89(a.device) or _is_sm90(a.device), platform_for(a.device).capability == (8, 7)
+        rows, n, _is_sm89(a.device) or _is_sm90(a.device), platform_for(a.device).capability == (8, 7), k=k,
+        sm90=_is_sm90(a.device),
     )
     _int8_gemm_kernel[(triton.cdiv(rows, block_m) * triton.cdiv(n, block_n),)](
         a,
@@ -369,19 +398,123 @@ def int8_gemm_bf16(
         w_scale,
         bias if bias is not None else out,
         out,
+        residual if residual is not None else out,
         rows,
         n,
         K=k,
         HAS_BIAS=bias is not None,
         RELU=relu,
+        GELU=gelu,
+        RESIDUAL=residual is not None,
+        ROW_SCALE=a_scale.numel() != 1,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         GROUP_M=8,
         num_warps=num_warps,
         num_stages=num_stages,
+        **(gelu_launch_kwargs(a.device) if gelu else {}),
     )
     return out
+
+
+# Store modes of :func:`int8_gemm_store` (the INT8 transformer glue of LightGlue, models/lightglue/int8_glue.py).
+STORE_QUANTIZE, STORE_SWAPPED, STORE_BOTH, STORE_QKV_ROPE = 1, 2, 3, 4
+
+
+@triton.jit
+def _int8_gemm_store_kernel(
+    a_ptr, b_ptr, a_scale_ptr, w_scale_ptr, bias_ptr, out_ptr, out2_ptr, aux_ptr, aux2_ptr, rows, N,
+    K: tl.constexpr, HAS_BIAS: tl.constexpr, MODE: tl.constexpr, LDO: tl.constexpr, HALF, HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
+):
+    """:func:`_int8_gemm_kernel`'s ``y = bf16(acc * a_scale * w_scale[n] + bias)`` (static ``a_scale``), stored by
+    ``MODE``: ``STORE_QUANTIZE`` static INT8 of ``y`` (scale at ``aux``: reciprocal multiply, half to even, +-127, as
+    ``quantize_int8``) into ``out`` with row stride ``LDO``; ``STORE_SWAPPED`` ``y`` at row ``(m + HALF) % (2 HALF)``
+    of ``out2`` (``y.view(2, HALF, N).flip(0)``), ``STORE_BOTH`` that and ``y`` into ``out``; ``STORE_QKV_ROPE`` the
+    columns ``[q | k | v]`` (``HEADS * HEAD_DIM`` each) with interleaved RoPE on q / k (``aux`` / ``aux2``: cos / sin,
+    ``[rows, HEAD_DIM]``; ``t * cos + rotate_pairs(t) * sin`` with separately rounded products, as
+    ``rope_qk_interleaved``'s kernel) scattered into ``out [3, rows / HALF, HEADS, HALF, HEAD_DIM]``."""
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(rows, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    group = pid // (GROUP_M * num_pid_n)
+    first_m = group * GROUP_M
+    group_size = min(num_pid_m - first_m, GROUP_M)
+    pid_m = first_m + (pid % group_size)
+    pid_n = (pid % (GROUP_M * num_pid_n)) // group_size
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_m = offs_m < rows
+    mask_n = offs_n < N
+    a_ptrs = a_ptr + offs_m[:, None].to(tl.int64) * K + offs_k[None, :]
+    b_ptrs = b_ptr + offs_n[None, :].to(tl.int64) * K + offs_k[:, None]
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for k0 in range(0, K, BLOCK_K):
+        k_mask = offs_k < K - k0
+        a = tl.load(a_ptrs, mask=mask_m[:, None] & k_mask[None, :], other=0)
+        b = tl.load(b_ptrs, mask=mask_n[None, :] & k_mask[:, None], other=0)
+        accumulator = tl.dot(a, b, accumulator, out_dtype=tl.int32)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K
+    scale = (tl.load(a_scale_ptr) * tl.load(w_scale_ptr + offs_n, mask=mask_n, other=0.0))[None, :]
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+        out = tl.fma(accumulator.to(tl.float32), scale, bias[None, :])
+    else:
+        out = accumulator.to(tl.float32) * scale
+    out = out.to(tl.bfloat16).to(tl.float32)
+    mask = mask_m[:, None] & mask_n[None, :]
+    rows64 = offs_m[:, None].to(tl.int64)
+    if MODE == 1:
+        quantized = libdevice.rint(out * (1.0 / tl.load(aux_ptr)))
+        tl.store(out_ptr + rows64 * LDO + offs_n[None, :], tl.maximum(tl.minimum(quantized, 127.0), -127.0).to(tl.int8),
+                 mask=mask)
+    elif MODE == 2 or MODE == 3:
+        swapped = ((offs_m + HALF) % (2 * HALF)).to(tl.int64)[:, None] * N + offs_n[None, :]
+        if MODE == 3:
+            tl.store(out_ptr + rows64 * N + offs_n[None, :], out.to(tl.bfloat16), mask=mask)
+        tl.store(out2_ptr + swapped, out.to(tl.bfloat16), mask=mask)
+    else:
+        C: tl.constexpr = HEADS * HEAD_DIM
+        d = offs_n % HEAD_DIM
+        table = rows64 * HEAD_DIM + d[None, :]
+        cos = tl.load(aux_ptr + table, mask=mask, other=0.0).to(tl.float32)
+        sin = tl.load(aux2_ptr + table, mask=mask, other=0.0).to(tl.float32)
+        even, odd = tl.split(tl.reshape(out, (BLOCK_M, BLOCK_N // 2, 2)))
+        rotated = tl.reshape(tl.join(-odd, even), (BLOCK_M, BLOCK_N))  # (-x1, x0, -x3, x2, ...)
+        roped = libdevice.add_rn(libdevice.mul_rn(out, cos), libdevice.mul_rn(rotated, sin))
+        out = tl.where((offs_n < 2 * C)[None, :], roped, out)
+        which = offs_n // C
+        head = (offs_n % C) // HEAD_DIM
+        image = offs_m // HALF
+        token = offs_m % HALF
+        num_images = rows // HALF
+        dst = ((((which[None, :] * num_images + image[:, None]) * HEADS + head[None, :]).to(tl.int64) * HALF
+                + token[:, None]) * HEAD_DIM + d[None, :])
+        tl.store(out_ptr + dst, out.to(tl.bfloat16), mask=mask)
+
+
+def int8_gemm_store(
+    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, mode: int, *, out: Tensor,
+    out2: Tensor | None = None, aux: Tensor | None = None, aux2: Tensor | None = None, half: int = 1, heads: int = 1,
+    head_dim: int = 1,
+) -> None:
+    """:func:`_int8_gemm_store_kernel` with :func:`int8_gemm_bf16`'s tiles (exact INT32 accumulation and the same
+    epilogue rounding, so the stored values do not depend on them)."""
+    rows, k = a.shape
+    n = weight.shape[0]
+    block_m, block_n, block_k, num_warps, num_stages = _int8_gemm_config(
+        rows, n, _is_sm89(a.device) or _is_sm90(a.device), platform_for(a.device).capability == (8, 7), k=k,
+        sm90=_is_sm90(a.device),
+    )
+    _int8_gemm_store_kernel[(triton.cdiv(rows, block_m) * triton.cdiv(n, block_n),)](
+        a, weight, a_scale, w_scale, bias if bias is not None else out, out, out2 if out2 is not None else out,
+        aux if aux is not None else out, aux2 if aux2 is not None else out, rows, n, K=k, HAS_BIAS=bias is not None,
+        MODE=mode, LDO=out.stride(0) if mode == STORE_QUANTIZE else 0, HALF=half, HEADS=heads, HEAD_DIM=head_dim,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, GROUP_M=8, num_warps=num_warps, num_stages=num_stages,
+    )
 
 
 @triton.jit
@@ -627,11 +760,46 @@ def _mxfp8_scaled_mm_impl(a, b_t, a_scale, b_scale, bias=None):
 
 
 # The fused-epilogue Triton GEMM beats cuBLAS ``_int_mm`` + separate dequant passes at every shape.
+def _int8_linear_eligible(a, weight, a_scale, w_scale, bias, *, relu=False, gelu=False, residual=None) -> bool:
+    """The epilogues are exact where they equal the unfused torch ops: ``gelu`` needs a libdevice whose ``erf`` is
+    torch's (:mod:`~flashim.backends.triton._libdevice`), ``residual`` a contiguous BF16 ``[rows, N]``; one activation."""
+    if gelu and (relu or torch_gelu_libdevice(a.device) is None):
+        return False
+    return residual is None or (
+        residual.dtype == torch.bfloat16 and residual.is_contiguous() and residual.shape == (a.shape[0], weight.shape[0])
+    )
+
+
 @ops.int8_linear.register(
-    "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON], priority=1
+    "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON], priority=1,
+    when=_int8_linear_eligible,
 )
-def _int8_linear_impl(a, weight, a_scale, w_scale, bias, *, relu: bool = False):
-    return int8_gemm_bf16(a.contiguous(), weight, a_scale, w_scale, bias, relu=relu)
+def _int8_linear_impl(a, weight, a_scale, w_scale, bias, *, relu: bool = False, gelu: bool = False, residual=None):
+    return int8_gemm_bf16(a.contiguous(), weight, a_scale, w_scale, bias, relu=relu, gelu=gelu, residual=residual)
+
+
+def _static_gemm_eligible(a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None) -> bool:
+    return (
+        a.dtype == weight.dtype == torch.int8 and a.ndim == 2 and a.is_contiguous() and weight.is_contiguous()
+        and a_scale.numel() == 1 and w_scale.dtype == torch.float32
+        and (bias is None or bias.dtype == torch.bfloat16)
+    )
+
+
+def _int8_linear_quantize_eligible(a, weight, a_scale, w_scale, bias, out_scale, out) -> bool:
+    return (
+        _static_gemm_eligible(a, weight, a_scale, w_scale, bias) and out.dtype == torch.int8
+        and out.shape == (a.shape[0], weight.shape[0]) and out.stride(1) == 1 and out_scale.numel() == 1
+    )
+
+
+@ops.int8_linear_quantize.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON],
+    when=_int8_linear_quantize_eligible,
+)
+def _int8_linear_quantize_impl(a, weight, a_scale, w_scale, bias, out_scale, out):
+    int8_gemm_store(a, weight, a_scale, w_scale, bias, STORE_QUANTIZE, out=out, aux=out_scale)
+    return out
 
 
 def _linear_fp32_small_n_eligible(x: Tensor, weight: Tensor, bias: Tensor) -> bool:

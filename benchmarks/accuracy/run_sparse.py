@@ -11,6 +11,11 @@ poselib, 2.0px), so each published number needs its own setting to be reproduced
 summed mean focal lengths, so ``--estimator opencv --ransac-thr 0.5`` is RDD's ``0.5`` exactly) and
 ``--bgr`` (RDD and XFeat feed OpenCV's BGR arrays to the network; FlashIM feeds RGB by default).
 
+Seeds: poselib takes the seed; OpenCV's RANSAC ignores ``cv2.setRNGSeed``, so the OpenCV path shuffles each pair's
+matches with the seed instead (LoMa's / RoMa's MegaDepth benchmarks shuffle before each RANSAC run). OpenCV results
+before this were one RANSAC draw whatever ``--seeds`` said. ``--save-matches`` keeps every pair's matches;
+``--from-matches`` re-runs pose estimation alone on them (no GPU), e.g. with more seeds.
+
 The images reach the model as PIL arrays decoded by the loader threads (the published numbers); ``--decoder`` instead
 passes each file through ``load_image(decoder=...)`` on the main thread, as ``match(path_a, path_b)`` does, to measure a
 decoder's effect on accuracy (``nvjpeg`` vs ``pil``). ``--save-errors`` keeps the per-pair pose errors ``[seed, pair]``
@@ -18,6 +23,9 @@ for paired bootstraps between runs.
 
     python benchmarks/accuracy/run_sparse.py --model xfeat --preset fp32 --seed 17
     python benchmarks/accuracy/run_sparse.py --model rdd --resize 1600 --estimator opencv --ransac-thr 0.5 --bgr
+    python benchmarks/accuracy/run_sparse.py --model loma-b --preset bf16 --resize 1024 --estimator opencv \
+        --ransac-thr 0.5 --save-matches m.npz
+    python benchmarks/accuracy/run_sparse.py --from-matches m.npz --estimator opencv --ransac-thr 0.5 --seeds 17 29 42
     python benchmarks/accuracy/run_sparse.py --model aliked-lightglue --preset bf16 --seeds 17 29 42 \
         --decoder nvjpeg --save-errors e.npy
 """
@@ -85,7 +93,10 @@ def _sparse_pose_error(estimator: str, pixel_thr: float, seed: int, kpts1, kpts2
         if estimator == "poselib":
             R_est, t_est = _poselib_pose(seed, kpts1, kpts2, K1, K2, pixel_thr)
         else:
-            cv2.setRNGSeed(seed)
+            # findEssentialMat's RANSAC ignores cv2.setRNGSeed (identical AUCs for every seed), but depends on the
+            # order of the matches: shuffle them per seed, as LoMa's / RoMa's MegaDepth benchmarks do per RANSAC run
+            order = np.random.default_rng(seed).permutation(len(kpts1))
+            kpts1, kpts2 = kpts1[order], kpts2[order]
             norm = pixel_thr / (np.mean(np.abs(K1[:2, :2])) + np.mean(np.abs(K2[:2, :2])))
             R_est, t_est, _ = estimate_pose_cv2_ransac(kpts1, kpts2, K1, K2, norm, conf=0.99999)
         e_t, e_R = compute_pose_error(R_est, t_est[:, 0], R, t)
@@ -164,6 +175,40 @@ def mega1500_sparse(
     return count
 
 
+class MatchRecorder:
+    """Pool wrapper that keeps every pair's matches and geometry (``--save-matches``) for pose-only reruns."""
+
+    def __init__(self, pool):
+        self.pool = pool
+        self.jobs: list[tuple] = []
+
+    def submit(self, *job) -> None:
+        self.jobs.append(job)
+        self.pool.submit(*job)
+
+    def errors(self):
+        return self.pool.errors()
+
+    def save(self, path: str) -> None:
+        kpts_a, kpts_b, K1, K2, R, t = zip(*self.jobs)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            path, offsets=np.cumsum([0, *(len(k) for k in kpts_a)]), kpts_a=np.concatenate(kpts_a).astype(np.float32),
+            kpts_b=np.concatenate(kpts_b).astype(np.float32), K1=np.stack(K1), K2=np.stack(K2), R=np.stack(R), t=np.stack(t),
+        )
+
+
+def replay_matches(path: str, pool, offset: float) -> int:
+    """Submit the matches saved by ``--save-matches`` (keypoints shifted by ``offset`` px) instead of running a model."""
+    data = np.load(path)
+    offsets = data["offsets"]
+    for i in range(len(offsets) - 1):
+        lo, hi = offsets[i], offsets[i + 1]
+        pool.submit(data["kpts_a"][lo:hi].astype(np.float64) + offset, data["kpts_b"][lo:hi].astype(np.float64) + offset,
+                    data["K1"][i], data["K2"][i], data["R"][i], data["t"][i])
+    return len(offsets) - 1
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default="rdd")
@@ -184,6 +229,10 @@ def main() -> None:
     parser.add_argument("--prefetch", type=int, default=16)
     parser.add_argument("--extra", default="", help="JSON dict of dotted config overrides")
     parser.add_argument("--overrides", nargs="*", default=[], help="dotted config overrides (config API)")
+    parser.add_argument("--save-matches", default="", help=".npz of every pair's matches and geometry")
+    parser.add_argument("--from-matches", default="", help="pose estimation only, on a --save-matches file (no model)")
+    parser.add_argument("--keypoint-offset", type=float, default=0.0,
+                        help="added to --from-matches keypoints (0.5: pixel-edge convention, as LoMa's own benchmark)")
     parser.add_argument("--decoder", default="", choices=("", *IMAGE_DECODERS),
                         help="decode the image files with load_image(decoder=...) on the main thread (default: PIL "
                         "arrays from the loader threads, the same pixels as 'pil')")
@@ -196,15 +245,22 @@ def main() -> None:
     torch.set_num_threads(ncpu)
     torch.backends.cudnn.benchmark = False
     data_root = Path(args.data_root) if args.data_root else DATA / "megadepth"
-    extra = parse_overrides(json.loads(args.extra)) if args.extra else None
-    model = flashim.load(args.model, args.preset, engine=args.engine, config=extra, overrides=args.overrides)
     started = time.time()
     seeds = args.seeds or [args.seed]
     pool = MultiSeedPool(args.workers, seeds, args.estimator, args.ransac_thr)
-    pairs = mega1500_sparse(
-        model, data_root, pool, args.max_pairs, {"workers": args.loaders, "depth": args.prefetch},
-        {"resize": args.resize, "max_matches": args.top_k or None}, args.bgr, args.decoder,
-    )
+    model = None
+    if args.from_matches:
+        pairs = replay_matches(args.from_matches, pool, args.keypoint_offset)
+    else:
+        extra = parse_overrides(json.loads(args.extra)) if args.extra else None
+        model = flashim.load(args.model, args.preset, engine=args.engine, config=extra, overrides=args.overrides)
+        recorder = MatchRecorder(pool) if args.save_matches else pool
+        pairs = mega1500_sparse(
+            model, data_root, recorder, args.max_pairs, {"workers": args.loaders, "depth": args.prefetch},
+            {"resize": args.resize, "max_matches": args.top_k or None}, args.bgr, args.decoder,
+        )
+        if args.save_matches:
+            recorder.save(args.save_matches)
     errors = pool.errors()
     if args.save_errors:
         np.save(args.save_errors, np.asarray(errors, dtype=np.float32))
@@ -220,6 +276,8 @@ def main() -> None:
         "estimator": args.estimator,
         "ransac_thr": args.ransac_thr,
         "bgr": args.bgr,
+        "from_matches": args.from_matches or None,
+        "keypoint_offset": args.keypoint_offset,
         "decoder": args.decoder or "pil",
         "seed": seeds[0] if len(seeds) == 1 else None,
         "seeds": seeds,
@@ -231,7 +289,7 @@ def main() -> None:
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
         "flashim_git": _git(Path(__file__).parent, "rev-parse", "HEAD"),
-        "calibration": getattr(model, "calibration_metadata", None),
+        "calibration": getattr(model, "calibration_metadata", None) if model is not None else None,
         "packing": model.quant_report.summary() if getattr(model, "quant_report", None) else None,
     }
     print(json.dumps(result, indent=2))

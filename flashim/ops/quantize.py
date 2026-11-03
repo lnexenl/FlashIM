@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from flashim.ops._registry import Op
+from flashim.quant.formats.int8 import INT8_MAX, quantize_symmetric, safe_scale
 from flashim.quant.tensor import Int8Tensor, QuantizedTensor, quantize_int8_static, quantize_static
 
 # -- LayerNorm (+ residual) -> static quantize ------------------------------------------
@@ -87,8 +88,12 @@ quantize_mxfp8 = Op("quantize_mxfp8", _quantize_static_reference)
 # -- INT8 producers: static per-tensor FP32 scale ---------------------------------------------------
 
 
-def _quantize_int8_reference(value: Tensor, scale: Tensor) -> Int8Tensor:
-    """``round(value / scale)`` saturated to +-127; ``scale`` is a single FP32 value."""
+def _quantize_int8_reference(value: Tensor, scale: Tensor, *, channel_scale: Tensor | None = None) -> Int8Tensor:
+    """``round(value / scale)`` saturated to +-127; ``scale`` is a single FP32 value. ``channel_scale`` (FP32, one per
+    channel of the last dimension) multiplies ``value`` first: SmoothQuant's ``1 / s``, with ``s`` folded into the
+    consuming weight's columns."""
+    if channel_scale is not None:
+        value = value.float() * channel_scale.float()
     return quantize_int8_static(value, scale)
 
 
@@ -124,3 +129,81 @@ def _gelu_quantize_int8_reference(value: Tensor, scale: Tensor, approximate: str
 
 
 gelu_quantize_int8 = Op("gelu_quantize_int8", _gelu_quantize_int8_reference)
+
+
+def _bias_relu_quantize_int8_reference(raw: Tensor, bias: Tensor, scale: Tensor) -> Int8Tensor:
+    """``quantize_int8(relu(raw + bias))`` for the bias-free output of a convolution: ``raw`` NCHW ``[B, C, H, W]``
+    (BF16, as cuDNN returns it), ``bias`` ``[C]`` added in ``raw``'s dtype (``Tensor.add_``'s rounding, which is what
+    ``nn.Conv2d`` does after the cuDNN call), then ReLU and the static quantize. Returns the INT8 NHWC
+    :class:`Int8Tensor` ``[B, H, W, C]`` the next quantized convolution reads."""
+    return quantize_int8_static(F.relu(raw + bias.view(1, -1, 1, 1)).permute(0, 2, 3, 1), scale)
+
+
+bias_relu_quantize_int8 = Op("bias_relu_quantize_int8", _bias_relu_quantize_int8_reference)
+
+
+# -- INT8 producer: dynamic per-row FP32 scale --------------------------------------------------------
+
+
+def _quantize_int8_rows_reference(value: Tensor) -> tuple[Tensor, Tensor]:
+    """Per-row (per-token) dynamic INT8: ``scale = amax(|row|) * (1 / 127)`` (FP32, ``safe_scale``; the reciprocal
+    product, which is what torch's CUDA division by a scalar computes, spelled out so every device agrees),
+    ``round(value / scale)`` saturated to +-127. Returns int8 values of ``value``'s shape and the FP32 scales
+    ``[*leading, 1]`` (the ``a_scale`` :func:`~flashim.ops.int8_linear` takes per row)."""
+    scale = safe_scale(value.float().abs().amax(-1, keepdim=True) * (1 / INT8_MAX))
+    return quantize_symmetric(value, scale), scale
+
+
+quantize_int8_rows = Op("quantize_int8_rows", _quantize_int8_rows_reference)
+
+
+def _layernorm_quantize_int8_rows_reference(
+    value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+) -> tuple[Tensor, Tensor]:
+    """``quantize_int8_rows(nn.LayerNorm(value))``: the normalization is torch's own (rounded to ``value.dtype``, the
+    tensor a separate LayerNorm module hands to the next layer), then per-row dynamic INT8 as
+    :func:`quantize_int8_rows`. Returns int8 values of ``value``'s shape and FP32 scales ``[*leading, 1]``."""
+    normalized = F.layer_norm(value, (value.shape[-1],), weight, bias, eps)
+    return _quantize_int8_rows_reference(normalized)
+
+
+layernorm_quantize_int8_rows = Op("layernorm_quantize_int8_rows", _layernorm_quantize_int8_rows_reference)
+
+
+# -- static INT8 for several consumers / from other layouts ------------------------------------------
+
+
+def _quantize_int8_multi_reference(value: Tensor, scales: list[Tensor], outs: list[Tensor]) -> list[Tensor]:
+    """``out[...] = quantize_int8(value, scale).values`` for every ``(scale, out)``: one activation ``[rows, C]`` quantized
+    for several INT8 consumers with their own static scales. Each ``out`` is an INT8 ``[rows, C]`` with unit column
+    stride and any row stride (e.g. the left half of a ``[rows, 2C]`` buffer whose right half another producer writes:
+    a ``cat`` never materialized). Returns ``outs``."""
+    for scale, out in zip(scales, outs):
+        out.copy_(quantize_int8_static(value, scale).values)
+    return outs
+
+
+quantize_int8_multi = Op("quantize_int8_multi", _quantize_int8_multi_reference)
+
+
+def _quantize_int8_heads_reference(value: Tensor, scale: Tensor) -> Int8Tensor:
+    """``quantize_int8(value.transpose(1, 2).reshape(B * N, H * D), scale)`` of an attention output ``[B, H, N, D]``:
+    the token-major INT8 input of the output projection, without the transposed BF16 copy."""
+    batch, heads, tokens, dim = value.shape
+    return quantize_int8_static(value.transpose(1, 2).reshape(batch * tokens, heads * dim), scale)
+
+
+quantize_int8_heads = Op("quantize_int8_heads", _quantize_int8_heads_reference)
+
+
+def _layernorm_gelu_quantize_int8_reference(
+    value: Tensor, weight: Tensor, bias: Tensor, eps: float, scale: Tensor, *, channel_scale: Tensor | None = None
+) -> Int8Tensor:
+    """``quantize_int8(GELU(nn.LayerNorm(value)), scale, channel_scale=)``: torch's LayerNorm and exact GELU, each in
+    ``value.dtype``, then the static INT8 quantization of the next linear (SmoothQuant ``channel_scale`` first): the middle
+    of a ``Linear -> LayerNorm -> GELU -> Linear`` FFN whose last linear is INT8."""
+    normalized = F.layer_norm(value, (value.shape[-1],), weight, bias, eps)
+    return _quantize_int8_reference(F.gelu(normalized), scale, channel_scale=channel_scale)
+
+
+layernorm_gelu_quantize_int8 = Op("layernorm_gelu_quantize_int8", _layernorm_gelu_quantize_int8_reference)

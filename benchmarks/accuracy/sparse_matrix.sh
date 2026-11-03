@@ -9,6 +9,8 @@
 # budget), dedode / dedode-g / dad keep dual-softmax matching; the *oracle* protocols (XFeat 1200 px poselib 1.0, RDD 1600 px
 # OpenCV 0.5, LoFTR 840 px OpenCV, DaD poselib 2.0) are reproduced with run_sparse.py's --resize / --estimator / --ransac-thr / --bgr.
 #   sift, orb: ratio test 0.8 (fp32 only: no weights)
+#   loma-<variant>: LoMa's own matcher; upstream's protocol (1024 px, 4096 keypoints, OpenCV 0.5 px) is run_sparse.py
+#   --resize 1024 --estimator opencv --ransac-thr 0.5 (results/loma/README.md)
 # In the *-lightglue pipelines the extractor and the matcher run in the same precision.
 # SEEDS (default "17 29 42"): RANSAC seeds evaluated on the same matches (AUC = their mean). CAL_DIR: directory of alternative
 # calibration tables (scripts/calibrate_extractor.py --out-dir, lightglue_<extractor>_<fmt>_mega.safetensors); only the
@@ -59,6 +61,7 @@ for p in $presets; do
   for m in superpoint disk alike xfeat dedode dedode-g dad ripe; do run $m $p 4096 $(cal $m $p); done
   for m in superpoint disk xfeat; do run $m-lightglue $p 4096 $(pipeline $m $p); done
   run loftr $p 0 $(cal loftr $p)
+  [ -z "$CAL_DIR" ] && for v in b128 b l g r; do run loma-$v $p 4096; done  # both components in the pipeline's preset
 done
 [ -n "$CAL_DIR" ] && exit 0
 run sift fp32 4096

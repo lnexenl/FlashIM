@@ -163,3 +163,141 @@ def test_int8_block_kernels_match_reference(impl, channels, width):
         got = ops.depthwise5x5_relu_pointwise_int8.get("triton_fused")(*args).float()
         want = ops.depthwise5x5_relu_pointwise_int8.get("reference")(*args).float()
         assert ((got - want).norm() / want.norm()) < 5e-3
+
+
+def test_hadamard_is_orthogonal_and_symmetric():
+    from flashim.quant.rotation import hadamard
+
+    h = hadamard(64, dtype=torch.float64)
+    torch.testing.assert_close(h @ h.T, torch.eye(64, dtype=torch.float64))
+    assert torch.equal(h, h.T) and h.abs().unique().numel() == 1
+    with pytest.raises(ValueError):
+        hadamard(96)
+
+
+def _outlier_input(rows=512, channels=128):
+    torch.manual_seed(0)
+    x = torch.randn(rows, channels)
+    x[:, :4] *= 40  # a few outlier channels, as after LoMa's FFN GELU
+    return x
+
+
+def test_smoothed_linear_folds_factors_into_the_weight():
+    x = _outlier_input()
+    linear = nn.Linear(128, 64)
+    smooth = x.abs().amax(0) ** 0.75 / linear.weight.abs().amax(0) ** 0.25
+    plain = StaticInt8Linear.from_linear(linear, x.abs().max() / 127)
+    smoothed = StaticInt8Linear.from_linear(linear, (x / smooth).abs().max() / 127, smooth=smooth)
+    torch.testing.assert_close(smoothed.channel_scale, 1 / smooth)
+    assert torch.equal(smoothed.quantize(x).values, quantize_int8_static(x / smooth, smoothed.input_scale).values)
+    ref = linear(x)
+    error = [((layer(x) - ref).norm() / ref.norm()).item() for layer in (plain, smoothed)]
+    assert error[1] < error[0] / 2, error
+    with pytest.raises(NotImplementedError):
+        smoothed.quantize_gelu(x, "none")
+
+
+def test_int8_table_round_trips_smoothing(tmp_path):
+    from flashim.quant.calibration import Int8CalibrationTable, Int8Calibrator, SmoothingCalibrator
+
+    model = nn.Sequential(nn.Linear(128, 32), nn.Linear(32, 8))
+    x = _outlier_input()
+    smoothing = SmoothingCalibrator(model, {"0": 0.5})
+    with torch.no_grad(), smoothing:
+        model(x)
+    smooth = smoothing.factors()
+    expected = (x.abs().amax(0).sqrt() / model[0].weight.abs().amax(0).sqrt()).clamp_min(1e-5)
+    torch.testing.assert_close(smooth["0"], expected)
+    observer = Int8Calibrator(model, ["0", "1"], percentile=1.0, smooth=smooth)
+    with torch.no_grad(), observer:
+        model(x)
+    table = observer.table({"model": "test"})
+    torch.testing.assert_close(table["0"], (x / smooth["0"]).abs().max() / 127)
+    table.save(tmp_path / "t.safetensors")
+    loaded = Int8CalibrationTable.load(tmp_path / "t.safetensors")
+    assert set(loaded.input_scale) == {"0", "1"} and set(loaded.smooth) == {"0"}
+    assert torch.equal(loaded.smooth["0"], table.smooth["0"]) and loaded.metadata["model"] == "test"
+
+
+@pytest.mark.cuda
+def test_channel_scaled_quantize_matches_reference():
+    torch.manual_seed(0)
+    scale = torch.tensor(0.05, device="cuda")
+    x = torch.randn(333, 1000, device="cuda", dtype=torch.bfloat16) * 3
+    channel_scale = torch.rand(1000, device="cuda") + 0.25
+    q = ops.quantize_int8.get("triton")(x, scale, channel_scale=channel_scale).values
+    r = ops.quantize_int8.get("reference")(x, scale, channel_scale=channel_scale).values
+    assert (q.int() - r.int()).abs().max() <= 1 and (q != r).float().mean() < 5e-3
+    assert ops.quantize_int8.explain(x, scale, channel_scale=channel_scale)["triton"] == "selected"
+    view = torch.randn(2, 1000, 3, 5, device="cuda", dtype=torch.bfloat16).permute(0, 2, 3, 1)
+    assert ops.quantize_int8.explain(view, scale, channel_scale=channel_scale)["triton"] != "selected"
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)])
+def test_dynamic_linear_handles_outlier_tokens(device):
+    """Per-token scales keep ordinary tokens accurate next to a token 1000x larger; one static scale cannot."""
+    from flashim.quant.methods.int8_linear import DynamicInt8Linear
+
+    torch.manual_seed(0)
+    linear = nn.Linear(256, 192).to(device)
+    x = torch.randn(2, 50, 256, device=device)
+    x[0, 3] *= 1000
+    packed = DynamicInt8Linear.from_linear(linear)
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    with torch.no_grad():
+        out, want = packed(x.to(dtype)).float(), linear(x.to(dtype).float())
+        static = StaticInt8Linear.from_linear(linear, x.abs().max() / 127)(x.to(dtype)).float()
+    assert out.shape == (2, 50, 192) and out.dtype == torch.float32
+    normal = torch.ones(2, 50, dtype=torch.bool)
+    normal[0, 3] = False
+    err = ((out - want)[normal].norm() / want[normal].norm()).item()
+    assert err < 0.02 and ((static - want)[normal].norm() / want[normal].norm()) > 5 * err
+    assert ((out - want)[0, 3].norm() / want[0, 3].norm()) < 0.02
+
+
+def test_quantize_model_token_scheme_needs_no_calibration():
+    from flashim.quant import scheme
+    from flashim.quant.apply import quantize_model
+    from flashim.quant.calibration import Int8CalibrationTable
+    from flashim.quant.methods.int8_linear import DynamicInt8Linear
+
+    model = nn.Sequential(nn.Linear(32, 64), nn.GELU(), nn.Linear(64, 16))
+    config = scheme.QuantConfig({
+        "dynamic": scheme.QuantScheme(("0",), scheme.INT8_WEIGHTS, scheme.INT8_TOKEN_ACTIVATIONS),
+        "static": scheme.QuantScheme(("0", "2"), scheme.INT8_WEIGHTS, scheme.INT8_ACTIVATIONS),  # "0": first group wins
+    })
+    report = quantize_model(model, config, Int8CalibrationTable({"2": torch.tensor(0.01)}))
+    assert isinstance(model[0], DynamicInt8Linear) and isinstance(model[2], StaticInt8Linear)
+    assert report.linears == {"0": "int8_linear_dynamic", "2": "int8_linear"}
+    assert model(torch.randn(3, 32)).shape == (3, 16)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("channels,width", [(512, 33), (256, 40), (32, 20), (256, 12)])
+def test_int8_producer_separable_block(channels, width):
+    """The depthwise conv as the packed pointwise conv's INT8 producer: same function as the unfused block (BF16
+    depthwise, ReLU, quantize, INT8 GEMM); shapes without a producer kernel run that block itself."""
+    from flashim.layers import IndexedSeparableConvBlock
+    from flashim.quant.methods.int8_linear import StaticInt8Conv1x1
+    from flashim.quant.passes.separable_conv_block import Int8ProducerSeparableConvBlock, fold_block_batchnorm
+
+    torch.manual_seed(0)
+    block = IndexedSeparableConvBlock(channels).cuda().eval()
+    block.norm.running_mean.normal_(), block.norm.running_var.uniform_(0.5, 2)
+    x = (torch.randn(1, channels, 24, width, device="cuda") * 2).bfloat16().contiguous(memory_format=torch.channels_last)
+    with torch.no_grad():
+        fold_block_batchnorm(torch.nn.ModuleList([block]))
+        hidden = torch.relu(block.conv_depthwise(x.float()))
+        block.conv_pointwise = StaticInt8Conv1x1.from_conv(block.conv_pointwise, hidden.abs().quantile(0.9999) / 127)
+        block.conv_depthwise.to(torch.bfloat16, memory_format=torch.channels_last)  # the packed conv keeps FP32 scales
+        unfused = block(x).float()
+        fused = Int8ProducerSeparableConvBlock(block)
+        ops.reset_call_counts()
+        out = fused(x)
+    assert out.shape == unfused.shape and out.dtype == torch.bfloat16
+    counts = ops.call_counts().get("depthwise5x5_relu_int8", {})
+    if ops.depthwise5x5_relu_int8.supports(x, fused.depthwise_weight, fused.depthwise_bias, block.conv_pointwise.input_scale):
+        assert "reference" not in counts and sum(counts.values()) == 1
+        assert ((out.float() - unfused).norm() / unfused.norm()) < 0.01  # BF16 depthwise rounding vs FP32 accumulation
+    else:
+        assert not counts and torch.equal(out.float(), unfused)

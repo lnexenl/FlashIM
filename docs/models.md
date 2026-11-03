@@ -33,6 +33,8 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | [`disk-lightglue`](models/lightglue.md) | DISK + LightGlue (cvg weights) | **`fp32`**, `bf16`, `int8`, `fp8` |
 | [`xfeat-lightglue`](models/lightglue.md) | XFeat + LighterGlue (verlab weights) | **`fp32`**, `bf16`, `int8`, `fp8` |
 | [`raco-<model>-lightglue`](models/raco-aliked-lightglue.md#raco-with-other-models) | RaCo keypoints + `superpoint`, `disk`, `xfeat` or `rdd` descriptors + LightGlue with that model's weights | as `<model>-lightglue` |
+| [`loma-<variant>`](models/loma.md) | LoMa: DaD keypoints + LoMa-trained DeDoDe descriptors + LoMa's LightGlue-style matcher (`loma-b128`, `loma-b`, `loma-l`, `loma-g`, `loma-r`; `loma` = `loma-b`) | `fp32`, **`bf16`**, `int8`, `fp8` |
+| [`loma-extractor`](models/loma.md), [`loma-matcher`](models/loma.md) | LoMa's components (variant `b128` \| `b` \| `l` \| `g` \| `r`) | `fp32`, **`bf16`**, `int8`, `fp8` |
 
 Every learned model is a native PyTorch port that is checked against its upstream implementation (`tests/parity`).
 
@@ -42,7 +44,7 @@ Every learned model is a native PyTorch port that is checked against its upstrea
 |---|---|
 | `fp32` | the checkpoint's own precision |
 | `bf16` | BF16 compute; keypoint selection, softmaxes and sampling / position math stay FP32 |
-| `int8` | INT8 with symmetric per-output-channel weights and one calibrated scale per activation tensor |
+| `int8` | INT8 with symmetric per-output-channel weights and one calibrated scale per activation tensor (DeDoDe-G's DINOv2 ViT: one scale per token, computed at run time) |
 | `fp8` | MXFP8: FP8 (E4M3) values with one power-of-two (E8M0) scale per 32 elements |
 
 **Engines** (`eager`, `compile`; RoMaV2 also `compile-full`) are separate from presets: any preset runs with any of

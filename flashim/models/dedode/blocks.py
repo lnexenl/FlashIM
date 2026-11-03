@@ -18,18 +18,71 @@ from flashim import ops
 from flashim.layers import IndexedSeparableConvBlock, fused_relu_end, sequential_forward
 from flashim.layers.conv import chains
 from flashim.layers.transformer import TransformerBlock
+from flashim.quant.tensor import Int8Tensor
 from flashim.utils import grid_sample
 
 VGG_CUT = {"11": (tvm.vgg11_bn, 22), "13": (tvm.vgg13_bn, 28), "19": (tvm.vgg19_bn, 40)}
 
 
 class VGG(nn.Module):
-    """``vgg*_bn().features[:cut]``; returns the maps feeding each max-pool (strides 1, 2, 4, 8) and their sizes."""
+    """``vgg*_bn().features[:cut]``; returns the maps feeding each max-pool (strides 1, 2, 4, 8) and their sizes. The
+    last pool (``cut`` ends on it) only exists to keep the checkpoint's layer indices: its output is never read, so
+    it is not run.
+
+    Two int8-preset fusions, enabled by spec passes (bit-identical to the layer-by-layer path):
+
+    - ``pooled_convs`` (``fused_pool_epilogue``): indices of INT8 convs followed by ``ReLU -> MaxPool2d(2) -> INT8
+      conv``, which write the full-resolution map (a decoder reads it) and the next conv's quantized pooled input
+      from one kernel (:meth:`StaticInt8Conv2d.forward_pooled`), not a pool pass and a quantize pass.
+    - ``first_conv_relu`` (``fused_first_conv_epilogue``): index of the ReLU after a BF16 first conv feeding an INT8
+      conv: cuDNN's bias-free output goes through bias, ReLU and the quantize in one pass
+      (``ops.bias_relu_quantize_int8``), not three.
+
+    A third, numerics-changing fusion (``tensor_core_first_conv``, pass ``tensor_core_first_conv``): ``(ReLU index,
+    bound ops.conv2d_small_cin_quantize_int8)``, the 3 -> 64 first conv itself on tensor cores with the same epilogue
+    (cuDNN's SIMT kernel replaced; FP32 summation order differs)."""
+
+    pooled_convs: frozenset[int] = frozenset()
+    first_conv_relu: int | None = None
+    tensor_core_first_conv: tuple[int, ops.BoundOp] | None = None
 
     def __init__(self, size: str = "19") -> None:
         super().__init__()
         factory, cut = VGG_CUT[size]
         self.layers = nn.ModuleList(factory(weights=None).features[:cut])
+
+    def find_pooled_convs(self) -> frozenset[int]:
+        """Indices ``i`` where ``layers[i] -> (Identity) -> ReLU -> MaxPool2d -> layers[k]`` is a quantized conv writing
+        its pooled output for the conv after the pool (:meth:`StaticInt8Conv2d.pools_into`)."""
+        layers = self.layers
+        found = set()
+        for i, layer in enumerate(layers):
+            end = fused_relu_end(layers, i)
+            if end is not None and end + 2 < len(layers):
+                pools_into = getattr(layer, "pools_into", None)
+                if pools_into is not None and pools_into(layers[end + 1], layers[end + 2]):
+                    found.add(i)
+        return frozenset(found)
+
+    def find_first_conv_relu(self) -> int | None:
+        """Index of the ReLU after ``layers[0]`` if that is a BF16 ``nn.Conv2d`` (norm folded) feeding a quantized
+        conv of its output width, else ``None``."""
+        from flashim.quant.methods.conv2d import StaticInt8Conv2d
+
+        layers = self.layers
+        first = layers[0]
+        if type(first) is not nn.Conv2d or first.weight.dtype != torch.bfloat16 or first.bias is None:
+            return None
+        end = 1
+        while end < len(layers) and isinstance(layers[end], nn.Identity):
+            end += 1
+        if end + 1 >= len(layers) or not isinstance(layers[end], nn.ReLU):
+            return None
+        consumer = layers[end + 1]
+        channels = first.out_channels
+        if not isinstance(consumer, StaticInt8Conv2d) or consumer.in_channels != channels:
+            return None
+        return end if channels & (channels - 1) == 0 else None  # the kernel holds all channels in a tile
 
     def forward(self, x: Tensor) -> tuple[list[Tensor], list[tuple[int, int]]]:
         feats, sizes = [], []
@@ -39,9 +92,32 @@ class VGG(nn.Module):
             if isinstance(layer, nn.MaxPool2d):
                 feats.append(x)
                 sizes.append(x.shape[-2:])
+                if i == len(layers) - 1:  # the last pool's output is never read
+                    break
+                x = layer(x)
+                i += 1
+                continue
+            if i == 0 and self.tensor_core_first_conv is not None and x.dtype == layer.weight.dtype and x.is_contiguous():
+                relu, fused_conv = self.tensor_core_first_conv
+                scale = layers[relu + 1].input_scale
+                x = Int8Tensor(fused_conv(x, scale).values, scale)
+                i = relu + 1
+                continue
+            if i == 0 and self.first_conv_relu is not None and x.dtype == layer.weight.dtype and x.is_contiguous():
+                relu = self.first_conv_relu
+                raw = F.conv2d(x, layer.weight, None, layer.stride, layer.padding, layer.dilation, layer.groups)
+                scale = layers[relu + 1].input_scale
+                x = Int8Tensor(ops.bias_relu_quantize_int8(raw, layer.bias, scale).values, scale)  # the consumer's scale
+                i = relu + 1
+                continue
             end = fused_relu_end(layers, i)  # conv -> folded BN -> ReLU as one quantized conv with a ReLU epilogue
             if end is None:
                 x = layer(x)
+            elif i in self.pooled_convs and (isinstance(x, Int8Tensor) or x.dtype == torch.bfloat16):
+                y, x = layer.forward_pooled(x, layers[end + 2], relu=True)  # ... which also pools and quantizes
+                feats.append(y)
+                sizes.append(y.shape[-2:])
+                end += 1  # the pool
             else:  # ... which also writes the next conv's quantized input when that conv follows directly
                 consumer = layers[end + 1] if end + 1 < len(layers) else None
                 x = layer(x, relu=True, quantize_for=consumer) if chains(layer, consumer) else layer(x, relu=True)
@@ -60,6 +136,8 @@ class VGG(nn.Module):
 class DinoV2(nn.Module):
     """DINOv2 ViT-L/14 patch features (``x_norm_patchtokens``) as ``[B, C, H/14, W/14]``; upstream's positional
     embedding interpolation (bicubic, ``scale_factor`` with the ``+0.1`` guard) is reproduced exactly."""
+
+    patch_embed_op: ops.BoundOp | None = None  # ``ops.patch_embed_tokens`` bound to the patch convolution (pass ``patch_embed_gemm``)
 
     def __init__(self, dim: int = 1024, depth: int = 24, heads: int = 16, patch: int = 14, img_size: int = 518) -> None:
         super().__init__()
@@ -94,9 +172,13 @@ class DinoV2(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         b, _, height, width = x.shape
         h, w = height // self.patch, width // self.patch
-        tokens = self.patch_embed.proj(x.to(self.patch_embed.proj.weight.dtype)).flatten(2).transpose(1, 2)
-        tokens = torch.cat([self.cls_token.to(tokens.dtype).expand(b, -1, -1), tokens], 1)
-        tokens = tokens + self.positions(h, w, tokens.dtype).to(tokens.device)
+        if self.patch_embed_op is not None:  # patch convolution + class token + positional embedding as one GEMM
+            dtype = self.patch_embed.proj.weight.dtype
+            tokens = self.patch_embed_op(x, self.cls_token, self.positions(h, w, dtype).to(x.device))
+        else:
+            tokens = self.patch_embed.proj(x.to(self.patch_embed.proj.weight.dtype)).flatten(2).transpose(1, 2)
+            tokens = torch.cat([self.cls_token.to(tokens.dtype).expand(b, -1, -1), tokens], 1)
+            tokens = tokens + self.positions(h, w, tokens.dtype).to(tokens.device)
         for block in self.blocks:
             tokens = block(tokens)
         return self.norm(tokens)[:, 1:].transpose(1, 2).reshape(b, -1, h, w)
@@ -119,9 +201,26 @@ class VGGDINOv2(nn.Module):
         return self.vgg.batchnorm_pairs(f"{prefix}vgg.")
 
 
+def refiner_input(features: Tensor, context: Tensor | None) -> Tensor:
+    """``cat(features, context)``; a coarser ``context`` is upsampled (bilinear, FP32) in the same pass."""
+    if context is None:
+        return features
+    if context.shape[-2:] != features.shape[-2:]:
+        return ops.upsample_concat(features, context)
+    return torch.cat((features, context.to(features.dtype)), dim=1)
+
+
 class ConvRefiner(nn.Module):
     """``block1`` (1x1) -> ``hidden_blocks`` (depthwise ``k x k`` -> BN -> ReLU -> 1x1, each) -> optional residual
-    ``(x + x0) / 1.4`` -> ``out_conv`` (1x1)."""
+    ``(x + x0) / 1.4`` -> ``out_conv`` (1x1), on the refiner input :func:`refiner_input` ``(features, context)``.
+
+    ``quantized_input`` (pass ``int8_refiner_input``; ``block1.0`` a static INT8 1x1 conv, BatchNorm folded): a coarser
+    context's upsample-concat writes ``block1.0``'s INT8 input directly (``ops.upsample_concat_int8``), not a BF16 map
+    and a quantize pass over it; same bits. ``residual_folded`` (:meth:`fold_residual_scale`): the residual's ``1 / 1.4``
+    lives in ``out_conv``'s weights instead of an elementwise pass over the hidden map."""
+
+    quantized_input = False
+    residual_folded = False
 
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, hidden_blocks: int = 5, kernel_size: int = 5,
                  residual: bool = True) -> None:
@@ -138,14 +237,32 @@ class ConvRefiner(nn.Module):
         conv1 = nn.Conv2d(cin, cout, kernel_size, 1, kernel_size // 2, bias=True)
         return nn.Sequential(conv1, nn.BatchNorm2d(cout), nn.ReLU(inplace=True), nn.Conv2d(cout, cout, 1, 1, 0))
 
-    def hidden(self, x: Tensor) -> Tensor:
+    def hidden(self, features: Tensor, context: Tensor | None = None) -> Tensor:
         """Everything before ``out_conv``."""
-        x0 = sequential_forward(self.block1, x)
+        if self.quantized_input and context is not None and context.shape[-2:] != features.shape[-2:]:
+            first = self.block1[0]
+            packed = ops.upsample_concat_int8(features, context, first.input_scale)
+            x0 = first.forward_prequantized(packed, relu=True).permute(0, 3, 1, 2)  # block1.0 -> folded BN -> ReLU
+            x0 = sequential_forward(self.block1[3:], x0)
+        else:
+            x0 = sequential_forward(self.block1, refiner_input(features, context))
         x = self.hidden_blocks(x0)
-        return (x + x0) / 1.4 if self.residual else x
+        if not self.residual:
+            return x
+        return x + x0 if self.residual_folded else (x + x0) / 1.4
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.out_conv(self.hidden(x))
+    def forward(self, features: Tensor, context: Tensor | None = None) -> Tensor:
+        return self.out_conv(self.hidden(features, context))
+
+    def fold_residual_scale(self) -> bool:
+        """``out_conv((x + x0) / 1.4)`` as ``(out_conv.weight / 1.4)`` applied to ``x + x0`` (bias unchanged); run
+        before the weights are cast or quantized. Returns whether anything was folded."""
+        if not self.residual or self.residual_folded:
+            return False
+        with torch.no_grad():
+            self.out_conv.weight.div_(1.4)
+        self.residual_folded = True
+        return True
 
 
 class Decoder(nn.Module):
@@ -154,17 +271,10 @@ class Decoder(nn.Module):
         self.layers = layers
         self.num_prototypes = num_prototypes
 
-    @staticmethod
-    def refiner_input(features: Tensor, context: Tensor | None) -> Tensor:
-        """``cat(features, context)``; a coarser ``context`` is upsampled (bilinear, FP32) in the same pass."""
-        if context is None:
-            return features
-        if context.shape[-2:] != features.shape[-2:]:
-            return ops.upsample_concat(features, context)
-        return torch.cat((features, context.to(features.dtype)), dim=1)
+    refiner_input = staticmethod(refiner_input)
 
     def forward(self, features: Tensor, context: Tensor | None, scale: str) -> tuple[Tensor, Tensor]:
-        out = self.layers[scale](self.refiner_input(features, context))
+        out = self.layers[scale](features, context)
         return out[:, : self.num_prototypes], out[:, self.num_prototypes :]
 
 
@@ -216,7 +326,7 @@ class DeDoDeNet(nn.Module):
         last = len(cfg.scales) - 1
         for idx, (feature_map, scale) in enumerate(zip(reversed(features), cfg.scales)):
             if points is not None and idx == last:
-                hidden = self.decoder.layers[scale].hidden(self.decoder.refiner_input(feature_map, context))
+                hidden = self.decoder.layers[scale].hidden(feature_map, context)
                 return self._read_last_scale(self.decoder.layers[scale].out_conv, hidden, out, points)
             delta, context = self.decoder(feature_map, context, scale)
             out = ops.upsample_add(out, delta) if coarse else out + delta.float()

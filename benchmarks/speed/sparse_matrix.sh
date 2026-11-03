@@ -38,6 +38,7 @@ for p in fp32 bf16 int8 fp8; do
     run "$m-lightglue-$p" $m-lightglue $p 4096 --overrides components.extractor.preset=$p
   done
   run "loftr-$p" loftr $p 0
+  for v in b128 b l g r; do run "loma-$v-$p" loma-$v $p 4096; done
 done
 run sift-fp32 sift fp32 4096
 run orb-fp32  orb  fp32 4096

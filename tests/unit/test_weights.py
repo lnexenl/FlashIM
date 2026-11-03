@@ -7,8 +7,8 @@ import torch
 
 from flashim.models.weights_util import Checkpoint, find_weights
 
-WEIGHT_MODULES = ("alike", "aliked", "dad", "dedode", "disk", "lightglue", "loftr", "raco", "rdd", "ripe", "romav2",
-                  "superpoint", "xfeat")
+WEIGHT_MODULES = ("alike", "aliked", "dad", "dedode", "disk", "lightglue", "loftr", "loma", "raco", "rdd", "ripe",
+                  "romav2", "superpoint", "xfeat")
 
 
 @pytest.fixture
@@ -69,4 +69,4 @@ def test_every_model_pins_its_release():
                 assert checkpoint.url.startswith("https://"), checkpoint
                 assert re.fullmatch(r"[0-9a-f]{64}", checkpoint.sha256), checkpoint
                 assert found.setdefault(checkpoint.filename, checkpoint.sha256) == checkpoint.sha256, checkpoint
-    assert len(found) == 29
+    assert len(found) == 34

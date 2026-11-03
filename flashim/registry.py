@@ -29,6 +29,9 @@ SPECS = {
     "xfeat-lightglue": "flashim.models.lightglue.spec:XFEAT_LIGHTGLUE",
     "superpoint-lightglue": "flashim.models.lightglue.spec:SUPERPOINT_LIGHTGLUE",
     "disk-lightglue": "flashim.models.lightglue.spec:DISK_LIGHTGLUE",
+    "loma-matcher": "flashim.models.loma.matcher_spec:SPEC",
+    "loma-extractor": "flashim.models.loma.extractor_spec:SPEC",
+    "loma": "flashim.models.loma.spec:LOMA",
 }
 
 # RaCo keypoints + the descriptors of any model that can describe given keypoints (raco-superpoint, raco-disk, ...).
@@ -39,6 +42,9 @@ for _descriptor in ("superpoint", "disk", "xfeat", "rdd"):
     SPECS[f"raco-{_descriptor}-lightglue"] = (
         f"flashim.models.lightglue.spec:RACO_{_descriptor.upper()}_LIGHTGLUE"
     )
+# LoMa's pipelines, one per variant (``loma`` = ``loma-b``).
+for _variant in ("b128", "b", "l", "g", "r"):
+    SPECS[f"loma-{_variant}"] = f"flashim.models.loma.spec:LOMA_{_variant.upper()}"
 
 for _name, _target in SPECS.items():
     register_spec(_name, _target)
