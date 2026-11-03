@@ -70,6 +70,21 @@ def test_strict_mode_raises_off_cpu():
             op(torch.zeros(1, device="cuda"))
 
 
+def test_supports_reports_the_fallback_without_raising():
+    op = _op("t_supports")
+    op.register("any", device=DeviceSpec("*"), when=lambda x: x.numel() > 1)(lambda x: "any")
+    assert op.supports(torch.zeros(2)) and not op.supports(torch.zeros(1))
+    ops.set_strict(True)
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        assert not op.supports(torch.zeros(1, device=device))  # strict mode raises on the call, not on the question
+    finally:
+        ops.set_strict(False)
+    ops.configure("-t_supports")
+    assert not op.supports(torch.zeros(2))
+    ops.configure(None)
+
+
 def test_dataclass_arguments_resolve_their_device():
     from flashim.ops._registry import _first_device
     from flashim.quant.tensor import QuantizedWeight

@@ -72,21 +72,30 @@ def _mxfp8_linear_reference(activation: QuantizedTensor, bias: Tensor | None, we
 mxfp8_linear = Op("mxfp8_linear", _mxfp8_linear_reference, weights=1)
 
 
-# -- static INT8 GEMM (per-channel weights, per-tensor activations) ---------------------------------
+# -- INT8 GEMM (per-channel weights, per-tensor or per-row activation scales) -------------------------
 
 
 def _int8_linear_reference(
-    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, *, relu: bool = False
+    a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, *, relu: bool = False,
+    gelu: bool = False, residual: Tensor | None = None,
 ) -> Tensor:
-    """``[M, K] int8 x [N, K] int8^T`` in INT32, then ``acc * (a_scale * w_scale) + bias`` (``relu``: then ReLU) -> BF16.
-    ReLU commutes with the BF16 rounding, so ``relu=True`` equals ``F.relu`` of the ``relu=False`` result bit for bit."""
+    """``[M, K] int8 x [N, K] int8^T`` in INT32, then ``acc * (a_scale * w_scale) + bias`` rounded to BF16, then the
+    epilogue in the order ``relu`` (ReLU commutes with the BF16 rounding, so ``relu=True`` equals ``F.relu`` of the plain
+    result bit for bit), ``gelu`` (``F.gelu`` of the BF16 result, exact erf form, rounded to BF16: ``nn.GELU`` after an
+    ``nn.Linear``), ``residual`` (``[M, N]`` BF16 added in BF16: ``x + linear(...)``). ``a_scale``: one static FP32
+    value, or ``[M, 1]`` per-row scales (dynamic per-token activations, :func:`~flashim.ops.quantize_int8_rows`)."""
     acc = a.long() @ weight.long().t() if a.device.type == "cpu" else a.double() @ weight.double().t()
     out = acc.float() * (a_scale.float() * w_scale.float())
     if bias is not None:
         out = out + bias.float()
     if relu:
         out = out.relu()
-    return out.to(torch.bfloat16)
+    out = out.to(torch.bfloat16)
+    if gelu:
+        out = F.gelu(out)
+    if residual is not None:
+        out = residual + out
+    return out
 
 
 int8_linear = Op("int8_linear", _int8_linear_reference)
