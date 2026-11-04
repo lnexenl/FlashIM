@@ -33,6 +33,7 @@ from flashim.ops.conv import (
 )
 from flashim.ops.correlation import dual_softmax_mutual, local_corr
 from flashim.ops.density import kde_density
+from flashim.ops.flexglue import flexglue_entmax_readout
 from flashim.ops.gemm import (
     int8_linear,
     int8_linear_quantize,
@@ -82,6 +83,7 @@ __all__ = [
     "depthwise5x5_relu_pointwise_int8",
     "depthwise5x5_relu_pointwise_mxfp8",
     "dual_softmax_mutual",
+    "flexglue_entmax_readout",
     "gelu_quantize",
     "gelu_quantize_int8",
     "im2col_gather",

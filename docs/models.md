@@ -27,6 +27,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | `sift`, `orb` | OpenCV baselines (CPU detection, GPU matching) | `fp32` |
 | [`lightglue`](models/lightglue.md) | LightGlue sparse matcher (variants `rdd`, `aliked`, `raco-aliked`, `superpoint`, `disk`, `xfeat`) | `fp32`, `bf16`, `int8`, **`fp8`** |
 | [`rdd-lightglue`](models/lightglue.md) | RDD + LightGlue | `fp32`, `bf16`, `int8`, **`fp8`** |
+| [`flexglue`](models/flexglue.md) | FlexGlue sparse-to-dense matcher (DINOv3-ConvNeXt search map, entmax readout) | `fp32`, `bf16`, `int8`, **`fp8`** |
 | [`aliked-lightglue`](models/lightglue.md) | ALIKED + LightGlue (cvg's ALIKED-trained weights) | **`fp32`**, `bf16`, `int8`, `fp8` |
 | [`raco-aliked-lightglue`](models/raco-aliked-lightglue.md) | RaCo keypoints + ALIKED descriptors + LightGlue (cvg's RaCo + ALIKED weights) | **`fp32`**, `bf16`, `int8`, `fp8` |
 | [`superpoint-lightglue`](models/lightglue.md) | SuperPoint + LightGlue (cvg weights) | **`fp32`**, `bf16`, `int8`, `fp8` |
