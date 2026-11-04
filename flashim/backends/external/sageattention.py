@@ -10,6 +10,10 @@ fragment rows: same accuracy class, fewer scale loads); ``sage-fp8-sm90`` / ``sa
 kernel (``sageattn_qk_int8_pv_fp8_cuda_sm90``), sm_90 only. ``sage-fp8`` keeps running the sm_89 kernel everywhere (so
 the accuracy evidence of the models that pin it stands), which on an H20 is slower than torch's cuDNN SDPA; the sm_90
 kernel is not.
+
+``sage-fp8-fast`` is ``sage-fp8`` with SageAttention2++'s ``pv_accum_dtype="fp32+fp16"``: the FP8 PV products
+accumulate in FP16 inside a block and in FP32 across blocks; ~16% faster on sm_120 at the same error (FlexGlue's
+[1, 8, 4096, 64]: 181 vs 216 us, rel. error vs FP32 SDPA 0.0099 vs 0.0100).
 """
 
 from __future__ import annotations
@@ -47,9 +51,10 @@ def _sage_sdpa(q: Tensor, k: Tensor, v: Tensor, variant: str) -> Tensor:
         return sageattention.sageattn_qk_int8_pv_fp8_cuda(
             q, k, v, tensor_layout="HND", is_causal=False, qk_quant_gran="per_warp", pv_accum_dtype="fp32+fp32"
         )
-    if variant == "fp8":
+    if variant in ("fp8", "fp8-fast"):
         return sageattention.sageattn_qk_int8_pv_fp8_cuda(
-            q, k, v, tensor_layout="HND", is_causal=False, pv_accum_dtype="fp32+fp32"
+            q, k, v, tensor_layout="HND", is_causal=False,
+            pv_accum_dtype="fp32+fp16" if variant == "fp8-fast" else "fp32+fp32",
         )
     return sageattention.sageattn_qk_int8_pv_fp16_cuda(
         q, k, v, tensor_layout="HND", is_causal=False, pv_accum_dtype="fp32"
@@ -74,6 +79,11 @@ def _sdpa_sage_fp8(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
 @ops.sdpa.register("sage-fp8-warp", device=DeviceSpec("cuda", min_capability=(8, 9)), priority=-1, when=_eligible)
 def _sdpa_sage_fp8_warp(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
     return _sage_sdpa(q, k, v, "fp8-warp")
+
+
+@ops.sdpa.register("sage-fp8-fast", device=DeviceSpec("cuda", min_capability=(8, 9)), priority=-1, when=_eligible)
+def _sdpa_sage_fp8_fast(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    return _sage_sdpa(q, k, v, "fp8-fast")
 
 
 if _SM90:
