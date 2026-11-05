@@ -9,6 +9,7 @@ SPECS = {
     "romav2": "flashim.models.romav2.spec:SPEC",
     "rdd": "flashim.models.rdd.spec:SPEC",
     "lightglue": "flashim.models.lightglue.spec:SPEC",
+    "flexglue": "flashim.models.flexglue.spec:SPEC",
     "aliked": "flashim.models.aliked.spec:SPEC",
     "raco": "flashim.models.raco.spec:SPEC",
     "raco-aliked": "flashim.models.raco.spec:RACO_ALIKED",

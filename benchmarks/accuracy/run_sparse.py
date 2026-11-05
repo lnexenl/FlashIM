@@ -214,7 +214,7 @@ def main() -> None:
     parser.add_argument("--model", default="rdd")
     parser.add_argument("--preset", default="fp8")
     parser.add_argument("--engine", default="eager")
-    parser.add_argument("--resize", type=int, default=1200, help="long side fed to the model")
+    parser.add_argument("--resize", type=int, default=1200, help="long side fed to the model (0: its own)")
     parser.add_argument("--top-k", type=int, default=4096, help="max_matches (0 = all)")
     parser.add_argument("--estimator", choices=("poselib", "opencv"), default="poselib")
     parser.add_argument("--ransac-thr", type=float, default=1.0, help="inlier threshold in pixels of the original image")
@@ -257,7 +257,7 @@ def main() -> None:
         recorder = MatchRecorder(pool) if args.save_matches else pool
         pairs = mega1500_sparse(
             model, data_root, recorder, args.max_pairs, {"workers": args.loaders, "depth": args.prefetch},
-            {"resize": args.resize, "max_matches": args.top_k or None}, args.bgr, args.decoder,
+            {"resize": args.resize or None, "max_matches": args.top_k or None}, args.bgr, args.decoder,
         )
         if args.save_matches:
             recorder.save(args.save_matches)

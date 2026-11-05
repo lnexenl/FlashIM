@@ -18,6 +18,7 @@ weight lookup (`flashim/models/*/weights.py`).
 | `xfeat/` | https://github.com/verlab/accelerated_features | Apache-2.0 |
 | `rdd/` | https://github.com/xtcpete/rdd @ 02ff372 (`convnext.py`: Meta, MIT: `LICENSE_ConvNeXt`; Deformable-DETR parts: SenseTime, Apache-2.0) | Apache-2.0 |
 | `raco/` | https://github.com/fabio-sim/LightGlue-ONNX (from cvg/RaCo) | Apache-2.0 |
+| `flexglue/` | https://github.com/cvg/FlexGlue @ c6cbc7a (`flexglue/`, not `utils/viz2d.py`; `refiner.py`: from RoMaV2, MIT; `LICENSE_DINOv3.md`: the DINOv3 License of the checkpoint's backbone weights, which are not here) | MIT |
 | `loma/` | https://github.com/davnords/LoMa @ 415caed (`src/loma/`; `descriptor/transformer/`: DINOv2, Meta; offline loader `loma_oracle.py`, see `loma/README.md`) | MIT (matcher in `loma.py`: Apache-2.0, from LightGlue; DINOv2: Apache-2.0) |
 
 Not vendored: cvg/LightGlue's `lightglue/superpoint.py` (it carries a Magic Leap notice forbidding reproduction and
