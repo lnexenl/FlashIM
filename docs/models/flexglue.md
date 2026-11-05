@@ -69,30 +69,37 @@ The calibration tables ship in `flashim/models/flexglue/calibration/`
 
 `match_keypoints` at 2048 RDD keypoints and `match()` on a MegaDepth pair, RTX 5070 Ti, best of interleaved runs:
 
-| configuration | `match_keypoints` eager / compile | `match()` eager / compile | MegaDepth-1500 AUC@5 (vs bf16) |
-|---|---|---|---|
-| `bf16` | 42.7 / 32.5 ms | 47.2 / 36.6 ms | 0.6397 |
-| `fp8` | 37.7 / 27.5 ms | 42.2 / 31.3 ms | 0.6369 (-0.0028) |
-| `int8` | 36.4 / 27.5 ms | 41.0 / 31.4 ms | 0.6370 (-0.0027) |
-| `fp8` + `optimize.attention=sage-fp8-fast` | 30.2 / 19.4 ms | 34.7 / 23.5 ms | 0.6371 (-0.0026) |
-| `int8` + `optimize.attention=sage` | 33.5 / 24.9 ms | 38.3 / 28.9 ms | 0.6380 (-0.0017) |
+| configuration | attention | `match_keypoints` eager / compile | `match()` eager / compile | MegaDepth-1500 AUC@5 (vs bf16) |
+|---|---|---|---|---|
+| `bf16` | torch SDPA | 42.7 / 32.5 ms | 47.2 / 36.6 ms | 0.6397 |
+| `fp8` | `sage-fp8-fast` | 30.2 / 19.4 ms | 34.7 / 23.5 ms | 0.6371 (-0.0026) |
+| `int8` | `sage` | 33.5 / 24.9 ms | 38.3 / 28.9 ms | 0.6380 (-0.0017) |
+| `fp8`, `optimize.passes=[]` | torch SDPA | 37.7 / 27.5 ms | 42.2 / 31.3 ms | 0.6369 (-0.0028) |
+| `int8`, `optimize.passes=[]` | torch SDPA | 36.4 / 27.5 ms | 41.0 / 31.4 ms | 0.6370 (-0.0027) |
 
-Each preset is paired with the attention that matches the GPUs it targets: `int8` is the preset for GPUs without
-FP8 (Ampere, Orin; `fp8` falls back to it there), so it uses `sage` (INT8 QK + FP16 PV, sm_80+), while the
-`sage-fp8*` variants need FP8 tensor cores (sm_89+) like the `fp8` preset.
+The `int8` / `fp8` presets run SageAttention (the `sage_attention` pass) on the architectures where it was measured
+faster than torch SDPA, with the variant the preset's GPUs can run: `fp8` uses `sage-fp8-fast` (INT8 QK + FP8 PV) on
+sm_89 / sm_120; `int8`, the preset for GPUs without FP8 (Ampere, Orin; `fp8` falls back to it there), uses `sage`
+(INT8 QK + FP16 PV) on sm_80 / 86 / 87 / 89 / 120 (Ampere and Orin not timed). On Hopper they keep torch SDPA:
+SageAttention's sm_89 kernels are slower than cuDNN SDPA on an H20 (compiled `match_keypoints` int8 31.0 -> 35.8,
+fp8 31.7 -> 37.3 ms); its sm_90 kernel is faster (`optimize.attention=sage-fp8-sm90-warp`: 28.8 ms) but FlexGlue's
+AUC with it is not measured. Without the `sageattention` package attention is torch SDPA (logged; the pass's entry in
+`model.build_report.passes` says what ran). `optimize.attention` pins any impl instead; `optimize.passes=[]` turns
+SageAttention off.
 
 AUC: dense `match()`, 5000 matches, poselib 1.0px, mean of RANSAC seeds 17 / 29 / 42 (eager);
 `benchmarks/accuracy/flexglue_matrix.sh`. Quantizing the descriptor costs MXFP8 0.0031 / INT8 0.0010-0.0019
 AUC@5 (the transformer-only presets: 0.6388 / 0.6380) for ~1.6 ms compiled. `engine="compile"` is the larger win (it fuses the
 per-head LayerNorms, the rotary and the residual adds around the linears; the first call compiles for tens of
-seconds). Attention over the 64x64 = 4096 tokens is the largest remaining kernel (37% of eager fp8 before
-SageAttention); `optimize.attention` swaps it for SageAttention (`sage`: INT8 QK + FP16 PV, `sage-fp8`: + FP8 PV,
-`sage-fp8-fast`: + SageAttention2++'s FP16 PV accumulation). It is opt-in because its AUC drop, although inside the
-0.005 gate, is measurable (transformer-only fp8: sage -0.0025, sage-fp8 -0.0022, sage-fp8-fast -0.0016 vs
--0.0009); it needs a BF16 preset (`fp32` rejects it). SageAttention3's NVFP4 attention measured 0.5475 (-0.092).
+seconds). Attention over the 64x64 = 4096 tokens is the largest kernel with torch SDPA (37% of eager fp8);
+SageAttention variants: `sage` (INT8 QK + FP16 PV), `sage-fp8` (+ FP8 PV), `sage-fp8-fast` (+ SageAttention2++'s
+FP16 PV accumulation). With a transformer-only fp8 they measured sage -0.0025, sage-fp8 -0.0022, sage-fp8-fast
+-0.0016 vs -0.0009 with torch SDPA; `optimize.attention` needs a BF16 preset (`fp32` rejects it). SageAttention3's
+NVFP4 attention measured 0.5475 (-0.092).
 
 ```python
-m = flashim.load("flexglue", "fp8", engine="compile", overrides={"optimize.attention": "sage-fp8-fast"})
+m = flashim.load("flexglue", "fp8", engine="compile")                                  # sage-fp8-fast on sm_89 / sm_120
+m = flashim.load("flexglue", "fp8", overrides={"optimize.attention": "sage-fp8-sm90-warp"})  # pin an impl
 ```
 
 ## Presets
@@ -101,8 +108,8 @@ m = flashim.load("flexglue", "fp8", engine="compile", overrides={"optimize.atten
 |---|---|
 | `fp32` | the checkpoint's own precision |
 | `bf16` | descriptor and transformer in BF16; the correspondence heads, search map, positions, entmax readout and mutual-NN stay FP32 |
-| `int8` | `bf16` + the transformer and descriptor-MLP linears as static symmetric INT8 |
-| `fp8` (default) | `bf16` + the transformer linears as static MXFP8 and the descriptor-MLP linears as static INT8 |
+| `int8` | `bf16` + the transformer and descriptor-MLP linears as static symmetric INT8; SageAttention `sage` |
+| `fp8` (default) | `bf16` + the transformer linears as static MXFP8 and the descriptor-MLP linears as static INT8; SageAttention `sage-fp8-fast` |
 
 ## When to use FlexGlue
 

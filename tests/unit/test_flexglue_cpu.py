@@ -195,3 +195,32 @@ def test_attention_impl_is_routed_and_fp32_rejects_it():
     assert all(layer.self_attn.sdpa_impl == layer.cross_attn.sdpa_impl == "sage" for layer in model.transformers)
     with pytest.raises(ValueError):
         _validate(RunConfig.from_dict({"model": "flexglue", "optimize": {"attention": "sage"}}))
+
+
+def test_sage_attention_pass_picks_the_measured_impl_per_architecture():
+    from types import SimpleNamespace
+
+    import flashim
+    from flashim.models.flexglue.spec import SPEC
+
+    apply = SPEC.passes["sage_attention"].apply
+    registered = {impl.name for impl in ops.sdpa.impls}
+    assert flashim.resolve("flexglue", "bf16").optimize.passes == ()
+
+    def run(preset: str, capability, attention: str = "sdpa"):
+        model = FlexGlue(SMALL)
+        config = flashim.resolve("flexglue", preset, {"optimize": {"attention": attention}})
+        platform = SimpleNamespace(capability=capability, describe=lambda: f"sm{capability}")
+        return apply(model, SimpleNamespace(config=config, platform=platform)), model.transformers[0].self_attn.sdpa_impl
+
+    for preset, capability, impl in (("fp8", (12, 0), "sage-fp8-fast"), ("int8", (8, 6), "sage")):
+        result, pinned = run(preset, capability)
+        if impl in registered:
+            assert result == pinned == impl
+        else:  # no sageattention package: torch SDPA
+            assert result.startswith("skipped") and pinned == "reference"
+    for preset, capability in (("fp8", (9, 0)), ("int8", (9, 0)), ("fp8", (8, 6)), ("int8", None)):
+        result, pinned = run(preset, capability)
+        assert result.startswith("skipped: torch SDPA") and pinned == "reference"
+    result, pinned = run("fp8", (12, 0), attention="sage")  # a pinned optimize.attention wins (set after the passes)
+    assert result.startswith("skipped: optimize.attention") and pinned == "reference"
