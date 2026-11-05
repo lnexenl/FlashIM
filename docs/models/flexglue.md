@@ -51,16 +51,19 @@ ratio is not kept). Keypoints are given and returned in the original images' pix
 
 ## Quantization
 
-The `int8` / `fp8` presets quantize 153 linears as static MXFP8 (E4M3 values, E8M0 block-32 scales) or symmetric
-INT8 (per-output-channel weights, one activation scale per tensor): the 9 transformer layers' QKV / output / FFN
-linears (81, self- and cross-attention) and the pointwise MLP of every ConvNeXt block in the descriptor's backbone
-(72, `pwconv1` / `pwconv2`: 83.7M of its 89.6M parameters). The backbone's convolutions, the descriptor's stride-8
+The `int8` / `fp8` presets quantize 153 linears: the 9 transformer layers' QKV / output / FFN linears (81, self-
+and cross-attention) and the pointwise MLP of every ConvNeXt block in the descriptor's backbone (72, `pwconv1` /
+`pwconv2`: 83.7M of its 89.6M parameters). `int8` makes all of them static symmetric INT8 (per-output-channel
+weights, one activation scale per tensor). `fp8` mixes formats: the transformer linears as static MXFP8 (E4M3
+values, E8M0 block-32 scales), the descriptor's as the same INT8 (every GPU with FP8 tensor cores also has INT8
+ones). Each part gets the format it loses least in: an MXFP8 descriptor costs 0.0012 AUC@5 more at the same speed. The backbone's convolutions, the descriptor's stride-8
 head, the input projection, the Fourier position encoding and the correspondence heads are not quantized: the heads
 feed the coordinate-sensitive entmax readout.
 
 The calibration tables ship in `flashim/models/flexglue/calibration/`
 (`flexglue_fp8_mega.safetensors`, `flexglue_int8_mega.safetensors`: 16 pairs of
-`data/quantization/calibration_megadepth.jsonl`); regenerate them with `scripts/calibrate_flexglue.py`.
+`data/quantization/calibration_megadepth.jsonl`; `fp8` reads both); regenerate them with
+`scripts/calibrate_flexglue.py`.
 
 ## Speed and accuracy
 
@@ -68,15 +71,19 @@ The calibration tables ship in `flashim/models/flexglue/calibration/`
 
 | configuration | `match_keypoints` eager / compile | `match()` eager / compile | MegaDepth-1500 AUC@5 (vs bf16) |
 |---|---|---|---|
-| `bf16` | 42.9 / 32.4 ms | 47.4 / 36.4 ms | 0.6397 |
-| `fp8` | 38.3 / 26.8 ms | 42.9 / 30.8 ms | 0.6357 (-0.0040) |
-| `int8` | 35.5 / 26.5 ms | 40.2 / 30.4 ms | 0.6370 (-0.0027) |
-| `fp8` + `optimize.attention=sage-fp8-fast` | 30.5 / 18.9 ms | 35.3 / 22.8 ms | 0.6359 (-0.0038) |
-| `int8` + `optimize.attention=sage-fp8-fast` | 28.0 / 19.0 ms | 32.5 / 22.9 ms | 0.6375 (-0.0022) |
+| `bf16` | 42.7 / 32.5 ms | 47.2 / 36.6 ms | 0.6397 |
+| `fp8` | 37.7 / 27.5 ms | 42.2 / 31.3 ms | 0.6369 (-0.0028) |
+| `int8` | 36.4 / 27.5 ms | 41.0 / 31.4 ms | 0.6370 (-0.0027) |
+| `fp8` + `optimize.attention=sage-fp8-fast` | 30.2 / 19.4 ms | 34.7 / 23.5 ms | 0.6371 (-0.0026) |
+| `int8` + `optimize.attention=sage` | 33.5 / 24.9 ms | 38.3 / 28.9 ms | 0.6380 (-0.0017) |
+
+Each preset is paired with the attention that matches the GPUs it targets: `int8` is the preset for GPUs without
+FP8 (Ampere, Orin; `fp8` falls back to it there), so it uses `sage` (INT8 QK + FP16 PV, sm_80+), while the
+`sage-fp8*` variants need FP8 tensor cores (sm_89+) like the `fp8` preset.
 
 AUC: dense `match()`, 5000 matches, poselib 1.0px, mean of RANSAC seeds 17 / 29 / 42 (eager);
-`benchmarks/accuracy/flexglue_matrix.sh`. Quantizing the descriptor costs fp8 0.0031 / int8 0.0010 AUC@5 (the
-transformer-only presets: 0.6388 / 0.6380) for ~1.6 ms compiled. `engine="compile"` is the larger win (it fuses the
+`benchmarks/accuracy/flexglue_matrix.sh`. Quantizing the descriptor costs MXFP8 0.0031 / INT8 0.0010-0.0019
+AUC@5 (the transformer-only presets: 0.6388 / 0.6380) for ~1.6 ms compiled. `engine="compile"` is the larger win (it fuses the
 per-head LayerNorms, the rotary and the residual adds around the linears; the first call compiles for tens of
 seconds). Attention over the 64x64 = 4096 tokens is the largest remaining kernel (37% of eager fp8 before
 SageAttention); `optimize.attention` swaps it for SageAttention (`sage`: INT8 QK + FP16 PV, `sage-fp8`: + FP8 PV,
@@ -95,7 +102,7 @@ m = flashim.load("flexglue", "fp8", engine="compile", overrides={"optimize.atten
 | `fp32` | the checkpoint's own precision |
 | `bf16` | descriptor and transformer in BF16; the correspondence heads, search map, positions, entmax readout and mutual-NN stay FP32 |
 | `int8` | `bf16` + the transformer and descriptor-MLP linears as static symmetric INT8 |
-| `fp8` (default) | `bf16` + the transformer and descriptor-MLP linears as static MXFP8 |
+| `fp8` (default) | `bf16` + the transformer linears as static MXFP8 and the descriptor-MLP linears as static INT8 |
 
 ## When to use FlexGlue
 

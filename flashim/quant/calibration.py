@@ -207,6 +207,15 @@ class Int8CalibrationTable:
         return cls(scales, meta, smooth)
 
 
+def load_table(path: str | Path) -> CalibrationTable | Int8CalibrationTable:
+    """A table of either kind, by the ``format`` in its metadata."""
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt") as handle:
+        fmt = (handle.metadata() or {}).get("format")
+    return (Int8CalibrationTable if fmt == INT8_FORMAT else CalibrationTable).load(path)
+
+
 class Int8Calibrator:
     """Record each targeted layer's input range (linears and 1x1 convs), RoMaV2 ``percentile`` observer.
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 from torch import nn
 
@@ -24,7 +24,7 @@ from flashim.utils import nbytes, set_submodule
 def quantize_model(
     model: nn.Module,
     config: QuantConfig,
-    calibration: CalibrationTable | Int8CalibrationTable | None,
+    calibration: CalibrationTable | Int8CalibrationTable | Sequence[CalibrationTable | Int8CalibrationTable] | None,
     *,
     protected: Iterable[str] = (),
 ) -> PackingReport:
@@ -35,8 +35,12 @@ def quantize_model(
     separable conv blocks whose ``conv_pointwise`` is targeted by a dynamic MXFP8 scheme become
     :class:`MXFP8SeparableConvBlock`, by a static INT8 scheme :class:`Int8SeparableConvBlock`
     (BatchNorm must already be folded). Other 1x1 convolutions targeted by an INT8 scheme become
-    :class:`StaticInt8Conv1x1`. Kernels are chosen by op dispatch on the layers' device.
+    :class:`StaticInt8Conv1x1`. Kernels are chosen by op dispatch on the layers' device. A config mixing MXFP8 and
+    INT8 schemes takes one table of each kind (a sequence; each scheme reads the table of its own kind).
     """
+    tables = tuple(calibration) if isinstance(calibration, Sequence) else (calibration,)
+    fp8_table = next((t for t in tables if isinstance(t, CalibrationTable)), None)
+    int8_table = next((t for t in tables if isinstance(t, Int8CalibrationTable)), None)
     names = [name for name, _ in model.named_modules()]
     config.check_protected(names, protected)
     report = PackingReport()
@@ -76,28 +80,28 @@ def quantize_model(
             continue
         if act is None or act.dynamic:
             continue
-        if calibration is None or name not in calibration:
+        table = int8_table if scheme.weights.type == "int" else fp8_table
+        if table is None and any(t is not None for t in tables):
+            kind = ("INT8", "an Int8CalibrationTable") if scheme.weights.type == "int" else ("MXFP8", "a CalibrationTable")
+            raise TypeError(f"{kind[0]} scheme for {name!r} needs {kind[1]}")
+        if table is None or name not in table:
             raise RuntimeError(f"No calibration for static-activation linear {name!r}")
         if scheme.weights.type == "int":
-            if not isinstance(calibration, Int8CalibrationTable):
-                raise TypeError(f"INT8 scheme for {name!r} needs an Int8CalibrationTable")
             if is_conv1x1:
                 build = StaticInt8Conv1x1.from_conv
             elif is_conv:
                 build = StaticInt8Conv2d.from_conv
             else:
                 build = StaticInt8Linear.from_linear
-            if name in calibration.smooth:
+            if name in table.smooth:
                 if not isinstance(module, nn.Linear):
                     raise ValueError(f"SmoothQuant factors for {name!r}: only linears take them")
-                packed = build(module, calibration[name], smooth=calibration.smooth[name])
+                packed = build(module, table[name], smooth=table.smooth[name])
             else:
-                packed = build(module, calibration[name])
+                packed = build(module, table[name])
         else:
-            if not isinstance(calibration, CalibrationTable):
-                raise TypeError(f"MXFP8 scheme for {name!r} needs a CalibrationTable")
             build = StaticMXFP8Conv2d.from_conv if is_conv else StaticMXFP8Linear.from_linear
-            packed = build(module, calibration[name].input_exponent)
+            packed = build(module, table[name].input_exponent)
         report.bytes_before += nbytes(module)
         report.bytes_after += nbytes(packed)
         set_submodule(model, name, packed)
@@ -129,9 +133,9 @@ def quantize_model(
             pointwise = f"{name}.{module.pointwise_name}"
             if scheme.input_activations is None or scheme.input_activations.dynamic:
                 raise ValueError(f"INT8 pointwise conv {pointwise!r} requires a static-activation scheme")
-            if not isinstance(calibration, Int8CalibrationTable) or pointwise not in calibration:
+            if int8_table is None or pointwise not in int8_table:
                 raise RuntimeError(f"No INT8 calibration for {pointwise!r}")
-            fused = Int8SeparableConvBlock(module, calibration[pointwise]).to(next(module.parameters()).device)
+            fused = Int8SeparableConvBlock(module, int8_table[pointwise]).to(next(module.parameters()).device)
         elif scheme.input_activations is None or not scheme.input_activations.dynamic:
             raise ValueError(f"Pointwise conv {name!r} requires a dynamic-activation scheme")
         else:
