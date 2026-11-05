@@ -1,4 +1,5 @@
-"""FlashIM's native FlexGlue against the reference implementation (cvg/FlexGlue, /tmp/flexglue_upstream).
+"""FlashIM's native FlexGlue against the reference implementation (cvg/FlexGlue, vendored in
+``tests/oracles/flexglue``).
 
 (a) fp32 parity: upstream ``flexglue.FlexGlue`` vs ``flashim.load('flexglue', 'fp32')`` on the same
 MegaDepth pair and the same 2048 RDD keypoints; the mutual-NN match index sets must overlap almost
@@ -21,7 +22,7 @@ from ..conftest import MEGADEPTH_IMAGES
 
 pytestmark = [pytest.mark.cuda, pytest.mark.slow]
 
-UPSTREAM = Path("/tmp/flexglue_upstream")
+ORACLE = Path(__file__).resolve().parents[1] / "oracles" / "flexglue"
 # the stable MegaDepth-0015 pair (505127/505128, ~343 matches at 2048 RDD keypoints); the
 # 33831624/299056923 pair used by the LightGlue test gives FlexGlue only ~56 matches, all of
 # them within ~0.05 of the 0.1 confidence threshold, so reduced-precision noise flips half of
@@ -57,13 +58,11 @@ def _load_image_tensor(path: Path) -> torch.Tensor:
 
 
 def _load_upstream(checkpoint: Path):
-    if not (UPSTREAM / "flexglue" / "flexglue.py").exists():
-        pytest.skip(f"needs the upstream FlexGlue checkout at {UPSTREAM}")
-    sys.path.insert(0, str(UPSTREAM))
+    sys.path.insert(0, str(ORACLE))
     try:
         import flexglue
-    except ImportError as exc:
-        pytest.skip(f"upstream flexglue does not import: {exc}")
+    finally:
+        sys.path.remove(str(ORACLE))
     # mp=None: run upstream's transformer in fp32 (no autocast), matching FlashIM's fp32 preset
     model = flexglue.FlexGlue(weights=str(checkpoint), mp=None).cuda().eval()
     return model

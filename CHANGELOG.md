@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Models
+
+- FlexGlue (`flexglue`, cvg/FlexGlue v0.1): sparse-to-dense matcher with a DINOv3-ConvNeXt descriptor.
+  `match_keypoints` matches any extractor's keypoints, `match` samples the dense warp with upstream's gates. Presets
+  `fp32` / `bf16` / `int8` / `fp8` (default: MXFP8 transformer linears + INT8 descriptor MLP); opt-in early stopping
+  and `arch.num_layers` truncation. MegaDepth-1500 AUC@5 (dense, 5000 matches, 3 seeds): bf16 0.6397, fp8 0.6369,
+  int8 0.6370; compiled `match_keypoints` at 2048 keypoints on an RTX 5070 Ti: bf16 32.5 ms, fp8 27.5 ms, fp8 +
+  `optimize.attention=sage-fp8-fast` 19.4 ms.
+
+### Interface
+
+- `optimize.attention="sage-fp8-fast"`: `sage-fp8` with FP16 PV accumulation (SageAttention2++), sm_89+, opt-in.
+- Quant configs may mix MXFP8 and INT8 schemes: `quantize_model` takes one table of each kind, a spec's default
+  calibration may be a tuple of files, and a table passed with `calibration=` replaces only the default of its kind.
+
 ### Performance
 
 - LoMa `int8` (`loma-*` pipelines, sm_89 / sm_90), from the LoMa tuning prototypes:

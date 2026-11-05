@@ -19,7 +19,8 @@ CHECKPOINT = Checkpoint(
 
 LICENSES = {
     "code": "MIT (cvg/FlexGlue); FlashIM re-implementation",
-    "weights": "cvg/FlexGlue release flexglue.pth (matcher + DINOv3-ConvNeXt descriptor)",
+    "weights": "cvg/FlexGlue release flexglue.pth: the DINOv3 ConvNeXt-B backbone (descriptor.backbone.*) under the "
+    "DINOv3 License; the matcher and descriptor heads MIT",
 }
 
 # Upstream's per-layer correspondence head names its covisibility logit layer ``disambiguate``.
