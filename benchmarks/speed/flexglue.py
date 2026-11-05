@@ -1,7 +1,9 @@
 """FlexGlue latency on one fixed MegaDepth pair: ``match_keypoints`` (RDD keypoints) and dense ``match()``.
 
-Keypoints are extracted once (RDD fp8, 2048 per image); ``warmups`` untimed calls (including compilation), then
-``iterations`` calls timed with CUDA events. Run each configuration in its own process.
+Keypoints are extracted once (RDD fp8, 2048 per image) and the images are decoded once, so the timed calls take
+tensors (``--from-path`` times the path input instead: file read + nvjpeg decode + upload are then included, ~7 ms
+on an H20). ``warmups`` untimed calls (including compilation), then ``iterations`` calls timed with CUDA events.
+Run each configuration in its own process.
 
     python benchmarks/speed/flexglue.py --preset fp8 --engine compile [--attention sage-fp8-fast]
 """
@@ -15,6 +17,7 @@ import statistics
 import torch
 
 import flashim
+from flashim.models.romav2.model import load_image
 from flashim.paths import IMAGE_A, IMAGE_B
 
 
@@ -41,6 +44,7 @@ def main() -> None:
     parser.add_argument("--max-matches", type=int, default=5000)
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--from-path", action="store_true", help="pass image paths (decoded in every call)")
     parser.add_argument("--tag", default="")
     args = parser.parse_args()
 
@@ -50,13 +54,12 @@ def main() -> None:
     overrides = {"optimize.attention": args.attention} if args.attention else {}
     model = flashim.load("flexglue", args.preset, engine=args.engine, overrides=overrides)
 
-    kp_times, kp_result = timed(
-        lambda: model.match_keypoints(str(IMAGE_A), kpts[0], str(IMAGE_B), kpts[1]), args.warmups, args.iterations)
-    dense_times, dense_result = timed(
-        lambda: model.match(str(IMAGE_A), str(IMAGE_B), max_matches=args.max_matches), args.warmups, args.iterations)
+    a, b = (str(IMAGE_A), str(IMAGE_B)) if args.from_path else (load_image(str(p), model.device) for p in (IMAGE_A, IMAGE_B))
+    kp_times, kp_result = timed(lambda: model.match_keypoints(a, kpts[0], b, kpts[1]), args.warmups, args.iterations)
+    dense_times, dense_result = timed(lambda: model.match(a, b, max_matches=args.max_matches), args.warmups, args.iterations)
     print(json.dumps({
         "tag": args.tag, "preset": model.preset, "engine": args.engine, "attention": args.attention,
-        "top_k": args.top_k,
+        "top_k": args.top_k, "from_path": args.from_path,
         "keypoints_median_ms": round(statistics.median(kp_times), 3), "keypoints_min_ms": round(min(kp_times), 3),
         "keypoints_matches": len(kp_result.confidence),
         "dense_median_ms": round(statistics.median(dense_times), 3), "dense_min_ms": round(min(dense_times), 3),

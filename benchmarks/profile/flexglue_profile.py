@@ -16,6 +16,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 import flashim
+from flashim.models.romav2.model import load_image
 from flashim.paths import IMAGE_A, IMAGE_B
 
 GROUPS = (
@@ -51,8 +52,10 @@ def main() -> None:
     overrides = {"optimize.attention": args.attention} if args.attention else {}
     model = flashim.load("flexglue", args.preset, engine=args.engine, overrides=overrides)
 
+    a, b = (load_image(str(p), model.device) for p in (IMAGE_A, IMAGE_B))  # decoded once: only the model's kernels
+
     def run():
-        return model.match_keypoints(str(IMAGE_A), kpts[0], str(IMAGE_B), kpts[1])
+        return model.match_keypoints(a, kpts[0], b, kpts[1])
 
     for _ in range(10):
         run()
