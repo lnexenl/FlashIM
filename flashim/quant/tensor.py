@@ -59,11 +59,15 @@ class QuantizedTensor:
 
 @dataclass(frozen=True)
 class QuantizedWeight:
-    """E4M3 ``[N, K]`` weight with one exponent per (output row, 32 inputs)."""
+    """E4M3 ``[N, K]`` weight with one exponent per (output row, 32 inputs).
+
+    ``activation_block``: how many input channels share one activation exponent in the layer that owns the weight
+    (32 = every block has its own; 128 = constant over groups of 4 blocks, which lets a GEMM use 1x128 scales)."""
 
     values: Tensor
     scale_exponent: Tensor
     logical_shape: tuple[int, int]
+    activation_block: int = BLOCK
 
     @property
     def out_features(self) -> int:

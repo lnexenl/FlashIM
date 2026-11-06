@@ -36,6 +36,7 @@ class StaticMXFP8Linear(nn.Module):
         super().__init__()
         self.in_features, self.out_features = weight.logical_shape[1], weight.logical_shape[0]
         self.impl = impl
+        self.activation_block = weight.activation_block
         device = weight.values.device
         self.register_buffer("weight_values", weight.values.view(torch.uint8))
         self.register_buffer("weight_exponent", weight.scale_exponent)
@@ -80,7 +81,21 @@ class StaticMXFP8Linear(nn.Module):
             self.weight_values.view(torch.float8_e4m3fn),
             self.weight_exponent,
             (self.out_features, self.in_features),
+            self.activation_block,
         )
+
+    def set_activation_block(self, block: int) -> None:
+        """Share each input exponent over ``block`` channels: the max of its ``block // 32`` blocks, written in place
+        (producers fused earlier hold this buffer) so the packed activations carry one scale per group. Coarser than
+        the calibrated block-32 scales, hence a numerics change (see ``cublas-block128``, which this enables for
+        128). Rebinds the GEMM."""
+        group = block // mx.BLOCK
+        if block % mx.BLOCK or self.input_exponent.numel() % group:
+            raise ValueError(f"activation block {block} does not tile {self.input_exponent.numel()} channel blocks")
+        groups = self.input_exponent.reshape(-1, group)
+        self.input_exponent.copy_(groups.amax(dim=-1, keepdim=True).expand_as(groups).reshape(-1))
+        self.activation_block = block
+        self._bind()
 
     def _finish(self, out: Tensor, leading: tuple[int, ...], dtype: torch.dtype) -> Tensor:
         if self.bias_bf16 is not None:

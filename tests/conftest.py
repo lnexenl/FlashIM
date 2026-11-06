@@ -27,6 +27,7 @@ CAPABILITY = torch.cuda.get_device_capability() if HAS_CUDA else (0, 0)
 def pytest_collection_modifyitems(config, items):
     skips = {
         "cuda": (not HAS_CUDA, "needs CUDA"),
+        "sm90": (CAPABILITY != (9, 0), "needs compute capability 9.0 (Hopper)"),
         "sm120": (CAPABILITY < (10, 0), "needs native MXFP8 scaled_mm (sm_100+)"),
         "weights": (not CHECKPOINT.exists(), f"needs {CHECKPOINT}"),
         "oracle": (importlib.util.find_spec("romav2") is None, "needs the romav2 reference package"),

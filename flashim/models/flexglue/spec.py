@@ -45,6 +45,32 @@ def _sage_attention(model: FlexGlue, ctx: BuildContext) -> str:
     return impl
 
 
+def _hopper(platform) -> bool:
+    return platform.device_type == "cuda" and platform.capability == (9, 0)
+
+
+def _block128(model: FlexGlue, ctx: BuildContext) -> str:
+    """fp8 on Hopper: every transformer MXFP8 linear whose shape tiles takes 1x128 activation / 128x128 weight scales
+    (cuBLAS blockwise FP8, ``cublas-block128``): the input exponents become the max over groups of 4 blocks. Only on
+    132-SM parts (H800 / H100 SXM): the GEMM time was measured there alone."""
+    import torch
+
+    from flashim.quant.methods.linear import StaticMXFP8Linear
+
+    layers = [(n, m) for n, m in model.named_modules() if type(m) is StaticMXFP8Linear]
+    if not layers:
+        return "skipped: no MXFP8 linears"
+    sms = torch.cuda.get_device_properties(layers[0][1].input_exponent.device).multi_processor_count
+    if sms != 132:
+        return f"skipped: {sms} SMs (measured on 132)"
+    done = 0
+    for _, layer in layers:
+        if layer.weight_values.shape[0] % 128 == 0 and layer.weight_values.shape[1] % 128 == 0:
+            layer.set_activation_block(128)
+            done += 1
+    return f"{done}/{len(layers)} linears"
+
+
 def _validate(config: RunConfig) -> None:
     if config.optimize.attention != "sdpa" and config.precision.compute_dtype == "fp32":
         raise ValueError(f"attention={config.optimize.attention!r} needs a bf16 / int8 / fp8 preset (BF16 attention "
@@ -84,6 +110,10 @@ SPEC = ModelSpec(
         "sage_attention": Pass(
             _sage_attention, exact=False,
             description="int8 / fp8: SageAttention (INT8 QK; FP16 / FP8 PV) where measured faster than torch SDPA",
+        ),
+        "block128": Pass(
+            _block128, requires=_hopper, exact=False,
+            description="fp8 on Hopper: cuBLAS blockwise FP8 GEMMs (1x128 activation scales, 128x128 weight blocks)",
         ),
     },
     engines={"eager": EngineSpec(), "compile": EngineSpec(_regions, recompile_limit=64)},
