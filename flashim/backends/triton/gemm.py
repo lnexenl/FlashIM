@@ -30,6 +30,26 @@ def _is_sm90(device: torch.device) -> bool:
     return platform_for(device).capability == (9, 0)
 
 
+_SM_COUNT: dict[tuple[str, int | None], int] = {}  # plain dict: torch.compile traces the lookups (see platform_for)
+
+
+@torch.compiler.disable
+def _probe_sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _is_sm90_132(device: torch.device) -> bool:
+    """The full GH100 (132 SMs: H100 SXM / H800 / GH200, measured on an H800). The H20 (78 SMs) and H100 PCIe (114) are
+    also (9, 0): launch configs tuned on one Hopper SKU do not carry over to another, so they key on the SM count."""
+    if not _is_sm90(device):
+        return False
+    key = (device.type, device.index)
+    count = _SM_COUNT.get(key)
+    if count is None:
+        count = _SM_COUNT[key] = _probe_sm_count(device)
+    return count == 132
+
+
 @triton.jit
 def _fp8_gemm_kernel(
     a_ptr,
@@ -126,35 +146,115 @@ def _gemm_config_sm90(rows: int, k: int, n: int) -> tuple[int, int, int, int, in
 _GEMM_CONFIGS = {(8, 9): _gemm_config_sm89, (9, 0): _gemm_config_sm90}
 
 
+@triton.jit
+def _fp8_gemm_swapped_kernel(
+    a_ptr,
+    a_scale_ptr,
+    b_ptr,
+    b_scale_ptr,
+    bias_ptr,
+    out_ptr,
+    rows,
+    N,
+    K: tl.constexpr,
+    K_BLOCKS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """:func:`_fp8_gemm_kernel` with the MMA operands swapped, bit for bit: the accumulator is ``[BLOCK_N, BLOCK_M]``
+    (the output transposed, stored back transposed), so each of a thread's accumulator rows has ONE scale per 32-wide
+    K block and the scale is a per-row broadcast instead of a per-column vector that took a shared-memory layout
+    round trip, 32 FMULs and a barrier per block (SASS of the original on an H800: 181 instructions per warp and K
+    block, 64 of them the accumulate, the wgmma pipe 1% busy). ``exp2(a_exp + b_exp)`` is the product of the two
+    powers of two (exact), and there are no masks when the tile divides the shape."""
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // num_pid_n
+    pid_n = pid - pid_m * num_pid_n
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < rows
+    mask_n = offs_n < N
+    accumulator = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        for k_tile in tl.static_range(BLOCK_K // 32):
+            offs_k = k0 + k_tile * 32 + tl.arange(0, 32)
+            kb = k0 // 32 + k_tile
+            if EVEN_M:
+                a_bits = tl.load(a_ptr + offs_m[:, None] * K + offs_k[None, :])
+            else:
+                a_bits = tl.load(a_ptr + offs_m[:, None] * K + offs_k[None, :], mask=mask_m[:, None], other=0.0)
+            if EVEN_N:
+                b_bits = tl.load(b_ptr + offs_n[:, None] * K + offs_k[None, :])
+                b_scale_exp = tl.load(b_scale_ptr + offs_n * K_BLOCKS + kb)
+            else:
+                b_bits = tl.load(b_ptr + offs_n[:, None] * K + offs_k[None, :], mask=mask_n[:, None], other=0.0)
+                b_scale_exp = tl.load(b_scale_ptr + offs_n * K_BLOCKS + kb, mask=mask_n, other=-127)
+            scale = tl.exp2((tl.load(a_scale_ptr + kb).to(tl.int32) + b_scale_exp.to(tl.int32)).to(tl.float32))
+            accumulator += tl.dot(b_bits, tl.trans(a_bits)) * scale[:, None]
+    if HAS_BIAS:
+        accumulator += tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)[:, None]
+    tl.store(
+        out_ptr + offs_m[:, None] * N + offs_n[None, :],
+        tl.trans(accumulator).to(tl.bfloat16),
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+def _swapped_config(rows: int, k: int, n: int) -> tuple[int, int, int, int, int] | None:
+    """Launch config of :func:`_fp8_gemm_swapped_kernel` on a 132-SM Hopper (measured on an H800 over BLOCK_M {32 .. 256}
+    x BLOCK_N {64, 128, 256} x BLOCK_K {32, 64} x 4 / 8 warps x 3-5 stages; every swapped config is bit-identical to
+    :func:`_gemm_config_sm90`'s kernel), or ``None`` where that one keeps the shape: 128 x 128 x 64 with 8 warps and 3
+    stages, 8192 rows: 512 -> 512 21.4 -> 15.3 us, 512 -> 1536 46.8 -> 41.9, 1024 -> 512 43.2 -> 24.6, 1024 -> 1024 64.3 ->
+    47.6; 131072 rows (L2-bound, 85%): 512 -> 512 246 -> 235, 1024 -> 1024 847 -> 713; 4096 -> 1024 306.7 -> 192 us at
+    8192 rows. Tile changes alone gain nothing there (old kernel: only 128 x 128 helps, at 8192 rows). Fewer than 8192
+    rows (the old kernel is 1.15-1.2x faster at 128-1024 rows and ties around 2048-5377, wave quantisation) and K < 512
+    (131072 x 256 -> 256 / 1024 lose 4 / 3%) keep :func:`_gemm_config_sm90`; N < 128 was not measured with this kernel."""
+    if rows >= 8192 and k >= 512 and k % 64 == 0 and n % 128 == 0:
+        return 128, 128, 64, 8, 3
+    return None
+
+
 def fp8_gemm_bf16(
-    activation: QuantizedTensor, weight: QuantizedWeight, bias: Tensor | None, config: tuple | None = None
+    activation: QuantizedTensor,
+    weight: QuantizedWeight,
+    bias: Tensor | None,
+    config: tuple | None = None,
+    *,
+    swapped: bool = False,
 ) -> Tensor:
-    """``[rows, K] x [N, K]^T`` with static activation scales; padded BF16 output."""
+    """``[rows, K] x [N, K]^T`` with static activation scales; padded BF16 output. ``config``: (BLOCK_M, BLOCK_N,
+    BLOCK_K, num_warps, num_stages); ``swapped`` runs :func:`_fp8_gemm_swapped_kernel` (same output bits) with it."""
     matrix = activation.matrix().contiguous()
     rows = matrix.shape[0]
     n, k = weight.out_features, weight.in_features
     out = torch.empty(rows, n, device=matrix.device, dtype=torch.bfloat16)
     if config is None:
-        config = _GEMM_CONFIGS.get(platform_for(matrix.device).capability, _gemm_config)(rows, k, n)
+        if _is_sm90_132(matrix.device):
+            config = _swapped_config(rows, k, n)
+            swapped = config is not None
+        if config is None:
+            config = _GEMM_CONFIGS.get(platform_for(matrix.device).capability, _gemm_config)(rows, k, n)
     block_m, block_n, block_k, num_warps, num_stages = config
-    _fp8_gemm_kernel[(triton.cdiv(rows, block_m) * triton.cdiv(n, block_n),)](
-        matrix,
-        activation.scale_exponent,
-        weight.values,
-        weight.scale_exponent,
-        bias if bias is not None else out,
-        out,
-        rows,
-        n,
-        K=k,
-        K_BLOCKS=k // 32,
-        HAS_BIAS=bias is not None,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
+    grid = (triton.cdiv(rows, block_m) * triton.cdiv(n, block_n),)
+    common = {
+        "K": k, "K_BLOCKS": k // 32, "HAS_BIAS": bias is not None, "BLOCK_M": block_m, "BLOCK_N": block_n,
+        "BLOCK_K": block_k, "num_warps": num_warps, "num_stages": num_stages,
+    }
+    if swapped:
+        _fp8_gemm_swapped_kernel[grid](
+            matrix, activation.scale_exponent, weight.values, weight.scale_exponent, bias if bias is not None else out,
+            out, rows, n, EVEN_M=rows % block_m == 0, EVEN_N=n % block_n == 0, **common,
+        )
+    else:
+        _fp8_gemm_kernel[grid](
+            matrix, activation.scale_exponent, weight.values, weight.scale_exponent, bias if bias is not None else out,
+            out, rows, n, **common,
+        )
     return out
 
 
