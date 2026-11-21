@@ -10,6 +10,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | model | what it is | presets |
 |---|---|---|
 | [`romav2`](models/romav2.md) | RoMa v2 dense matcher (DINOv3 ViT-L/16, MV-ViT, DPT head, conv refiners) | `bf16`, `int8`, **`fp8`** |
+| `tiny-roma` | Tiny-RoMa dense matcher (`tiny_roma_v1_outdoor`: XFeat backbone + coarse/fine conv refiners) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | [`rdd`](models/rdd.md) | RDD sparse detector + descriptor (ConvNeXt-tiny, multi-scale deformable transformer) | `fp32`, `bf16`, **`fp8`** |
 | [`aliked`](models/aliked.md) | ALIKED sparse detector + descriptor (deformable-conv encoder, SDDH) | **`fp32`**, `bf16` |
 | [`raco`](models/raco-aliked-lightglue.md) | RaCo keypoint detector + ranker | **`fp32`**, `bf16` |

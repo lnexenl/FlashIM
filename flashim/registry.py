@@ -7,6 +7,7 @@ from flashim.build import register_spec
 
 SPECS = {
     "romav2": "flashim.models.romav2.spec:SPEC",
+    "tiny-roma": "flashim.models.tiny_roma.spec:SPEC",
     "rdd": "flashim.models.rdd.spec:SPEC",
     "lightglue": "flashim.models.lightglue.spec:SPEC",
     "aliked": "flashim.models.aliked.spec:SPEC",
