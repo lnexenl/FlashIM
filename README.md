@@ -19,7 +19,7 @@
   <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/architecture.md">Architecture</a>
 </p>
 
-FlashIM runs image-matching models (dense RoMa v2; sparse RDD, ALIKED, RaCo, SuperPoint, DISK, DeDoDe, LoFTR and others; LightGlue and LoMa matching) faster than their reference
+FlashIM runs image-matching models (dense RoMa v2; detector-free LoFTR and XoFTR; sparse RDD, ALIKED, RaCo, SuperPoint, DISK, DeDoDe and others; LightGlue and LoMa matching) faster than their reference
 implementations, without giving up measured accuracy. Every model is a native PyTorch port checked against the upstream code, and the
 speedups come from quantization (MXFP8, INT8), fused kernels (Triton, TileLang, CUDA C++) and `torch.compile`.
 
@@ -57,6 +57,9 @@ m.indices_A, m.features_A                                    # match indices int
 
 loma = flashim.load("loma-g")                                # LoMa: DaD + LoMa descriptors + matcher (b128, b, l, g, r)
 m = loma.match("a.jpg", "b.jpg", max_matches=4096)           # 4096 keypoints per image (default 2048)
+
+xoftr = flashim.load("xoftr")                                # XoFTR: cross-modal visible-thermal matcher (default 640 px)
+m = xoftr.match("a.jpg", "b.jpg")                            # Matches at original image resolution
 ```
 
 `match(a, b, *, resize, max_matches, threshold)` is the same for every model: `resize` is the long side of the working

@@ -24,6 +24,7 @@ SPECS = {
     "dad": "flashim.models.dad.spec:SPEC",
     "ripe": "flashim.models.ripe.spec:SPEC",
     "loftr": "flashim.models.loftr.spec:SPEC",
+    "xoftr": "flashim.models.xoftr.spec:SPEC",
     "sift": "flashim.models.sift.spec:SPEC",
     "orb": "flashim.models.orb.spec:SPEC",
     "xfeat-lightglue": "flashim.models.lightglue.spec:XFEAT_LIGHTGLUE",

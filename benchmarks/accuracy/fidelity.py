@@ -32,6 +32,7 @@ from flashim.paths import DATA
 PROTOCOL = {  # model -> (resize, top_k), as benchmarks/accuracy/sparse_matrix.sh
     "superpoint": (1600, 4096), "disk": (1600, 4096), "alike": (1600, 4096), "xfeat": (1600, 4096),
     "dedode": (1024, 8192), "dedode-g": (1024, 8192), "dad": (1024, 8192), "ripe": (1024, 4096), "loftr": (840, 0),
+    "xoftr": (640, 0),
     # LoMa: upstream's benchmark protocol (DaD at a 1024 px long side, 4096 keypoints)
     **{f"loma-{variant}": (1024, 4096) for variant in ("b128", "b", "l", "g", "r")},
 }
@@ -70,7 +71,7 @@ def agreement(ref_a, ref_b, a, b, radius: float = 2.0) -> float:
 
 def evaluate(model_name: str, presets: list[str], image_pairs: list[tuple[str, str]]) -> list[dict]:
     resize, top_k = PROTOCOL[model_name]
-    pair_level = model_name == "loftr"
+    pair_level = model_name in ("loftr", "xoftr")
     reference: dict[str, object] = {}
     rows = []
     for preset in ["fp32", *presets]:
