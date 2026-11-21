@@ -61,6 +61,25 @@ def _depthwise5x5_relu_int8_reference(value: Tensor, weight: Tensor, bias: Tenso
 depthwise5x5_relu_int8 = Op("depthwise5x5_relu_int8", _depthwise5x5_relu_int8_reference)
 
 
+# -- BF16 depthwise 5x5 + bias + ReLU (channels-last output) --------------------------------------
+
+
+def _depthwise5x5_relu_reference(value: Tensor, weight: Tensor, bias: Tensor) -> Tensor:
+    """Depthwise 5x5 (pad 2) on BF16-rounded inputs, + FP32 bias, ReLU -> BF16 ``[B, H, W, C]`` (contiguous).
+
+    ``value`` is ``[B, C, H, W]``; ``weight`` is packed ``[25, C]`` (ky, kx major); ``bias`` is FP32 ``[C]``.
+    Paired with ``F.linear`` (cuBLAS BF16 GEMM with fused bias) for large-channel separable conv blocks
+    (``C > 128``) where the fully fused ``depthwise5x5_relu_pointwise`` kernel cannot fit ``[BW, C]`` in registers.
+    """
+    channels = value.shape[1]
+    kernel = weight.float().t().reshape(channels, 1, 5, 5)
+    out = F.relu(F.conv2d(value.to(torch.bfloat16).float(), kernel, bias.float(), padding=2, groups=channels))
+    return out.to(torch.bfloat16).permute(0, 2, 3, 1).contiguous()
+
+
+depthwise5x5_relu = Op("depthwise5x5_relu", _depthwise5x5_relu_reference)
+
+
 # -- BF16 depthwise 5x5 + bias + ReLU + pointwise + bias (fused refiner block) -----------------
 
 

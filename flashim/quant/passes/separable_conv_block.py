@@ -14,10 +14,12 @@ quantization already packed (:class:`StaticInt8Conv1x1`, any channel count with 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from flashim import ops
 from flashim.layers import SeparableConvBlock
+from flashim.ops.conv import DEPTHWISE5X5_RELU_POINTWISE_CHANNELS
 from flashim.quant.formats import int8, mx
 from flashim.quant.methods.int8_linear import StaticInt8Conv1x1
 from flashim.quant.tensor import Int8Tensor
@@ -70,7 +72,9 @@ class MXFP8SeparableConvBlock(nn.Module):
     def __init__(self, block: nn.Module) -> None:
         super().__init__()
         depthwise, pointwise = block.conv_depthwise, block.conv_pointwise
-        self.channels = channels = _check_block(block, (32, 128, 512))
+        self.channels = channels = _check_block(block)
+        if channels % 32 != 0:
+            raise ValueError(f"MXFP8SeparableConvBlock requires channels divisible by 32, got {channels}")
         self.register_buffer("depthwise_weight", _packed_depthwise_weight(depthwise))
         self.register_buffer("depthwise_bias", depthwise.bias.detach().float().contiguous())
         weight = pointwise.weight.detach().reshape(channels, channels)
@@ -195,7 +199,8 @@ def fuse_int8_producers(model: nn.Module, prefixes: tuple[str, ...]) -> list[str
 
 
 class BF16SeparableConvBlock(nn.Module):
-    """BF16 block as one kernel: depthwise 5x5 + bias + ReLU + pointwise + bias.
+    """BF16 block as one fused kernel (``C in {16, 32, 64, 128}``: ``ops.depthwise5x5_relu_pointwise``) or two
+    kernels (``C > 128``: row-rolling ``ops.depthwise5x5_relu`` feeding cuBLAS ``F.linear`` with fused bias).
 
     Same precision as the autocast BF16 block (BF16 weights and activations, FP32
     accumulation); differs only in reduction order and in adding biases before rounding.
@@ -205,8 +210,12 @@ class BF16SeparableConvBlock(nn.Module):
         super().__init__()
         depthwise, pointwise = block.conv_depthwise, block.conv_pointwise
         self.channels = channels = _check_block(block)
+        self.fused_pointwise = channels in DEPTHWISE5X5_RELU_POINTWISE_CHANNELS
         self.register_buffer("depthwise_weight", _packed_depthwise_weight(depthwise))
-        self.register_buffer("depthwise_bias", depthwise.bias.detach().to(torch.bfloat16))
+        self.register_buffer(
+            "depthwise_bias",
+            depthwise.bias.detach().to(torch.bfloat16) if self.fused_pointwise else depthwise.bias.detach().float().contiguous(),
+        )
         self.register_buffer(
             "pointwise_weight", pointwise.weight.detach().reshape(channels, channels).to(torch.bfloat16).contiguous()
         )
@@ -215,9 +224,12 @@ class BF16SeparableConvBlock(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if not x.is_contiguous(memory_format=torch.channels_last):
             x = x.contiguous(memory_format=torch.channels_last)
-        return ops.depthwise5x5_relu_pointwise(
-            x, self.depthwise_weight, self.depthwise_bias, self.pointwise_weight, self.pointwise_bias
-        )
+        if self.fused_pointwise:
+            return ops.depthwise5x5_relu_pointwise(
+                x, self.depthwise_weight, self.depthwise_bias, self.pointwise_weight, self.pointwise_bias
+            )
+        hidden = ops.depthwise5x5_relu(x, self.depthwise_weight, self.depthwise_bias)
+        return F.linear(hidden, self.pointwise_weight, self.pointwise_bias).permute(0, 3, 1, 2)
 
     def extra_repr(self) -> str:
         return f"channels={self.channels}, bf16 dwconv5x5+relu+pointwise fused"

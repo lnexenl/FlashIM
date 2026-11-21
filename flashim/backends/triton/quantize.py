@@ -20,7 +20,7 @@ from flashim.backends.triton._layernorm_stats import THREADS as LN_THREADS
 from flashim.backends.triton._layernorm_stats import torch_layernorm_apply, torch_layernorm_stats
 from flashim.backends.triton._libdevice import gelu_erf, gelu_launch_kwargs, torch_gelu_libdevice
 from flashim.ops._registry import DeviceSpec
-from flashim.platforms import Feature
+from flashim.platforms import Feature, platform_for
 from flashim.quant.formats.mx import padded_channels
 from flashim.quant.tensor import Int8Tensor, QuantizedTensor
 
@@ -705,11 +705,18 @@ def _layernorm_rows_eligible(value, weight, bias, eps) -> bool:
     )
 
 
-# Bit-exact against ``nn.LayerNorm`` + ``quantize_int8_rows`` as measured on an L20 (sm_89) and an H20 (sm_90) only:
-# other architectures run the torch reference until someone has checked them.
+# Bit-exact against ``nn.LayerNorm`` + ``quantize_int8_rows`` as measured on L20 (sm_89), H20 (sm_90), and
+# RTX 5070 Ti (sm_120); other architectures run the torch reference until checked.
+def _layernorm_rows_arch(value, weight, bias, eps) -> bool:
+    return (
+        platform_for(value.device).capability in ((8, 9), (9, 0), (12, 0))
+        and _layernorm_rows_eligible(value, weight, bias, eps)
+    )
+
+
 ops.layernorm_quantize_int8_rows.register(
-    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)), requires=[Feature.TRITON],
-    when=_layernorm_rows_eligible,
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 9)), requires=[Feature.TRITON],
+    when=_layernorm_rows_arch,
 )(layernorm_quantize_int8_rows)
 ops.quantize_int8_rows.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON],

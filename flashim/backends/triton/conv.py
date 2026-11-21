@@ -512,7 +512,7 @@ def depthwise5x5_relu_pointwise_int8(
 def _depthwise_eligible(value: Tensor, weight: Tensor, bias: Tensor, *_) -> bool:
     return (
         value.ndim == 4
-        and value.shape[1] in (32, 128, 512)
+        and value.shape[1] % 32 == 0
         and value.is_contiguous(memory_format=torch.channels_last)
         and tuple(weight.shape) == (25, value.shape[1])
     )
@@ -522,7 +522,7 @@ ops.depthwise5x5_relu_mxfp8.register(  # an E4M3 producer: see ``backends/triton
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3], when=_depthwise_eligible
 )(depthwise5x5_relu_mxfp8)
 def _depthwise_int8_eligible(value: Tensor, weight: Tensor, bias: Tensor, *_) -> bool:
-    """Any channel count % 32 (the MXFP8 producer stays at 32 / 128 / 512). The fused producer beats the unfused block
+    """Any channel count % 32 (matching the MXFP8 producer). The fused producer beats the unfused block
     (cuDNN depthwise, ReLU, quantize, GEMM; whole ``Int8ProducerSeparableConvBlock``, DeDoDe's real shapes, CUDA-graph
     replay) at the 256 and 768 channels it newly covers: L20 256 x 224 x 300 0.245 -> 0.139 ms, 768 x 64 x 84 0.083 ->
     0.059; H20 0.328 -> 0.203, 0.100 -> 0.072 (512 channels: 0.137 -> 0.096 / 0.177 -> 0.136). Unmeasured on sm_80 /
@@ -1328,3 +1328,91 @@ def _conv2d_single_output_eligible(x: Tensor, weight: Tensor, bias: Tensor | Non
 ops.conv2d_single_output.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_conv2d_single_output_eligible
 )(_conv2d_single_output_triton)
+
+
+# -- BF16 depthwise 5x5 + bias + ReLU (channels-last output) --------------------------------------
+
+
+@triton.jit
+def _depthwise5x5_relu_bf16_kernel(
+    input_ptr,
+    weight_ptr,
+    bias_ptr,
+    output_ptr,
+    HEIGHT: tl.constexpr,
+    WIDTH: tl.constexpr,
+    CHANNELS: tl.constexpr,
+    GROUPS: tl.constexpr,
+    BW: tl.constexpr,
+    TILE_H: tl.constexpr,
+):
+    """Row-rolling BF16 depthwise 5x5 + FP32 bias + ReLU -> BF16 ``[B, H, W, C]``."""
+    x = tl.program_id(0) * BW + tl.arange(0, BW)
+    y_start = tl.program_id(1) * TILE_H
+    batch = tl.program_id(2) // GROUPS
+    group = tl.program_id(2) % GROUPS
+    x_ok = x < WIDTH
+    channel = group * 32 + tl.arange(0, 32)
+    c_ok = channel < CHANNELS
+    bias = tl.load(bias_ptr + channel, mask=c_ok, other=0.0).to(tl.float32)
+    acc0 = tl.zeros((BW, 32), dtype=tl.float32)
+    acc1 = tl.zeros((BW, 32), dtype=tl.float32)
+    acc2 = tl.zeros((BW, 32), dtype=tl.float32)
+    acc3 = tl.zeros((BW, 32), dtype=tl.float32)
+    acc4 = tl.zeros((BW, 32), dtype=tl.float32)
+    for step in range(TILE_H + 4):
+        input_y = y_start - 2 + step
+        row_ok = (input_y >= 0) & (input_y < HEIGHT)
+        row_base = (batch * HEIGHT + input_y) * WIDTH
+        for kx in tl.static_range(5):
+            ix = x + (kx - 2)
+            mask = (x_ok & row_ok & (ix >= 0) & (ix < WIDTH))[:, None] & c_ok[None, :]
+            vals = tl.load(input_ptr + (row_base + ix)[:, None] * CHANNELS + channel[None, :], mask=mask, other=0.0)
+            vals = vals.to(tl.bfloat16).to(tl.float32)
+            acc4 += vals * tl.load(weight_ptr + (0 * 5 + kx) * CHANNELS + channel, mask=c_ok, other=0.0).to(tl.float32)[None, :]
+            acc3 += vals * tl.load(weight_ptr + (1 * 5 + kx) * CHANNELS + channel, mask=c_ok, other=0.0).to(tl.float32)[None, :]
+            acc2 += vals * tl.load(weight_ptr + (2 * 5 + kx) * CHANNELS + channel, mask=c_ok, other=0.0).to(tl.float32)[None, :]
+            acc1 += vals * tl.load(weight_ptr + (3 * 5 + kx) * CHANNELS + channel, mask=c_ok, other=0.0).to(tl.float32)[None, :]
+            acc0 += vals * tl.load(weight_ptr + (4 * 5 + kx) * CHANNELS + channel, mask=c_ok, other=0.0).to(tl.float32)[None, :]
+        out_y = input_y - 2
+        if (step >= 4) & (out_y < HEIGHT):
+            act = tl.maximum(acc0 + bias[None, :], 0.0).to(tl.bfloat16)
+            row = (batch * HEIGHT + out_y) * WIDTH + x
+            tl.store(output_ptr + row[:, None] * CHANNELS + channel[None, :], act, mask=x_ok[:, None] & c_ok[None, :])
+        acc0, acc1, acc2, acc3 = acc1, acc2, acc3, acc4
+        acc4 = tl.zeros((BW, 32), dtype=tl.float32)
+
+
+def depthwise5x5_relu(
+    value: Tensor, weight: Tensor, bias: Tensor, *, bw: int | None = None, tile_h: int | None = None, num_warps: int = 4
+) -> Tensor:
+    """Row-rolling BF16 depthwise 5x5 + FP32 bias + ReLU -> BF16 ``[B, H, W, C]`` contiguous."""
+    batch, channels, height, width = value.shape
+    bw = bw or (32 if width > 32 else 16)
+    tile_h = tile_h or (32 if height > 64 else 16)
+    groups = triton.cdiv(channels, 32)
+    out = torch.empty((batch, height, width, channels), device=value.device, dtype=torch.bfloat16)
+    _depthwise5x5_relu_bf16_kernel[(triton.cdiv(width, bw), triton.cdiv(height, tile_h), batch * groups)](
+        value, weight, bias, out,
+        HEIGHT=height, WIDTH=width, CHANNELS=channels, GROUPS=groups, BW=bw, TILE_H=tile_h, num_warps=num_warps,
+    )
+    return out
+
+
+def _depthwise_relu_eligible(value: Tensor, weight: Tensor, bias: Tensor) -> bool:
+    return (
+        value.ndim == 4
+        and value.dtype == torch.bfloat16
+        and value.is_contiguous(memory_format=torch.channels_last)
+        and tuple(weight.shape) == (25, value.shape[1])
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and tuple(bias.shape) == (value.shape[1],)
+        and bias.dtype == torch.float32
+        and (value.numel() + 128 * value.shape[1]) < 2**31
+    )
+
+
+ops.depthwise5x5_relu.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_depthwise_relu_eligible
+)(depthwise5x5_relu)

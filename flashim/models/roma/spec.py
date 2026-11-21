@@ -18,10 +18,15 @@ from torch import nn
 from flashim.build import BuildContext, EngineSpec, ModelSpec, Pass
 from flashim.build import dtype as resolve_dtype
 from flashim.config import RunConfig
+from flashim.models.dedode.spec import fused_first_conv_epilogue, fused_pool_epilogue
 from flashim.models.roma import quant
 from flashim.models.roma.config import RoMaConfig
 from flashim.models.roma.model import RoMa
-from flashim.quant.passes.separable_conv_block import fold_block_batchnorm
+from flashim.quant.passes.separable_conv_block import (
+    fold_block_batchnorm,
+    fuse_bf16_blocks,
+    fuse_int8_producers,
+)
 from flashim.quant.passes.transformer_block import (
     QuantizedAttention,
     enable_fused_epilogues,
@@ -34,6 +39,16 @@ COMPILE_REGIONS = (
     "decoder.embedding_decoder",
     *(f"decoder.conv_refiner.{s}.{part}" for s in ("16", "8", "4", "2", "1") for part in ("block1", "hidden_blocks")),
 )
+
+
+def _compile_regions(model: nn.Module) -> tuple[str, ...]:
+    """Skip compile regions under ``int8`` (every heavy block is already fused Triton/TileLang with <0.5 ms launch
+    gap, and Dynamo 2.11 cannot trace ``@triton.autotune`` inside ``StaticInt8Conv2d``)."""
+    from flashim.quant.methods.conv2d import StaticInt8Conv2d
+
+    if any(isinstance(m, StaticInt8Conv2d) for m in model.encoder.cnn.modules()):
+        return ()
+    return COMPILE_REGIONS
 
 
 def _loader(default_variant: str):
@@ -68,14 +83,35 @@ def _fold_batchnorm(model: RoMa, ctx: BuildContext) -> int:
     return folded
 
 
+def _pad_refiners(model: RoMa, ctx: BuildContext) -> dict[str, int]:
+    """Zero-pad ConvRefiner channels (1377/1137/569/144/24 -> 1408/1152/576/192/32); mathematically exact.
+
+    For ``fp8``, enables ``fuse_quantized`` on scales 16/8/4/2 so ``quantize_model`` builds dynamic
+    :class:`MXFP8SeparableConvBlock` modules (TileLang TMA depthwise producer -> cuBLAS ``mxfp8_scaled_mm``).
+    """
+    padded = {}
+    enable_mx_fuse = ctx.config.precision.quant == "fp8"
+    for scale, target in quant.REFINER_PADDED_CHANNELS.items():
+        refiner = model.decoder.conv_refiner[scale]
+        if refiner.pad_channels(target):
+            padded[scale] = target
+        if enable_mx_fuse and scale != "1":
+            for block in (refiner.block1, *refiner.hidden_blocks):
+                block.fuse_quantized = True
+    return padded
+
+
 def _channels_last(model: RoMa, ctx: BuildContext) -> list[str]:
-    """NHWC weights and inputs for VGG19-BN and the 5 ConvRefiners."""
+    """NHWC weights and inputs for VGG19-BN (skipped when VGG is INT8-quantized, which reads NCHW) and refiners."""
     applied = []
-    model.encoder.channels_last = True
-    for m in model.encoder.cnn.modules():
-        if isinstance(m, nn.Conv2d):
-            m.weight.data = m.weight.data.to(memory_format=torch.channels_last)
-    applied.append("encoder.cnn")
+    q = ctx.config.precision.quant
+    vgg_quantized = q is not None and ctx.spec.quant_configs[q].scheme_for("encoder.cnn.layers.3") is not None
+    if not vgg_quantized:
+        model.encoder.channels_last = True
+        for m in model.encoder.cnn.modules():
+            if isinstance(m, nn.Conv2d):
+                m.weight.data = m.weight.data.to(memory_format=torch.channels_last)
+        applied.append("encoder.cnn")
     for scale, refiner in model.decoder.conv_refiner.items():
         refiner.channels_last = True
         for m in (*refiner.block1.modules(), *refiner.hidden_blocks.modules()):
@@ -83,6 +119,35 @@ def _channels_last(model: RoMa, ctx: BuildContext) -> list[str]:
                 m.weight.data = m.weight.data.to(memory_format=torch.channels_last)
         applied.append(f"decoder.conv_refiner.{scale}")
     return applied
+
+
+def _fused_refiner_io(model: RoMa, ctx: BuildContext) -> list[str]:
+    """Fuse refiner input assembly (``ops.roma_refiner_input``), FP32 3-ch output head (``ops.roma_refiner_head``),
+    channels-last projection GEMMs, and contiguous last-dim coarse softmax (avoids 4.1 ms SpatialSoftMax)."""
+    model.decoder.fused_io = True
+    model.decoder.fast_softmax = True
+    applied = []
+    for scale, refiner in model.decoder.conv_refiner.items():
+        refiner.enable_fused_io()
+        applied.append(f"decoder.conv_refiner.{scale}")
+    return applied
+
+
+def _fused_bf16_refiners(model: RoMa, ctx: BuildContext) -> list[str]:
+    """Replace all 5 ConvRefiners' separable conv blocks with :class:`BF16SeparableConvBlock`."""
+    return fuse_bf16_blocks(model, ("decoder.conv_refiner.",))
+
+
+def _fused_bf16_s1(model: RoMa, ctx: BuildContext) -> list[str]:
+    """Replace scale-1 ConvRefiner blocks (padded to 32 ch) with fused 32-ch :class:`BF16SeparableConvBlock`."""
+    return fuse_bf16_blocks(model, ("decoder.conv_refiner.1.",))
+
+
+def _int8_refiner_producers(model: RoMa, ctx: BuildContext) -> list[str] | str:
+    """int8: fuse depthwise 5x5 + ReLU + static INT8 quantize (TileLang TMA / Triton) into scales 16/8/4/2."""
+    if ctx.config.precision.quant != "int8":
+        return "skipped: not int8"
+    return fuse_int8_producers(model, ("decoder.conv_refiner.",))
 
 
 def _fold_layer_scale(model: RoMa, ctx: BuildContext) -> list[str] | str:
@@ -110,13 +175,15 @@ def _set_precision(model: RoMa, config: RunConfig) -> None:
     dt = resolve_dtype(config.precision.compute_dtype)
     if dt == torch.float32:
         return
-    # Cast encoders, coarse TransformerDecoder, and refiner conv stacks to compute_dtype;
-    # keep geometry/coordinate layers (GP, projections, disp_emb, out_conv) in FP32.
+    # Cast encoders, coarse TransformerDecoder, fine refiner projections (scales 8/4/2/1), and refiner conv stacks
+    # to compute_dtype; keep scale-16 projection (feeds GP Cholesky), GP, disp_emb, and out_conv in FP32.
     model.encoder.cnn.to(dt)
     model.encoder.dinov2.to(dt)
     model.decoder.embedding_decoder.blocks.to(dt)
     model.decoder.embedding_decoder.to_out.to(dt)
     model.decoder.embedding_decoder.compute_dtype = dt
+    for scale in ("8", "4", "2", "1"):
+        model.decoder.proj[scale].to(dt)
     for refiner in model.decoder.conv_refiner.values():
         refiner.block1.to(dt)
         refiner.hidden_blocks.to(dt)
@@ -137,11 +204,32 @@ PASSES = {
     "fold_batchnorm": Pass(
         _fold_batchnorm, stage="pre_quant", exact=False, description="fold eval BatchNorm into VGG, proj, and refiners"
     ),
+    "pad_refiners": Pass(
+        _pad_refiners, stage="pre_quant", description="zero-pad refiner channels to 1408/1152/576/192/32"
+    ),
     "channels_last": Pass(
         _channels_last, stage="pre_quant", exact=False, description="NHWC weights and inputs for VGG and refiners"
     ),
     "fold_layer_scale": Pass(
         _fold_layer_scale, stage="pre_quant", exact=False, description="fold DINOv2 LayerScale into proj / fc2"
+    ),
+    "fused_bf16_refiners": Pass(
+        _fused_bf16_refiners, exact=False, description="bf16: fused depthwise+ReLU (+ pointwise at scale 1) refiners"
+    ),
+    "fused_refiner_io": Pass(
+        _fused_refiner_io, exact=False, description="fused refiner input/head Triton ops + last-dim coarse softmax"
+    ),
+    "fused_bf16_s1": Pass(
+        _fused_bf16_s1, exact=False, description="fused 32-channel BF16 scale-1 refiner blocks"
+    ),
+    "int8_refiner_producers": Pass(
+        _int8_refiner_producers, exact=False, description="int8: TileLang/Triton depthwise+ReLU->INT8 refiner producers"
+    ),
+    "fused_pool_epilogue": Pass(
+        fused_pool_epilogue, description="int8: max pool + next conv quantize in VGG INT8 conv epilogue"
+    ),
+    "fused_first_conv_epilogue": Pass(
+        fused_first_conv_epilogue, description="int8: first VGG conv bias + ReLU + quantize as one pass"
     ),
     "fused_dynamic_vit_blocks": Pass(
         _fused_dynamic_vit_blocks, description="int8: fused LayerNorm + row quantize and epilogues for DINOv2 blocks"
@@ -157,17 +245,40 @@ def _spec(name: str, default_variant: str, description: str) -> ModelSpec:
         "fp32": {},
         "bf16": {
             "precision": {"compute_dtype": "bf16"},
-            "optimize": {"passes": ["fold_batchnorm", "channels_last"]},
+            "optimize": {
+                "passes": ["fold_batchnorm", "pad_refiners", "channels_last", "fused_bf16_refiners", "fused_refiner_io"]
+            },
         },
         "int8": {
-            "extends": "bf16",
-            "precision": {"quant": "int8"},
-            "optimize": {"passes+": ["fold_layer_scale", "fused_dynamic_vit_blocks"]},
+            "precision": {"compute_dtype": "bf16", "quant": "int8"},
+            "optimize": {
+                "passes": [
+                    "fold_batchnorm",
+                    "pad_refiners",
+                    "channels_last",
+                    "fold_layer_scale",
+                    "fused_dynamic_vit_blocks",
+                    "int8_refiner_producers",
+                    "fused_pool_epilogue",
+                    "fused_first_conv_epilogue",
+                    "fused_bf16_s1",
+                    "fused_refiner_io",
+                ]
+            },
         },
         "fp8": {
-            "extends": "bf16",
-            "precision": {"quant": "fp8"},
-            "optimize": {"passes+": ["fold_layer_scale", "fused_block_epilogues"]},
+            "precision": {"compute_dtype": "bf16", "quant": "fp8"},
+            "optimize": {
+                "passes": [
+                    "fold_batchnorm",
+                    "pad_refiners",
+                    "channels_last",
+                    "fold_layer_scale",
+                    "fused_block_epilogues",
+                    "fused_bf16_s1",
+                    "fused_refiner_io",
+                ]
+            },
         },
     }
     if default_variant != "outdoor":
@@ -191,7 +302,7 @@ def _spec(name: str, default_variant: str, description: str) -> ModelSpec:
         calibrations=calibrations,
         protected=quant.PROTECTED,
         passes=PASSES,
-        engines={"eager": EngineSpec(), "compile": EngineSpec(COMPILE_REGIONS)},
+        engines={"eager": EngineSpec(), "compile": EngineSpec(_compile_regions)},
         set_precision=_set_precision,
         set_attention=_set_attention,
         apply_inference=_apply_inference,

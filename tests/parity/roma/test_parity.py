@@ -97,13 +97,13 @@ def test_fp32_bit_exact_against_oracle(romatch_pkg, name, variant, fp32_highest,
         assert torch.equal(out_ref.overlap_AB[..., 0], ref_cab)
         assert torch.equal(out_ref.overlap_BA[..., 0], ref_cba)
 
-        # 2) Default Triton local_corr stays very close
+        # 2) Default Triton local_corr (scales 16, 8, 4) stays very close
         ops.configure(None)
         out_def = model.forward_normalized(an_lr, bn_lr, an_hr, bn_hr)
-        assert (out_def.warp_AB - ref_ab).abs().max() < 2e-3
-        assert (out_def.warp_BA - ref_ba).abs().max() < 2e-3
-        assert (out_def.overlap_AB[..., 0] - ref_cab).abs().max() < 2e-3
-        assert (out_def.overlap_BA[..., 0] - ref_cba).abs().max() < 2e-3
+        assert (out_def.warp_AB - ref_ab).abs().max() < 5e-3 and (out_def.warp_AB - ref_ab).abs().mean() < 1e-4
+        assert (out_def.warp_BA - ref_ba).abs().max() < 5e-3 and (out_def.warp_BA - ref_ba).abs().mean() < 1e-4
+        assert (out_def.overlap_AB[..., 0] - ref_cab).abs().max() < 5e-3
+        assert (out_def.overlap_BA[..., 0] - ref_cba).abs().max() < 5e-3
 
         # 3) Sampling parity: bit-exact with reference KDE and the same RNG seed
         torch.manual_seed(0)

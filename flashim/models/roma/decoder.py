@@ -60,6 +60,25 @@ def cls_to_flow_refine(cls: Tensor) -> Tensor:
     return (flow / neighbours.sum(dim=1)).permute(0, 3, 1, 2)
 
 
+def cls_to_flow_refine_hwc(cls: Tensor) -> Tensor:
+    """``[B, H, W, R^2]`` contiguous logits -> ``[B, 2, H, W]`` warp using fast last-dim warp-shuffle softmax."""
+    c = cls.shape[-1]
+    res = round(math.sqrt(c))
+    grid = normalized_grid(1, res, res, cls.device).reshape(c, 2)
+    probs = cls.float().softmax(dim=-1)
+    mode = probs.argmax(dim=-1)
+    index = torch.stack((mode - 1, mode, mode + 1, mode - res, mode + res), dim=-1).clamp(0, c - 1)
+    neighbours = torch.gather(probs, dim=-1, index=index)
+    flow = (
+        neighbours[..., 0:1] * grid[index[..., 0]]
+        + neighbours[..., 1:2] * grid[index[..., 1]]
+        + neighbours[..., 2:3] * grid[index[..., 2]]
+        + neighbours[..., 3:4] * grid[index[..., 3]]
+        + neighbours[..., 4:5] * grid[index[..., 4]]
+    )
+    return (flow / neighbours.sum(dim=-1, keepdim=True)).permute(0, 3, 1, 2).contiguous()
+
+
 class CosKernel(nn.Module):
     """Cosine-similarity exponential kernel ``exp((cos(x, y) - 1) / T)``."""
 
@@ -69,8 +88,9 @@ class CosKernel(nn.Module):
 
     def forward(self, x: Tensor, y: Tensor, eps: float = 1e-6) -> Tensor:
         c = torch.einsum("bnd,bmd->bnm", x, y) / (x.norm(dim=-1)[..., None] * y.norm(dim=-1)[:, None] + eps)
-        # Tensor divisor (not Python float) keeps IEEE div(c - 1, T) instead of mul(c - 1, 1/T), bit-exact to upstream.
-        t = torch.tensor(self.temperature, device=c.device, dtype=c.dtype)
+        # Tensor divisor (not Python float) keeps IEEE div(c - 1, T) instead of mul(c - 1, 1/T), bit-exact to upstream,
+        # and torch.full allocates directly on-device (no H2D copy, CUDA-graph safe).
+        t = torch.full((), self.temperature, device=c.device, dtype=c.dtype)
         return ((c - 1.0) / t).exp()
 
 
@@ -117,13 +137,16 @@ class TransformerDecoder(nn.Module):
         self.to_out = nn.Linear(hidden_dim, self.out_dim)
         self.compute_dtype = torch.float32
 
-    def forward(self, gp_posterior: Tensor, features: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, gp_posterior: Tensor, features: Tensor, *, hwc_cls: bool = False) -> tuple[Tensor, Tensor]:
         b, _, h, w = gp_posterior.shape
         x = torch.cat((gp_posterior, features), dim=1)
         tokens = x.flatten(2).transpose(1, 2).to(self.compute_dtype)
         z = self.blocks(tokens)
         out_dtype = self.to_out.weight.dtype if isinstance(self.to_out, nn.Linear) else self.compute_dtype
         out = self.to_out(z.to(out_dtype)).float()
+        if hwc_cls:
+            out_hwc = out.view(b, h, w, self.out_dim)
+            return out_hwc[..., :-1], out_hwc[..., -1:].permute(0, 3, 1, 2).contiguous()
         out = out.transpose(1, 2).reshape(b, self.out_dim, h, w)
         return out[:, :-1], out[:, -1:]
 
@@ -146,8 +169,85 @@ class ConvRefiner(nn.Module):
         self.local_corr_radius = spec.local_corr_radius
         self.compute_dtype = torch.float32
         self.channels_last = False
+        self.padded_channels = channels
+        self.fused_io = False
+        self.register_buffer("_head_weight", None, persistent=False)
 
-    def forward(self, x: Tensor, y: Tensor, warp: Tensor, *, scale_factor: float = 1.0) -> tuple[Tensor, Tensor]:
+    def enable_fused_io(self) -> None:
+        """Enable fused Triton refiner input assembly (``ops.roma_refiner_input``) and FP32 head (``ops.roma_refiner_head``)."""
+        orig = self.spec.channels
+        self.register_buffer("_head_weight", self.out_conv.weight.detach()[:, :orig, 0, 0].float().contiguous(), persistent=False)
+        self.fused_io = True
+
+    def pad_channels(self, target: int) -> bool:
+        """Zero-pad separable block channels from ``spec.channels`` to ``target`` (must run after BatchNorm folding).
+
+        Mathematically exact: extra input channels are zero-padded and extra weight/bias rows and columns are zero,
+        so extra feature channels stay identically zero through every block and contribute zero to ``out_conv``.
+        Aligning RoMa's odd channel counts (1377/1137/569/144/24 -> 1408/1152/576/192/32) unlocks aligned BF16
+        cuBLAS GEMMs, TileLang TMA depthwise producers (C % 64 == 0), cuBLAS MXFP8 / INT8 GEMMs, and the fused
+        32-channel BF16 block at scale 1.
+        """
+        orig = self.padded_channels
+        if target <= orig:
+            return False
+
+        def _pad_dw(conv: nn.Conv2d) -> nn.Conv2d:
+            out = nn.Conv2d(
+                target, target, conv.kernel_size, stride=conv.stride, padding=conv.padding,
+                groups=target, bias=conv.bias is not None, device=conv.weight.device, dtype=conv.weight.dtype,
+            )
+            with torch.no_grad():
+                out.weight.zero_()
+                out.weight[:orig].copy_(conv.weight)
+                if conv.bias is not None:
+                    out.bias.zero_()
+                    out.bias[:orig].copy_(conv.bias)
+            return out
+
+        def _pad_pw(conv: nn.Conv2d) -> nn.Conv2d:
+            out = nn.Conv2d(
+                target, target, conv.kernel_size, stride=conv.stride, padding=conv.padding,
+                bias=conv.bias is not None, device=conv.weight.device, dtype=conv.weight.dtype,
+            )
+            with torch.no_grad():
+                out.weight.zero_()
+                out.weight[:orig, :orig].copy_(conv.weight)
+                if conv.bias is not None:
+                    out.bias.zero_()
+                    out.bias[:orig].copy_(conv.bias)
+            return out
+
+        for block in (self.block1, *self.hidden_blocks):
+            if not isinstance(block.norm, nn.Identity):
+                raise TypeError("pad_channels requires folded BatchNorm (run fold_batchnorm first)")
+            block.conv_depthwise = _pad_dw(block.conv_depthwise)
+            block.conv_pointwise = _pad_pw(block.conv_pointwise)
+        out_conv = nn.Conv2d(
+            target, self.out_conv.out_channels, 1, 1, 0,
+            bias=self.out_conv.bias is not None, device=self.out_conv.weight.device, dtype=self.out_conv.weight.dtype,
+        )
+        with torch.no_grad():
+            out_conv.weight.zero_()
+            out_conv.weight[:, :orig].copy_(self.out_conv.weight)
+            if self.out_conv.bias is not None:
+                out_conv.bias.copy_(self.out_conv.bias)
+        self.out_conv = out_conv
+        self.padded_channels = target
+        return True
+
+    def forward(
+        self, x: Tensor, y: Tensor, warp: Tensor, *, scale_factor: float = 1.0, pair: int = 0
+    ) -> tuple[Tensor, Tensor]:
+        if self.fused_io and self.compute_dtype == torch.bfloat16:
+            radius = -1 if self.local_corr_radius is None else self.local_corr_radius
+            d = ops.roma_refiner_input(
+                x, y, warp, self.disp_emb.weight, self.disp_emb.bias, scale_factor, radius, self.padded_channels, pair
+            )
+            d = self.block1(d)
+            d = self.hidden_blocks(d)
+            head_w = self._head_weight if self._head_weight is not None else self.out_conv.weight[:, : self.spec.channels, 0, 0]
+            return ops.roma_refiner_head(d, head_w, self.out_conv.bias)
         b, _, hs, ws = x.shape
         warp_bhwc = warp.permute(0, 2, 3, 1)
         x_hat = grid_sample(y, warp_bhwc, align_corners=False, mode="bilinear")
@@ -159,6 +259,8 @@ class ConvRefiner(nn.Module):
             d = torch.cat((x, x_hat, emb, corr), dim=1)
         else:
             d = torch.cat((x, x_hat, emb), dim=1)
+        if self.padded_channels > d.shape[1]:
+            d = F.pad(d, (0, 0, 0, 0, 0, self.padded_channels - d.shape[1]))
         d = d.to(self.compute_dtype)
         if self.channels_last:
             d = d.to(memory_format=torch.channels_last)
@@ -183,6 +285,8 @@ class Decoder(nn.Module):
         )
         self.conv_refiner = nn.ModuleDict({scale: ConvRefiner(spec) for scale, spec in REFINER_SPECS.items()})
         self.refine_init = 4.0
+        self.fused_io = False
+        self.fast_softmax = False
 
     def batchnorm_pairs(self, prefix: str = "") -> list[tuple[str, str]]:
         pairs = [(f"{prefix}proj.{s}.0", f"{prefix}proj.{s}.1") for s in SCALES]
@@ -197,6 +301,10 @@ class Decoder(nn.Module):
         proj = self.proj[scale]
         first = proj[0]
         dtype = first.weight.dtype if hasattr(first, "weight") else torch.bfloat16
+        if self.fused_io and isinstance(first, nn.Conv2d) and isinstance(proj[1], nn.Identity):
+            # Cast + channels-last in one pass, then cuBLAS GEMM directly into channels-last FP32 [B, P, H, W].
+            x_nhwc = feat.to(dtype=dtype, memory_format=torch.channels_last).permute(0, 2, 3, 1)
+            return F.linear(x_nhwc, first.weight[:, :, 0, 0], first.bias).float().permute(0, 3, 1, 2)
         return proj(feat.to(dtype)).float()
 
     def forward(
@@ -228,20 +336,31 @@ class Decoder(nn.Module):
         corresps: dict[int, dict[str, Tensor]] = {}
         for new_scale in all_scales:
             ins = int(new_scale)
+            refiner = self.conv_refiner[new_scale]
+            use_pair = symmetric and refiner.fused_io and refiner.compute_dtype == torch.bfloat16 and b % 2 == 0
             if symmetric:
                 f1_s = self._project(new_scale, f1[ins])
-                a_s, b_s = f1_s.chunk(2, dim=0)
-                f2_s = torch.cat((b_s, a_s), dim=0)
+                if ins == 16 or not use_pair:
+                    a_s, b_s = f1_s.chunk(2, dim=0)
+                    f2_s = torch.cat((b_s, a_s), dim=0)
+                else:
+                    f2_s = f1_s
             else:
                 f1_s = self._project(new_scale, f1[ins])
                 f2_s = self._project(new_scale, f2[ins])
 
             if ins == 16:
                 gp_posterior = self.gps["16"](f1_s, f2_s)
-                gm_cls, certainty_t = self.embedding_decoder(gp_posterior, f1_s)
-                flow = cls_to_flow_refine(gm_cls)
+                if self.fast_softmax:
+                    gm_cls, certainty_t = self.embedding_decoder(gp_posterior, f1_s, hwc_cls=True)
+                    flow = cls_to_flow_refine_hwc(gm_cls)
+                else:
+                    gm_cls, certainty_t = self.embedding_decoder(gp_posterior, f1_s)
+                    flow = cls_to_flow_refine(gm_cls)
 
-            delta_flow, delta_certainty = self.conv_refiner[new_scale](f1_s, f2_s, flow, scale_factor=scale_factor)
+            delta_flow, delta_certainty = refiner(
+                f1_s, f2_s, flow, scale_factor=scale_factor, pair=(b // 2 if use_pair else 0)
+            )
             displacement = ins * torch.stack(
                 (
                     delta_flow[:, 0].float() / (self.refine_init * w),

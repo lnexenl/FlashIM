@@ -44,7 +44,12 @@ def main() -> None:
     if not pairs:
         raise ValueError("empty calibration manifest")
 
-    model = flashim.load("roma" if args.variant == "outdoor" else "roma-indoor", "bf16")
+    # Run fold_batchnorm + pad_refiners only (skip fused_bf16_refiners so padded refiner 1x1s remain nn.Conv2d).
+    model = flashim.load(
+        "roma" if args.variant == "outdoor" else "roma-indoor",
+        "bf16",
+        overrides={"optimize.passes": ["fold_batchnorm", "pad_refiners"]},
+    )
     is_int8 = args.format == "int8"
     scheme_config = quant.QUANT_CONFIGS["int8" if is_int8 else "fp8"]
 

@@ -205,7 +205,7 @@ def test_rope_qk(table_dtype):
 @pytest.mark.parametrize(
     "channels,hw,radius",
     [(48, (30, 40), 1), (48, (30, 40), 3), (192, (37, 45), 3), (48, (64, 80), 1), (5, (7, 9), 0),
-     (256, (13, 11), 2)],
+     (256, (13, 11), 2), (512, (40, 40), 7), (512, (23, 19), 3), (384, (17, 15), 5)],
 )
 @pytest.mark.parametrize("layout", ["nchw", "channels_last"])
 def test_local_corr(channels, hw, radius, layout):
@@ -225,6 +225,23 @@ def test_local_corr(channels, hw, radius, layout):
     # FP32 summation order, plus taps whose coordinate is within ~1e-5 px of an integer (the reference
     # switches corners there, the kernel's shared corners extrapolate by that much).
     assert torch.allclose(fast, ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "channels,hw",
+    [(24, (17, 23)), (32, (37, 53)), (192, (40, 48)), (576, (35, 41)), (1152, (24, 28)), (1408, (20, 20))],
+)
+def test_depthwise_relu_bf16(channels, hw):
+    torch.manual_seed(3)
+    x = torch.randn(2, channels, *hw, device=DEV).to(torch.bfloat16).to(memory_format=torch.channels_last)
+    dw = (torch.randn(25, channels, device=DEV) * 0.2).to(torch.bfloat16).contiguous()
+    dwb = torch.randn(channels, device=DEV, dtype=torch.float32)
+    assert ops.depthwise5x5_relu.explain(x, dw, dwb)["triton"] == "selected"
+    fast, ref = _both(ops.depthwise5x5_relu, "triton", x, dw, dwb)
+    assert fast.shape == ref.shape and fast.dtype == torch.bfloat16 and fast.is_contiguous()
+    assert torch.allclose(fast.float(), ref.float(), atol=2e-2, rtol=1e-2)
+    mismatch = (fast != ref).float().mean().item()
+    assert mismatch < 5e-3
 
 
 @pytest.mark.parametrize(
@@ -995,8 +1012,8 @@ def test_int8_linear_per_row_scale(impl):
 
 # -- ViT glue: LayerNorm + per-row INT8, and the GELU / residual epilogues of the INT8 GEMM -------------------------------
 _EXACT_LN_ARCH = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((8, 9), (9, 0)),
-    reason="the torch-exact LayerNorm kernel is registered for sm_89 / sm_90 (the archs it was checked on)",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((8, 9), (9, 0), (12, 0)),
+    reason="the torch-exact LayerNorm kernel is registered for sm_89 / sm_90 / sm_120 (the archs it was checked on)",
 )
 
 
@@ -1050,3 +1067,45 @@ def test_int8_linear_gelu_epilogue(rows, k, n):
     fused = ops.int8_linear.get("triton")(q, w, scale, w_scale, bias, gelu=True)
     assert torch.equal(fused, F.gelu(plain))
     assert ops.int8_linear.get("reference")(q, w, scale, w_scale, bias, gelu=True).shape == plain.shape
+
+
+@pytest.mark.parametrize(
+    "p,e,radius,c_pad,hw,pair",
+    [
+        (512, 128, 7, 1408, (20, 20), 0),
+        (512, 64, 3, 1152, (35, 35), 1),
+        (256, 32, 2, 576, (44, 38), 1),
+        (64, 16, -1, 192, (64, 48), 1),
+        (9, 6, -1, 32, (72, 64), 1),
+    ],
+)
+def test_roma_refiner_input(p, e, radius, c_pad, hw, pair):
+    """Fused RoMa refiner input matches reference across all 5 refiner scales, with and without symmetric pairing."""
+    torch.manual_seed(0)
+    b = 2
+    fa = torch.randn(b, p, *hw, device=DEV).contiguous(memory_format=torch.channels_last)
+    fb = torch.randn(b, p, *hw, device=DEV).contiguous(memory_format=torch.channels_last)
+    warp = torch.randn(b, 2, *hw, device=DEV) * 0.9
+    emb_w = torch.randn(e, 2, 1, 1, device=DEV) * 0.5
+    emb_b = torch.randn(e, device=DEV) * 0.5
+    fast, ref = _both(ops.roma_refiner_input, "triton", fa, fb, warp, emb_w, emb_b, 1.54, radius, c_pad, pair)
+    assert fast.shape == ref.shape == (b, c_pad, *hw)
+    assert fast.dtype == torch.bfloat16 and fast.is_contiguous(memory_format=torch.channels_last)
+    orig = 2 * p + e + ((2 * radius + 1) ** 2 if radius >= 0 else 0)
+    assert (fast[:, orig:] == 0).all()
+    torch.testing.assert_close(fast.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("c_orig,c_pad,hw", [(1377, 1408, (40, 40)), (569, 576, (70, 70)), (24, 32, (128, 128))])
+def test_roma_refiner_head(c_orig, c_pad, hw):
+    """Fused RoMa FP32 3-ch output head matches reference without materializing FP32 padded activations."""
+    torch.manual_seed(0)
+    z = torch.randn(2, c_pad, *hw, device=DEV, dtype=torch.bfloat16).contiguous(memory_format=torch.channels_last)
+    z[:, c_orig:] = 999.0  # padded channels must be ignored
+    w = torch.randn(3, c_orig, device=DEV) * 0.1
+    b = torch.randn(3, device=DEV)
+    with torch.backends.cudnn.flags(allow_tf32=False):  # compare against a true-FP32 reference
+        fast, ref = _both(ops.roma_refiner_head, "triton", z, w, b)
+    assert fast[0].shape == ref[0].shape == (2, 2, *hw) and fast[1].shape == ref[1].shape == (2, 1, *hw)
+    torch.testing.assert_close(fast[0], ref[0], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(fast[1], ref[1], atol=1e-5, rtol=1e-5)

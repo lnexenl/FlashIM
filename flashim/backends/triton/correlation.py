@@ -99,14 +99,25 @@ def _local_corr_kernel(
 
 
 def local_corr(
-    feature0: Tensor, feature1: Tensor, warp: Tensor, radius: int, *, block_m: int = 16, num_warps: int = 4
+    feature0: Tensor, feature1: Tensor, warp: Tensor, radius: int, *, block_m: int | None = None, num_warps: int = 4
 ) -> Tensor:
     """FP32, any strides (channels-last views gather their channel vectors coalesced); ``[B, K, H, W]`` out.
 
     16 rows x 4 warps was the fastest spill-free tile at all four RoMaV2 refiner calls (sm_120; C=192 r=3 at
     200^2 / 320^2: 0.84 / 1.87 ms, C=48 r=1 at 400^2 / 640^2: 0.19 / 0.29 ms; 3.5-5.2x the former
-    ``fused-local-corr`` package)."""
+    ``fused-local-corr`` package). For C > 256 (RoMa v1: C=512 r=3/7), 8 rows x 4 warps keeps ``f0`` resident without
+    spills and beats tiled C loops (sm_120: 108^2 r=3 1.14 vs 1.15-1.78 ms, 40^2 r=7 0.57 vs 0.79-0.98 ms; ncu
+    61-70% compute-memory SOL, 18.8-21.5x over the torch reference). NCHW inputs with C >= 32 are copied to
+    channels-last first so gathers stay coalesced (256 ch 216^2 r=2: 15.95 -> 1.47 ms + ~0.12 ms copy; 512 ch 108^2
+    r=3: 13.09 -> 1.14 ms)."""
     batch, channels, h, w = feature0.shape
+    if channels >= 32:
+        if feature0.stride(1) != 1:
+            feature0 = feature0.contiguous(memory_format=torch.channels_last)
+        if feature1.stride(1) != 1:
+            feature1 = feature1.contiguous(memory_format=torch.channels_last)
+    if block_m is None:
+        block_m = 16 if channels <= 256 else 8
     taps = 2 * radius + 1
     cc = triton.next_power_of_2(channels)
     out = torch.empty((batch, taps * taps, h, w), device=feature0.device, dtype=torch.float32)
@@ -374,8 +385,8 @@ def _local_corr_eligible(feature0: Tensor, feature1: Tensor, warp: Tensor, radiu
         feature0.dtype == feature1.dtype == warp.dtype == torch.float32
         and feature1.shape == feature0.shape
         and tuple(warp.shape) == (batch, h, w, 2)
-        and channels <= 256
-        and 0 <= radius <= 3
+        and channels <= 512
+        and 0 <= radius <= 7
         and max(_span(feature0), _span(feature1), _span(warp), batch * (2 * radius + 1) ** 2 * h * w) < 2**31
     )
 

@@ -21,6 +21,7 @@ from flashim.ops.conv import (
     conv2d_at_points,
     conv2d_single_output,
     conv2d_small_cin_quantize_int8,
+    depthwise5x5_relu,
     depthwise5x5_relu_int8,
     depthwise5x5_relu_mxfp8,
     depthwise5x5_relu_pointwise,
@@ -61,6 +62,7 @@ from flashim.ops.quantize import (
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
 from flashim.ops.resample import pil_bicubic_resize, upsample_add, upsample_concat, upsample_concat_int8
+from flashim.ops.roma import roma_refiner_head, roma_refiner_input
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 
 __all__ = [
@@ -76,6 +78,7 @@ __all__ = [
     "conv2d_small_cin_quantize_int8",
     "deform_patches_int8",
     "deformable_attention",
+    "depthwise5x5_relu",
     "depthwise5x5_relu_int8",
     "depthwise5x5_relu_mxfp8",
     "depthwise5x5_relu_pointwise",
@@ -115,6 +118,8 @@ __all__ = [
     "raco_head5x5",
     "raco_resblock",
     "reset_call_counts",
+    "roma_refiner_head",
+    "roma_refiner_input",
     "romav2_refiner_heads",
     "romav2_refiner_input",
     "rope_qk",

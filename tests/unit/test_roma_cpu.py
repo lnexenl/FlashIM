@@ -100,3 +100,21 @@ def test_matches_type_and_forward_shapes_on_synthetic_cpu():
     assert out.dense.precision_AB is None
     assert out.keypoints_A.shape == out.keypoints_B.shape == (32, 2)
     assert out.confidence.shape == (32,)
+
+
+def test_conv_refiner_pad_channels_exact_on_cpu():
+    from flashim.models.roma.decoder import REFINER_SPECS, ConvRefiner
+    from flashim.quant.passes.separable_conv_block import fold_block_batchnorm
+
+    torch.manual_seed(0)
+    ref = ConvRefiner(REFINER_SPECS["1"]).eval()
+    fold_block_batchnorm(ref)
+    x = torch.randn(2, 9, 8, 8)
+    y = torch.randn(2, 9, 8, 8)
+    warp = torch.rand(2, 2, 8, 8) * 1.6 - 0.8
+    with torch.inference_mode():
+        f0, c0 = ref(x, y, warp)
+        assert ref.pad_channels(32)
+        f1, c1 = ref(x, y, warp)
+    torch.testing.assert_close(f1, f0, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(c1, c0, atol=1e-5, rtol=1e-5)

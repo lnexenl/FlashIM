@@ -166,8 +166,7 @@ class RoMa(ImageMatcher, nn.Module):
             raw_cert = raw_cert - low_res_cert
         overlap = raw_cert.sigmoid()
         wrong = (flow.abs() > 1).any(dim=-1)
-        if wrong.any():
-            overlap = overlap.masked_fill(wrong[:, None], 0.0)
+        overlap = overlap.masked_fill(wrong[:, None], 0.0)
         flow = flow.clamp(-1.0, 1.0)
         raw_cert_bhwc = raw_cert.permute(0, 2, 3, 1)
         overlap_bhwc = overlap.permute(0, 2, 3, 1)
