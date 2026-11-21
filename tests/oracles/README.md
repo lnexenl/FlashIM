@@ -20,8 +20,9 @@ weight lookup (`flashim/models/*/weights.py`).
 | `raco/` | https://github.com/fabio-sim/LightGlue-ONNX (from cvg/RaCo) | Apache-2.0 |
 | `loma/` | https://github.com/davnords/LoMa @ 415caed (`src/loma/`; `descriptor/transformer/`: DINOv2, Meta; offline loader `loma_oracle.py`, see `loma/README.md`) | MIT (matcher in `loma.py`: Apache-2.0, from LightGlue; DINOv2: Apache-2.0) |
 
-Not vendored: cvg/LightGlue's `lightglue/superpoint.py` (it carries a Magic Leap notice forbidding reproduction and
-distribution) and RIPE. Both are downloaded on demand by their tests (`tests/parity/_fetch.py`). RIPE (https://github.com/fraunhoferhhi/RIPE) is not vendored: its license (Fraunhofer academic use, version 2.0) grants
+Not vendored: cvg/LightGlue's `lightglue/superpoint.py`, Magic Leap's `SuperGluePretrainedNetwork` (`models/superglue.py`,
+both carry a Magic Leap notice forbidding reproduction and distribution) and RIPE. All three are downloaded on demand by
+their tests (`tests/parity/_fetch.py`). RIPE (https://github.com/fraunhoferhhi/RIPE) is not vendored: its license (Fraunhofer academic use, version 2.0) grants
 internal non-commercial use only and no other rights, so its code cannot be shipped here. `tests/parity/ripe` downloads
 the files it needs (pinned by commit and SHA-256) into `~/.cache/flashim/oracles` when you run it, or uses the checkout
 in `$FLASHIM_RIPE_ROOT`; it skips without network access.

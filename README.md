@@ -19,7 +19,7 @@
   <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/architecture.md">Architecture</a>
 </p>
 
-FlashIM runs image-matching models (dense RoMa v2; sparse RDD, ALIKED, RaCo, SuperPoint, DISK, DeDoDe, LoFTR and others; LightGlue and LoMa matching) faster than their reference
+FlashIM runs image-matching models (dense RoMa v2; sparse RDD, ALIKED, RaCo, SuperPoint, DISK, DeDoDe, LoFTR and others; LightGlue, SuperGlue and LoMa matching) faster than their reference
 implementations, without giving up measured accuracy. Every model is a native PyTorch port checked against the upstream code, and the
 speedups come from quantization (MXFP8, INT8), fused kernels (Triton, TileLang, CUDA C++) and `torch.compile`.
 
@@ -57,6 +57,9 @@ m.indices_A, m.features_A                                    # match indices int
 
 loma = flashim.load("loma-g")                                # LoMa: DaD + LoMa descriptors + matcher (b128, b, l, g, r)
 m = loma.match("a.jpg", "b.jpg", max_matches=4096)           # 4096 keypoints per image (default 2048)
+
+sg = flashim.load("superpoint-superglue")                    # SuperPoint + SuperGlue (outdoor default; variant indoor)
+m = sg.match("a.jpg", "b.jpg", resize=1024)                  # 1024 keypoints per image, match_threshold=0.2
 ```
 
 `match(a, b, *, resize, max_matches, threshold)` is the same for every model: `resize` is the long side of the working
@@ -150,7 +153,8 @@ FlashIM is released under the Apache License 2.0 ([LICENSE](https://github.com/l
 
 The package's license expression is therefore `Apache-2.0 AND MIT AND LicenseRef-DINOv3`. Model weights are downloaded
 from their publishers, never shipped, and keep their upstream licenses, some more restrictive than Apache-2.0: the RoMaV2
-checkpoint contains DINOv3 weights (DINOv3 License), SuperPoint and RIPE are for non-commercial use only; LoMa is MIT
+checkpoint contains DINOv3 weights (DINOv3 License), SuperPoint, SuperGlue (Magic Leap academic/non-profit
+non-commercial research only) and RIPE are for non-commercial use only; LoMa is MIT
 except its LightGlue-derived matcher (Apache-2.0), and its checkpoints hold DINOv2 (Apache-2.0). Details, and
 the licenses of vendored test code and assets: [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl/FlashIM/blob/main/THIRD_PARTY_NOTICES.md).
 
