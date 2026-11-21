@@ -10,6 +10,7 @@ weight lookup (`flashim/models/*/weights.py`).
 | directory | upstream | license |
 |---|---|---|
 | `romav2/` | https://github.com/Parskatt/RoMaV2 @ 95c9968 (`vit/` and `dpt.py` carry Meta's DINOv3 License: `LICENSE_DINOv3`) | MIT |
+| `roma/` | https://github.com/Parskatt/RoMa (`romatch/models/transformer/`: DINOv2, Meta: `LICENSE_DINOv2`) | MIT (DINOv2: Apache-2.0) |
 | `dad/` | https://github.com/Parskatt/dad | MIT |
 | `dedode/` | https://github.com/Parskatt/DeDoDe (`transformer/`: DINOv2, Meta) | MIT (DINOv2: Apache-2.0) |
 | `aliked/` | https://github.com/Shiaoming/ALIKED | BSD-3-Clause |
