@@ -117,3 +117,18 @@ def _jpeg_fancy_upsample_reference(rgb: Tensor, v_factor: int) -> Tensor:
 
 
 jpeg_fancy_upsample = Op("jpeg_fancy_upsample", _jpeg_fancy_upsample_reference)
+
+
+def _gray_instance_norm_reference(
+    rgb: Tensor, eps: float = 1e-5, out_dtype: torch.dtype | None = None
+) -> Tensor:
+    """Mean-channel grayscale followed by 2D instance normalization (unbiased=False, no affine) and optional cast.
+
+    ``rgb`` ``[B, 3, H, W]`` FP32 -> ``[B, 1, H, W]`` in ``out_dtype`` (or ``rgb.dtype`` when ``None``).
+    """
+    gray = rgb.mean(dim=1, keepdim=True)
+    out = torch.nn.functional.instance_norm(gray, eps=eps)
+    return out if out_dtype is None else out.to(out_dtype)
+
+
+gray_instance_norm = Op("gray_instance_norm", _gray_instance_norm_reference)

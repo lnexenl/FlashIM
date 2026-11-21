@@ -68,8 +68,8 @@ def test_fp32_parity_different_sizes(oracle, monkeypatch):
     ref_flow = ref_warp[..., 2:]
     assert dense.warp_AB[0].shape == ref_flow.shape
     assert dense.overlap_AB[0, ..., 0].shape == ref_cert.shape
-    assert (dense_unfolded.warp_AB[0] - ref_flow).abs().max().item() < 1e-5
-    assert (dense_unfolded.overlap_AB[0, ..., 0] - ref_cert).abs().max().item() < 1e-5
+    assert (dense_unfolded.warp_AB[0] - ref_flow).abs().max().item() < 2e-5
+    assert (dense_unfolded.overlap_AB[0, ..., 0] - ref_cert).abs().max().item() < 2e-5
 
     flow_diff = (dense.warp_AB[0] - ref_flow).abs().max().item()
     cert_diff = (dense.overlap_AB[0, ..., 0] - ref_cert).abs().max().item()

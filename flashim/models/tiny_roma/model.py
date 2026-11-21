@@ -63,10 +63,13 @@ class XFeatBackbone(nn.Module):
             BasicLayer(64, 64, stride=1), BasicLayer(64, 64, stride=1), nn.Conv2d(64, 64, 1, padding=0)
         )
         self.compute_dtype = torch.float32
+        self.channels_last = False
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         """``[B, 3, H, W]`` RGB in ``[0, 1]`` -> ``(fine [B, 24, H/4, W/4], coarse [B, 64, H/8, W/8])``."""
-        gray = self.norm(x.mean(dim=1, keepdim=True)).to(self.compute_dtype)
+        gray = ops.gray_instance_norm(x, self.norm.eps, self.compute_dtype)
+        if self.channels_last:
+            gray = gray.to(memory_format=torch.channels_last)
         x1 = self.block1(gray)
         x2 = self.block2(x1 + self.skip1(gray))
         x3 = self.block3(x2)
@@ -245,8 +248,7 @@ class TinyRoMa(ImageMatcher, nn.Module):
             feats_x0_f, feats_x0_c = self.forward_single(im0)
             feats_x1_f, feats_x1_c = self.forward_single(im1)
 
-        corr_volume = self.corr_volume(feats_x0_c, feats_x1_c)
-        coarse_warp = self.pos_embed(corr_volume)
+        coarse_warp = ops.tiny_roma_corr_pos_embed(feats_x0_c, feats_x1_c, self.config.exact_softmax)
         coarse_matches = torch.cat((coarse_warp, torch.zeros_like(coarse_warp[:, -1:])), dim=1)
 
         # Keep warp coordinates in FP32 for grid_sample so BF16 mantissa truncation never quantizes pixel coordinates.

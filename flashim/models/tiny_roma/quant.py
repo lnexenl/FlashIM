@@ -33,10 +33,15 @@ Tried and rejected (20 MegaDepth-1500 pairs, ``resize=1024``, vs ``fp32``):
 - ``int8`` ``coarse_123 + fine_123``: ``med_px=0.196``, ``@2px=0.9936`` (``fine_matcher`` slower than BF16).
 - ``fp8`` ``coarse_123 + fine_123``: ``med_px=0.185``, ``@2px=0.9941`` (``fine_matcher`` slower than BF16).
 - ``int8`` ``coarse_123`` only: ``med_px=0.158``, ``@2px=0.9939``.
-- ``int8`` ``coarse_0123`` + SmoothQuant ``32x`` (kept as ``int8``): ``med_px=0.183``, ``mean_px=0.254``,
-  ``@1px=0.9743``, ``@2px=0.9937``, ``@5px=0.9996``, ``cert_mae=0.0083`` (eager forward 5.30 ms vs BF16 5.74 ms).
-- ``fp8`` ``coarse_123`` only (kept as ``fp8``): ``med_px=0.162``, ``mean_px=0.232``, ``@1px=0.9752``,
-  ``@2px=0.9944``, ``@5px=0.9997``, ``cert_mae=0.0078`` (eager forward 5.39 ms vs BF16 5.74 ms).
+- ``int8`` ``coarse_0123`` + SmoothQuant ``32x`` (kept as ``int8``): ``med_px=0.160``, ``mean_px=0.224``,
+  ``@1px=0.9814``, ``@2px=0.9960``, ``@5px=0.9998``, ``cert_mae=0.0073`` (sacre_coeur: 2.54 ms eager / 1.67 ms
+  compile / 1.59 ms compile+CG forward; 3.29 ms eager / 2.44 ms compile match(5k)).
+- ``fp8`` ``coarse_123`` only (kept as ``fp8``): ``med_px=0.140``, ``mean_px=0.200``, ``@1px=0.9868``,
+  ``@2px=0.9963``, ``@5px=0.9998``, ``cert_mae=0.0067`` (sacre_coeur: 2.67 ms eager / 1.84 ms compile / 1.72 ms
+  compile+CG forward; 3.43 ms eager / 2.63 ms compile match(5k)).
+- ``bf16`` after fused Triton ops + ``channels_last``: ``med_px=0.113``, ``mean_px=0.172``, ``@1px=0.9870``,
+  ``@2px=0.9970``, ``@5px=0.9998``, ``cert_mae=0.0058`` (sacre_coeur: 2.97 ms eager / 2.02 ms compile / 1.97 ms
+  compile+CG forward; 3.72 ms eager / 2.79 ms compile match(5k)).
 """
 
 from __future__ import annotations
