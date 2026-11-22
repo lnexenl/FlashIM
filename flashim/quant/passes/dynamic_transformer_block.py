@@ -25,7 +25,11 @@ from flashim.utils import set_submodule
 
 
 def _dynamic_linears(block: TransformerBlock) -> bool:
-    return all(isinstance(m, DynamicInt8Linear) for m in (block.attn.qkv, block.attn.proj, block.mlp.fc1, block.mlp.fc2))
+    linears = (block.attn.qkv, block.attn.proj, block.mlp.fc1, block.mlp.fc2)
+    return (
+        all(isinstance(m, DynamicInt8Linear) for m in linears)
+        and all(getattr(m, "channel_scale", None) is None for m in linears[:3])
+    )
 
 
 def is_fusable(block: nn.Module) -> bool:
@@ -41,8 +45,7 @@ def is_fusable(block: nn.Module) -> bool:
 
 
 class DynamicInt8TransformerBlock(nn.Module):
-    """:class:`~flashim.layers.TransformerBlock` (same submodule names) with the fusions of this module's docstring.
-    ``rope`` is not supported (DINOv2 has none): such a call runs the original block."""
+    """:class:`~flashim.layers.TransformerBlock` (same submodule names) with the fusions of this module's docstring."""
 
     def __init__(self, block: TransformerBlock, device: torch.device | None = None) -> None:
         super().__init__()
@@ -83,7 +86,7 @@ class DynamicInt8TransformerBlock(nn.Module):
         return ops.quantize_int8_rows(norm(x))
 
     def forward(self, x: Tensor, rope: tuple[Tensor, Tensor] | None = None) -> Tensor:
-        if rope is not None or x.dtype != torch.bfloat16 or not x.is_contiguous():
+        if x.dtype != torch.bfloat16 or not x.is_contiguous():
             return self._unfused(x, rope)
         ln, gelu, residual = self.plan(x.device)
         batch, tokens, channels = x.shape
@@ -92,14 +95,19 @@ class DynamicInt8TransformerBlock(nn.Module):
         q, s = self._norm_quantize(self.norm1, flat, ln)
         qkv = self._linear(attn.qkv, q, s).reshape(batch, tokens, 3, attn.num_heads, channels // attn.num_heads)
         qh, kh, vh = (t.transpose(1, 2) for t in qkv.unbind(2))
-        out = ops.sdpa.get(attn.sdpa_impl)(qh, kh, vh).transpose(1, 2).reshape(-1, channels)
-        q, s = ops.quantize_int8_rows(out if out.is_contiguous() else out.contiguous())
+        if rope is not None:
+            rope_op = ops.rope_qk_2d if getattr(attn, "rope_2d", False) else ops.rope_qk
+            qh, kh = rope_op.get(attn.rope_impl)(qh, kh, *rope)
+        out = ops.sdpa.get(attn.sdpa_impl)(qh, kh, vh)
+        q, s = ops.quantize_int8_rows_heads(out)
         x1 = self._linear(attn.proj, q, s, residual=flat) if residual else flat + self._linear(attn.proj, q, s)
         q, s = self._norm_quantize(self.norm2, x1, ln)
+        fc2_cs = self.mlp.fc2.channel_scale
         if gelu:
-            q, s = ops.quantize_int8_rows(self._linear(self.mlp.fc1, q, s, gelu=True))
+            h = self._linear(self.mlp.fc1, q, s, gelu=True)
         else:
-            q, s = ops.quantize_int8_rows(self.mlp.act(self._linear(self.mlp.fc1, q, s)))
+            h = self.mlp.act(self._linear(self.mlp.fc1, q, s))
+        q, s = ops.quantize_int8_rows(h, channel_scale=fc2_cs) if fc2_cs is not None else ops.quantize_int8_rows(h)
         x2 = self._linear(self.mlp.fc2, q, s, residual=x1) if residual else x1 + self._linear(self.mlp.fc2, q, s)
         return x2.view(batch, tokens, channels)
 

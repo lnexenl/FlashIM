@@ -351,7 +351,8 @@ def _int8_gemm_kernel(
 
 
 def _int8_gemm_config(
-    rows: int, n: int, small_tiles: bool = False, four_warps: bool = False, *, k: int = 0, sm90: bool = False
+    rows: int, n: int, small_tiles: bool = False, four_warps: bool = False, *, k: int = 0, sm90: bool = False,
+    sm120: bool = False,
 ) -> tuple[int, int, int, int, int]:
     """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages). ``small_tiles`` (sm_89, sm_90): 4-warp 64-row tiles
     measured faster than 128 x 128 with 8 warps on an L20 (exact INT32 accumulation: bit-identical), e.g. 2505 x 1024
@@ -365,12 +366,16 @@ def _int8_gemm_config(
     128 x 64 (K block 128 when ``k >= 96``). In situ (CUDA graph, L2-warm, real call sites at 1200 px) dedode-g's
     decoder GEMMs take 0.82 ms less per extract (65856 x 256 -> 256 0.057 -> 0.043 ms, 263424 x 64 -> 256
     0.104 -> 0.048, 1053696 x 32 -> 96 0.262 -> 0.100, 1053696 x 64 -> 64 0.163 -> 0.090); on an L20 the same rule is
-    within noise (-0.02 ms), so it stays H20-only. Exact (INT32 accumulation: bit-identical)."""
+    within noise (-0.02 ms), so it stays H20-only. ``sm120`` (RTX 5070 Ti): 128 x 64 x 64 with 4 warps avoids
+    under-utilizing the 70 SMs on medium shapes (512 <= rows <= 1536, 512 <= n <= 1536: 1536x4096->1024 67.5 ->
+    61.6 us, 768x768->1536 26.8 -> 24.4 us). Exact (INT32 accumulation: bit-identical)."""
     if sm90 and rows >= 2048 and n < 512:
         tiny = n <= 32
         return 128 if tiny else 64, 64, 128 if tiny and k >= 96 else 64, 4, 3
     if small_tiles and rows >= 2048 and n >= 512:
         return 64, 128 if rows >= 32768 else 64, 64, 4, 3
+    if sm120 and 512 <= rows <= 1536 and 512 <= n <= 1536:
+        return 128, 64, 64, 4, 3
     if rows >= 512:
         return 128, 128, 64, 4 if four_warps else 8, 3
     if rows >= 128:
@@ -387,9 +392,9 @@ def int8_gemm_bf16(
     rows, k = a.shape
     n = weight.shape[0]
     out = torch.empty(rows, n, device=a.device, dtype=torch.bfloat16)
+    cap = platform_for(a.device).capability
     block_m, block_n, block_k, num_warps, num_stages = config or _int8_gemm_config(
-        rows, n, _is_sm89(a.device) or _is_sm90(a.device), platform_for(a.device).capability == (8, 7), k=k,
-        sm90=_is_sm90(a.device),
+        rows, n, cap in ((8, 9), (9, 0)), cap == (8, 7), k=k, sm90=cap == (9, 0), sm120=cap == (12, 0),
     )
     _int8_gemm_kernel[(triton.cdiv(rows, block_m) * triton.cdiv(n, block_n),)](
         a,
