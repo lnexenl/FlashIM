@@ -55,6 +55,8 @@ class ResNet_8_2(nn.Module):
 class CoarseMatching(nn.Module):
     """Projects coarse tokens and selects the union of row-wise and column-wise softmax nearest neighbours."""
 
+    low_precision_similarity = False
+
     def __init__(self, d_model: int = 256) -> None:
         super().__init__()
         self.final_proj = nn.Linear(d_model, d_model, bias=True)
@@ -73,19 +75,21 @@ class CoarseMatching(nn.Module):
         temperature: float,
         fold_temperature: bool = False,
     ) -> tuple[Tensor, Tensor]:
-        a = self.final_proj(feat_c0).float() / (feat_c0.shape[-1] ** 0.5)
-        b = self.final_proj(feat_c1).float() / (feat_c1.shape[-1] ** 0.5)
-        if fold_temperature:
-            sim = torch.einsum("nlc,nsc->nls", a / temperature, b)[0]
+        c = feat_c0.shape[-1]
+        if self.low_precision_similarity and feat_c0.dtype != torch.float32:
+            a = self.final_proj(feat_c0)[0]
+            b = self.final_proj(feat_c1)[0]
+            sim = ops.matmul_nt_fp32(a, b, 1.0 / (c * temperature))
         else:
-            sim = torch.einsum("nlc,nsc->nls", a, b)[0] / temperature
+            a = self.final_proj(feat_c0).float() / (c**0.5)
+            b = self.final_proj(feat_c1).float() / (c**0.5)
+            if fold_temperature:
+                sim = torch.einsum("nlc,nsc->nls", a / temperature, b)[0]
+            else:
+                sim = torch.einsum("nlc,nsc->nls", a, b)[0] / temperature
 
-        # Union of one-way softmax thresholded nearest neighbours without materializing [L, S] softmax / bool masks:
-        # (softmax(sim, dim=1) > thr & row_max) OR (softmax(sim, dim=0) > thr & col_max).
-        row_max, row_j = sim.max(dim=1)
-        row_prob = (row_max - torch.logsumexp(sim, dim=1)).exp()
-        col_max, col_i = sim.max(dim=0)
-        col_prob = (col_max - torch.logsumexp(sim, dim=0)).exp()
+        # Union of one-way softmax thresholded nearest neighbours (single-pass Triton kernel on CUDA).
+        row_prob, row_j, col_prob, col_i = ops.union_softmax_match(sim)
         del sim
 
         keep_row = row_prob > threshold
@@ -134,43 +138,55 @@ class WindowAttention(nn.Module):
         self.kv_proj = nn.Linear(dim, dim * 2, bias=False)
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.merge = nn.Linear(dim, dim, bias=True)
+        self._qkv_weight: Tensor | None = None
 
-    def forward(self, x_q: Tensor, x_kv: Tensor | None = None) -> Tensor:
-        if x_kv is None:
-            x_kv = x_q
-        bs, _, dim = x_q.shape
-        kv = self.kv_proj(x_kv).reshape(bs, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q = self.q_proj(x_q).reshape(bs, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        out = ops.sdpa(q, kv[0], kv[1]).transpose(1, 2).reshape(bs, -1, dim)
+    def pack_qkv(self) -> None:
+        """Pack ``q_proj`` + ``kv_proj`` weights into one ``[3*C, C]`` GEMM (exact)."""
+        if isinstance(self.q_proj, nn.Linear) and isinstance(self.kv_proj, nn.Linear):
+            self._qkv_weight = torch.cat((self.q_proj.weight.detach(), self.kv_proj.weight.detach()), dim=0).contiguous()
+
+    def forward(self, x_q: Tensor, x_kv: Tensor | None = None, *, query_len: int | None = None) -> Tensor:
+        bs, seq_len, dim = x_q.shape
+        out_len = seq_len if query_len is None else query_len
+        if x_kv is None and self._qkv_weight is not None:
+            qkv = F.linear(x_q, self._qkv_weight).reshape(bs, seq_len, 3, self.num_heads, self.head_dim)
+            q = (qkv[:, :out_len, 0] if out_len < seq_len else qkv[:, :, 0]).permute(0, 2, 1, 3)
+            k = qkv[:, :, 1].permute(0, 2, 1, 3)
+            v = qkv[:, :, 2].permute(0, 2, 1, 3)
+        else:
+            if x_kv is None:
+                x_kv = x_q
+            kv = self.kv_proj(x_kv).reshape(bs, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            q_in = x_q[:, :out_len] if out_len < seq_len else x_q
+            q = self.q_proj(q_in).reshape(bs, out_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            k, v = kv[0], kv[1]
+        out = ops.sdpa(q, k, v).transpose(1, 2).reshape(bs, out_len, dim)
         return self.merge(out)
 
 
 class CrossBidirectionalAttention(nn.Module):
-    """Shared-QK bidirectional cross-attention between matched local windows (FP32 softmax)."""
+    """Shared-QK bidirectional cross-attention between matched local windows (``ops.bidirectional_cross_attention``)."""
 
     def __init__(self, dim: int, num_heads: int) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.25
         self.qk_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.merge = nn.Linear(dim, dim, bias=False)
         # Present in upstream checkpoints (unused in forward); kept for strict=True loading.
         self.temperature = nn.Parameter(torch.zeros(1))
+        self._qkv_weight: Tensor | None = None
+
+    def pack_qkv(self) -> None:
+        """Pack ``qk_proj`` + ``v_proj`` weights into one ``[2*C, C]`` GEMM (exact)."""
+        if isinstance(self.qk_proj, nn.Linear) and isinstance(self.v_proj, nn.Linear):
+            self._qkv_weight = torch.cat((self.qk_proj.weight.detach(), self.v_proj.weight.detach()), dim=0).contiguous()
 
     def forward(self, x0: Tensor, x1: Tensor) -> tuple[Tensor, Tensor]:
-        bs = x0.shape[0]
         qk0, qk1 = self.qk_proj(x0), self.qk_proj(x1)
         v0, v1 = self.v_proj(x0), self.v_proj(x1)
-        qk0, qk1, v0, v1 = (
-            t.reshape(bs, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3) for t in (qk0, qk1, v0, v1)
-        )
-        sim = ((qk0 * self.scale) @ (qk1 * self.scale).transpose(-2, -1)).float()
-        attn01 = F.softmax(sim, dim=-1).to(v1.dtype)
-        attn10 = F.softmax(sim.transpose(-2, -1), dim=-1).to(v0.dtype)
-        out0 = (attn01 @ v1).transpose(1, 2).flatten(-2)
-        out1 = (attn10 @ v0).transpose(1, 2).flatten(-2)
+        out0, out1 = ops.bidirectional_cross_attention(qk0, qk1, v0, v1, self.num_heads)
         return self.merge(out0), self.merge(out1)
 
 
@@ -182,20 +198,22 @@ class WindowPosEmbMLP(nn.Module):
         self.pos_mlp = nn.Sequential(nn.Linear(2, 512, bias=True), nn.ReLU(), nn.Linear(512, dim, bias=False))
         self._cache: dict[tuple[int, torch.device, torch.dtype], Tensor] = {}
 
-    def forward(self, x: Tensor) -> Tensor:
-        seq_length = x.shape[1]
+    def get_pos(self, seq_length: int, device: torch.device) -> Tensor:
         dtype = self.pos_mlp[0].weight.dtype
-        key = (seq_length, x.device, dtype)
+        key = (seq_length, device, dtype)
         pos = self._cache.get(key)
         if pos is None:
             side = int(seq_length**0.5)
-            coords = torch.arange(0, side, device=x.device, dtype=dtype)
+            coords = torch.arange(0, side, device=device, dtype=dtype)
             grid = torch.stack(torch.meshgrid(coords, coords, indexing="ij")).unsqueeze(0)
             half = side // 2
             grid = (grid - half) / half
             pos = self.pos_mlp(grid.flatten(2).transpose(1, 2))
             self._cache[key] = pos
-        return x + pos.to(x.dtype)
+        return pos
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.get_pos(x.shape[1], x.device).to(x.dtype)
 
 
 class WindowSelfAttention(nn.Module):
@@ -208,12 +226,50 @@ class WindowSelfAttention(nn.Module):
         self.attn = WindowAttention(dim, num_heads)
         self.pos_embed = WindowPosEmbMLP(dim)
         self.pos_embed_pre: nn.Module = WindowPosEmbMLP(dim) if use_pre_pos_embed else nn.Identity()
+        self._gamma_folded = False
 
-    def forward(self, x: Tensor, x_pre: Tensor) -> tuple[Tensor, Tensor]:
+    def fold_gamma(self) -> None:
+        if not self._gamma_folded:
+            with torch.no_grad():
+                g = self.gamma.to(self.norm1.weight.dtype)
+                self.norm1.weight.mul_(g)
+                self.norm1.bias.mul_(g)
+                self.gamma.fill_(1.0)
+            self._gamma_folded = True
+
+    def forward(self, x: Tensor, x_pre: Tensor, *, drop_pre: bool = False) -> tuple[Tensor, Tensor | None]:
         ww, ww_pre = x.shape[1], x_pre.shape[1]
-        x = torch.cat((self.pos_embed(x), self.pos_embed_pre(x_pre)), dim=1)
-        x = x + self.gamma * self.norm1(self.mlp(torch.cat((x, self.attn(self.norm2(x))), dim=-1)))
-        return x.split((ww, ww_pre), dim=1)
+        pos = self.pos_embed.get_pos(ww, x.device)
+        pos_pre = (
+            self.pos_embed_pre.get_pos(ww_pre, x_pre.device)
+            if isinstance(self.pos_embed_pre, WindowPosEmbMLP)
+            else None
+        )
+        x_base, x_norm = ops.pos_cat_layernorm(
+            x, x_pre, pos, pos_pre, self.norm2.weight, self.norm2.bias, self.norm2.eps, return_all_pos=not drop_pre
+        )
+        attn_out = self.attn(x_norm, query_len=ww if drop_pre else None)
+        if self._gamma_folded and isinstance(self.mlp.fc1, nn.Linear) and isinstance(self.mlp.fc2, nn.Linear):
+            x_out = ops.cat_gelu_mlp(
+                x_base,
+                attn_out,
+                self.mlp.fc1.weight,
+                self.mlp.fc1.bias,
+                self.mlp.fc2.weight,
+                self.mlp.fc2.bias,
+                self.norm1.weight,
+                self.norm1.bias,
+                self.norm1.eps,
+            )
+        else:
+            mlp_out = self.mlp(torch.cat((x_base, attn_out), dim=-1))
+            if self._gamma_folded:
+                x_out = ops.residual_layernorm(mlp_out, x_base, self.norm1.weight, self.norm1.bias, self.norm1.eps)
+            else:
+                x_out = x_base + self.gamma * self.norm1(mlp_out)
+        if drop_pre:
+            return x_out, None
+        return x_out.split((ww, ww_pre), dim=1)
 
 
 class WindowCrossAttention(nn.Module):
@@ -224,12 +280,49 @@ class WindowCrossAttention(nn.Module):
         self.mlp = WindowMlp(dim * 2, dim * mlp_hidden_coef, dim)
         self.cross_attn = CrossBidirectionalAttention(dim, num_heads)
         self.gamma = nn.Parameter(torch.ones(dim))
+        self._gamma_folded = False
+
+    def fold_gamma(self) -> None:
+        if not self._gamma_folded:
+            with torch.no_grad():
+                g = self.gamma.to(self.norm2.weight.dtype)
+                self.norm2.weight.mul_(g)
+                self.norm2.bias.mul_(g)
+                self.gamma.fill_(1.0)
+            self._gamma_folded = True
+
+    def forward_stacked(self, x: Tensor) -> Tensor:
+        n = ops.residual_layernorm(x, None, self.norm1.weight, self.norm1.bias, self.norm1.eps)
+        ca = self.cross_attn
+        if ca._qkv_weight is not None:
+            qkv = F.linear(n, ca._qkv_weight)
+            qk, v = qkv.chunk(2, dim=-1)
+            qk0, qk1 = qk.chunk(2, dim=0)
+            v0, v1 = v.chunk(2, dim=0)
+        else:
+            qk0, qk1 = ca.qk_proj(n).chunk(2, dim=0)
+            v0, v1 = ca.v_proj(n).chunk(2, dim=0)
+        a0, a1 = ops.bidirectional_cross_attention(qk0, qk1, v0, v1, ca.num_heads)
+        m = ca.merge(torch.cat((a0, a1), dim=0))
+        if self._gamma_folded and isinstance(self.mlp.fc1, nn.Linear) and isinstance(self.mlp.fc2, nn.Linear):
+            return ops.cat_gelu_mlp(
+                x,
+                m,
+                self.mlp.fc1.weight,
+                self.mlp.fc1.bias,
+                self.mlp.fc2.weight,
+                self.mlp.fc2.bias,
+                self.norm2.weight,
+                self.norm2.bias,
+                self.norm2.eps,
+            )
+        mlp_out = self.mlp(torch.cat((x, m), dim=-1))
+        if self._gamma_folded:
+            return ops.residual_layernorm(mlp_out, x, self.norm2.weight, self.norm2.bias, self.norm2.eps)
+        return x + self.gamma * self.norm2(mlp_out)
 
     def forward(self, x0: Tensor, x1: Tensor) -> tuple[Tensor, Tensor]:
-        m0, m1 = self.cross_attn(self.norm1(x0), self.norm1(x1))
-        x0 = x0 + self.gamma * self.norm2(self.mlp(torch.cat((x0, m0), dim=-1)))
-        x1 = x1 + self.gamma * self.norm2(self.mlp(torch.cat((x1, m1), dim=-1)))
-        return x0, x1
+        return self.forward_stacked(torch.cat((x0, x1), dim=0)).chunk(2, dim=0)
 
 
 class FineProcess(nn.Module):
@@ -277,8 +370,16 @@ class FineProcess(nn.Module):
 
         c0_2d = feat_c0.permute(0, 2, 1).reshape(1, -1, hc0, wc0)
         c1_2d = feat_c1.permute(0, 2, 1).reshape(1, -1, hc1, wc1)
-        c0_m = self.conv_merge(torch.cat((c0_2d, feat_c0_pre), dim=1)).permute(0, 2, 3, 1).reshape(1, -1, 1, d2)
-        c1_m = self.conv_merge(torch.cat((c1_2d, feat_c1_pre), dim=1)).permute(0, 2, 3, 1).reshape(1, -1, 1, d2)
+        if (hc0, wc0) == (hc1, wc1):
+            c_both = self.conv_merge(
+                torch.cat((torch.cat((c0_2d, feat_c0_pre), dim=1), torch.cat((c1_2d, feat_c1_pre), dim=1)), dim=0)
+            )
+            c0_m, c1_m = c_both.permute(0, 2, 3, 1).reshape(2, -1, 1, d2).unbind(0)
+            c0_sel, c1_sel = c0_m[i_ids], c1_m[j_ids]
+        else:
+            c0_m = self.conv_merge(torch.cat((c0_2d, feat_c0_pre), dim=1)).permute(0, 2, 3, 1).reshape(-1, 1, d2)
+            c1_m = self.conv_merge(torch.cat((c1_2d, feat_c1_pre), dim=1)).permute(0, 2, 3, 1).reshape(-1, 1, d2)
+            c0_sel, c1_sel = c0_m[i_ids], c1_m[j_ids]
 
         if feat_m0.shape[2:] == feat_m1.shape[2:]:
             feat_m0, feat_m1 = self.out_conv_m(torch.cat((feat_m0, feat_m1), dim=0)).chunk(2, dim=0)
@@ -290,26 +391,22 @@ class FineProcess(nn.Module):
         stride_m = feat_m0.shape[2] // hc0
         stride_f = feat_f0.shape[2] // hc0
 
-        def unfold_select(feat: Tensor, win: int, stride: int, ids: Tensor) -> Tensor:
-            u = F.unfold(feat, kernel_size=(win, win), stride=stride, padding=win // 2)
-            return u.reshape(1, feat.shape[1], win * win, -1).permute(0, 3, 2, 1)[0, ids]
+        m0 = ops.gather_windows(feat_m0, i_ids, wc0, self.W_m, stride_m)
+        m1 = ops.gather_windows(feat_m1, j_ids, wc1, self.W_m, stride_m)
+        f0 = ops.gather_windows(feat_f0, i_ids, wc0, self.W_f, stride_f)
+        f1 = ops.gather_windows(feat_f1, j_ids, wc1, self.W_f, stride_f)
 
-        m0 = unfold_select(feat_m0, self.W_m, stride_m, i_ids)
-        m1 = unfold_select(feat_m1, self.W_m, stride_m, j_ids)
-        f0 = unfold_select(feat_f0, self.W_f, stride_f, i_ids)
-        f1 = unfold_select(feat_f1, self.W_f, stride_f, j_ids)
-        c0_sel, c1_sel = c0_m[0, i_ids], c1_m[0, j_ids]
-
-        # Self + cross attention at medium level (1/4, 3x3 + coarse token)
-        m_both, _ = self.self_attn_m(torch.cat((m0, m1), dim=0), torch.cat((c0_sel, c1_sel), dim=0))
-        m0, m1 = m_both.chunk(2, dim=0)
-        m0, m1 = self.cross_attn_m(m0, m1)
+        # Self + cross attention at medium level (1/4, 3x3 + coarse token), kept stacked [2*M, L, C]
+        m_both, _ = self.self_attn_m(
+            torch.cat((m0, m1), dim=0), torch.cat((c0_sel, c1_sel), dim=0), drop_pre=True
+        )
+        m_both = self.cross_attn_m.forward_stacked(m_both)
 
         # Down-project medium window to fine dim, then self + cross attention at fine level (1/2, 5x5 + 3x3)
-        m0, m1 = self.down_proj_m_f(torch.cat((m0, m1), dim=0)).chunk(2, dim=0)
-        f_both, _ = self.self_attn_f(torch.cat((f0, f1), dim=0), torch.cat((m0, m1), dim=0))
-        f0, f1 = f_both.chunk(2, dim=0)
-        return self.cross_attn_f(f0, f1)
+        m_both = self.down_proj_m_f(m_both)
+        f_both, _ = self.self_attn_f(torch.cat((f0, f1), dim=0), m_both, drop_pre=True)
+        f_both = self.cross_attn_f.forward_stacked(f_both)
+        return f_both.chunk(2, dim=0)
 
 
 class FineSubMatching(nn.Module):
@@ -347,25 +444,36 @@ class FineSubMatching(nn.Module):
             empty_pts = feat_f0_unfold.new_empty((0, 2), dtype=torch.float32)
             return empty_pts, empty_pts, feat_f0_unfold.new_empty((0,), dtype=torch.float32)
 
-        f0 = self.fine_proj(feat_f0_unfold).float() / (feat_f0_unfold.shape[-1] ** 0.5)
-        f1 = self.fine_proj(feat_f1_unfold).float() / (feat_f1_unfold.shape[-1] ** 0.5)
-        sim = torch.einsum("nlc,nsc->nls", f0, f1) / temperature
-        conf = F.softmax(sim, dim=1) * F.softmax(sim, dim=2)
-
-        mask = conf > fine_threshold
-        if not mask.any():
-            mask[0, 0, 0] = True
-            conf[0, 0, 0] = 1.0
-
+        f0_proj = self.fine_proj(feat_f0_unfold)
+        f1_proj = self.fine_proj(feat_f1_unfold)
+        c_dim = feat_f0_unfold.shape[-1]
         if not denser:
-            mask = mask & (conf == conf.amax(dim=(1, 2), keepdim=True))
+            best_conf, best_i, best_j = ops.batched_dual_softmax_argmax(f0_proj, f1_proj, 1.0 / (c_dim * temperature))
+            valid = best_conf > fine_threshold
+            if not valid.any():
+                b_ids = torch.zeros(1, device=best_conf.device, dtype=torch.long)
+                i_ids = torch.zeros(1, device=best_conf.device, dtype=torch.long)
+                j_ids = torch.zeros(1, device=best_conf.device, dtype=torch.long)
+                mconf = torch.ones(1, device=best_conf.device, dtype=torch.float32)
+            else:
+                b_ids = torch.nonzero(valid)[:, 0]
+                i_ids = best_i[b_ids]
+                j_ids = best_j[b_ids]
+                mconf = best_conf[b_ids]
         else:
+            f0 = f0_proj.float() / (c_dim**0.5)
+            f1 = f1_proj.float() / (c_dim**0.5)
+            sim = torch.einsum("nlc,nsc->nls", f0, f1) / temperature
+            conf = F.softmax(sim, dim=1) * F.softmax(sim, dim=2)
+            mask = conf > fine_threshold
+            if not mask.any():
+                mask[0, 0, 0] = True
+                conf[0, 0, 0] = 1.0
             mask = mask & (conf == conf.max(dim=2, keepdim=True).values) & (conf == conf.max(dim=1, keepdim=True).values)
-
-        mask_v, all_j_ids = mask.max(dim=2)
-        b_ids, i_ids = torch.where(mask_v)
-        j_ids = all_j_ids[b_ids, i_ids]
-        mconf = conf[b_ids, i_ids, j_ids]
+            mask_v, all_j_ids = mask.max(dim=2)
+            b_ids, i_ids = torch.where(mask_v)
+            j_ids = all_j_ids[b_ids, i_ids]
+            mconf = conf[b_ids, i_ids, j_ids]
 
         W_f = self.W_f
         scale_f_c = hf0 // hc0
@@ -390,6 +498,68 @@ class FineSubMatching(nn.Module):
         return mkpts0[keep], mkpts1[keep], mconf[keep]
 
 
+def _run_coarse_transformer_fused(
+    transformer: LocalFeatureTransformer, feat0: Tensor, feat1: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Fused execution of ``loftr_coarse``: packed QKV/KV GEMMs, batched self-attention when ``L0 == L1``, and
+    ``ops.elu_linear_attention`` (5-7x faster than PyTorch ``linear_attention``). Leaves ``LoFTREncoderLayer`` and
+    LoFTR itself untouched."""
+    same_len = feat0.shape[1] == feat1.shape[1]
+    for layer, name in zip(transformer.layers, transformer.layer_names):
+        nhead, dim = layer.nhead, layer.dim
+        gemm_dt = layer.attention_gemm_dtype
+        if name == "self":
+            qkv_w = getattr(layer, "_qkv_w", None)
+            if same_len:
+                x = torch.cat((feat0, feat1), dim=0)  # [2, L, C]
+                bs, seq_len, c = x.shape
+                if qkv_w is not None:
+                    q, k, v = F.linear(x, qkv_w).reshape(bs, seq_len, 3, nhead, dim).unbind(2)
+                else:
+                    q = layer.q_proj(x).reshape(bs, seq_len, nhead, dim)
+                    k = layer.k_proj(x).reshape(bs, seq_len, nhead, dim)
+                    v = layer.v_proj(x).reshape(bs, seq_len, nhead, dim)
+                msg = ops.elu_linear_attention(q, k, v, 1e-6, gemm_dt).reshape(bs, seq_len, c)
+                mlp_in = ops.cat_layernorm(x, layer.merge(msg), layer.norm1.weight, layer.norm1.bias, layer.norm1.eps)
+                feat0, feat1 = ops.residual_layernorm(
+                    layer.mlp(mlp_in), x, layer.norm2.weight, layer.norm2.bias, layer.norm2.eps
+                ).chunk(2, dim=0)
+            else:
+                outs = []
+                for x in (feat0, feat1):
+                    bs, seq_len, c = x.shape
+                    if qkv_w is not None:
+                        q, k, v = F.linear(x, qkv_w).reshape(bs, seq_len, 3, nhead, dim).unbind(2)
+                    else:
+                        q = layer.q_proj(x).reshape(bs, seq_len, nhead, dim)
+                        k = layer.k_proj(x).reshape(bs, seq_len, nhead, dim)
+                        v = layer.v_proj(x).reshape(bs, seq_len, nhead, dim)
+                    msg = ops.elu_linear_attention(q, k, v, 1e-6, gemm_dt).reshape(bs, seq_len, c)
+                    mlp_in = ops.cat_layernorm(x, layer.merge(msg), layer.norm1.weight, layer.norm1.bias, layer.norm1.eps)
+                    outs.append(ops.residual_layernorm(layer.mlp(mlp_in), x, layer.norm2.weight, layer.norm2.bias, layer.norm2.eps))
+                feat0, feat1 = outs[0], outs[1]
+        else:
+            kv_w = getattr(layer, "_kv_w", None)
+            for idx in (0, 1):
+                x, src = (feat0, feat1) if idx == 0 else (feat1, feat0)
+                bs, l_q, c = x.shape
+                l_s = src.shape[1]
+                q = layer.q_proj(x).reshape(bs, l_q, nhead, dim)
+                if kv_w is not None:
+                    k, v = F.linear(src, kv_w).reshape(bs, l_s, 2, nhead, dim).unbind(2)
+                else:
+                    k = layer.k_proj(src).reshape(bs, l_s, nhead, dim)
+                    v = layer.v_proj(src).reshape(bs, l_s, nhead, dim)
+                msg = ops.elu_linear_attention(q, k, v, 1e-6, gemm_dt).reshape(bs, l_q, c)
+                mlp_in = ops.cat_layernorm(x, layer.merge(msg), layer.norm1.weight, layer.norm1.bias, layer.norm1.eps)
+                updated = ops.residual_layernorm(layer.mlp(mlp_in), x, layer.norm2.weight, layer.norm2.bias, layer.norm2.eps)
+                if idx == 0:
+                    feat0 = updated
+                else:
+                    feat1 = updated
+    return feat0, feat1
+
+
 class XoFTR(ImageMatcher, nn.Module):
     """Module paths follow the official ``weights_xoftr_640.ckpt`` checkpoint (``backbone``, ``loftr_coarse``,
     ``coarse_matching``, ``fine_process``, ``fine_matching``); loads strictly. ``match(img_a, img_b)`` ->
@@ -398,6 +568,7 @@ class XoFTR(ImageMatcher, nn.Module):
     div_by = 8
     match_defaults: Mapping[str, Any] = {"resize": 640}
     fold_temperature = False  # see spec.py's fold_similarity_temperature pass
+    fused_coarse = False  # see spec.py's fused_coarse_transformer pass
     preset: str | None = None
     engine: str | None = None
     quant_report = None
@@ -496,7 +667,10 @@ class XoFTR(ImageMatcher, nn.Module):
 
         tokens0 = (c0.float() + self.positions(hc0, wc0)).to(c0.dtype).permute(0, 2, 3, 1).reshape(1, -1, c0.shape[1])
         tokens1 = (c1.float() + self.positions(hc1, wc1)).to(c1.dtype).permute(0, 2, 3, 1).reshape(1, -1, c1.shape[1])
-        tokens0, tokens1 = self.loftr_coarse(tokens0, tokens1)
+        if self.fused_coarse:
+            tokens0, tokens1 = _run_coarse_transformer_fused(self.loftr_coarse, tokens0, tokens1)
+        else:
+            tokens0, tokens1 = self.loftr_coarse(tokens0, tokens1)
 
         i_ids, j_ids = self.coarse_matching(
             tokens0,

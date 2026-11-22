@@ -504,3 +504,92 @@ def _eligible_pil_resize(image: Tensor, sizes: Sequence[tuple[int, int]]) -> boo
 ops.pil_bicubic_resize.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible_pil_resize
 )(pil_bicubic_resize)
+
+
+# -- strided spatial window gather -----------------------------------------------------------------------
+
+
+@triton.jit
+def _gather_windows_kernel(
+    feat_ptr,
+    ids_ptr,
+    out_ptr,
+    sc,
+    sh,
+    sw,
+    H,
+    W,
+    COARSE_W,
+    STRIDE: tl.constexpr,
+    WIN: tl.constexpr,
+    HALF: tl.constexpr,
+    C: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """One program per ``(match m, window row wy)``: gathers ``WIN`` horizontal pixels x ``C`` channels from
+    ``feat [1, C, H, W]`` (arbitrary strides) into ``out [M, WIN*WIN, C]`` contiguous."""
+    m = tl.program_id(0).to(tl.int64)
+    wy = tl.program_id(1)
+    cell = tl.load(ids_ptr + m).to(tl.int64)
+    cy = cell // COARSE_W
+    cx = cell - cy * COARSE_W
+    iy = cy * STRIDE + wy - HALF
+    wx = tl.arange(0, BLOCK_W)
+    c = tl.arange(0, BLOCK_C)
+    ix = cx * STRIDE + wx - HALF
+    in_y = (iy >= 0) & (iy < H)
+    ok_w = wx < WIN
+    ok_c = c < C
+    in_bounds = in_y & ok_w & (ix >= 0) & (ix < W)
+    ptrs = feat_ptr + iy * sh + ix[:, None] * sw + c[None, :] * sc
+    vals = tl.load(ptrs, mask=in_bounds[:, None] & ok_c[None, :], other=0.0)
+    out_base = out_ptr + (m * (WIN * WIN) + wy * WIN) * C
+    tl.store(out_base + wx[:, None] * C + c[None, :], vals, mask=ok_w[:, None] & ok_c[None, :])
+
+
+def gather_windows(feat: Tensor, ids: Tensor, coarse_w: int, win: int, stride: int) -> Tensor:
+    m = ids.shape[0]
+    c, h, w = feat.shape[1], feat.shape[2], feat.shape[3]
+    if m == 0:
+        return feat.new_empty((0, win * win, c))
+    out = torch.empty((m, win * win, c), device=feat.device, dtype=feat.dtype)
+    block_w = triton.next_power_of_2(win)
+    block_c = triton.next_power_of_2(c)
+    _gather_windows_kernel[(m, win)](
+        feat,
+        ids,
+        out,
+        feat.stride(1),
+        feat.stride(2),
+        feat.stride(3),
+        h,
+        w,
+        coarse_w,
+        STRIDE=stride,
+        WIN=win,
+        HALF=win // 2,
+        C=c,
+        BLOCK_W=block_w,
+        BLOCK_C=block_c,
+        num_warps=4,
+    )
+    return out
+
+
+def _gather_windows_eligible(feat: Tensor, ids: Tensor, coarse_w: int, win: int, stride: int) -> bool:
+    return (
+        not torch.is_grad_enabled()
+        and feat.ndim == 4
+        and feat.shape[0] == 1
+        and ids.ndim == 1
+        and feat.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and feat.shape[1] <= 512
+        and 1 <= win <= 9
+        and win % 2 == 1
+    )
+
+
+ops.gather_windows.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_gather_windows_eligible
+)(gather_windows)

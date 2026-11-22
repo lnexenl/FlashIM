@@ -155,3 +155,28 @@ def _mxfp8_gelu_mlp_reference(
 
 
 mxfp8_gelu_mlp = Op("mxfp8_gelu_mlp", _mxfp8_gelu_mlp_reference)
+
+
+# -- fused dual-input GELU MLP (+ optional residual LayerNorm) -------------------------------------------
+
+
+def _cat_gelu_mlp_reference(
+    a: Tensor,
+    b: Tensor,
+    w1: Tensor,
+    b1: Tensor | None,
+    w2: Tensor,
+    b2: Tensor | None,
+    norm_weight: Tensor | None = None,
+    norm_bias: Tensor | None = None,
+    eps: float = 1e-5,
+) -> Tensor:
+    """``fc2(GELU(fc1(cat((a, b), -1))))``, optionally followed by ``a + LayerNorm(out, norm_weight, norm_bias, eps)``."""
+    h = F.gelu(F.linear(torch.cat((a, b), dim=-1), w1, b1))
+    out = F.linear(h, w2, b2)
+    if norm_weight is not None:
+        out = a + F.layer_norm(out, (out.shape[-1],), norm_weight, norm_bias, eps)
+    return out
+
+
+cat_gelu_mlp = Op("cat_gelu_mlp", _cat_gelu_mlp_reference)

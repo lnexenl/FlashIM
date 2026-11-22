@@ -405,3 +405,452 @@ def _deformable_attention_op(
 def _(value, offsets, weights, reference, shapes, softmax):
     n, queries, m, d = value.shape[0], offsets.shape[1], value.shape[2], value.shape[3]
     return value.new_empty(n, queries, m * d)
+
+
+# -- short-window SDPA (L <= 64, D <= 32, high batch*heads; avoids FlashAttention's 128x128 tile padding) -
+
+
+@triton.jit
+def _short_window_sdpa_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    out_ptr,
+    qs_b,
+    qs_h,
+    qs_l,
+    ks_b,
+    ks_h,
+    ks_l,
+    vs_b,
+    vs_h,
+    vs_l,
+    os_b,
+    os_h,
+    os_l,
+    H,
+    L_Q,
+    L_KV,
+    scale,
+    D: tl.constexpr,
+    BLOCK_LQ: tl.constexpr,
+    BLOCK_LKV: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    bh = tl.program_id(0).to(tl.int64)
+    b = bh // H
+    h = bh - b * H
+    lq_idx = tl.arange(0, BLOCK_LQ)
+    lkv_idx = tl.arange(0, BLOCK_LKV)
+    d_idx = tl.arange(0, BLOCK_D)
+    lq_ok = lq_idx < L_Q
+    lkv_ok = lkv_idx < L_KV
+    d_ok = d_idx < D
+    q_mask = lq_ok[:, None] & d_ok[None, :]
+    kv_mask = lkv_ok[:, None] & d_ok[None, :]
+
+    q = tl.load(q_ptr + b * qs_b + h * qs_h + lq_idx[:, None] * qs_l + d_idx[None, :], mask=q_mask, other=0.0)
+    k = tl.load(k_ptr + b * ks_b + h * ks_h + lkv_idx[:, None] * ks_l + d_idx[None, :], mask=kv_mask, other=0.0)
+    v = tl.load(v_ptr + b * vs_b + h * vs_h + lkv_idx[:, None] * vs_l + d_idx[None, :], mask=kv_mask, other=0.0)
+
+    scores = tl.dot(q, tl.trans(k)) * scale
+    scores = tl.where(lkv_ok[None, :], scores, -float("inf"))
+    scores = scores - tl.max(scores, axis=1)[:, None]
+    p = tl.exp(scores)
+    p = p / tl.sum(p, axis=1)[:, None]
+    out = tl.dot(p.to(q.dtype), v)
+    tl.store(out_ptr + b * os_b + h * os_h + lq_idx[:, None] * os_l + d_idx[None, :], out.to(q.dtype), mask=q_mask)
+
+
+def short_window_sdpa(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    batch, heads, l_q, head_dim = q.shape
+    l_kv = k.shape[2]
+    # Output in [B, L_q, H, D].transpose(1, 2) layout so caller's .transpose(1, 2).reshape(B, L_q, H*D) is zero-copy.
+    out = torch.empty((batch, l_q, heads, head_dim), device=q.device, dtype=q.dtype).transpose(1, 2)
+    block_lq = max(16, triton.next_power_of_2(l_q))
+    block_lkv = max(16, triton.next_power_of_2(l_kv))
+    block_d = max(16, triton.next_power_of_2(head_dim))
+    num_warps = 2 if max(block_lq, block_lkv) <= 32 else 4
+    _short_window_sdpa_kernel[(batch * heads,)](
+        q,
+        k,
+        v,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        heads,
+        l_q,
+        l_kv,
+        head_dim**-0.5,
+        D=head_dim,
+        BLOCK_LQ=block_lq,
+        BLOCK_LKV=block_lkv,
+        BLOCK_D=block_d,
+        num_warps=num_warps,
+    )
+    return out
+
+
+def _short_window_sdpa_eligible(q: Tensor, k: Tensor, v: Tensor) -> bool:
+    return (
+        not torch.is_grad_enabled()
+        and q.ndim == 4
+        and k.ndim == 4
+        and v.ndim == 4
+        and q.shape[:2] == k.shape[:2] == v.shape[:2]
+        and q.shape[3] == k.shape[3] == v.shape[3]
+        and k.shape[2] == v.shape[2]
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+        and 0 < q.shape[2] <= 64
+        and 0 < k.shape[2] <= 64
+        and 0 < q.shape[3] <= 32
+        and q.shape[0] * q.shape[1] >= 256
+    )
+
+
+ops.sdpa.register(
+    "triton_short_window", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_short_window_sdpa_eligible
+)(short_window_sdpa)
+
+
+# -- shared-QK bidirectional cross-attention (short windows) ----------------------------------------------
+
+
+@triton.jit
+def _bidirectional_cross_attn_kernel(
+    qk0_ptr,
+    qk1_ptr,
+    v0_ptr,
+    v1_ptr,
+    out0_ptr,
+    out1_ptr,
+    s0_m,
+    s0_l,
+    s1_m,
+    s1_l,
+    v0_m,
+    v0_l,
+    v1_m,
+    v1_l,
+    o0_m,
+    o0_l,
+    o1_m,
+    o1_l,
+    H,
+    L0,
+    L1,
+    scale,
+    D: tl.constexpr,
+    BLOCK_L0: tl.constexpr,
+    BLOCK_L1: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    mh = tl.program_id(0).to(tl.int64)
+    m = mh // H
+    h = mh - m * H
+    h_off = h * D
+    l0 = tl.arange(0, BLOCK_L0)
+    l1 = tl.arange(0, BLOCK_L1)
+    d = tl.arange(0, BLOCK_D)
+    m0 = l0 < L0
+    m1 = l1 < L1
+    md = d < D
+
+    qk0 = tl.load(qk0_ptr + m * s0_m + l0[:, None] * s0_l + h_off + d[None, :], mask=m0[:, None] & md[None, :], other=0.0)
+    qk1 = tl.load(qk1_ptr + m * s1_m + l1[:, None] * s1_l + h_off + d[None, :], mask=m1[:, None] & md[None, :], other=0.0)
+    v0 = tl.load(v0_ptr + m * v0_m + l0[:, None] * v0_l + h_off + d[None, :], mask=m0[:, None] & md[None, :], other=0.0)
+    v1 = tl.load(v1_ptr + m * v1_m + l1[:, None] * v1_l + h_off + d[None, :], mask=m1[:, None] & md[None, :], other=0.0)
+
+    sim = tl.dot(qk0, tl.trans(qk1)) * scale
+
+    s01 = tl.where(m1[None, :], sim, -float("inf"))
+    s01 = s01 - tl.max(s01, axis=1)[:, None]
+    p01 = tl.exp(s01)
+    p01 = p01 / tl.sum(p01, axis=1)[:, None]
+    out0 = tl.dot(p01.to(v1.dtype), v1)
+    tl.store(
+        out0_ptr + m * o0_m + l0[:, None] * o0_l + h_off + d[None, :],
+        out0.to(v1.dtype),
+        mask=m0[:, None] & md[None, :],
+    )
+
+    s10 = tl.where(m0[:, None], sim, -float("inf"))
+    s10 = s10 - tl.max(s10, axis=0)[None, :]
+    p10 = tl.exp(s10)
+    p10 = p10 / tl.sum(p10, axis=0)[None, :]
+    out1 = tl.dot(tl.trans(p10).to(v0.dtype), v0)
+    tl.store(
+        out1_ptr + m * o1_m + l1[:, None] * o1_l + h_off + d[None, :],
+        out1.to(v0.dtype),
+        mask=m1[:, None] & md[None, :],
+    )
+
+
+def bidirectional_cross_attention(
+    qk0: Tensor, qk1: Tensor, v0: Tensor, v1: Tensor, num_heads: int
+) -> tuple[Tensor, Tensor]:
+    m, l0, c = qk0.shape
+    l1 = qk1.shape[1]
+    d = c // num_heads
+    if m == 0:
+        return torch.empty_like(v0), torch.empty_like(v1)
+    out0 = torch.empty((m, l0, c), device=v0.device, dtype=v0.dtype)
+    out1 = torch.empty((m, l1, c), device=v1.device, dtype=v1.dtype)
+    block_l0 = max(16, triton.next_power_of_2(l0))
+    block_l1 = max(16, triton.next_power_of_2(l1))
+    block_d = max(16, triton.next_power_of_2(d))
+    num_warps = 2 if max(block_l0, block_l1) <= 32 else 4
+    _bidirectional_cross_attn_kernel[(m * num_heads,)](
+        qk0,
+        qk1,
+        v0,
+        v1,
+        out0,
+        out1,
+        qk0.stride(0),
+        qk0.stride(1),
+        qk1.stride(0),
+        qk1.stride(1),
+        v0.stride(0),
+        v0.stride(1),
+        v1.stride(0),
+        v1.stride(1),
+        out0.stride(0),
+        out0.stride(1),
+        out1.stride(0),
+        out1.stride(1),
+        num_heads,
+        l0,
+        l1,
+        d**-0.5,
+        D=d,
+        BLOCK_L0=block_l0,
+        BLOCK_L1=block_l1,
+        BLOCK_D=block_d,
+        num_warps=num_warps,
+    )
+    return out0, out1
+
+
+def _bidirectional_cross_attn_eligible(qk0: Tensor, qk1: Tensor, v0: Tensor, v1: Tensor, num_heads: int) -> bool:
+    if torch.is_grad_enabled() or qk0.ndim != 3 or qk1.ndim != 3 or v0.shape != qk0.shape or v1.shape != qk1.shape:
+        return False
+    if qk0.dtype not in (torch.bfloat16, torch.float16) or not (qk0.dtype == qk1.dtype == v0.dtype == v1.dtype):
+        return False
+    if not all(t.stride(-1) == 1 for t in (qk0, qk1, v0, v1)):
+        return False
+    d = qk0.shape[2] // num_heads
+    return qk0.shape[2] % num_heads == 0 and 0 < qk0.shape[1] <= 64 and 0 < qk1.shape[1] <= 64 and 0 < d <= 32
+
+
+ops.bidirectional_cross_attention.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_bidirectional_cross_attn_eligible
+)(bidirectional_cross_attention)
+
+
+# -- ELU+1 linear attention ------------------------------------------------------------------------------
+
+
+@triton.jit
+def _elu_linear_kv_kernel(
+    k_ptr,
+    v_ptr,
+    kv_part_ptr,
+    ksum_part_ptr,
+    ks_b,
+    ks_s,
+    ks_h,
+    vs_b,
+    vs_s,
+    vs_h,
+    H,
+    S,
+    inv_s,
+    SPLITS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BF16_GEMM: tl.constexpr,
+):
+    bh = tl.program_id(0).to(tl.int64)
+    split = tl.program_id(1)
+    b = bh // H
+    h = bh - b * H
+    chunk = (S + SPLITS - 1) // SPLITS
+    s_start = split * chunk
+    s_end = tl.minimum(s_start + chunk, S)
+
+    d_idx = tl.arange(0, BLOCK_D)
+    d_ok = d_idx < D
+    kv_acc = tl.zeros((BLOCK_D, BLOCK_D), dtype=tl.float32)
+    ksum_acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+    for s0 in range(s_start, s_end, BLOCK_S):
+        s_idx = s0 + tl.arange(0, BLOCK_S)
+        s_ok = s_idx < s_end
+        mask = s_ok[:, None] & d_ok[None, :]
+        k = tl.load(k_ptr + b * ks_b + s_idx[:, None] * ks_s + h * ks_h + d_idx[None, :], mask=mask, other=0.0).to(
+            tl.float32
+        )
+        v = tl.load(v_ptr + b * vs_b + s_idx[:, None] * vs_s + h * vs_h + d_idx[None, :], mask=mask, other=0.0).to(
+            tl.float32
+        )
+        phi_k = tl.where(s_ok[:, None] & d_ok[None, :], tl.where(k > 0.0, k + 1.0, tl.exp(k)), 0.0)
+        ksum_acc += tl.sum(phi_k, axis=0)
+        v_scaled = v * inv_s
+        if BF16_GEMM:
+            kv_acc += tl.dot(tl.trans(phi_k.to(tl.bfloat16)), v_scaled.to(tl.bfloat16))
+        else:
+            kv_acc += tl.dot(tl.trans(phi_k), v_scaled, input_precision="ieee")
+
+    part_id = bh * SPLITS + split
+    tl.store(
+        kv_part_ptr + part_id * (D * D) + d_idx[:, None] * D + d_idx[None, :],
+        kv_acc,
+        mask=d_ok[:, None] & d_ok[None, :],
+    )
+    tl.store(ksum_part_ptr + part_id * D + d_idx, ksum_acc, mask=d_ok)
+
+
+@triton.jit
+def _elu_linear_q_kernel(
+    q_ptr,
+    kv_ptr,
+    ksum_ptr,
+    out_ptr,
+    qs_b,
+    qs_l,
+    qs_h,
+    os_b,
+    os_l,
+    os_h,
+    H,
+    L,
+    S_f,
+    eps,
+    D: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BF16_GEMM: tl.constexpr,
+):
+    l_block = tl.program_id(0)
+    bh = tl.program_id(1).to(tl.int64)
+    b = bh // H
+    h = bh - b * H
+    l_idx = l_block * BLOCK_L + tl.arange(0, BLOCK_L)
+    d_idx = tl.arange(0, BLOCK_D)
+    l_ok = l_idx < L
+    d_ok = d_idx < D
+    mask = l_ok[:, None] & d_ok[None, :]
+
+    kv = tl.load(kv_ptr + bh * (D * D) + d_idx[:, None] * D + d_idx[None, :], mask=d_ok[:, None] & d_ok[None, :], other=0.0)
+    ksum = tl.load(ksum_ptr + bh * D + d_idx, mask=d_ok, other=0.0)
+    q = tl.load(q_ptr + b * qs_b + l_idx[:, None] * qs_l + h * qs_h + d_idx[None, :], mask=mask, other=0.0).to(tl.float32)
+    phi_q = tl.where(q > 0.0, q + 1.0, tl.exp(q))
+    z = S_f / (tl.sum(phi_q * ksum[None, :], axis=1) + eps)
+    if BF16_GEMM:
+        out = tl.dot(phi_q.to(tl.bfloat16), kv.to(tl.bfloat16)) * z[:, None]
+    else:
+        out = tl.dot(phi_q, kv, input_precision="ieee") * z[:, None]
+    tl.store(out_ptr + b * os_b + l_idx[:, None] * os_l + h * os_h + d_idx[None, :], out.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def elu_linear_attention(
+    q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6, gemm_dtype: torch.dtype | None = None
+) -> Tensor:
+    batch, seq_l, heads, dim = q.shape
+    seq_s = k.shape[1]
+    bf16_gemm = gemm_dtype == torch.bfloat16
+    splits = 16 if seq_s >= 1024 else 1
+    block_d = max(16, triton.next_power_of_2(dim))
+    kv_part = torch.empty((batch * heads, splits, dim, dim), device=q.device, dtype=torch.float32)
+    ksum_part = torch.empty((batch * heads, splits, dim), device=q.device, dtype=torch.float32)
+    _elu_linear_kv_kernel[(batch * heads, splits)](
+        k,
+        v,
+        kv_part,
+        ksum_part,
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        heads,
+        seq_s,
+        1.0 / seq_s,
+        SPLITS=splits,
+        D=dim,
+        BLOCK_S=128,
+        BLOCK_D=block_d,
+        BF16_GEMM=bf16_gemm,
+        num_warps=4,
+    )
+    kv = kv_part.sum(dim=1) if splits > 1 else kv_part[:, 0]
+    ksum = ksum_part.sum(dim=1) if splits > 1 else ksum_part[:, 0]
+    out = torch.empty((batch, seq_l, heads, dim), device=q.device, dtype=q.dtype)
+    block_l = 64
+    _elu_linear_q_kernel[(triton.cdiv(seq_l, block_l), batch * heads)](
+        q,
+        kv,
+        ksum,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        heads,
+        seq_l,
+        float(seq_s),
+        eps,
+        D=dim,
+        BLOCK_L=block_l,
+        BLOCK_D=block_d,
+        BF16_GEMM=bf16_gemm,
+        num_warps=4,
+    )
+    return out
+
+
+def _elu_linear_attn_eligible(
+    q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6, gemm_dtype: torch.dtype | None = None
+) -> bool:
+    return (
+        not torch.is_grad_enabled()
+        and q.ndim == 4
+        and k.ndim == 4
+        and v.shape == k.shape
+        and q.shape[0] == k.shape[0]
+        and q.shape[2] == k.shape[2]
+        and q.shape[3] == k.shape[3]
+        and q.dtype in _FLOATS
+        and k.dtype in _FLOATS
+        and v.dtype in _FLOATS
+        and gemm_dtype in (None, torch.bfloat16)
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+        and 0 < q.shape[3] <= 64
+    )
+
+
+ops.elu_linear_attention.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_elu_linear_attn_eligible
+)(elu_linear_attention)

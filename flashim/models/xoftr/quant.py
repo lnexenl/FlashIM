@@ -30,6 +30,10 @@ match agreement within 2 px against ``fp32``, and eager latency on RTX 5070 Ti /
   - ``int8``: agreement 0.9027 (ratio 1.0004; cf. LoFTR ``int8`` 0.9042), 15.28 ms (1.19x vs ``bf16`` eager).
   - ``fp8`` : agreement 0.8705 (ratio 0.9967; cf. LoFTR ``fp8`` 0.7782), 15.95 ms (1.14x vs ``bf16`` eager).
   (Quantizing ``layer1.0.conv2`` as well saves 0.50 ms in INT8 for -0.0085 agreement: 0.8942 / 14.78 ms.)
+- After Phase 2 Triton kernel optimizations (interleaved best-of-2 on RTX 5070 Ti / sm_120, 640 px, eager):
+  - ``bf16``: agreement 0.9310 (ratio 1.0006), 10.83 ms (``sacre_coeur``) / 13.50 ms (``toronto``); ``compile`` 10.01 / 12.61 ms.
+  - ``int8``: agreement 0.9060 (ratio 1.0019), 8.15 ms (``sacre_coeur``) / 11.02 ms (``toronto``) — 1.33x / 1.23x vs ``bf16``.
+  - ``fp8`` : agreement 0.8736 (ratio 0.9972), 8.68 ms (``sacre_coeur``) / 11.46 ms (``toronto``) — 1.25x / 1.18x vs ``bf16``.
 """
 
 from __future__ import annotations
