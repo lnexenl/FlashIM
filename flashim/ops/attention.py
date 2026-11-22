@@ -33,6 +33,40 @@ def _rope_qk_reference(q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> tuple[
 rope_qk = Op("rope_qk", _rope_qk_reference)
 
 
+def _apply_rope_2d(value: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
+    """Apply split-half 2D axial RoPE (CroCo convention: ``[y1, y2, x1, x2]``) to ``[B, H, N, D]``."""
+    v_dtype = value.dtype
+    v = value.to(sin.dtype)
+    y, x = v.chunk(2, dim=-1)
+    y1, y2 = y.chunk(2, dim=-1)
+    x1, x2 = x.chunk(2, dim=-1)
+    rotated = torch.cat((-y2, y1, -x2, x1), dim=-1)
+    return (v * cos + rotated * sin).to(v_dtype)
+
+
+def _rope_qk_2d_reference(
+    q: Tensor,
+    k: Tensor,
+    sin: Tensor,
+    cos: Tensor,
+    k_sin: Tensor | None = None,
+    k_cos: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Apply CroCo-style 2D axial RoPE to ``q [B, H, Nq, D]`` and ``k [B, H, Nk, D]``.
+
+    Each head vector is split into two halves ``(y, x)`` and half-split rotary embedding is applied independently
+    to each half (``[y1, y2, x1, x2]`` rotates ``(y1, y2)`` and ``(x1, x2)``). ``sin`` / ``cos`` have shape
+    ``[Nq, D]`` (or broadcastable to ``[B, 1, Nq, D]``); for cross-attention where ``k`` has different positions or
+    length, pass ``k_sin`` / ``k_cos`` for ``k`` (defaults to ``sin`` / ``cos``).
+    """
+    if k_sin is None:
+        k_sin, k_cos = sin, cos
+    return _apply_rope_2d(q, sin, cos), _apply_rope_2d(k, k_sin, k_cos)
+
+
+rope_qk_2d = Op("rope_qk_2d", _rope_qk_2d_reference)
+
+
 def _rotate_pairs(x: Tensor) -> Tensor:
     """``(x0, x1, x2, x3, ...) -> (-x1, x0, -x3, x2, ...)``."""
     return torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).flatten(-2)

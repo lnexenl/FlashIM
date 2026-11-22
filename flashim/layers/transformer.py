@@ -59,12 +59,21 @@ class Attention(nn.Module):
     reproduce upstream eager math.
     """
 
-    def __init__(self, dim: int, num_heads: int, *, mask_k_bias: bool = False, rope_impl: str | None = None) -> None:
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        *,
+        mask_k_bias: bool = False,
+        rope_impl: str | None = None,
+        rope_2d: bool = False,
+    ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.qkv = LinearKMaskedBias(dim, 3 * dim) if mask_k_bias else nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
         self.rope_impl = rope_impl
+        self.rope_2d = rope_2d
         self.sdpa_impl: str | None = "reference"
 
     def forward(self, x: Tensor, rope: tuple[Tensor, Tensor] | None = None) -> Tensor:
@@ -72,7 +81,8 @@ class Attention(nn.Module):
         qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, channels // self.num_heads)
         q, k, v = (t.transpose(1, 2) for t in qkv.unbind(2))
         if rope is not None:
-            q, k = ops.rope_qk.get(self.rope_impl)(q, k, *rope)
+            rope_op = ops.rope_qk_2d if self.rope_2d else ops.rope_qk
+            q, k = rope_op.get(self.rope_impl)(q, k, *rope)
         out = ops.sdpa.get(self.sdpa_impl)(q, k, v)
         return self.proj(out.transpose(1, 2).reshape(batch, tokens, channels))
 
@@ -89,11 +99,14 @@ class TransformerBlock(nn.Module):
         layer_scale: bool = False,
         mask_k_bias: bool = False,
         rope_impl: str | None = None,
+        rope_2d: bool = False,
         mlp_ratio: int = 4,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, eps=eps)
-        self.attn = Attention(dim, num_heads, mask_k_bias=mask_k_bias, rope_impl=rope_impl)
+        self.attn = Attention(
+            dim, num_heads, mask_k_bias=mask_k_bias, rope_impl=rope_impl, rope_2d=rope_2d
+        )
         self.ls1 = LayerScale(dim) if layer_scale else nn.Identity()
         self.norm2 = nn.LayerNorm(dim, eps=eps)
         self.mlp = Mlp(dim, mlp_ratio * dim)

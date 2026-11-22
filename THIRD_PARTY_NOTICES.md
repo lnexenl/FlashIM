@@ -22,16 +22,18 @@ upstream code or licenses nevertheless apply.
   source is copied.
 
 Other models (ALIKED and ALIKE: BSD-3-Clause; DaD, DeDoDe: MIT, DeDoDe's DINOv2 parts Apache-2.0; LoMa: MIT, its
-LightGlue-derived matcher Apache-2.0, built on `flashim/models/lightglue/`; RDD, XFeat, LoFTR, DISK, RaCo: Apache-2.0)
+LightGlue-derived matcher Apache-2.0, built on `flashim/models/lightglue/`; RDD, XFeat, LoFTR, DISK, RaCo: Apache-2.0;
+MASt3R / DUSt3R / CroCo: CC BY-NC-SA 4.0, non-commercial use only)
 are independent implementations of the published architectures; the license of each upstream is recorded in
 `flashim/models/<model>/weights.py` (`LICENSES`) next to the checkpoint it applies to.
 
 ## Weights (downloaded, never shipped)
 
 Checkpoints are fetched from their publishers (URLs and SHA-256 in `flashim/models/*/weights.py`) and keep their own
-licenses. Two are not open-source licenses: **SuperPoint** (`superpoint_v1.pth`, Magic Leap, non-commercial research)
-and **RIPE** (Fraunhofer academic-use license: internal non-commercial use only). The DINOv3 weights inside the RoMaV2
-checkpoint are under the DINOv3 License.
+licenses. Three are not open-source licenses: **SuperPoint** (`superpoint_v1.pth`, Magic Leap, non-commercial research),
+**RIPE** (Fraunhofer academic-use license: internal non-commercial use only), and **MASt3R**
+(`MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only).
+The DINOv3 weights inside the RoMaV2 checkpoint are under the DINOv3 License.
 
 ## Test references (`tests/oracles/`)
 

@@ -65,3 +65,109 @@ def _dual_softmax_mutual_reference(
 
 
 dual_softmax_mutual = Op("dual_softmax_mutual", _dual_softmax_mutual_reference)
+
+
+def _nn_query_blocked(queries: Tensor, db: Tensor, block_size: int, dist: str) -> Tensor:
+    """For each row of ``queries [Q, D]``, index of its nearest neighbor in ``db [N, D]`` (first occurrence wins on
+    ties, matching ``torch.max`` / ``torch.min``)."""
+    q_count, n_count = queries.shape[0], db.shape[0]
+    if q_count == 0:
+        return torch.empty(0, dtype=torch.int64, device=queries.device)
+    if dist not in ("dot", "l2"):
+        raise ValueError(f"Unknown dist={dist!r}; expected 'dot' or 'l2'")
+    best_idx = torch.empty(q_count, dtype=torch.int64, device=queries.device)
+    for qs in range(0, q_count, block_size):
+        qe = min(qs + block_size, q_count)
+        q_blk = queries[qs:qe]
+        if n_count <= block_size:
+            if dist == "dot":
+                best_idx[qs:qe] = (q_blk @ db.t()).argmax(dim=1)
+            else:
+                best_idx[qs:qe] = torch.cdist(q_blk, db).argmin(dim=1)
+            continue
+        best_val = torch.full(
+            (qe - qs,), float("-inf") if dist == "dot" else float("inf"),
+            device=queries.device, dtype=queries.dtype,
+        )
+        cur_idx = torch.zeros(qe - qs, dtype=torch.int64, device=queries.device)
+        for ns in range(0, n_count, block_size):
+            ne = min(ns + block_size, n_count)
+            d_blk = db[ns:ne]
+            if dist == "dot":
+                vals, idx = (q_blk @ d_blk.t()).max(dim=1)
+                better = vals > best_val
+            else:
+                vals, idx = torch.cdist(q_blk, d_blk).min(dim=1)
+                better = vals < best_val
+            best_val = torch.where(better, vals, best_val)
+            cur_idx = torch.where(better, idx + ns, cur_idx)
+        best_idx[qs:qe] = cur_idx
+    return best_idx
+
+
+def _fast_reciprocal_nn_reference(
+    desc1: Tensor,
+    desc2: Tensor,
+    subsample: int = 8,
+    max_iter: int = 10,
+    block_size: int = 8192,
+    dist: str = "dot",
+) -> tuple[Tensor, Tensor]:
+    """Iterative reciprocal nearest-neighbor matching on dense descriptor maps (MASt3R ``fast_reciprocal_NNs``).
+
+    Starts from a stride-``subsample`` grid on ``desc1 [H1, W1, D]`` and alternates nearest-neighbor lookups into
+    ``desc2 [H2, W2, D]`` and back into ``desc1`` for up to ``max_iter`` iterations until fixed points (reciprocal
+    pairs) converge. Returns unique converged correspondences sorted by image-1 flat index: ``(xy1, xy2)`` as
+    int64 ``[M, 2]`` ``(x, y)`` pixel indices.
+    """
+    h1, w1, dim1 = desc1.shape
+    _h2, w2, dim2 = desc2.shape
+    if dim1 != dim2:
+        raise ValueError(f"Descriptor dim mismatch: {dim1} vs {dim2}")
+    device = desc1.device
+    start = subsample // 2
+    if start >= h1 or start >= w1:
+        empty = torch.empty((0, 2), dtype=torch.int64, device=device)
+        return empty, empty
+    pts1 = desc1.reshape(-1, dim1)
+    pts2 = desc2.reshape(-1, dim2)
+
+    ys = torch.arange(start, h1, subsample, device=device, dtype=torch.int64)
+    xs = torch.arange(start, w1, subsample, device=device, dtype=torch.int64)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    xy1 = (grid_x + w1 * grid_y).reshape(-1)
+    xy2 = torch.full_like(xy1, -1)
+    old_xy1 = xy1.clone()
+    old_xy2 = xy2.clone()
+    notyet = torch.ones(xy1.shape[0], dtype=torch.bool, device=device)
+
+    for _ in range(max_iter):
+        active = notyet.nonzero(as_tuple=True)[0]
+        if active.numel() == 0:
+            break
+        xy2[active] = _nn_query_blocked(pts1[xy1[active]], pts2, block_size, dist)
+        notyet &= old_xy2 != xy2
+
+        active = notyet.nonzero(as_tuple=True)[0]
+        if active.numel() == 0:
+            break
+        xy1[active] = _nn_query_blocked(pts2[xy2[active]], pts1, block_size, dist)
+        notyet &= old_xy1 != xy1
+
+        old_xy2.copy_(xy2)
+        old_xy1.copy_(xy1)
+
+    converged = ~notyet
+    c1, c2 = xy1[converged], xy2[converged]
+    if c1.numel() == 0:
+        empty = torch.empty((0, 2), dtype=torch.int64, device=device)
+        return empty, empty
+    packed = torch.unique((c1 << 32) | c2, sorted=True)
+    idx1 = packed >> 32
+    idx2 = packed & 0xFFFFFFFF
+    out1 = torch.stack((idx1 % w1, idx1 // w1), dim=-1)
+    out2 = torch.stack((idx2 % w2, idx2 // w2), dim=-1)
+    return out1, out2
+
+
+fast_reciprocal_nn = Op("fast_reciprocal_nn", _fast_reciprocal_nn_reference)

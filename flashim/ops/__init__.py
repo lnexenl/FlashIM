@@ -16,7 +16,7 @@ from flashim.ops._registry import (
     set_strict,
 )
 from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
-from flashim.ops.attention import deformable_attention, rope_qk, rope_qk_interleaved, sdpa
+from flashim.ops.attention import deformable_attention, rope_qk, rope_qk_2d, rope_qk_interleaved, sdpa
 from flashim.ops.conv import (
     conv2d_at_points,
     conv2d_single_output,
@@ -31,7 +31,7 @@ from flashim.ops.conv import (
     int8_conv2d_maxpool,
     mxfp8_conv2d,
 )
-from flashim.ops.correlation import dual_softmax_mutual, local_corr
+from flashim.ops.correlation import dual_softmax_mutual, fast_reciprocal_nn, local_corr
 from flashim.ops.density import kde_density
 from flashim.ops.gemm import (
     int8_linear,
@@ -57,6 +57,7 @@ from flashim.ops.quantize import (
     quantize_int8_heads,
     quantize_int8_multi,
     quantize_int8_rows,
+    quantize_int8_rows_heads,
     quantize_mxfp8,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
@@ -82,6 +83,7 @@ __all__ = [
     "depthwise5x5_relu_pointwise_int8",
     "depthwise5x5_relu_pointwise_mxfp8",
     "dual_softmax_mutual",
+    "fast_reciprocal_nn",
     "gelu_quantize",
     "gelu_quantize_int8",
     "im2col_gather",
@@ -111,6 +113,7 @@ __all__ = [
     "quantize_int8_heads",
     "quantize_int8_multi",
     "quantize_int8_rows",
+    "quantize_int8_rows_heads",
     "quantize_mxfp8",
     "raco_head5x5",
     "raco_resblock",
@@ -118,6 +121,7 @@ __all__ = [
     "romav2_refiner_heads",
     "romav2_refiner_input",
     "rope_qk",
+    "rope_qk_2d",
     "rope_qk_interleaved",
     "sdpa",
     "set_strict",

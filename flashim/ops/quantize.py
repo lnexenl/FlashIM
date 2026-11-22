@@ -145,16 +145,30 @@ bias_relu_quantize_int8 = Op("bias_relu_quantize_int8", _bias_relu_quantize_int8
 # -- INT8 producer: dynamic per-row FP32 scale --------------------------------------------------------
 
 
-def _quantize_int8_rows_reference(value: Tensor) -> tuple[Tensor, Tensor]:
+def _quantize_int8_rows_reference(value: Tensor, *, channel_scale: Tensor | None = None) -> tuple[Tensor, Tensor]:
     """Per-row (per-token) dynamic INT8: ``scale = amax(|row|) * (1 / 127)`` (FP32, ``safe_scale``; the reciprocal
     product, which is what torch's CUDA division by a scalar computes, spelled out so every device agrees),
-    ``round(value / scale)`` saturated to +-127. Returns int8 values of ``value``'s shape and the FP32 scales
-    ``[*leading, 1]`` (the ``a_scale`` :func:`~flashim.ops.int8_linear` takes per row)."""
+    ``round(value / scale)`` saturated to +-127. With ``channel_scale`` ``[K]`` (FP32 SmoothQuant ``1 / s``), scales
+    ``value`` column-wise in FP32 before computing the row scales. Returns int8 values of ``value``'s shape and the
+    FP32 scales ``[*leading, 1]`` (the ``a_scale`` :func:`~flashim.ops.int8_linear` takes per row)."""
+    if channel_scale is not None:
+        value = value.float() * channel_scale.float()
     scale = safe_scale(value.float().abs().amax(-1, keepdim=True) * (1 / INT8_MAX))
     return quantize_symmetric(value, scale), scale
 
 
 quantize_int8_rows = Op("quantize_int8_rows", _quantize_int8_rows_reference)
+
+
+def _quantize_int8_rows_heads_reference(value: Tensor) -> tuple[Tensor, Tensor]:
+    """``quantize_int8_rows(value.transpose(1, 2).reshape(B * N, H * D))`` of an attention output ``[B, H, N, D]``:
+    produces the token-major INT8 ``[B * N, H * D]`` activation and FP32 per-row scales ``[B * N, 1]`` for the
+    output projection without materializing the transposed BF16 copy."""
+    batch, heads, tokens, dim = value.shape
+    return _quantize_int8_rows_reference(value.transpose(1, 2).reshape(batch * tokens, heads * dim))
+
+
+quantize_int8_rows_heads = Op("quantize_int8_rows_heads", _quantize_int8_rows_heads_reference)
 
 
 def _layernorm_quantize_int8_rows_reference(

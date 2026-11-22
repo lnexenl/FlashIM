@@ -309,16 +309,31 @@ def _quantize(model: nn.Module, ctx: BuildContext) -> None:
 
     spec, config = ctx.spec, ctx.config
     quant = spec.quant_configs[config.precision.quant]
-    int8 = any(scheme.weights.type == "int" for scheme in quant.config_groups.values())
+    has_static_fp8 = any(
+        s.weights.type == "float" and s.input_activations is not None and not s.input_activations.dynamic
+        for s in quant.config_groups.values()
+    )
+    has_static_int8 = any(
+        s.weights.type == "int" and s.input_activations is not None and not s.input_activations.dynamic
+        for s in quant.config_groups.values()
+    )
+    int8 = not has_static_fp8 and any(scheme.weights.type == "int" for scheme in quant.config_groups.values())
     if not int8 and not ctx.platform.supports(Feature.MXFP8_SCALED_MM):
         message = f"{spec.name}: no native MXFP8 GEMM on {ctx.platform.describe()}; quantized linears are emulated"
         if config.optimize.strict:
             raise RuntimeError(message)
         logger.warning(message)
         ctx.report.emulated_quant = True
-    table = _load_calibration(spec, config, int8)
+    has_cal_path = bool(
+        config.optimize.options.get("calibration_table") is not None
+        or config.precision.calibration
+        or spec.calibrations.get(f"{config.variant}/{config.precision.quant}")
+        or spec.calibrations.get(config.precision.quant)
+    )
+    needs_cal = has_static_fp8 or has_static_int8 or (int8 and has_cal_path)
+    table = _load_calibration(spec, config, int8) if needs_cal else None
     model.quant_report = quantize_model(model, quant, table, protected=spec.protected)
-    model.calibration_metadata = dict(table.metadata)
+    model.calibration_metadata = dict(table.metadata) if table is not None else {}
     ctx.report.quant = model.quant_report.summary()
 
 
