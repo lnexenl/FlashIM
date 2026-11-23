@@ -316,9 +316,14 @@ def _quantize(model: nn.Module, ctx: BuildContext) -> None:
             raise RuntimeError(message)
         logger.warning(message)
         ctx.report.emulated_quant = True
-    table = _load_calibration(spec, config, int8)
+    all_dynamic = all(
+        scheme.input_activations is not None and scheme.input_activations.dynamic
+        for scheme in quant.config_groups.values()
+        if scheme.targets
+    )
+    table = None if (all_dynamic and not config.precision.calibration) else _load_calibration(spec, config, int8)
     model.quant_report = quantize_model(model, quant, table, protected=spec.protected)
-    model.calibration_metadata = dict(table.metadata)
+    model.calibration_metadata = None if table is None else dict(table.metadata)
     ctx.report.quant = model.quant_report.summary()
 
 

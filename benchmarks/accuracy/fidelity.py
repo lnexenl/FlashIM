@@ -34,6 +34,7 @@ PROTOCOL = {  # model -> (resize, top_k), as benchmarks/accuracy/sparse_matrix.s
     "dedode": (1024, 8192), "dedode-g": (1024, 8192), "dad": (1024, 8192), "ripe": (1024, 4096), "loftr": (840, 0),
     # LoMa: upstream's benchmark protocol (DaD at a 1024 px long side, 4096 keypoints)
     **{f"loma-{variant}": (1024, 4096) for variant in ("b128", "b", "l", "g", "r")},
+    "omniglue": (1024, 1024),
 }
 
 

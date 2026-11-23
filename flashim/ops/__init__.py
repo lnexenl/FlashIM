@@ -15,6 +15,7 @@ from flashim.ops._registry import (
     reset_call_counts,
     set_strict,
 )
+from flashim.ops.activation import relu_affine
 from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
 from flashim.ops.attention import deformable_attention, rope_qk, rope_qk_interleaved, sdpa
 from flashim.ops.conv import (
@@ -31,7 +32,7 @@ from flashim.ops.conv import (
     int8_conv2d_maxpool,
     mxfp8_conv2d,
 )
-from flashim.ops.correlation import dual_softmax_mutual, local_corr
+from flashim.ops.correlation import dual_softmax_mutual, local_corr, sinkhorn_mutual
 from flashim.ops.density import kde_density
 from flashim.ops.gemm import (
     int8_linear,
@@ -44,6 +45,7 @@ from flashim.ops.gemm import (
 )
 from flashim.ops.image import jpeg_fancy_upsample
 from flashim.ops.lightglue import lightglue_qkv_rope, lightglue_swapped_linear
+from flashim.ops.nms import box_nms_2d
 from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
     bias_relu_quantize_int8,
@@ -69,6 +71,7 @@ __all__ = [
     "DeviceSpec",
     "Op",
     "bias_relu_quantize_int8",
+    "box_nms_2d",
     "call_counts",
     "configure",
     "conv2d_at_points",
@@ -114,6 +117,7 @@ __all__ = [
     "quantize_mxfp8",
     "raco_head5x5",
     "raco_resblock",
+    "relu_affine",
     "reset_call_counts",
     "romav2_refiner_heads",
     "romav2_refiner_input",
@@ -121,6 +125,7 @@ __all__ = [
     "rope_qk_interleaved",
     "sdpa",
     "set_strict",
+    "sinkhorn_mutual",
     "upsample_add",
     "upsample_concat",
     "upsample_concat_int8",

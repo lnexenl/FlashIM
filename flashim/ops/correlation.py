@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -65,3 +67,45 @@ def _dual_softmax_mutual_reference(
 
 
 dual_softmax_mutual = Op("dual_softmax_mutual", _dual_softmax_mutual_reference)
+
+
+def _sinkhorn_mutual_reference(
+    sim: Tensor, bin_score: Tensor, iters: int = 100
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Mutual best matches of log-space Sinkhorn optimal transport with a learned dustbin score (FP32).
+
+    ``sim`` is ``[M, N]`` (FP32); ``bin_score`` is a scalar Tensor appended as dustbin row/column; runs
+    ``iters`` Sinkhorn iterations with marginals ``mu = [1, ..., 1, N] / (M + N)`` and
+    ``nu = [1, ..., 1, M] / (M + N)`` (SuperGlue / OmniGlue). Returns per row ``i``: ``prob [M]`` (FP32,
+    row maximum of ``P[:M, :N]``), ``index [M]`` (int64, its column) and ``mutual [M]`` (bool).
+    """
+    sim = sim.float()
+    m, n = sim.shape
+    alpha = bin_score.float().reshape(())
+    couplings = torch.empty((m + 1, n + 1), device=sim.device, dtype=torch.float32)
+    couplings[:m, :n] = sim
+    couplings[:m, n] = alpha
+    couplings[m, :] = alpha
+
+    norm = -math.log(m + n)
+    log_mu = torch.empty(m + 1, device=sim.device, dtype=torch.float32)
+    log_mu[:m] = norm
+    log_mu[m] = math.log(n) + norm
+    log_nu = torch.empty(n + 1, device=sim.device, dtype=torch.float32)
+    log_nu[:n] = norm
+    log_nu[n] = math.log(m) + norm
+
+    u = torch.zeros_like(log_mu)
+    v = torch.zeros_like(log_nu)
+    for _ in range(iters):
+        u = log_mu - torch.logsumexp(couplings + v.unsqueeze(0), dim=1)
+        v = log_nu - torch.logsumexp(couplings + u.unsqueeze(1), dim=0)
+
+    prob = torch.exp(sim + u[:m, None] + v[None, :n] - norm)
+    best0 = prob.max(dim=1)
+    best1 = prob.argmax(dim=0)
+    mutual = best1[best0.indices] == torch.arange(m, device=sim.device)
+    return best0.values, best0.indices, mutual
+
+
+sinkhorn_mutual = Op("sinkhorn_mutual", _sinkhorn_mutual_reference)
