@@ -51,6 +51,16 @@ def _fold_layer_scale(model: UFM, ctx: BuildContext) -> list[str]:
     return fold_layer_scale(model)
 
 
+def _rotate_residual_stream(model: UFM, ctx: BuildContext) -> dict | str:
+    """Fold exact LayerNorm-commuting orthogonal rotations (``Q_1024``, ``Q_768``, per-head ``H_64`` on ``V->proj``)
+    and attach signed ``H_64`` online block rotation to all 36 ``mlp.fc2`` linears."""
+    if ctx.config.precision.quant not in ("int8", "fp8"):
+        return "skipped: not quantized"
+    rotated = quant.rotate_ufm(model)
+    fc2 = quant.attach_fc2_hadamard(model, block_size=64, signed=True, seed=0)
+    return {"rotated_tensors": rotated, "fc2_hadamard": fc2}
+
+
 def _fused_block_epilogues(model: UFM, ctx: BuildContext) -> list[str] | str:
     from flashim.quant.passes.transformer_block import enable_fused_epilogues
 
@@ -60,16 +70,9 @@ def _fused_block_epilogues(model: UFM, ctx: BuildContext) -> list[str] | str:
 def _fused_dynamic_vit_blocks(model: UFM, ctx: BuildContext) -> list[str] | str:
     if ctx.config.precision.quant not in ("int8", "fp8"):
         return "skipped: not quantized"
-    from flashim.quant.passes.dynamic_transformer_block import (
-        DynamicInt8TransformerBlock,
-        fuse_dynamic_blocks,
-    )
+    from flashim.quant.passes.dynamic_transformer_block import fuse_dynamic_blocks
 
-    fused = fuse_dynamic_blocks(model)
-    for mod in model.modules():
-        if isinstance(mod, DynamicInt8TransformerBlock):
-            mod.fuse_gelu_quantize = True
-    return fused or "skipped: no dynamic INT8 transformer blocks"
+    return fuse_dynamic_blocks(model) or "skipped: no dynamic INT8 transformer blocks"
 
 
 def _sage_platform(platform) -> bool:
@@ -161,8 +164,8 @@ SPEC = ModelSpec(
             "optimize": {
                 "passes+": [
                     "fold_layer_scale",
+                    "rotate_residual_stream",
                     "fused_dynamic_vit_blocks",
-                    "vit_sage_attention",
                 ]
             },
         },
@@ -172,9 +175,8 @@ SPEC = ModelSpec(
             "optimize": {
                 "passes+": [
                     "fold_layer_scale",
-                    "fused_block_epilogues",
+                    "rotate_residual_stream",
                     "fused_dynamic_vit_blocks",
-                    "vit_sage_attention",
                 ]
             },
         },
@@ -188,14 +190,18 @@ SPEC = ModelSpec(
             _fold_layer_scale, stage="pre_quant", exact=False,
             description="ViT LayerScale folded into attn.proj / mlp.fc2",
         ),
+        "rotate_residual_stream": Pass(
+            _rotate_residual_stream, stage="pre_quant", exact=False,
+            description="LayerNorm-commuting orthogonal rotation (Q_1024/Q_768 + per-head H_64) and fc2 signed H_64",
+        ),
         "fused_block_epilogues": Pass(
             _fused_block_epilogues, stage="post_quant", exact=False,
             description="fp8: encoder biases / residual adds fused into MXFP8 GEMM epilogues and quantize kernels",
         ),
         "fused_dynamic_vit_blocks": Pass(
             _fused_dynamic_vit_blocks, stage="post_quant", exact=False,
-            description="Dynamic INT8 transformer blocks with fused LayerNorm+quantize, HND attention quantize, "
-            "GELU+quantize, and residual epilogues",
+            description="Dynamic INT8 / hybrid MXFP8 transformer blocks with fused LayerNorm+quantize, "
+            "Hadamard-rotated fc2 quantize, and residual epilogues",
         ),
         "vit_sage_attention": Pass(
             _vit_sage_attention, stage="post_quant", requires=_sage_platform, exact=False,

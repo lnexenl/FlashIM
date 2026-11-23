@@ -145,16 +145,41 @@ bias_relu_quantize_int8 = Op("bias_relu_quantize_int8", _bias_relu_quantize_int8
 # -- INT8 producer: dynamic per-row FP32 scale --------------------------------------------------------
 
 
-def _quantize_int8_rows_reference(value: Tensor) -> tuple[Tensor, Tensor]:
+def _quantize_int8_rows_reference(
+    value: Tensor, *, channel_scale: Tensor | None = None
+) -> tuple[Tensor, Tensor]:
     """Per-row (per-token) dynamic INT8: ``scale = amax(|row|) * (1 / 127)`` (FP32, ``safe_scale``; the reciprocal
     product, which is what torch's CUDA division by a scalar computes, spelled out so every device agrees),
     ``round(value / scale)`` saturated to +-127. Returns int8 values of ``value``'s shape and the FP32 scales
-    ``[*leading, 1]`` (the ``a_scale`` :func:`~flashim.ops.int8_linear` takes per row)."""
-    scale = safe_scale(value.float().abs().amax(-1, keepdim=True) * (1 / INT8_MAX))
-    return quantize_symmetric(value, scale), scale
+    ``[*leading, 1]`` (the ``a_scale`` :func:`~flashim.ops.int8_linear` takes per row). Optional ``channel_scale``
+    (FP32 ``[K]``) multiplies channels first (SmoothQuant ``1 / s``)."""
+    x = value.float() * channel_scale.float() if channel_scale is not None else value.float()
+    scale = safe_scale(x.abs().amax(-1, keepdim=True) * (1 / INT8_MAX))
+    return quantize_symmetric(x, scale), scale
 
 
 quantize_int8_rows = Op("quantize_int8_rows", _quantize_int8_rows_reference)
+
+
+def _rotate_quantize_int8_rows_reference(
+    value: Tensor,
+    matrix: Tensor,
+    *,
+    channel_scale: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Optional per-channel ``channel_scale``, block-wise orthogonal rotation by ``matrix [B, B]`` along the last
+    dimension (``x.reshape(..., K // B, B) @ matrix``), then per-row dynamic INT8 quantization as
+    :func:`quantize_int8_rows`. Used with ``W @ block_diag(matrix, ...)`` folded into a consuming linear's weights
+    to spread post-activation channel and weight outliers before INT8 quantization (originated from
+    ``model/mast3r``, commit ``7741ccc``)."""
+    x = value.float() * channel_scale.float() if channel_scale is not None else value.float()
+    b = matrix.shape[0]
+    k = value.shape[-1]
+    rotated = (x.reshape(*value.shape[:-1], k // b, b) @ matrix.float()).reshape(value.shape)
+    return _quantize_int8_rows_reference(rotated)
+
+
+rotate_quantize_int8_rows = Op("rotate_quantize_int8_rows", _rotate_quantize_int8_rows_reference)
 
 
 def _layernorm_quantize_int8_rows_reference(

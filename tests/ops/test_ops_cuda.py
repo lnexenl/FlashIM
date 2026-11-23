@@ -1116,3 +1116,25 @@ def test_gelu_quantize_int8_rows(rows, k, approximate):
     assert fast[0].shape == ref[0].shape and fast[1].shape == ref[1].shape
     assert (fast[0].int() - ref[0].int()).abs().max() <= 1 and _mismatch(fast[0], ref[0]) < 1e-4
     torch.testing.assert_close(fast[1], ref[1], atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("rows,cols,block", [(2402, 4096, 64), (2400, 3072, 64), (2402, 4096, 128), (37, 128, 32)])
+@pytest.mark.parametrize("with_cs", [False, True])
+def test_rotate_quantize_int8_rows(rows, cols, block, with_cs):
+    """Fused block-orthogonal rotation + per-row dynamic INT8 vs reference."""
+    from flashim.quant.rotation import signed_hadamard
+
+    torch.manual_seed(0)
+    x = torch.randn(rows, cols, device=DEV, dtype=torch.bfloat16) * 2
+    r = signed_hadamard(block, device=DEV, dtype=torch.bfloat16).contiguous()
+    cs = (torch.rand(cols, device=DEV, dtype=torch.float32) * 2.0 + 0.1) if with_cs else None
+    assert ops.rotate_quantize_int8_rows.select(x, r, channel_scale=cs)[0] == "triton"
+    fast, ref = _both(ops.rotate_quantize_int8_rows, "triton", x, r, channel_scale=cs)
+    assert fast[0].shape == ref[0].shape and fast[1].shape == ref[1].shape
+    torch.testing.assert_close(fast[1], ref[1], atol=2e-4, rtol=5e-3)
+    diff = (fast[0].int() - ref[0].int()).abs()
+    assert diff.max().item() <= 2
+    # Exact +-0.125 H_64 without cs is near bit-exact; cs rounds (x * cs) to BF16 before tl.dot, and H_32/H_128
+    # have BF16-rounded +-1/sqrt(B) entries.
+    tol_frac = 0.08 if with_cs else (1e-3 if block == 64 else 0.02)
+    assert (diff > 0).float().mean().item() < tol_frac

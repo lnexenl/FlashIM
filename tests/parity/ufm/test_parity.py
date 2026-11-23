@@ -133,9 +133,9 @@ def test_fp32_forward_and_matches_parity(fp32_models, pair_name):
 @pytest.mark.parametrize(
     "preset,max_med_epe,min_lt2,min_iou",
     [
-        ("bf16", 0.35, 0.98, 0.97),
-        ("int8", 0.80, 0.94, 0.92),
-        ("fp8", 0.80, 0.94, 0.93),
+        ("bf16", 0.35, 0.99, 0.975),
+        ("int8", 0.65, 0.99, 0.975),
+        ("fp8", 0.65, 0.99, 0.975),
     ],
 )
 def test_reduced_precision_presets_track_fp32(fp32_models, preset, max_med_epe, min_lt2, min_iou):
