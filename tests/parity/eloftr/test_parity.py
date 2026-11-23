@@ -116,7 +116,7 @@ def test_reduced_precision_tracks_fp32(preset):
     fp32 = flashim.load("eloftr", "fp32", device="cuda")
     model = flashim.load("eloftr", preset, device="cuda")
     if preset in ("int8", "fp8") and not model.build_report.fallbacks:
-        assert model.build_report.quant["linears"] == 48
+        assert model.build_report.quant["linears"] == (25 if preset == "int8" else 24)
     g0, g1 = _prepared_pair((480, 640), (480, 640), torch.device("cuda"))
     with torch.inference_mode():
         ref0, ref1, ref_c = fp32.match_prepared(g0, g1)

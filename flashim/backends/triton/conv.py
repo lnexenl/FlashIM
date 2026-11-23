@@ -708,12 +708,12 @@ def _int8_conv2d_kernel(
     x_ptr, w_ptr, bias_ptr, out_ptr, out_scale_ptr, pool_ptr,
     a_scale_ptr, w_scale_ptr,
     B, H, W, HO, WO, rows, ROWS_BUCKET,
-    res_ptr, res_channels, rs_b, rs_h, rs_w, rs_c,
+    res_ptr, res_channels, rs_b, rs_h, rs_w, rs_c, res_scale_ptr,
     CIN: tl.constexpr, COUT: tl.constexpr, TAPS: tl.constexpr,
     KH: tl.constexpr, KW: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
     PH: tl.constexpr, PW: tl.constexpr, DH: tl.constexpr, DW: tl.constexpr,
-    HAS_BIAS: tl.constexpr, RELU: tl.constexpr, HAS_RESIDUAL: tl.constexpr, QUANT_OUT: tl.constexpr,
-    POOL: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr, RELU: tl.constexpr, HAS_RESIDUAL: tl.constexpr, HAS_RES_SCALE: tl.constexpr,
+    QUANT_OUT: tl.constexpr, POOL: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     """Implicit-GEMM INT8 ``nn.Conv2d`` (``groups == 1``): per filter tap, INT32 ``tl.dot``s over ``BLOCK_K``-channel
     chunks gathered straight from ``x_ptr`` ``[B, H, W, CIN]`` with the tap's spatial offset folded into the address
@@ -785,7 +785,10 @@ def _int8_conv2d_kernel(
         res_ptrs = (res_ptr + b[:, None].to(tl.int64) * rs_b + oh[:, None].to(tl.int64) * rs_h
                     + ow[:, None].to(tl.int64) * rs_w + offs_n[None, :].to(tl.int64) * rs_c)
         res_ok = mask_m[:, None] & (offs_n < res_channels)[None, :]
-        out += tl.load(res_ptrs, mask=res_ok, other=0.0).to(tl.float32)
+        res_val = tl.load(res_ptrs, mask=res_ok, other=0.0).to(tl.float32)
+        if HAS_RES_SCALE:
+            res_val = res_val * tl.load(res_scale_ptr + offs_n, mask=offs_n < res_channels, other=0.0).to(tl.float32)[None, :]
+        out += res_val
     if RELU:
         out = tl.maximum(out, 0.0)
     out_ptrs = out_ptr + offs_m[:, None].to(tl.int64) * COUT + offs_n[None, :]
@@ -814,7 +817,8 @@ def _residual_args(residual: Tensor | None, out: Tensor) -> tuple:
 
 
 def _int8_conv2d_triton(
-    x, weight, a_scale, w_scale, bias, kh, kw, sh, sw, ph, pw, dh, dw, *, relu=False, residual=None, out_scale=None
+    x, weight, a_scale, w_scale, bias, kh, kw, sh, sw, ph, pw, dh, dw, *, relu=False, residual=None,
+    residual_scale=None, out_scale=None,
 ) -> Tensor:
     b, h, w, cin = x.shape
     cout = weight.shape[0]
@@ -827,8 +831,10 @@ def _int8_conv2d_triton(
     _int8_conv2d_kernel[grid](
         x, weight, bias, out, out_scale if quantize else a_scale, out, a_scale, w_scale,
         b, h, w, ho, wo, rows, triton.next_power_of_2(rows), *_residual_args(residual, out),
+        out if residual_scale is None else residual_scale,
         CIN=cin, COUT=cout, TAPS=kh * kw, KH=kh, KW=kw, SH=sh, SW=sw, PH=ph, PW=pw, DH=dh, DW=dw,
-        HAS_BIAS=bias is not None, RELU=relu, HAS_RESIDUAL=residual is not None, QUANT_OUT=quantize, POOL=False,
+        HAS_BIAS=bias is not None, RELU=relu, HAS_RESIDUAL=residual is not None,
+        HAS_RES_SCALE=residual_scale is not None, QUANT_OUT=quantize, POOL=False,
     )
     return out
 
@@ -846,9 +852,9 @@ def _int8_conv2d_maxpool_triton(
     grid = lambda meta: (b * (ho // 2) * triton.cdiv(wo, meta["BLOCK_M"] // 2) * triton.cdiv(cout, meta["BLOCK_N"]),)
     _int8_conv2d_kernel[grid](
         x, weight, bias, out, out_scale, pooled, a_scale, w_scale,
-        b, h, w, ho, wo, rows, triton.next_power_of_2(rows), *_residual_args(None, out),
+        b, h, w, ho, wo, rows, triton.next_power_of_2(rows), *_residual_args(None, out), out,
         CIN=cin, COUT=cout, TAPS=kh * kw, KH=kh, KW=kw, SH=sh, SW=sw, PH=ph, PW=pw, DH=dh, DW=dw,
-        HAS_BIAS=bias is not None, RELU=relu, HAS_RESIDUAL=False, QUANT_OUT=False, POOL=True,
+        HAS_BIAS=bias is not None, RELU=relu, HAS_RESIDUAL=False, HAS_RES_SCALE=False, QUANT_OUT=False, POOL=True,
     )
     return out, pooled
 
@@ -979,12 +985,12 @@ def _mxfp8_conv2d_tiles(configs, named_args, **kwargs):
 def _mxfp8_conv2d_kernel(
     x_ptr, w_ptr, wexp_ptr, cexp_ptr, bias_ptr, out_ptr, oexp_ptr,
     B, H, W, HO, WO, rows, ROWS_BUCKET,
-    res_ptr, res_channels, rs_b, rs_h, rs_w, rs_c,
+    res_ptr, res_channels, rs_b, rs_h, rs_w, rs_c, res_scale_ptr,
     CIN: tl.constexpr, COUT: tl.constexpr, TAPS: tl.constexpr, CIN_BLOCKS: tl.constexpr,
     KH: tl.constexpr, KW: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
     PH: tl.constexpr, PW: tl.constexpr, DH: tl.constexpr, DW: tl.constexpr,
-    HAS_BIAS: tl.constexpr, RELU: tl.constexpr, HAS_RESIDUAL: tl.constexpr, QUANT_OUT: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    HAS_BIAS: tl.constexpr, RELU: tl.constexpr, HAS_RESIDUAL: tl.constexpr, HAS_RES_SCALE: tl.constexpr,
+    QUANT_OUT: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     """Implicit-GEMM static MXFP8 ``nn.Conv2d`` (``groups == 1``): one 32-channel-block E4M3 ``tl.dot`` per
     (tap, channel block), gathered straight from ``x_ptr`` ``[B, H, W, CIN]`` (``CIN`` already a multiple of 32),
@@ -1048,7 +1054,10 @@ def _mxfp8_conv2d_kernel(
         res_ptrs = (res_ptr + b[:, None].to(tl.int64) * rs_b + oh[:, None].to(tl.int64) * rs_h
                     + ow[:, None].to(tl.int64) * rs_w + offs_n[None, :].to(tl.int64) * rs_c)
         res_ok = mask_m[:, None] & (offs_n < res_channels)[None, :]
-        out += tl.load(res_ptrs, mask=res_ok, other=0.0).to(tl.float32)
+        res_val = tl.load(res_ptrs, mask=res_ok, other=0.0).to(tl.float32)
+        if HAS_RES_SCALE:
+            res_val = res_val * tl.load(res_scale_ptr + offs_n, mask=offs_n < res_channels, other=0.0).to(tl.float32)[None, :]
+        out += res_val
     if RELU:
         out = tl.maximum(out, 0.0)
     out_ptrs = out_ptr + offs_m[:, None].to(tl.int64) * COUT + offs_n[None, :]
@@ -1064,7 +1073,7 @@ def _mxfp8_conv2d_kernel(
 
 def _mxfp8_conv2d_triton(
     x, channel_exponent, weight, weight_exponent, bias, kh, kw, sh, sw, ph, pw, dh, dw, *, relu=False, residual=None,
-    out_exponent=None,
+    residual_scale=None, out_exponent=None,
 ) -> Tensor:
     b, h, w, cin = x.shape
     cout = weight.shape[0]
@@ -1077,8 +1086,10 @@ def _mxfp8_conv2d_triton(
     _mxfp8_conv2d_kernel[grid](
         x, weight, weight_exponent, channel_exponent, bias, out, out_exponent if quantize else channel_exponent,
         b, h, w, ho, wo, rows, triton.next_power_of_2(rows), *_residual_args(residual, out),
+        out if residual_scale is None else residual_scale,
         CIN=cin, COUT=cout, TAPS=kh * kw, CIN_BLOCKS=cin // 32, KH=kh, KW=kw, SH=sh, SW=sw, PH=ph, PW=pw, DH=dh, DW=dw,
-        HAS_BIAS=bias is not None, RELU=relu, HAS_RESIDUAL=residual is not None, QUANT_OUT=quantize,
+        HAS_BIAS=bias is not None, RELU=relu, HAS_RESIDUAL=residual is not None,
+        HAS_RES_SCALE=residual_scale is not None, QUANT_OUT=quantize,
     )
     return out
 
@@ -1127,11 +1138,11 @@ def _mxfp8_conv2d_scaled_block_k(configs, named_args, **kwargs):
 def _mxfp8_conv2d_scaled_kernel(
     x_ptr, w_ptr, wexp_ptr, cexp_ptr, bias_ptr, out_ptr,
     H, W, HO, WO, rows, ROWS_BUCKET,
-    res_ptr, res_channels, rs_b, rs_h, rs_w, rs_c,
+    res_ptr, res_channels, rs_b, rs_h, rs_w, rs_c, res_scale_ptr,
     CIN: tl.constexpr, COUT: tl.constexpr, TAPS: tl.constexpr,
     KH: tl.constexpr, KW: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
     PH: tl.constexpr, PW: tl.constexpr, DH: tl.constexpr, DW: tl.constexpr,
-    HAS_BIAS: tl.constexpr, RELU: tl.constexpr, HAS_RESIDUAL: tl.constexpr,
+    HAS_BIAS: tl.constexpr, RELU: tl.constexpr, HAS_RESIDUAL: tl.constexpr, HAS_RES_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     """Implicit-GEMM static MXFP8 ``nn.Conv2d`` on block-scaled tensor cores: per filter tap, one ``tl.dot_scaled``
@@ -1185,7 +1196,10 @@ def _mxfp8_conv2d_scaled_kernel(
         res_ptrs = (res_ptr + b[:, None].to(tl.int64) * rs_b + oh[:, None].to(tl.int64) * rs_h
                     + ow[:, None].to(tl.int64) * rs_w + offs_n[None, :].to(tl.int64) * rs_c)
         res_ok = mask_m[:, None] & (offs_n < res_channels)[None, :]
-        out += tl.load(res_ptrs, mask=res_ok, other=0.0).to(tl.float32)
+        res_val = tl.load(res_ptrs, mask=res_ok, other=0.0).to(tl.float32)
+        if HAS_RES_SCALE:
+            res_val = res_val * tl.load(res_scale_ptr + offs_n, mask=offs_n < res_channels, other=0.0).to(tl.float32)[None, :]
+        out += res_val
     if RELU:
         out = tl.maximum(out, 0.0)
     out_ptrs = out_ptr + offs_m[:, None].to(tl.int64) * COUT + offs_n[None, :]
@@ -1193,7 +1207,8 @@ def _mxfp8_conv2d_scaled_kernel(
 
 
 def _mxfp8_conv2d_scaled_triton(
-    x, channel_exponent, weight, weight_exponent, bias, kh, kw, sh, sw, ph, pw, dh, dw, *, relu=False, residual=None
+    x, channel_exponent, weight, weight_exponent, bias, kh, kw, sh, sw, ph, pw, dh, dw, *, relu=False, residual=None,
+    residual_scale=None,
 ) -> Tensor:
     b, h, w, cin = x.shape
     cout = weight.shape[0]
@@ -1203,9 +1218,11 @@ def _mxfp8_conv2d_scaled_triton(
     rows = b * ho * wo
     grid = lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]) * triton.cdiv(cout, meta["BLOCK_N"]),)
     _mxfp8_conv2d_scaled_kernel[grid](
-        x, weight, weight_exponent, channel_exponent, bias, out, h, w, ho, wo, rows, triton.next_power_of_2(rows), *_residual_args(residual, out),
+        x, weight, weight_exponent, channel_exponent, bias, out, h, w, ho, wo, rows, triton.next_power_of_2(rows),
+        *_residual_args(residual, out), out if residual_scale is None else residual_scale,
         CIN=cin, COUT=cout, TAPS=kh * kw, KH=kh, KW=kw, SH=sh, SW=sw, PH=ph, PW=pw, DH=dh, DW=dw,
         HAS_BIAS=bias is not None, RELU=relu, HAS_RESIDUAL=residual is not None,
+        HAS_RES_SCALE=residual_scale is not None,
     )
     return out
 
