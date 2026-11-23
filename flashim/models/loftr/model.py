@@ -177,8 +177,9 @@ class LoFTR(ImageMatcher, nn.Module):
     @classmethod
     def from_pretrained(cls, *, variant: str = "outdoor", checkpoint: str | Path | None = None,
                         device: torch.device | str | None = None, **kwargs) -> LoFTR:
+        temp_bug_fix = kwargs.pop("temp_bug_fix", variant != "outdoor")
         with torch.device("meta"):
-            model = cls(temp_bug_fix=variant == "indoor", **kwargs)
+            model = cls(temp_bug_fix=temp_bug_fix, **kwargs)
         model.load_state_dict(weights.load_state_dict(variant, checkpoint), strict=True, assign=True)
         return model.to(torch.device(device or default_device())).eval()
 

@@ -290,6 +290,8 @@ def _spec(name: str, default_variant: str, description: str) -> ModelSpec:
         "outdoor/int8": quant.CALIBRATION_DIR / "roma_outdoor_int8_mega.safetensors",
         "indoor/fp8": quant.CALIBRATION_DIR / "roma_indoor_fp8_mega.safetensors",
         "indoor/int8": quant.CALIBRATION_DIR / "roma_indoor_int8_mega.safetensors",
+        "minima/fp8": quant.CALIBRATION_DIR / "roma_minima_fp8_mega.safetensors",
+        "minima/int8": quant.CALIBRATION_DIR / "roma_minima_int8_mega.safetensors",
     }
     return ModelSpec(
         name=name,
@@ -311,3 +313,8 @@ def _spec(name: str, default_variant: str, description: str) -> ModelSpec:
 
 SPEC = _spec("roma", "outdoor", "RoMa (v1) dense matcher (outdoor default; VGG19-BN + DINOv2 ViT-L/14 + GP + refiners)")
 SPEC_INDOOR = _spec("roma-indoor", "indoor", "RoMa (v1) dense matcher (indoor weights)")
+SPEC_MINIMA = _spec(
+    "minima-roma",
+    "minima",
+    "MINIMA-RoMa modality-invariant dense matcher (RoMa v1 architecture, MINIMA weights)",
+)

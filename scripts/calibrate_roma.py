@@ -28,7 +28,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--manifest", required=True, help="JSONL (or JSON list) with image_a / image_b")
     parser.add_argument("--root", default=".", help="base directory for relative image paths")
-    parser.add_argument("--variant", choices=("outdoor", "indoor"), default="outdoor")
+    parser.add_argument("--variant", choices=("outdoor", "indoor", "minima"), default="outdoor")
     parser.add_argument("--max-pairs", type=int, default=16)
     parser.add_argument("--format", choices=("mxfp8", "int8"), default="mxfp8")
     parser.add_argument("--out", required=True)
@@ -45,8 +45,9 @@ def main() -> None:
         raise ValueError("empty calibration manifest")
 
     # Run fold_batchnorm + pad_refiners only (skip fused_bf16_refiners so padded refiner 1x1s remain nn.Conv2d).
+    model_name = {"outdoor": "roma", "indoor": "roma-indoor", "minima": "minima-roma"}[args.variant]
     model = flashim.load(
-        "roma" if args.variant == "outdoor" else "roma-indoor",
+        model_name,
         "bf16",
         overrides={"optimize.passes": ["fold_batchnorm", "pad_refiners"]},
     )

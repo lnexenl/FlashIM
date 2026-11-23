@@ -1,17 +1,21 @@
 """LoFTR's :class:`~flashim.build.ModelSpec` (presets ``fp32`` / ``bf16`` / ``int8`` / ``fp8``); variant ``outdoor``
-(MegaDepth, default) or ``indoor`` (ScanNet)."""
+(MegaDepth, default), ``indoor`` (ScanNet), or ``minima`` (MINIMA modality-invariant weights, also registered directly
+as ``minima-loftr``)."""
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import torch
 from torch import nn
 
-from flashim.build import BuildContext, Pass
+from flashim.build import BuildContext, ModelSpec, Pass
 from flashim.config import RunConfig
 from flashim.models.loftr.model import LoFTR, LoFTREncoderLayer
 from flashim.models.sparse_spec import extractor_spec
+
+CALIBRATION_DIR = Path(__file__).parent / "calibration"
 
 # Quantized: the backbone's 3x3 / 1x1 convs after the 1-channel 7x7 stem and every transformer linear (q/k/v/merge/MLP,
 # coarse and fine). Protected: the stem and the coarse -> fine feature projections (``fine_preprocess``), which feed the
@@ -25,8 +29,13 @@ QUANTIZED = (
 PROTECTED = ("backbone.conv1", "fine_preprocess.*")
 
 
-def _load(config: RunConfig) -> LoFTR:
-    return LoFTR.from_pretrained(variant=config.variant or "outdoor", checkpoint=config.checkpoint, device=config.device, **config.arch)
+def _loader(default_variant: str):
+    def load(config: RunConfig) -> LoFTR:
+        return LoFTR.from_pretrained(
+            variant=config.variant or default_variant, checkpoint=config.checkpoint, device=config.device, **config.arch
+        )
+
+    return load
 
 
 def _channels_last(model: nn.Module, ctx: BuildContext) -> str:
@@ -62,23 +71,44 @@ def _fold_similarity_temperature(model: nn.Module, ctx: BuildContext) -> str:
     return "coarse matching"
 
 
-SPEC = extractor_spec(
-    name="loftr",
-    description="LoFTR detector-free matcher (variant outdoor | indoor); match(a, b) only",
-    load=_load,
-    calibration_dir=Path(__file__).parent / "calibration",
-    quantized=QUANTIZED,
-    protected=PROTECTED,
-    compile_regions=("backbone",),
-    role="dense",
-    extra_passes={
-        "channels_last": Pass(_channels_last, description="NHWC backbone convolutions (bf16 / fp32)", exact=False),
-        "bf16_linear_attention": Pass(
-            _bf16_linear_attention, description="linear-attention GEMMs on BF16 tensor cores (not fp32)", exact=False
-        ),
-        "fold_similarity_temperature": Pass(
-            _fold_similarity_temperature, description="coarse-similarity temperature folded into an operand", exact=False
-        ),
-    },
-    structural_passes=("channels_last", "bf16_linear_attention", "fold_similarity_temperature"),
+def _spec(name: str, default_variant: str, description: str) -> ModelSpec:
+    spec = extractor_spec(
+        name=name,
+        description=description,
+        load=_loader(default_variant),
+        calibration_dir=CALIBRATION_DIR,
+        quantized=QUANTIZED,
+        protected=PROTECTED,
+        compile_regions=("backbone",),
+        role="dense",
+        extra_passes={
+            "channels_last": Pass(_channels_last, description="NHWC backbone convolutions (bf16 / fp32)", exact=False),
+            "bf16_linear_attention": Pass(
+                _bf16_linear_attention, description="linear-attention GEMMs on BF16 tensor cores (not fp32)", exact=False
+            ),
+            "fold_similarity_temperature": Pass(
+                _fold_similarity_temperature, description="coarse-similarity temperature folded into an operand", exact=False
+            ),
+        },
+        structural_passes=("channels_last", "bf16_linear_attention", "fold_similarity_temperature"),
+    )
+    presets = spec.presets
+    if default_variant != "outdoor":
+        presets = {k: {"variant": default_variant, **v} for k, v in presets.items()}
+    calibrations = {
+        "fp8": CALIBRATION_DIR / ("loftr_fp8.safetensors" if default_variant == "outdoor" else f"loftr_{default_variant}_fp8.safetensors"),
+        "int8": CALIBRATION_DIR / ("loftr_int8.safetensors" if default_variant == "outdoor" else f"loftr_{default_variant}_int8.safetensors"),
+        "outdoor/fp8": CALIBRATION_DIR / "loftr_fp8.safetensors",
+        "outdoor/int8": CALIBRATION_DIR / "loftr_int8.safetensors",
+        "minima/fp8": CALIBRATION_DIR / "loftr_minima_fp8.safetensors",
+        "minima/int8": CALIBRATION_DIR / "loftr_minima_int8.safetensors",
+    }
+    return dataclasses.replace(spec, presets=presets, calibrations=calibrations)
+
+
+SPEC = _spec("loftr", "outdoor", "LoFTR detector-free matcher (variant outdoor | indoor | minima); match(a, b) only")
+SPEC_MINIMA = _spec(
+    "minima-loftr",
+    "minima",
+    "MINIMA-LoFTR modality-invariant detector-free matcher (LoFTR architecture, MINIMA weights); match(a, b) only",
 )
