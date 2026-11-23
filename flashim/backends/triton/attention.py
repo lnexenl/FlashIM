@@ -323,6 +323,135 @@ def rope_qk_interleaved(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple
     return q_out, k_out
 
 
+# -- 2D axial RoPE (CroCo convention: [y1, y2, x1, x2]) -------------------------------------------------
+
+
+@triton.jit
+def _rope_2d_rows(src, s_b, s_h, s_n, dst, b, h, n, d, partner, sign, sin, cos, ok, out_off,
+                  TABLES_FP32: tl.constexpr, TABLES_BF16: tl.constexpr):
+    row = src + b * s_b + h * s_h + n[:, None] * s_n
+    val = tl.load(row + d[None, :], mask=ok, other=0.0)
+    rot = tl.load(row + partner[None, :], mask=ok, other=0.0)
+    if TABLES_FP32:
+        v = val.to(tl.float32)
+        r = rot.to(tl.float32) * sign[None, :]
+        out = libdevice.add_rn(libdevice.mul_rn(v, cos), libdevice.mul_rn(r, sin))
+        tl.store(dst + out_off, out.to(dst.dtype.element_ty), mask=ok)
+    elif TABLES_BF16:
+        p1 = libdevice.mul_rn(val.to(tl.float32), cos.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        p2 = libdevice.mul_rn(rot.to(tl.float32) * sign[None, :], sin.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        out = libdevice.add_rn(p1, p2).to(tl.bfloat16)
+        tl.store(dst + out_off, out.to(dst.dtype.element_ty), mask=ok)
+    else:
+        p1 = libdevice.mul_rn(val.to(tl.float32), cos.to(tl.float32)).to(tl.float16).to(tl.float32)
+        p2 = libdevice.mul_rn(rot.to(tl.float32) * sign[None, :], sin.to(tl.float32)).to(tl.float16).to(tl.float32)
+        out = libdevice.add_rn(p1, p2).to(tl.float16)
+        tl.store(dst + out_off, out.to(dst.dtype.element_ty), mask=ok)
+
+
+@triton.jit
+def _rope_qk_2d_kernel(
+    q_ptr, k_ptr, q_sin_ptr, q_cos_ptr, k_sin_ptr, k_cos_ptr, q_out_ptr, k_out_ptr,
+    qs_b, qs_h, qs_n, ks_b, ks_h, ks_n,
+    qsin_n, qcos_n, ksin_n, kcos_n,
+    H, N,
+    D: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_N: tl.constexpr,
+    SHARED_TABLES: tl.constexpr, TABLES_FP32: tl.constexpr, TABLES_BF16: tl.constexpr,
+):
+    """Apply CroCo 2D RoPE to ``q`` and ``k`` (same sequence length ``N``) in one launch."""
+    bh = tl.program_id(1)
+    b = (bh // H).to(tl.int64)
+    h = (bh % H).to(tl.int64)
+    n = (tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+    d = tl.arange(0, BLOCK_D)
+    half: tl.constexpr = D // 2
+    quarter: tl.constexpr = D // 4
+    in_first = (d % half) < quarter
+    partner = tl.where(in_first, d + quarter, d - quarter)
+    sign = tl.where(in_first, -1.0, 1.0)
+    ok = (n < N)[:, None] & (d < D)[None, :]
+    q_sin = tl.load(q_sin_ptr + n[:, None] * qsin_n + d[None, :], mask=ok, other=0.0)
+    q_cos = tl.load(q_cos_ptr + n[:, None] * qcos_n + d[None, :], mask=ok, other=0.0)
+    out_off = ((b * H + h) * N + n[:, None]) * D + d[None, :]
+    _rope_2d_rows(q_ptr, qs_b, qs_h, qs_n, q_out_ptr, b, h, n, d, partner, sign, q_sin, q_cos, ok, out_off,
+                  TABLES_FP32, TABLES_BF16)
+    if SHARED_TABLES:
+        k_sin, k_cos = q_sin, q_cos
+    else:
+        k_sin = tl.load(k_sin_ptr + n[:, None] * ksin_n + d[None, :], mask=ok, other=0.0)
+        k_cos = tl.load(k_cos_ptr + n[:, None] * kcos_n + d[None, :], mask=ok, other=0.0)
+    _rope_2d_rows(k_ptr, ks_b, ks_h, ks_n, k_out_ptr, b, h, n, d, partner, sign, k_sin, k_cos, ok, out_off,
+                  TABLES_FP32, TABLES_BF16)
+
+
+@triton.jit
+def _rope_2d_single_kernel(
+    x_ptr, sin_ptr, cos_ptr, out_ptr,
+    xs_b, xs_h, xs_n, sin_n, cos_n,
+    H, N,
+    D: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_N: tl.constexpr,
+    TABLES_FP32: tl.constexpr, TABLES_BF16: tl.constexpr,
+):
+    """Apply CroCo 2D RoPE to one ``[B, H, N, D]`` tensor (cross-attention when ``Nq != Nk``)."""
+    bh = tl.program_id(1)
+    b = (bh // H).to(tl.int64)
+    h = (bh % H).to(tl.int64)
+    n = (tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+    d = tl.arange(0, BLOCK_D)
+    half: tl.constexpr = D // 2
+    quarter: tl.constexpr = D // 4
+    in_first = (d % half) < quarter
+    partner = tl.where(in_first, d + quarter, d - quarter)
+    sign = tl.where(in_first, -1.0, 1.0)
+    ok = (n < N)[:, None] & (d < D)[None, :]
+    sin = tl.load(sin_ptr + n[:, None] * sin_n + d[None, :], mask=ok, other=0.0)
+    cos = tl.load(cos_ptr + n[:, None] * cos_n + d[None, :], mask=ok, other=0.0)
+    out_off = ((b * H + h) * N + n[:, None]) * D + d[None, :]
+    _rope_2d_rows(x_ptr, xs_b, xs_h, xs_n, out_ptr, b, h, n, d, partner, sign, sin, cos, ok, out_off,
+                  TABLES_FP32, TABLES_BF16)
+
+
+def rope_qk_2d(
+    q: Tensor,
+    k: Tensor,
+    sin: Tensor,
+    cos: Tensor,
+    k_sin: Tensor | None = None,
+    k_cos: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    batch, heads, nq, dim = q.shape
+    nk = k.shape[2]
+    q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    k_out = torch.empty(k.shape, device=k.device, dtype=k.dtype)
+    block_n = 64
+    block_d = triton.next_power_of_2(dim)
+    shared = k_sin is None
+    ks = sin if shared else k_sin
+    kc = cos if shared else k_cos
+    tables_fp32 = sin.dtype == torch.float32
+    tables_bf16 = sin.dtype == torch.bfloat16
+    if nq == nk:
+        _rope_qk_2d_kernel[(triton.cdiv(nq, block_n), batch * heads)](
+            q, k, sin, cos, ks, kc, q_out, k_out,
+            q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2),
+            sin.stride(0), cos.stride(0), ks.stride(0), kc.stride(0),
+            heads, nq, D=dim, BLOCK_D=block_d, BLOCK_N=block_n,
+            SHARED_TABLES=shared, TABLES_FP32=tables_fp32, TABLES_BF16=tables_bf16, num_warps=4,
+        )
+    else:
+        _rope_2d_single_kernel[(triton.cdiv(nq, block_n), batch * heads)](
+            q, sin, cos, q_out, q.stride(0), q.stride(1), q.stride(2), sin.stride(0), cos.stride(0),
+            heads, nq, D=dim, BLOCK_D=block_d, BLOCK_N=block_n,
+            TABLES_FP32=tables_fp32, TABLES_BF16=tables_bf16, num_warps=4,
+        )
+        _rope_2d_single_kernel[(triton.cdiv(nk, block_n), batch * heads)](
+            k, ks, kc, k_out, k.stride(0), k.stride(1), k.stride(2), ks.stride(0), kc.stride(0),
+            heads, nk, D=dim, BLOCK_D=block_d, BLOCK_N=block_n,
+            TABLES_FP32=ks.dtype == torch.float32, TABLES_BF16=ks.dtype == torch.bfloat16, num_warps=4,
+        )
+    return q_out, k_out
+
+
 # -- registrations ---------------------------------------------------------------------------------------
 
 _FLOATS = (torch.float16, torch.bfloat16, torch.float32)
@@ -343,6 +472,45 @@ def _rope_eligible(q: Tensor, k: Tensor, sin: Tensor, cos: Tensor) -> bool:
 
 
 ops.rope_qk.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_rope_eligible)(rope_qk)
+
+
+def _rope_2d_eligible(
+    q: Tensor,
+    k: Tensor,
+    sin: Tensor,
+    cos: Tensor,
+    k_sin: Tensor | None = None,
+    k_cos: Tensor | None = None,
+) -> bool:
+    if torch.is_grad_enabled() or q.ndim != 4 or k.ndim != 4:
+        return False
+    if q.shape[0] != k.shape[0] or q.shape[1] != k.shape[1] or q.shape[3] != k.shape[3]:
+        return False
+    dim = q.shape[3]
+    if dim % 4 != 0 or dim > 256 or q.stride(-1) != 1 or k.stride(-1) != 1:
+        return False
+    if q.dtype not in _FLOATS or k.dtype not in _FLOATS:
+        return False
+    if sin.ndim != 2 or cos.ndim != 2 or sin.shape != (q.shape[2], dim) or cos.shape != sin.shape:
+        return False
+    if sin.dtype != cos.dtype or sin.dtype not in _FLOATS or sin.stride(-1) != 1 or cos.stride(-1) != 1:
+        return False
+    if sin.dtype != torch.float32 and (q.dtype != sin.dtype or (k_sin is None and k.dtype != sin.dtype)):
+        return False
+    if k_sin is None:
+        return q.shape[2] == k.shape[2]
+    if k_cos is None or k_sin.ndim != 2 or k_cos.ndim != 2:
+        return False
+    if k_sin.shape != (k.shape[2], dim) or k_cos.shape != k_sin.shape:
+        return False
+    if k_sin.dtype != k_cos.dtype or k_sin.dtype not in _FLOATS or k_sin.stride(-1) != 1 or k_cos.stride(-1) != 1:
+        return False
+    return k_sin.dtype == torch.float32 or k.dtype == k_sin.dtype
+
+
+ops.rope_qk_2d.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_rope_2d_eligible)(
+    rope_qk_2d
+)
 
 
 def _rope_interleaved_eligible(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> bool:

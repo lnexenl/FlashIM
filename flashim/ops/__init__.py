@@ -22,6 +22,7 @@ from flashim.ops.attention import (
     deformable_attention,
     elu_linear_attention,
     rope_qk,
+    rope_qk_2d,
     rope_qk_interleaved,
     sdpa,
 )
@@ -43,6 +44,7 @@ from flashim.ops.conv import (
 from flashim.ops.correlation import (
     batched_dual_softmax_argmax,
     dual_softmax_mutual,
+    fast_reciprocal_nn,
     local_corr,
     union_softmax_match,
 )
@@ -86,7 +88,9 @@ from flashim.ops.quantize import (
     quantize_int8_heads,
     quantize_int8_multi,
     quantize_int8_rows,
+    quantize_int8_rows_heads,
     quantize_mxfp8,
+    rotate_quantize_int8_rows,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
 from flashim.ops.resample import (
@@ -131,6 +135,7 @@ __all__ = [
     "eloftr_upsample_add_leaky_relu",
     "eloftr_upsample_gather_windows",
     "elu_linear_attention",
+    "fast_reciprocal_nn",
     "gather_windows",
     "gelu_quantize",
     "gelu_quantize_int8",
@@ -169,6 +174,7 @@ __all__ = [
     "quantize_int8_heads",
     "quantize_int8_multi",
     "quantize_int8_rows",
+    "quantize_int8_rows_heads",
     "quantize_mxfp8",
     "raco_head5x5",
     "raco_resblock",
@@ -179,7 +185,9 @@ __all__ = [
     "romav2_refiner_heads",
     "romav2_refiner_input",
     "rope_qk",
+    "rope_qk_2d",
     "rope_qk_interleaved",
+    "rotate_quantize_int8_rows",
     "sdpa",
     "set_strict",
     "tiny_roma_corr_pos_embed",

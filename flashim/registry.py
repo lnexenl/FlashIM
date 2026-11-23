@@ -41,6 +41,7 @@ SPECS = {
     "loma-matcher": "flashim.models.loma.matcher_spec:SPEC",
     "loma-extractor": "flashim.models.loma.extractor_spec:SPEC",
     "loma": "flashim.models.loma.spec:LOMA",
+    "mast3r": "flashim.models.mast3r.spec:SPEC",
 }
 
 # RaCo keypoints + the descriptors of any model that can describe given keypoints (raco-superpoint, raco-disk, ...).

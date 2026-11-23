@@ -42,6 +42,7 @@ class QuantizedAttention(nn.Module):
         if head_dim % 32 or head_dim & (head_dim - 1):
             raise ValueError(f"head_dim must be a power of two divisible by 32, got {head_dim}")
         self.rope_impl = rope_impl
+        self.rope_2d: bool = getattr(attn, "rope_2d", False)
         # ``ops.sdpa`` implementation: "reference" (torch SDPA), "sage" (INT8 QK attention) or None = dispatch.
         self.sdpa_impl: str | None = getattr(attn, "sdpa_impl", "reference")
 
@@ -51,7 +52,8 @@ class QuantizedAttention(nn.Module):
         q, k, v = qkv.view(batch, tokens, 3, self.num_heads, channels // self.num_heads).permute(2, 0, 3, 1, 4)
         if rope is not None:
             sin, cos = (t.reshape(-1, t.shape[-1]).to(device=q.device, dtype=q.dtype) for t in rope)
-            q, k = ops.rope_qk.get(self.rope_impl)(q, k, sin, cos)
+            rope_op = ops.rope_qk_2d if self.rope_2d else ops.rope_qk
+            q, k = rope_op.get(self.rope_impl)(q, k, sin, cos)
         out = ops.sdpa.get(self.sdpa_impl)(q, k, v)
         return out.transpose(1, 2).reshape(batch, tokens, channels)
 

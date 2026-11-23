@@ -24,6 +24,7 @@ weight lookup (`flashim/models/*/weights.py`).
 | `eloftr/` | https://github.com/zju3dv/EfficientLoFTR @ ffd4a46440 (`src/loftr/`, `src/utils/misc.py`; last Apache-2.0 commit before upstream re-licensed to ZJU3DV PRL v1.0 in `07e9c1401e`) | Apache-2.0 (`repvgg.py`: RepVGG MIT) |
 | `xoftr/` | https://github.com/OnderT/XoFTR (`src/xoftr/` + `src/config/default.py`, trimmed `xoftr/__init__.py`) | Apache-2.0 |
 | `minima/` | https://github.com/LSXI7/MINIMA (`LoFTR_minima` submodule `src/loftr/`; `minima-roma` parity reuses `roma/`) | Apache-2.0 |
+| `mast3r/` | https://github.com/naver/mast3r + submodules https://github.com/naver/dust3r and https://github.com/naver/croco | CC BY-NC-SA 4.0 (non-commercial use only) |
 
 Not vendored: cvg/LightGlue's `lightglue/superpoint.py`, Magic Leap's `SuperGluePretrainedNetwork` (`models/superglue.py`,
 both carry a Magic Leap notice forbidding reproduction and distribution) and RIPE. All three are downloaded on demand by

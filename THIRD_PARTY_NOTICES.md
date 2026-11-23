@@ -22,17 +22,19 @@ upstream code or licenses nevertheless apply.
   source is copied.
 
 Other models (ALIKED and ALIKE: BSD-3-Clause; DaD, DeDoDe, RoMa, Tiny-RoMa: MIT, DINOv2 parts Apache-2.0, Tiny-RoMa's XFeat backbone Apache-2.0; LoMa: MIT, its
-LightGlue-derived matcher Apache-2.0, built on `flashim/models/lightglue/`; RDD, XFeat, LoFTR, EfficientLoFTR @ `ffd4a46440`, XoFTR, DISK, RaCo, MINIMA: Apache-2.0; note that upstream `zju3dv/EfficientLoFTR` re-licensed to ZJU3DV PRL v1.0 in commit `07e9c1401e` on 2026-09-15)
+LightGlue-derived matcher Apache-2.0, built on `flashim/models/lightglue/`; RDD, XFeat, LoFTR, EfficientLoFTR @ `ffd4a46440`, XoFTR, DISK, RaCo, MINIMA: Apache-2.0;
+MASt3R / DUSt3R / CroCo: CC BY-NC-SA 4.0, non-commercial use only; note that upstream `zju3dv/EfficientLoFTR` re-licensed to ZJU3DV PRL v1.0 in commit `07e9c1401e` on 2026-09-15)
 are independent implementations of the published architectures; the license of each upstream is recorded in
 `flashim/models/<model>/weights.py` (`LICENSES`) next to the checkpoint it applies to.
 
 ## Weights (downloaded, never shipped)
 
 Checkpoints are fetched from their publishers (URLs and SHA-256 in `flashim/models/*/weights.py`) and keep their own
-licenses. Three are not open-source licenses: **SuperPoint** (`superpoint_v1.pth`, Magic Leap, non-commercial research),
+licenses. Four are not open-source licenses: **SuperPoint** (`superpoint_v1.pth`, Magic Leap, non-commercial research),
 **SuperGlue** (`superglue_outdoor.pth` / `superglue_indoor.pth`, Magic Leap, academic or non-profit non-commercial
-research use only) and **RIPE** (Fraunhofer academic-use license: internal non-commercial use only). The DINOv3 weights
-inside the RoMaV2 checkpoint are under the DINOv3 License.
+research use only), **RIPE** (Fraunhofer academic-use license: internal non-commercial use only), and **MASt3R**
+(`MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only).
+The DINOv3 weights inside the RoMaV2 checkpoint are under the DINOv3 License.
 
 ## Test references (`tests/oracles/`)
 
