@@ -37,6 +37,7 @@ PROTOCOL = {  # model -> (resize, top_k), as benchmarks/accuracy/sparse_matrix.s
     # LoMa: upstream's benchmark protocol (DaD at a 1024 px long side, 4096 keypoints)
     **{f"loma-{variant}": (1024, 4096) for variant in ("b128", "b", "l", "g", "r")},
     "superpoint-superglue": (1600, 1024),
+    "omniglue": (1024, 1024),
 }
 
 

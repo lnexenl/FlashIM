@@ -15,8 +15,9 @@ from flashim.ops._registry import (
     reset_call_counts,
     set_strict,
 )
+from flashim.ops.activation import relu_affine
 from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
-from flashim.ops.assignment import log_optimal_transport
+from flashim.ops.assignment import log_optimal_transport, sinkhorn_mutual
 from flashim.ops.attention import (
     bidirectional_cross_attention,
     deformable_attention,
@@ -71,6 +72,7 @@ from flashim.ops.gemm import (
 )
 from flashim.ops.image import gray_instance_norm, jpeg_fancy_upsample
 from flashim.ops.lightglue import lightglue_qkv_rope, lightglue_swapped_linear
+from flashim.ops.nms import box_nms_2d
 from flashim.ops.norm import cat_layernorm, pos_cat_layernorm, residual_layernorm
 from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
@@ -116,6 +118,7 @@ __all__ = [
     "batched_dual_softmax_argmax",
     "bias_relu_quantize_int8",
     "bidirectional_cross_attention",
+    "box_nms_2d",
     "call_counts",
     "cat_gelu_mlp",
     "cat_layernorm",
@@ -185,6 +188,7 @@ __all__ = [
     "raco_head5x5",
     "raco_resblock",
     "reciprocal_nn",
+    "relu_affine",
     "reset_call_counts",
     "residual_layernorm",
     "roma_refiner_head",
@@ -197,6 +201,7 @@ __all__ = [
     "rotate_quantize_int8_rows",
     "sdpa",
     "set_strict",
+    "sinkhorn_mutual",
     "tiny_roma_corr_pos_embed",
     "union_softmax_match",
     "upsample_add",

@@ -27,6 +27,7 @@ weight lookup (`flashim/models/*/weights.py`).
 | `mast3r/` | https://github.com/naver/mast3r + submodules https://github.com/naver/dust3r and https://github.com/naver/croco | CC BY-NC-SA 4.0 (non-commercial use only) |
 | `dust3r/` | https://github.com/naver/dust3r + submodule https://github.com/naver/croco | CC BY-NC-SA 4.0 (non-commercial use only) |
 | `ufm/` | https://github.com/UniFlowMatch/UFM + https://github.com/castacks/UniCeption @ ee7fa0b (`uniflowmatch/`, `uniception/`; offline loader `ufm_oracle.py`, see `ufm/README.md`) | BSD-3-Clause (`croco/` DPT blocks: CC BY-NC-SA 4.0) |
+| `omniglue/` | https://github.com/google-research/omniglue (`src/omniglue/`, `third_party/dinov2/`; TF-CPU subprocess runner `tf_oracle.py`, set `$FLASHIM_OMNIGLUE_TF_PYTHON`, see `omniglue/README.md`) | Apache-2.0 |
 
 Not vendored: cvg/LightGlue's `lightglue/superpoint.py`, Magic Leap's `SuperGluePretrainedNetwork` (`models/superglue.py`,
 both carry a Magic Leap notice forbidding reproduction and distribution) and RIPE. All three are downloaded on demand by

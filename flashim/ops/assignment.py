@@ -48,3 +48,22 @@ def _log_optimal_transport_reference(scores: Tensor, alpha: Tensor, iters: int) 
 
 
 log_optimal_transport = Op("log_optimal_transport", _log_optimal_transport_reference)
+
+
+def _sinkhorn_mutual_reference(
+    sim: Tensor, bin_score: Tensor, iters: int = 100
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Mutual best matches of :func:`log_optimal_transport` over ``sim [M, N]`` (FP32) with dustbin ``bin_score``.
+
+    Returns per row ``i``: ``prob [M]`` (FP32, row maximum of ``exp(log_P[:M, :N])``), ``index [M]`` (int64, its
+    column) and ``mutual [M]`` (bool).
+    """
+    m, n = sim.shape
+    prob = _log_optimal_transport_reference(sim.float().unsqueeze(0), bin_score.float().reshape(()), iters)[0, :m, :n].exp()
+    best0 = prob.max(dim=1)
+    best1 = prob.argmax(dim=0)
+    mutual = best1[best0.indices] == torch.arange(m, device=sim.device)
+    return best0.values, best0.indices, mutual
+
+
+sinkhorn_mutual = Op("sinkhorn_mutual", _sinkhorn_mutual_reference)

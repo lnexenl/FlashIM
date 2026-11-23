@@ -19,7 +19,7 @@
   <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/architecture.md">Architecture</a>
 </p>
 
-FlashIM runs image-matching models (dense RoMa, RoMa v2, Tiny-RoMa, MASt3R, DUSt3R, UFM; detector-free LoFTR, EfficientLoFTR and XoFTR; sparse RDD, ALIKED, RaCo, SuperPoint, DISK, DeDoDe and others; LightGlue, SuperGlue and LoMa matching) faster than their reference
+FlashIM runs image-matching models (dense RoMa, RoMa v2, Tiny-RoMa, MASt3R, DUSt3R, UFM; detector-free LoFTR, EfficientLoFTR and XoFTR; sparse RDD, ALIKED, RaCo, SuperPoint, DISK, DeDoDe and others; LightGlue, SuperGlue, LoMa and OmniGlue matching) faster than their reference
 implementations, without giving up measured accuracy. Every model is a native PyTorch port checked against the upstream code, and the
 speedups come from quantization (MXFP8, INT8), fused kernels (Triton, TileLang, CUDA C++) and `torch.compile`.
 
@@ -84,6 +84,9 @@ m = dust3r.match("a.jpg", "b.jpg")                           # Matches from exac
 
 ufm = flashim.load("ufm", "int8")                            # UFM: DINOv2 ViT-L + global ViT + dual DPT dense flow
 m = ufm.match("a.jpg", "b.jpg", max_matches=5000)            # 5000 balanced samples of the dense flow + covisibility
+
+og = flashim.load("omniglue")                                # OmniGlue: SuperPoint (sp_v6) + DINOv2 ViT-B/14 + matcher
+m = og.match("a.jpg", "b.jpg", threshold=0.02)               # 1024 keypoints per image (default)
 ```
 
 `match(a, b, *, resize, max_matches, threshold)` is the same for every model: `resize` is the long side of the working
@@ -177,14 +180,14 @@ FlashIM is released under the Apache License 2.0 ([LICENSE](https://github.com/l
 
 The package's license expression is therefore `Apache-2.0 AND MIT AND LicenseRef-DINOv3`. Model weights are downloaded
 from their publishers, never shipped, and keep their upstream licenses, some more restrictive than Apache-2.0: the RoMaV2
-checkpoint contains DINOv3 weights (DINOv3 License), SuperPoint, SuperGlue (Magic Leap academic/non-profit
-non-commercial research only) and RIPE are for non-commercial use only, MASt3R, DUSt3R and UFM weights are
-CC BY-NC-SA 4.0 (non-commercial use only); RoMa (v1) is MIT with frozen DINOv2 weights (Apache-2.0); MINIMA
-(`minima-loftr`, `minima-roma`) is Apache-2.0 (with frozen DINOv2 Apache-2.0 for `minima-roma`); LoMa is MIT except
-its LightGlue-derived matcher (Apache-2.0), and its checkpoints hold DINOv2 (Apache-2.0); EfficientLoFTR's mirror
-weights (`vismatch/eloftr`) and vendored test oracle (`ffd4a46440`) are Apache-2.0, while upstream
-`zju3dv/EfficientLoFTR` re-licensed to the ZJU3DV Project Registration License (PRL) v1.0 on 2026-09-15 (commit
-`07e9c1401e`). Details, and
+checkpoint contains DINOv3 weights (DINOv3 License), SuperPoint (`superpoint_v1.pth`; `sp_v6` is MIT),
+SuperGlue (Magic Leap academic/non-profit non-commercial research only) and RIPE are for non-commercial use only,
+MASt3R, DUSt3R and UFM weights are CC BY-NC-SA 4.0 (non-commercial use only); RoMa (v1) is MIT with frozen DINOv2
+weights (Apache-2.0); MINIMA (`minima-loftr`, `minima-roma`) is Apache-2.0 (with frozen DINOv2 Apache-2.0 for
+`minima-roma`); LoMa is MIT except its LightGlue-derived matcher (Apache-2.0), and its checkpoints hold DINOv2
+(Apache-2.0); OmniGlue and DINOv2 ViT-B/14 are Apache-2.0; EfficientLoFTR's mirror weights (`vismatch/eloftr`) and
+vendored test oracle (`ffd4a46440`) are Apache-2.0, while upstream `zju3dv/EfficientLoFTR` re-licensed to the
+ZJU3DV Project Registration License (PRL) v1.0 on 2026-09-15 (commit `07e9c1401e`). Details, and
 the licenses of vendored test code and assets: [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl/FlashIM/blob/main/THIRD_PARTY_NOTICES.md).
 
 <p align="center">

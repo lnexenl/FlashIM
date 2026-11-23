@@ -44,6 +44,9 @@ SPECS = {
     "mast3r": "flashim.models.mast3r.spec:SPEC",
     "dust3r": "flashim.models.dust3r.spec:SPEC",
     "ufm": "flashim.models.ufm.spec:SPEC",
+    "omniglue-matcher": "flashim.models.omniglue.spec:MATCHER_SPEC",
+    "omniglue-extractor": "flashim.models.omniglue.spec:EXTRACTOR_SPEC",
+    "omniglue": "flashim.models.omniglue.spec:SPEC",
 }
 
 # RaCo keypoints + the descriptors of any model that can describe given keypoints (raco-superpoint, raco-disk, ...).
