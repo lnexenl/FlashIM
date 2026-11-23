@@ -98,6 +98,30 @@ upsampling: 0.0008 levels from PIL on average, ~10 ms less per MegaDepth image);
 
 Weights download on first use and are checked against pinned SHA-256 hashes ([Checkpoints](https://github.com/lnexenl/FlashIM#checkpoints)).
 
+## Supported models
+
+Default preset in **bold**; full registry and notes in [docs/models.md](https://github.com/lnexenl/FlashIM/blob/main/docs/models.md). Presets are always named `fp32` / `bf16` / `int8` / `fp8`; `mast3r` and `dust3r` run **FP16** compute under `bf16` / `int8` / `fp8` (CroCo residual activations reach ~344–649 where BF16 ULP degrades 3D precision).
+
+| category | models | presets | upstream / weight license |
+|---|---|---|---|
+| Dense | `romav2` | `bf16`, `int8`, **`fp8`** | MIT + **DINOv3 License** (weights) |
+| Dense | `roma`, `roma-indoor`, `minima-roma` | `fp32`, **`bf16`**, `int8`, `fp8` | MIT / Apache-2.0 (`minima-roma`); DINOv2 Apache-2.0 |
+| Dense | `tiny-roma` | `fp32`, **`bf16`**, `int8`, `fp8` | MIT (XFeat backbone Apache-2.0) |
+| Dense | `ufm` | `fp32`, **`bf16`**, `int8`, `fp8` | BSD-3-Clause code; **CC BY-NC-SA 4.0 weights (non-commercial)** |
+| Dense 3D | `mast3r`, `dust3r` *(FP16 compute)* | `fp32`, **`bf16`**, `int8`, `fp8` | **CC BY-NC-SA 4.0 (non-commercial)** |
+| Detector-free | `loftr`, `minima-loftr` | `fp32`, **`bf16`**, `int8`, `fp8` | Apache-2.0 |
+| Detector-free | `eloftr` | `fp32`, **`bf16`**, `int8`, `fp8` | Apache-2.0 (`vismatch` weights & `ffd4a46440` oracle; upstream re-licensed to ZJU3DV PRL v1.0 on 2026-09-15) |
+| Detector-free | `xoftr` | `fp32`, **`bf16`**, `int8`, `fp8` | Apache-2.0 |
+| Sparse extractors | `rdd` | `fp32`, `bf16`, **`fp8`** | Apache-2.0 |
+| Sparse extractors | `aliked`, `raco`, `raco-aliked` | **`fp32`**, `bf16` | BSD-3-Clause (`aliked`) / Apache-2.0 (`raco`) |
+| Sparse extractors | `alike`, `disk`, `xfeat`, `dedode`, `dedode-g`, `dad` | `fp32`, **`bf16`**, `int8`, `fp8` | BSD-3-Clause / Apache-2.0 / MIT |
+| Sparse extractors | `superpoint`, `ripe` | `fp32`, **`bf16`**, `int8`, `fp8` | **Non-commercial** (`superpoint_v1.pth` Magic Leap; `ripe` Fraunhofer; SuperPoint `sp_v6` is MIT) |
+| Sparse extractors | `sift`, `orb` | **`fp32`** | Apache-2.0 (OpenCV) |
+| Sparse matchers & pipelines | `lightglue`, `{rdd,aliked,raco-aliked,superpoint,disk,xfeat}-lightglue` | `fp32`, `bf16`, `int8`, **`fp8`** | Apache-2.0 (inherits extractor weight license) |
+| Sparse matchers & pipelines | `loma`, `loma-{b128,b,l,g,r}`, `loma-{extractor,matcher}` | `fp32`, **`bf16`**, `int8`, `fp8` | MIT / Apache-2.0 |
+| Sparse matchers & pipelines | `superglue`, `superpoint-superglue` | `fp32`, **`bf16`**, `int8` *(pipeline adds `fp8`)* | **Magic Leap (academic/non-profit non-commercial)** |
+| Sparse matchers & pipelines | `omniglue`, `omniglue-{extractor,matcher}` | `fp32`, **`bf16`**, `int8`, `fp8` *(matcher degrades `fp8`->`int8`)* | Apache-2.0 (`sp_v6` MIT) |
+
 ## Results
 
 All numbers are from an RTX 5070 Ti. The latency of every model, preset and engine is in the
