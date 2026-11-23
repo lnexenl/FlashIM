@@ -206,3 +206,55 @@ def _fast_reciprocal_nn_reference(
 
 
 fast_reciprocal_nn = Op("fast_reciprocal_nn", _fast_reciprocal_nn_reference)
+
+
+def _l2_nn_blocked(queries: Tensor, db: Tensor, block_size: int) -> Tensor:
+    """For each row of ``queries [Q, D]``, index of its exact L2 nearest neighbor in ``db [N, D]`` using
+    ``donot_use_mm_for_euclid_dist`` to avoid catastrophic cancellation on distant 3D points."""
+    q_count, n_count = queries.shape[0], db.shape[0]
+    if q_count == 0:
+        return torch.empty(0, dtype=torch.int64, device=queries.device)
+    best_idx = torch.empty(q_count, dtype=torch.int64, device=queries.device)
+    for qs in range(0, q_count, block_size):
+        qe = min(qs + block_size, q_count)
+        q_blk = queries[qs:qe]
+        if n_count <= block_size:
+            best_idx[qs:qe] = torch.cdist(
+                q_blk, db, compute_mode="donot_use_mm_for_euclid_dist"
+            ).argmin(dim=1)
+            continue
+        best_val = torch.full((qe - qs,), float("inf"), device=queries.device, dtype=queries.dtype)
+        cur_idx = torch.zeros(qe - qs, dtype=torch.int64, device=queries.device)
+        for ns in range(0, n_count, block_size):
+            ne = min(ns + block_size, n_count)
+            vals, idx = torch.cdist(
+                q_blk, db[ns:ne], compute_mode="donot_use_mm_for_euclid_dist"
+            ).min(dim=1)
+            better = vals < best_val
+            best_val = torch.where(better, vals, best_val)
+            cur_idx = torch.where(better, idx + ns, cur_idx)
+        best_idx[qs:qe] = cur_idx
+    return best_idx
+
+
+def _reciprocal_nn_reference(pts1: Tensor, pts2: Tensor, block_size: int = 4096) -> tuple[Tensor, Tensor]:
+    """Exact Euclidean (L2) reciprocal nearest neighbors between ``pts1 [N1, D]`` and ``pts2 [N2, D]``.
+
+    Equivalent to upstream DUSt3R ``find_reciprocal_matches(P1, P2)``: finds every index pair ``(i, j)`` where
+    ``j = argmin_k ||pts1[i] - pts2[k]||_2`` and ``i = argmin_k ||pts2[j] - pts1[k]||_2``. Returns ``(idx1, idx2)``
+    as int64 ``[M]`` tensors sorted by ``idx2``.
+    """
+    if pts1.ndim != 2 or pts2.ndim != 2 or pts1.shape[1] != pts2.shape[1]:
+        raise ValueError(f"Expected [N1, D] and [N2, D] point sets, got {tuple(pts1.shape)} and {tuple(pts2.shape)}")
+    device = pts1.device
+    if pts1.shape[0] == 0 or pts2.shape[0] == 0:
+        empty = torch.empty(0, dtype=torch.int64, device=device)
+        return empty, empty
+    nn1_in_2 = _l2_nn_blocked(pts1, pts2, block_size)
+    nn2_in_1 = _l2_nn_blocked(pts2, pts1, block_size)
+    idx2 = torch.arange(pts2.shape[0], device=device, dtype=torch.int64)
+    reciprocal = nn1_in_2[nn2_in_1] == idx2
+    return nn2_in_1[reciprocal], idx2[reciprocal]
+
+
+reciprocal_nn = Op("reciprocal_nn", _reciprocal_nn_reference)

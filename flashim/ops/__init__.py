@@ -46,9 +46,11 @@ from flashim.ops.correlation import (
     dual_softmax_mutual,
     fast_reciprocal_nn,
     local_corr,
+    reciprocal_nn,
     union_softmax_match,
 )
 from flashim.ops.density import kde_density
+from flashim.ops.dust3r import dust3r_pts3d_conf
 from flashim.ops.eloftr import (
     eloftr_agg_norm,
     eloftr_leaky_relu_quantize,
@@ -97,6 +99,7 @@ from flashim.ops.resample import (
     gather_windows,
     pil_bicubic_resize,
     upsample_add,
+    upsample_bilinear2x,
     upsample_concat,
     upsample_concat_int8,
 )
@@ -128,6 +131,7 @@ __all__ = [
     "depthwise5x5_relu_pointwise_int8",
     "depthwise5x5_relu_pointwise_mxfp8",
     "dual_softmax_mutual",
+    "dust3r_pts3d_conf",
     "eloftr_agg_norm",
     "eloftr_leaky_relu_quantize",
     "eloftr_pool_norm",
@@ -178,6 +182,7 @@ __all__ = [
     "quantize_mxfp8",
     "raco_head5x5",
     "raco_resblock",
+    "reciprocal_nn",
     "reset_call_counts",
     "residual_layernorm",
     "roma_refiner_head",
@@ -193,6 +198,7 @@ __all__ = [
     "tiny_roma_corr_pos_embed",
     "union_softmax_match",
     "upsample_add",
+    "upsample_bilinear2x",
     "upsample_concat",
     "upsample_concat_int8",
 ]

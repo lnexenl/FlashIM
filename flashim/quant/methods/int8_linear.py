@@ -193,6 +193,9 @@ class DynamicInt8Linear(nn.Module):
             values, scale = ops.quantize_int8_rows(rows, channel_scale=self.channel_scale)
         else:
             values, scale = ops.quantize_int8_rows(rows)
+        if x.dtype == torch.float16:
+            out = ops.int8_linear(values, self.weight_int8, scale, self.weight_scale, self.bias, out_dtype=torch.float16)
+            return out.reshape(*x.shape[:-1], self.out_features)
         out = ops.int8_linear(values, self.weight_int8, scale, self.weight_scale, self.bias)
         return out.reshape(*x.shape[:-1], self.out_features).to(x.dtype)
 

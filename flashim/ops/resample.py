@@ -90,3 +90,11 @@ def _gather_windows_reference(
 
 
 gather_windows = Op("gather_windows", _gather_windows_reference)
+
+
+def _upsample_bilinear2x_reference(x: Tensor) -> Tensor:
+    """2x bilinear upsampling with ``align_corners=True`` on ``[B, C, H, W]``."""
+    return F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=True)
+
+
+upsample_bilinear2x = Op("upsample_bilinear2x", _upsample_bilinear2x_reference)

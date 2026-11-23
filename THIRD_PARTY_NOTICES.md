@@ -30,10 +30,11 @@ are independent implementations of the published architectures; the license of e
 ## Weights (downloaded, never shipped)
 
 Checkpoints are fetched from their publishers (URLs and SHA-256 in `flashim/models/*/weights.py`) and keep their own
-licenses. Four are not open-source licenses: **SuperPoint** (`superpoint_v1.pth`, Magic Leap, non-commercial research),
+licenses. Five are not open-source licenses: **SuperPoint** (`superpoint_v1.pth`, Magic Leap, non-commercial research),
 **SuperGlue** (`superglue_outdoor.pth` / `superglue_indoor.pth`, Magic Leap, academic or non-profit non-commercial
-research use only), **RIPE** (Fraunhofer academic-use license: internal non-commercial use only), and **MASt3R**
-(`MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only).
+research use only), **RIPE** (Fraunhofer academic-use license: internal non-commercial use only), **MASt3R**
+(`MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only),
+and **DUSt3R** (`DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only).
 The DINOv3 weights inside the RoMaV2 checkpoint are under the DINOv3 License.
 
 ## Test references (`tests/oracles/`)
