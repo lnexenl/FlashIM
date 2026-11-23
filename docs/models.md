@@ -26,6 +26,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | `ripe` | RIPE (VGG19 + ConvRefiner heatmap, hypercolumn 256-d descriptors) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `loftr` | LoFTR detector-free, semi-dense matcher (variants `outdoor`, `indoor`); `match(a, b)` only | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `eloftr` | EfficientLoFTR detector-free, semi-dense matcher (RepVGG + aggregated RoPE attention; variants `full`, `opt`); `match(a, b)` only | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `xoftr` | XoFTR cross-modal (visible-thermal) detector-free matcher (default 640 px); `match(a, b)` only | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `sift`, `orb` | OpenCV baselines (CPU detection, GPU matching) | `fp32` |
 | [`lightglue`](models/lightglue.md) | LightGlue sparse matcher (variants `rdd`, `aliked`, `raco-aliked`, `superpoint`, `disk`, `xfeat`) | `fp32`, `bf16`, `int8`, **`fp8`** |
 | [`rdd-lightglue`](models/lightglue.md) | RDD + LightGlue | `fp32`, `bf16`, `int8`, **`fp8`** |

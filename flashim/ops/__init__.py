@@ -16,7 +16,14 @@ from flashim.ops._registry import (
     set_strict,
 )
 from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
-from flashim.ops.attention import deformable_attention, rope_qk, rope_qk_interleaved, sdpa
+from flashim.ops.attention import (
+    bidirectional_cross_attention,
+    deformable_attention,
+    elu_linear_attention,
+    rope_qk,
+    rope_qk_interleaved,
+    sdpa,
+)
 from flashim.ops.conv import (
     conv2d_at_points,
     conv2d_single_output,
@@ -31,7 +38,12 @@ from flashim.ops.conv import (
     int8_conv2d_maxpool,
     mxfp8_conv2d,
 )
-from flashim.ops.correlation import dual_softmax_mutual, local_corr
+from flashim.ops.correlation import (
+    batched_dual_softmax_argmax,
+    dual_softmax_mutual,
+    local_corr,
+    union_softmax_match,
+)
 from flashim.ops.density import kde_density
 from flashim.ops.eloftr import (
     eloftr_agg_norm,
@@ -42,6 +54,7 @@ from flashim.ops.eloftr import (
     eloftr_upsample_gather_windows,
 )
 from flashim.ops.gemm import (
+    cat_gelu_mlp,
     int8_linear,
     int8_linear_quantize,
     linear_fp32,
@@ -52,6 +65,7 @@ from flashim.ops.gemm import (
 )
 from flashim.ops.image import gray_instance_norm, jpeg_fancy_upsample
 from flashim.ops.lightglue import lightglue_qkv_rope, lightglue_swapped_linear
+from flashim.ops.norm import cat_layernorm, pos_cat_layernorm, residual_layernorm
 from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
     bias_relu_quantize_int8,
@@ -68,7 +82,13 @@ from flashim.ops.quantize import (
     quantize_mxfp8,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
-from flashim.ops.resample import pil_bicubic_resize, upsample_add, upsample_concat, upsample_concat_int8
+from flashim.ops.resample import (
+    gather_windows,
+    pil_bicubic_resize,
+    upsample_add,
+    upsample_concat,
+    upsample_concat_int8,
+)
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 from flashim.ops.tiny_roma import tiny_roma_corr_pos_embed
 
@@ -77,8 +97,12 @@ __all__ = [
     "BoundOp",
     "DeviceSpec",
     "Op",
+    "batched_dual_softmax_argmax",
     "bias_relu_quantize_int8",
+    "bidirectional_cross_attention",
     "call_counts",
+    "cat_gelu_mlp",
+    "cat_layernorm",
     "configure",
     "conv2d_at_points",
     "conv2d_single_output",
@@ -97,6 +121,8 @@ __all__ = [
     "eloftr_post_norm_add",
     "eloftr_upsample_add_leaky_relu",
     "eloftr_upsample_gather_windows",
+    "elu_linear_attention",
+    "gather_windows",
     "gelu_quantize",
     "gelu_quantize_int8",
     "gray_instance_norm",
@@ -123,6 +149,7 @@ __all__ = [
     "mxfp8_scaled_mm",
     "patch_embed_tokens",
     "pil_bicubic_resize",
+    "pos_cat_layernorm",
     "quantize_int8",
     "quantize_int8_heads",
     "quantize_int8_multi",
@@ -131,6 +158,7 @@ __all__ = [
     "raco_head5x5",
     "raco_resblock",
     "reset_call_counts",
+    "residual_layernorm",
     "romav2_refiner_heads",
     "romav2_refiner_input",
     "rope_qk",
@@ -138,6 +166,7 @@ __all__ = [
     "sdpa",
     "set_strict",
     "tiny_roma_corr_pos_embed",
+    "union_softmax_match",
     "upsample_add",
     "upsample_concat",
     "upsample_concat_int8",

@@ -65,3 +65,38 @@ def _dual_softmax_mutual_reference(
 
 
 dual_softmax_mutual = Op("dual_softmax_mutual", _dual_softmax_mutual_reference)
+
+
+def _union_softmax_match_reference(sim: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Row-wise and column-wise one-way softmax maxima and argmax indices over ``sim [L, S]`` (FP32).
+
+    Returns ``(row_prob [L], row_j [L], col_prob [S], col_i [S])`` where ``row_j[i] = argmax_j sim[i, j]``,
+    ``row_prob[i] = softmax(sim, 1)[i, row_j[i]]``, and symmetrically for columns."""
+    row_max, row_j = sim.max(dim=1)
+    row_prob = (row_max - torch.logsumexp(sim, dim=1)).exp()
+    col_max, col_i = sim.max(dim=0)
+    col_prob = (col_max - torch.logsumexp(sim, dim=0)).exp()
+    return row_prob, row_j, col_prob, col_i
+
+
+union_softmax_match = Op("union_softmax_match", _union_softmax_match_reference)
+
+
+def _batched_dual_softmax_argmax_reference(
+    f0: Tensor, f1: Tensor, scale: float
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Per-batch dual-softmax global maximum over small ``[M, W, C]`` windows (FP32):
+    ``conf = softmax(sim, 1) * softmax(sim, 2)`` where ``sim = (f0 @ f1^T) * scale``.
+    Returns ``(best_conf [M], best_i [M], best_j [M])``."""
+    if f0.shape[0] == 0:
+        empty_i = torch.empty((0,), device=f0.device, dtype=torch.long)
+        return torch.empty((0,), device=f0.device, dtype=torch.float32), empty_i, empty_i
+    sim = torch.einsum("mlc,msc->mls", f0.float(), f1.float()) * scale
+    conf = F.softmax(sim, dim=1) * F.softmax(sim, dim=2)
+    flat = conf.reshape(conf.shape[0], -1)
+    best_conf, best_flat = flat.max(dim=1)
+    w1 = sim.shape[2]
+    return best_conf, torch.div(best_flat, w1, rounding_mode="trunc"), best_flat % w1
+
+
+batched_dual_softmax_argmax = Op("batched_dual_softmax_argmax", _batched_dual_softmax_argmax_reference)

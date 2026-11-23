@@ -70,3 +70,18 @@ def _pil_bicubic_resize_reference(image: Tensor, sizes: Sequence[tuple[int, int]
 
 
 pil_bicubic_resize = Op("pil_bicubic_resize", _pil_bicubic_resize_reference)
+
+
+def _gather_windows_reference(
+    feat: Tensor, ids: Tensor, coarse_w: int, win: int, stride: int
+) -> Tensor:
+    """Gather ``win x win`` spatial windows around coarse grid cells ``ids [M]`` from ``feat [1, C, H, W]`` (zero
+    padded at borders, identical to ``F.unfold(feat, (win, win), stride=stride, padding=win // 2)`` indexed by
+    ``ids``). Returns ``[M, win * win, C]``."""
+    if ids.numel() == 0:
+        return feat.new_empty((0, win * win, feat.shape[1]))
+    unfold = F.unfold(feat, kernel_size=(win, win), stride=stride, padding=win // 2)
+    return unfold.reshape(1, feat.shape[1], win * win, -1).permute(0, 3, 2, 1)[0, ids].contiguous()
+
+
+gather_windows = Op("gather_windows", _gather_windows_reference)

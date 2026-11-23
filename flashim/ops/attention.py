@@ -62,6 +62,58 @@ def _sdpa_reference(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
 sdpa = Op("sdpa", _sdpa_reference)
 
 
+# -- shared-QK bidirectional cross-attention --------------------------------------------------------------
+
+
+def _bidirectional_cross_attention_reference(
+    qk0: Tensor, qk1: Tensor, v0: Tensor, v1: Tensor, num_heads: int
+) -> tuple[Tensor, Tensor]:
+    """Shared-QK bidirectional cross-attention on ``[M, L0, C]`` / ``[M, L1, C]`` (FP32 softmax).
+
+    Computes ``sim = (qk0 @ qk1^T) / sqrt(D)`` per head, then ``out0 = softmax(sim, -1) @ v1`` and
+    ``out1 = softmax(sim^T, -1) @ v0``, returning ``(out0 [M, L0, C], out1 [M, L1, C])`` in ``v0``'s dtype."""
+    bs, _, channels = qk0.shape
+    if bs == 0:
+        return torch.empty_like(v0), torch.empty_like(v1)
+    head_dim = channels // num_heads
+    q0, q1, val0, val1 = (
+        t.reshape(bs, t.shape[1], num_heads, head_dim).permute(0, 2, 1, 3) for t in (qk0, qk1, v0, v1)
+    )
+    sim = (q0.float() @ q1.float().transpose(-2, -1)) * (head_dim**-0.5)
+    attn01 = torch.softmax(sim, dim=-1).to(val1.dtype)
+    attn10 = torch.softmax(sim.transpose(-2, -1), dim=-1).to(val0.dtype)
+    out0 = (attn01 @ val1).transpose(1, 2).flatten(-2)
+    out1 = (attn10 @ val0).transpose(1, 2).flatten(-2)
+    return out0, out1
+
+
+bidirectional_cross_attention = Op("bidirectional_cross_attention", _bidirectional_cross_attention_reference)
+
+
+# -- ELU+1 linear attention -------------------------------------------------------------------------------
+
+
+def _elu_linear_attention_reference(
+    q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6, gemm_dtype: torch.dtype | None = None
+) -> Tensor:
+    """ELU+1 kernel linear attention on ``q [B, L, H, D]``, ``k [B, S, H, D]``, ``v [B, S, H, D]`` -> ``[B, L, H, D]``
+    in ``q.dtype``. ``gemm_dtype`` runs the two contractions on operands cast to that dtype while ELU, normalizer and
+    scaling stay FP32."""
+    qf, kf, vf = torch.nn.functional.elu(q.float()) + 1.0, torch.nn.functional.elu(k.float()) + 1.0, v.float()
+    length = vf.shape[1]
+    z = 1.0 / (torch.einsum("nlhd,nhd->nlh", qf, kf.sum(dim=1)) + eps)
+    if gemm_dtype is None:
+        kv = torch.einsum("nshd,nshv->nhdv", kf, vf / length)
+        out = torch.einsum("nlhd,nhdv,nlh->nlhv", qf, kv, z) * length
+    else:
+        kv = torch.einsum("nshd,nshv->nhdv", kf.to(gemm_dtype), (vf / length).to(gemm_dtype))
+        out = torch.einsum("nlhd,nhdv->nlhv", qf.to(gemm_dtype), kv).float() * z[..., None] * length
+    return out.to(q.dtype)
+
+
+elu_linear_attention = Op("elu_linear_attention", _elu_linear_attention_reference)
+
+
 # -- multi-scale deformable attention (Deformable DETR core) --------------------------------------------
 
 # Reference sampling tensors are built per query chunk of about this many float32 elements.

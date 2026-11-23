@@ -399,3 +399,201 @@ def _dual_softmax_mutual_impl(
     sim: Tensor, row_bias: Tensor | None = None, col_bias: Tensor | None = None
 ) -> tuple[Tensor, Tensor, Tensor]:
     return dual_softmax_mutual(sim, row_bias, col_bias)
+
+
+# -- one-way union softmax match (single DRAM pass over sim [L, S]) --------------------------------------
+
+
+@triton.jit
+def _union_softmax_band_kernel(
+    sim_ptr,
+    col_prob_ptr,
+    col_idx_ptr,
+    row_max_ptr,
+    row_sum_ptr,
+    row_idx_ptr,
+    L,
+    S,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """One ``BLOCK_N``-column band streaming once over ``sim [L, S]``: computes each column's exact softmax max
+    probability ``1 / sum_i exp(sim[i, j] - max_i)`` and argmax row, while emitting per-row band partials
+    ``(max, sum_exp, argmax_col)`` at ``[band, row]``."""
+    band = tl.program_id(0)
+    cols = band * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_ok = cols < S
+    col_peak = tl.full((BLOCK_N,), -float("inf"), dtype=tl.float32)
+    col_sum = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    col_best = tl.zeros((BLOCK_N,), dtype=tl.int32)
+    for start in range(0, L, BLOCK_M):
+        rows = start + tl.arange(0, BLOCK_M)
+        row_ok = rows < L
+        ok = row_ok[:, None] & col_ok[None, :]
+        tile = tl.load(sim_ptr + rows[:, None].to(tl.int64) * S + cols[None, :], mask=ok, other=-float("inf"))
+        t_cmax, t_cidx = tl.max(tile, axis=0, return_indices=True)
+        better = t_cmax > col_peak
+        new_peak = tl.where(better, t_cmax, col_peak)
+        col_best = tl.where(better, start + t_cidx, col_best)
+        col_sum = col_sum * tl.exp(col_peak - new_peak) + tl.sum(tl.exp(tile - new_peak[None, :]), axis=0)
+        col_peak = new_peak
+
+        t_rmax, t_ridx = tl.max(tile, axis=1, return_indices=True)
+        t_rsum = tl.sum(tl.exp(tile - t_rmax[:, None]), axis=1)
+        partial = band.to(tl.int64) * L + rows
+        tl.store(row_max_ptr + partial, t_rmax, mask=row_ok)
+        tl.store(row_sum_ptr + partial, t_rsum, mask=row_ok)
+        tl.store(row_idx_ptr + partial, band * BLOCK_N + t_ridx, mask=row_ok)
+
+    tl.store(col_prob_ptr + cols, 1.0 / col_sum, mask=col_ok)
+    tl.store(col_idx_ptr + cols, col_best, mask=col_ok)
+
+
+@triton.jit
+def _union_softmax_row_reduce_kernel(
+    row_max_ptr, row_sum_ptr, row_idx_ptr, row_prob_ptr, row_best_ptr, L, BANDS, BLOCK_M: tl.constexpr
+):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_ok = rows < L
+    peak = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    total = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    best = tl.zeros((BLOCK_M,), dtype=tl.int32)
+    for band in range(BANDS):
+        off = band.to(tl.int64) * L + rows
+        bmax = tl.load(row_max_ptr + off, mask=row_ok, other=-float("inf"))
+        bsum = tl.load(row_sum_ptr + off, mask=row_ok, other=0.0)
+        bidx = tl.load(row_idx_ptr + off, mask=row_ok, other=0)
+        better = bmax > peak
+        new_peak = tl.where(better, bmax, peak)
+        best = tl.where(better, bidx, best)
+        total = total * tl.exp(peak - new_peak) + bsum * tl.exp(bmax - new_peak)
+        peak = new_peak
+    tl.store(row_prob_ptr + rows, 1.0 / total, mask=row_ok)
+    tl.store(row_best_ptr + rows, best, mask=row_ok)
+
+
+def union_softmax_match(sim: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    rows, cols = sim.shape
+    device = sim.device
+    block_m, block_n, reduce_m = 64, 64, 128
+    bands = triton.cdiv(cols, block_n)
+    col_prob = torch.empty(cols, device=device, dtype=torch.float32)
+    col_idx = torch.empty(cols, device=device, dtype=torch.int32)
+    row_prob = torch.empty(rows, device=device, dtype=torch.float32)
+    row_idx = torch.empty(rows, device=device, dtype=torch.int32)
+    p_max = torch.empty((bands, rows), device=device, dtype=torch.float32)
+    p_sum = torch.empty((bands, rows), device=device, dtype=torch.float32)
+    p_idx = torch.empty((bands, rows), device=device, dtype=torch.int32)
+    _union_softmax_band_kernel[(bands,)](
+        sim, col_prob, col_idx, p_max, p_sum, p_idx, rows, cols, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=4
+    )
+    _union_softmax_row_reduce_kernel[(triton.cdiv(rows, reduce_m),)](
+        p_max, p_sum, p_idx, row_prob, row_idx, rows, bands, BLOCK_M=reduce_m, num_warps=4
+    )
+    return row_prob, row_idx.long(), col_prob, col_idx.long()
+
+
+def _union_softmax_eligible(sim: Tensor) -> bool:
+    return not torch.is_grad_enabled() and sim.ndim == 2 and sim.dtype == torch.float32 and sim.is_contiguous() and sim.numel() > 0
+
+
+ops.union_softmax_match.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_union_softmax_eligible
+)(union_softmax_match)
+
+
+# -- batched small-window dual-softmax argmax (register-resident [W, W]) ---------------------------------
+
+
+@triton.jit
+def _batched_dual_softmax_argmax_kernel(
+    f0_ptr,
+    f1_ptr,
+    conf_ptr,
+    i_ptr,
+    j_ptr,
+    scale,
+    W0: tl.constexpr,
+    W1: tl.constexpr,
+    C: tl.constexpr,
+    BLOCK_W0: tl.constexpr,
+    BLOCK_W1: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    m = tl.program_id(0).to(tl.int64)
+    r = tl.arange(0, BLOCK_W0)
+    k = tl.arange(0, BLOCK_W1)
+    c = tl.arange(0, BLOCK_C)
+    mr = r < W0
+    mk = k < W1
+    mc = c < C
+
+    a = tl.load(f0_ptr + (m * W0 + r[:, None]) * C + c[None, :], mask=mr[:, None] & mc[None, :], other=0.0)
+    b = tl.load(f1_ptr + (m * W1 + k[:, None]) * C + c[None, :], mask=mk[:, None] & mc[None, :], other=0.0)
+    sim = tl.dot(a, tl.trans(b)) * scale
+
+    s_row = tl.where(mk[None, :], sim, -float("inf"))
+    rmax = tl.max(s_row, axis=1)
+    rlse = rmax + tl.log(tl.sum(tl.exp(s_row - rmax[:, None]), axis=1))
+
+    s_col = tl.where(mr[:, None], sim, -float("inf"))
+    cmax = tl.max(s_col, axis=0)
+    clse = cmax + tl.log(tl.sum(tl.exp(s_col - cmax[None, :]), axis=0))
+
+    log_conf = tl.where(mr[:, None] & mk[None, :], 2.0 * sim - rlse[:, None] - clse[None, :], -float("inf"))
+    row_best_val, row_best_j = tl.max(log_conf, axis=1, return_indices=True)
+    best_log_conf, best_i = tl.max(row_best_val, axis=0, return_indices=True)
+    best_j = tl.sum(tl.where(r == best_i, row_best_j, 0), axis=0)
+
+    tl.store(conf_ptr + m, tl.exp(best_log_conf))
+    tl.store(i_ptr + m, best_i)
+    tl.store(j_ptr + m, best_j)
+
+
+def batched_dual_softmax_argmax(f0: Tensor, f1: Tensor, scale: float) -> tuple[Tensor, Tensor, Tensor]:
+    m, w0, c = f0.shape
+    w1 = f1.shape[1]
+    if m == 0:
+        empty_i = torch.empty((0,), device=f0.device, dtype=torch.long)
+        return torch.empty((0,), device=f0.device, dtype=torch.float32), empty_i, empty_i
+    f0_c = f0.contiguous()
+    f1_c = f1.contiguous()
+    conf = torch.empty((m,), device=f0.device, dtype=torch.float32)
+    i_out = torch.empty((m,), device=f0.device, dtype=torch.int32)
+    j_out = torch.empty((m,), device=f0.device, dtype=torch.int32)
+    _batched_dual_softmax_argmax_kernel[(m,)](
+        f0_c,
+        f1_c,
+        conf,
+        i_out,
+        j_out,
+        scale,
+        W0=w0,
+        W1=w1,
+        C=c,
+        BLOCK_W0=max(16, triton.next_power_of_2(w0)),
+        BLOCK_W1=max(16, triton.next_power_of_2(w1)),
+        BLOCK_C=max(16, triton.next_power_of_2(c)),
+        num_warps=4,
+    )
+    return conf, i_out.long(), j_out.long()
+
+
+def _batched_dual_softmax_eligible(f0: Tensor, f1: Tensor, scale: float) -> bool:
+    return (
+        not torch.is_grad_enabled()
+        and f0.ndim == 3
+        and f1.ndim == 3
+        and f0.shape[0] == f1.shape[0]
+        and f0.shape[2] == f1.shape[2]
+        and f0.dtype in (torch.bfloat16, torch.float16)
+        and f1.dtype == f0.dtype
+        and 0 < f0.shape[1] <= 64
+        and 0 < f1.shape[1] <= 64
+        and 0 < f0.shape[2] <= 256
+    )
+
+
+ops.batched_dual_softmax_argmax.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_batched_dual_softmax_eligible
+)(batched_dual_softmax_argmax)
