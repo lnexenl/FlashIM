@@ -51,4 +51,39 @@ def test_log_optimal_transport_cuda_matches_cpu():
     alpha = torch.tensor(1.5)
     cpu = ops.log_optimal_transport(scores, alpha, 100)
     gpu = ops.log_optimal_transport(scores.cuda(), alpha.cuda(), 100).cpu()
-    assert torch.allclose(cpu, gpu, atol=1e-5)
+    assert torch.allclose(cpu, gpu, atol=1e-4)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("b", "m", "n", "iters"),
+    [
+        (1, 1, 1, 10),
+        (1, 1, 17, 20),
+        (1, 17, 1, 20),
+        (1, 37, 53, 100),
+        (1, 64, 128, 0),
+        (2, 129, 257, 100),
+        (1, 816, 1024, 100),
+        (1, 1024, 1024, 100),
+        (1, 1500, 1200, 100),
+    ],
+)
+def test_log_optimal_transport_triton_matches_reference(b, m, n, iters):
+    torch.manual_seed(42 + m + n)
+    scores = torch.randn(b, m, n, device="cuda", dtype=torch.float32) * 2.0
+    alpha = torch.tensor(1.3, device="cuda", dtype=torch.float32)
+    explain = ops.log_optimal_transport.explain(scores, alpha, iters)
+    assert any(v == "selected" for v in explain.values()), explain
+    ref = ops.log_optimal_transport.get("reference")(scores, alpha, iters)
+    for impl in ("triton", "cuda"):
+        if explain.get(impl) not in ("selected", "lower priority"):
+            continue
+        got = ops.log_optimal_transport.get(impl)(scores, alpha, iters)
+        assert got.shape == ref.shape
+        # Base-2 exp2/log2 vs base-e exp/log over 100 iterations differs by ~1e-5 in log space, ~1e-6 in prob space.
+        # Note: the (M, N) dustbin corner has exp() ~ max(M, N) (not a probability in [0, 1]), so its relative
+        # error is bounded by the log-space check; check probabilities on all [0, 1] match and dustbin entries.
+        assert float((got - ref).abs().max()) < 5e-4, f"{impl}: max log diff"
+        assert float((got[:, :-1, :].exp() - ref[:, :-1, :].exp()).abs().max()) < 5e-5, f"{impl}: max prob diff"
+        assert float((got[:, -1, :-1].exp() - ref[:, -1, :-1].exp()).abs().max()) < 5e-5, f"{impl}: max dustbin diff"
