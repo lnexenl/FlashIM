@@ -757,3 +757,185 @@ ops.layernorm_gelu_quantize_int8.register(
     "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)), requires=[Feature.TRITON],
     when=_layernorm_gelu_eligible,
 )(layernorm_gelu_quantize_int8)
+
+
+# -- residual + LayerNorm and cat([x, LayerNorm(value)]) (+ quantize) --------------------------------
+
+
+@triton.jit
+def _layernorm_add_kernel(
+    res_ptr, val_ptr, w_ptr, b_ptr, out_ptr, eps,
+    C: tl.constexpr, BLOCK_C: tl.constexpr, HAS_WEIGHT: tl.constexpr, HAS_BIAS: tl.constexpr, ROUND: tl.constexpr,
+):
+    """Single-pass ``residual + LayerNorm(value)`` for ``C <= 1024`` (one program per row)."""
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_C)
+    mask = cols < C
+    base = row * C + cols
+    v = tl.load(val_ptr + base, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.sum(v, axis=0) / C
+    diff = tl.where(mask, v - mean, 0.0)
+    rstd = tl.rsqrt(tl.sum(diff * diff, axis=0) / C + tl.cast(eps, tl.float32))
+    y = diff * rstd
+    if HAS_WEIGHT:
+        y = y * tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    if HAS_BIAS:
+        y = y + tl.load(b_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y = _round_to_dense(y, ROUND)
+    r = tl.load(res_ptr + base, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + base, (r + y).to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def layernorm_add(
+    residual: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+) -> Tensor:
+    c = value.shape[-1]
+    out = torch.empty_like(value)
+    rows = value.numel() // c
+    _layernorm_add_kernel[(rows,)](
+        residual, value,
+        weight if weight is not None else value,
+        bias if bias is not None else value,
+        out, float(eps),
+        C=c, BLOCK_C=triton.next_power_of_2(c),
+        HAS_WEIGHT=weight is not None, HAS_BIAS=bias is not None,
+        ROUND=_ROUND_CODE[value.dtype],
+        num_warps=4 if c >= 256 else 1,
+    )
+    return out
+
+
+@triton.jit
+def _layernorm_cat_kernel(
+    x_ptr, val_ptr, w_ptr, b_ptr, scale_ptr, out_ptr, row_scale_ptr, eps,
+    C: tl.constexpr, BLOCK_C: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr, HAS_BIAS: tl.constexpr,
+    ROUND: tl.constexpr, MODE: tl.constexpr,
+):
+    """Single-pass ``cat([x, LayerNorm(value)], dim=-1)`` (``C <= 1024``, one program per row).
+
+    ``MODE``: 0 = dense output, 1 = static INT8, 2 = dynamic per-row INT8, 3 = static MXFP8 (requires ``C % 32 == 0``).
+    """
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_C)
+    mask = cols < C
+    base = row * C + cols
+    v = tl.load(val_ptr + base, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.sum(v, axis=0) / C
+    diff = tl.where(mask, v - mean, 0.0)
+    rstd = tl.rsqrt(tl.sum(diff * diff, axis=0) / C + tl.cast(eps, tl.float32))
+    y = diff * rstd
+    if HAS_WEIGHT:
+        y = y * tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    if HAS_BIAS:
+        y = y + tl.load(b_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y = _round_to_dense(y, ROUND)
+    x = tl.load(x_ptr + base, mask=mask, other=0.0).to(tl.float32)
+
+    out_left = out_ptr + row * (2 * C) + cols
+    out_right = out_ptr + row * (2 * C) + C + cols
+    if MODE == 0:
+        tl.store(out_left, x.to(out_ptr.dtype.element_ty), mask=mask)
+        tl.store(out_right, y.to(out_ptr.dtype.element_ty), mask=mask)
+    elif MODE == 1:
+        inv = 1.0 / tl.load(scale_ptr)
+        qx = tl.maximum(tl.minimum(libdevice.rint(x * inv), 127.0), -127.0).to(tl.int8)
+        qy = tl.maximum(tl.minimum(libdevice.rint(y * inv), 127.0), -127.0).to(tl.int8)
+        tl.store(out_left, qx, mask=mask)
+        tl.store(out_right, qy, mask=mask)
+    elif MODE == 2:
+        ax = tl.max(tl.where(mask, tl.abs(x), 0.0), axis=0)
+        ay = tl.max(tl.where(mask, tl.abs(y), 0.0), axis=0)
+        scale = tl.maximum(tl.maximum(ax, ay) * (1.0 / 127.0), 1e-8)
+        tl.store(row_scale_ptr + row, scale)
+        inv = 1.0 / scale
+        qx = tl.maximum(tl.minimum(libdevice.rint(x * inv), 127.0), -127.0).to(tl.int8)
+        qy = tl.maximum(tl.minimum(libdevice.rint(y * inv), 127.0), -127.0).to(tl.int8)
+        tl.store(out_left, qx, mask=mask)
+        tl.store(out_right, qy, mask=mask)
+    else:
+        exp_l = tl.load(scale_ptr + cols // 32, mask=mask, other=0).to(tl.float32)
+        exp_r = tl.load(scale_ptr + (C + cols) // 32, mask=mask, other=0).to(tl.float32)
+        qx = to_e4m3(tl.maximum(tl.minimum(x * tl.exp2(-exp_l), 448.0), -448.0))
+        qy = to_e4m3(tl.maximum(tl.minimum(y * tl.exp2(-exp_r), 448.0), -448.0))
+        tl.store(out_left, qx, mask=mask)
+        tl.store(out_right, qy, mask=mask)
+
+
+def _launch_layernorm_cat(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float,
+    mode: int, out: Tensor, scale: Tensor | None = None, row_scale: Tensor | None = None,
+) -> None:
+    c = value.shape[-1]
+    rows = value.numel() // c
+    _layernorm_cat_kernel[(rows,)](
+        x, value,
+        weight if weight is not None else value,
+        bias if bias is not None else value,
+        scale if scale is not None else value,
+        out,
+        row_scale if row_scale is not None else value,
+        float(eps),
+        C=c, BLOCK_C=triton.next_power_of_2(c),
+        HAS_WEIGHT=weight is not None, HAS_BIAS=bias is not None,
+        ROUND=_ROUND_CODE[value.dtype], MODE=mode,
+        num_warps=4 if c >= 256 else 1,
+    )
+
+
+def layernorm_cat(x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float) -> Tensor:
+    out = torch.empty((*x.shape[:-1], 2 * x.shape[-1]), device=x.device, dtype=x.dtype)
+    _launch_layernorm_cat(x, value, weight, bias, eps, 0, out)
+    return out
+
+
+def layernorm_cat_quantize_int8(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float, scale: Tensor
+) -> Int8Tensor:
+    out = torch.empty((*x.shape[:-1], 2 * x.shape[-1]), device=x.device, dtype=torch.int8)
+    _launch_layernorm_cat(x, value, weight, bias, eps, 1, out, scale=scale)
+    return Int8Tensor(out, scale)
+
+
+def layernorm_cat_quantize_int8_rows(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+) -> tuple[Tensor, Tensor]:
+    out = torch.empty((*x.shape[:-1], 2 * x.shape[-1]), device=x.device, dtype=torch.int8)
+    row_scale = torch.empty((*x.shape[:-1], 1), device=x.device, dtype=torch.float32)
+    _launch_layernorm_cat(x, value, weight, bias, eps, 2, out, row_scale=row_scale)
+    return out, row_scale
+
+
+def layernorm_cat_quantize_mxfp8(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float, scale_exponent: Tensor
+) -> QuantizedTensor:
+    c2 = 2 * x.shape[-1]
+    out = torch.empty((*x.shape[:-1], c2), device=x.device, dtype=torch.float8_e4m3fn)
+    exp = scale_exponent.to(x.device, torch.int8)
+    _launch_layernorm_cat(x, value, weight, bias, eps, 3, out, scale=exp)
+    return QuantizedTensor(out, exp, (*x.shape[:-1], c2))
+
+
+def _ln_pair_eligible(a: Tensor, b: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float, *_) -> bool:
+    return (
+        _row_major(a) and _row_major(b) and a.shape == b.shape and a.dtype == b.dtype and a.shape[-1] <= 1024
+        and (weight is None or weight.is_contiguous()) and (bias is None or bias.is_contiguous())
+    )
+
+
+ops.layernorm_add.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_ln_pair_eligible
+)(layernorm_add)
+ops.layernorm_cat.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_ln_pair_eligible
+)(layernorm_cat)
+ops.layernorm_cat_quantize_int8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_ln_pair_eligible
+)(layernorm_cat_quantize_int8)
+ops.layernorm_cat_quantize_int8_rows.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_ln_pair_eligible
+)(layernorm_cat_quantize_int8_rows)
+ops.layernorm_cat_quantize_mxfp8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3],
+    when=lambda x, v, w, b, eps, se: _ln_pair_eligible(x, v, w, b, eps) and x.shape[-1] % 32 == 0,
+)(layernorm_cat_quantize_mxfp8)

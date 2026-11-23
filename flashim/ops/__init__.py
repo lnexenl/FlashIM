@@ -16,7 +16,7 @@ from flashim.ops._registry import (
     set_strict,
 )
 from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
-from flashim.ops.attention import deformable_attention, rope_qk, rope_qk_interleaved, sdpa
+from flashim.ops.attention import deformable_attention, linear_attention, rope_qk, rope_qk_interleaved, sdpa
 from flashim.ops.conv import (
     conv2d_at_points,
     conv2d_single_output,
@@ -50,6 +50,11 @@ from flashim.ops.quantize import (
     bias_relu_quantize_int8,
     gelu_quantize,
     gelu_quantize_int8,
+    layernorm_add,
+    layernorm_cat,
+    layernorm_cat_quantize_int8,
+    layernorm_cat_quantize_int8_rows,
+    layernorm_cat_quantize_mxfp8,
     layernorm_gelu_quantize_int8,
     layernorm_quantize,
     layernorm_quantize_int8,
@@ -94,12 +99,18 @@ __all__ = [
     "int8_linear_quantize",
     "jpeg_fancy_upsample",
     "kde_density",
+    "layernorm_add",
+    "layernorm_cat",
+    "layernorm_cat_quantize_int8",
+    "layernorm_cat_quantize_int8_rows",
+    "layernorm_cat_quantize_mxfp8",
     "layernorm_gelu_quantize_int8",
     "layernorm_quantize",
     "layernorm_quantize_int8",
     "layernorm_quantize_int8_rows",
     "lightglue_qkv_rope",
     "lightglue_swapped_linear",
+    "linear_attention",
     "linear_fp32",
     "local_corr",
     "matmul_nt_fp32",

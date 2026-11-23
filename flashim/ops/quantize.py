@@ -3,6 +3,7 @@ linear writes its E4M3 input directly."""
 
 from __future__ import annotations
 
+import torch
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -207,3 +208,70 @@ def _layernorm_gelu_quantize_int8_reference(
 
 
 layernorm_gelu_quantize_int8 = Op("layernorm_gelu_quantize_int8", _layernorm_gelu_quantize_int8_reference)
+
+
+# -- residual + LayerNorm and cat([x, LayerNorm(value)]) (+ quantize) --------------------------------
+
+
+def _layernorm_add_reference(
+    residual: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+) -> Tensor:
+    """``residual + LayerNorm(value)`` with FP32 statistics, rounded to ``value.dtype``."""
+    normalized = F.layer_norm(
+        value.float(),
+        (value.shape[-1],),
+        weight.float() if weight is not None else None,
+        bias.float() if bias is not None else None,
+        eps,
+    ).to(value.dtype)
+    return residual + normalized
+
+
+layernorm_add = Op("layernorm_add", _layernorm_add_reference)
+
+
+def _layernorm_cat_reference(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+) -> Tensor:
+    """``cat([x, LayerNorm(value)], dim=-1)`` with FP32 statistics, rounded to ``value.dtype``."""
+    normalized = F.layer_norm(
+        value.float(),
+        (value.shape[-1],),
+        weight.float() if weight is not None else None,
+        bias.float() if bias is not None else None,
+        eps,
+    ).to(value.dtype)
+    return torch.cat((x, normalized), dim=-1)
+
+
+layernorm_cat = Op("layernorm_cat", _layernorm_cat_reference)
+
+
+def _layernorm_cat_quantize_int8_reference(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float, scale: Tensor
+) -> Int8Tensor:
+    """``quantize_int8(cat([x, LayerNorm(value)], dim=-1), scale)`` with static per-tensor INT8 scale."""
+    return quantize_int8_static(_layernorm_cat_reference(x, value, weight, bias, eps), scale)
+
+
+layernorm_cat_quantize_int8 = Op("layernorm_cat_quantize_int8", _layernorm_cat_quantize_int8_reference)
+
+
+def _layernorm_cat_quantize_int8_rows_reference(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+) -> tuple[Tensor, Tensor]:
+    """``quantize_int8_rows(cat([x, LayerNorm(value)], dim=-1))`` with dynamic per-row INT8 scale."""
+    return _quantize_int8_rows_reference(_layernorm_cat_reference(x, value, weight, bias, eps))
+
+
+layernorm_cat_quantize_int8_rows = Op("layernorm_cat_quantize_int8_rows", _layernorm_cat_quantize_int8_rows_reference)
+
+
+def _layernorm_cat_quantize_mxfp8_reference(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float, scale_exponent: Tensor
+) -> QuantizedTensor:
+    """``quantize_static(cat([x, LayerNorm(value)], dim=-1), scale_exponent)`` for static MXFP8."""
+    return quantize_static(_layernorm_cat_reference(x, value, weight, bias, eps), scale_exponent)
+
+
+layernorm_cat_quantize_mxfp8 = Op("layernorm_cat_quantize_mxfp8", _layernorm_cat_quantize_mxfp8_reference)

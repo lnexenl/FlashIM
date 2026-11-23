@@ -34,10 +34,15 @@ def _upsample_concat_int8_reference(features: Tensor, coarse: Tensor, scale: Ten
 upsample_concat_int8 = Op("upsample_concat_int8", _upsample_concat_int8_reference)
 
 
-def _upsample_add_reference(coarse: Tensor, delta: Tensor) -> Tensor:
-    """``upsample(coarse) + delta`` in FP32: ``coarse`` ``[B, C, h, w]`` upsampled bilinearly (``align_corners=False``) to
-    ``delta``'s ``[B, C, H, W]`` size -> FP32."""
-    upsampled = F.interpolate(coarse.float(), size=delta.shape[-2:], mode="bilinear", align_corners=False)
+def _upsample_add_reference(
+    coarse: Tensor, delta: Tensor, *, align_corners: bool = False, out_dtype: torch.dtype | None = None
+) -> Tensor:
+    """``upsample(coarse) + delta``: ``coarse`` ``[B, C, h, w]`` upsampled bilinearly to ``delta``'s ``[B, C, H, W]``
+    size and added to ``delta``. Defaults (``align_corners=False, out_dtype=None``) return FP32; setting ``out_dtype``
+    rounds the interpolated map and sum to that dtype."""
+    upsampled = F.interpolate(coarse.float(), size=delta.shape[-2:], mode="bilinear", align_corners=align_corners)
+    if out_dtype is not None:
+        return upsampled.to(out_dtype) + delta.to(out_dtype)
     return upsampled + delta.float()
 
 

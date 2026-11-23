@@ -80,3 +80,56 @@ def test_unknown_variants_raise():
         loftr_weights.load_state_dict("nonexistent")
     with pytest.raises(ValueError, match="Unknown RoMa variant"):
         roma_weights.load_state_dict("nonexistent")
+
+
+def test_loftr_fused_qkv_and_passes_cpu():
+    """Fused QKV/KV projections and fused passes match the unfused LoFTREncoderLayer on CPU."""
+    import torch
+
+    from flashim.models.loftr import spec as loftr_spec
+    from flashim.models.loftr.model import LocalFeatureTransformer
+
+    torch.manual_seed(0)
+    tr_ref = LocalFeatureTransformer(64, 4, ["self", "cross"]).eval()
+    tr_opt = LocalFeatureTransformer(64, 4, ["self", "cross"]).eval()
+    tr_opt.load_state_dict(tr_ref.state_dict())
+
+    for layer, name in zip(tr_opt.layers, tr_opt.layer_names):
+        layer.use_fused_linear_attention = True
+        layer.fused_epilogues = True
+        if name == "self":
+            layer.qkv_proj = loftr_spec._merge_linears((layer.q_proj, layer.k_proj, layer.v_proj))
+            layer.q_proj = layer.k_proj = layer.v_proj = None
+        else:
+            layer.kv_proj = loftr_spec._merge_linears((layer.k_proj, layer.v_proj))
+            layer.k_proj = layer.v_proj = None
+    tr_opt.batch_self = True
+
+    with torch.inference_mode():
+        # Equal-length pair
+        a = torch.randn(1, 16, 64)
+        b = torch.randn(1, 16, 64)
+        r0, r1 = tr_ref(a, b)
+        o0, o1 = tr_opt(a, b)
+        torch.testing.assert_close(o0, r0, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(o1, r1, atol=1e-4, rtol=1e-4)
+
+        # Unequal-length pair (exercises forward_self_pair)
+        b2 = torch.randn(1, 19, 64)
+        r0, r1 = tr_ref(a, b2)
+        o0, o1 = tr_opt(a, b2)
+        torch.testing.assert_close(o0, r0, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(o1, r1, atol=1e-4, rtol=1e-4)
+
+
+def test_loftr_compile_regions():
+    import torch
+
+    from flashim.models.loftr import spec as loftr_spec
+    from flashim.quant.methods.conv2d import StaticInt8Conv2d
+
+    m = LoFTR().eval()
+    assert loftr_spec._compile_regions(m) == ("backbone",)
+    conv = m.backbone.layer1[0].conv1
+    m.backbone.layer1[0].conv1 = StaticInt8Conv2d.from_conv(conv, torch.tensor(0.05))
+    assert loftr_spec._compile_regions(m) == ()

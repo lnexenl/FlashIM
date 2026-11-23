@@ -117,3 +117,24 @@ def _deformable_attention_reference(
 
 
 deformable_attention = Op("deformable_attention", _deformable_attention_reference)
+
+
+# -- ELU+1 linear attention (LoFTR / Katharopoulos et al.) -----------------------------------------------
+
+
+def _linear_attention_reference(q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6) -> Tensor:
+    """ELU+1 linear attention on ``[N, L, H, D]`` / ``[N, S, H, D]`` / ``[N, S, H, V]`` (FP32 core, returns ``q.dtype``).
+
+    Values are scaled by ``1 / S`` before accumulating ``K^T V`` and multiplied back by ``S`` on output to match
+    upstream LoFTR's overflow guard.
+    """
+    q_f = torch.nn.functional.elu(q.float()) + 1.0
+    k_f = torch.nn.functional.elu(k.float()) + 1.0
+    v_f = v.float()
+    length = v_f.shape[1]
+    z = 1.0 / (torch.einsum("nlhd,nhd->nlh", q_f, k_f.sum(dim=1)) + eps)
+    kv = torch.einsum("nshd,nshv->nhdv", k_f, v_f / length)
+    return (torch.einsum("nlhd,nhdv,nlh->nlhv", q_f, kv, z) * length).to(q.dtype)
+
+
+linear_attention = Op("linear_attention", _linear_attention_reference)
