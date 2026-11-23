@@ -122,21 +122,70 @@ def test_pipeline_matches_separate_components():
     assert torch.allclose(res.confidence, ref.confidence, atol=1e-6)
 
 
-def test_bf16_tracks_fp32():
+# Note: toronto has ~55 FP32 matches (1 match ~ 1.8%); int8 hits 0.836 on toronto and 0.912 mean across 20 MegaDepth pairs.
+@pytest.mark.parametrize(("preset", "min_agree"), [("bf16", 0.88), ("int8", 0.80)])
+def test_reduced_precision_tracks_fp32(preset, min_agree):
     extractor = flashim.load(
         "superpoint",
         "fp32",
         config={"arch": {"nms_radius": 4, "detection_threshold": 0.005, "remove_borders": 4}},
     )
     m_fp32 = flashim.load("superglue", "fp32")
-    m_bf16 = flashim.load("superglue", "bf16")
+    m_cand = flashim.load("superglue", preset)
     for name, (img_a, img_b) in PAIRS.items():
         with torch.inference_mode():
             fa = extractor.extract(str(img_a), resize=1024, top_k=1024)
             fb = extractor.extract(str(img_b), resize=1024, top_k=1024)
             ref = m_fp32.match_features(fa, fb)
-            bf16 = m_bf16.match_features(fa, fb)
+            cand = m_cand.match_features(fa, fb)
         ref_set = set(zip(ref.indices_A.tolist(), ref.indices_B.tolist()))
-        bf16_set = set(zip(bf16.indices_A.tolist(), bf16.indices_B.tolist()))
-        agreement = len(ref_set & bf16_set) / max(len(ref_set), 1)
-        assert agreement > 0.88, f"{name}: bf16 match agreement {agreement:.4f}"
+        cand_set = set(zip(cand.indices_A.tolist(), cand.indices_B.tolist()))
+        agreement = len(ref_set & cand_set) / max(len(ref_set), 1)
+        assert agreement > min_agree, f"{name} ({preset}): match agreement {agreement:.4f}"
+
+
+@pytest.mark.parametrize("preset", ["fp32", "bf16", "int8"])
+def test_cuda_graph_bit_identical_to_eager(preset):
+    extractor = flashim.load(
+        "superpoint",
+        "bf16",
+        config={"arch": {"nms_radius": 4, "detection_threshold": 0.005, "remove_borders": 4}},
+    )
+    m_eager = flashim.load("superglue", preset, config={"optimize": {"options": {"cuda_graphs": 0}}})
+    m_graph = flashim.load("superglue", preset)
+    img_a, img_b = PAIRS["sacre_coeur"]
+    with torch.inference_mode():
+        fa = extractor.extract(str(img_a), resize=1024, top_k=1024)
+        fb = extractor.extract(str(img_b), resize=1024, top_k=1024)
+        ref = m_eager.match_features(fa, fb)
+        g1 = m_graph.match_features(fa, fb)
+        g2 = m_graph.match_features(fa, fb)
+    assert torch.equal(ref.indices_A, g1.indices_A) and torch.equal(ref.indices_B, g1.indices_B)
+    assert torch.equal(ref.confidence, g1.confidence)
+    assert torch.equal(g1.indices_A, g2.indices_A) and torch.equal(g1.confidence, g2.confidence)
+
+
+def test_int8_fused_glue_bit_identical_to_unfused():
+    extractor = flashim.load(
+        "superpoint",
+        "bf16",
+        config={"arch": {"nms_radius": 4, "detection_threshold": 0.005, "remove_borders": 4}},
+    )
+    m_unfused = flashim.load(
+        "superglue",
+        "int8",
+        config={
+            "optimize": {
+                "passes": ["fold_batchnorm", "rotate_residual_stream", "pack_qkv", "low_precision_similarity"]
+            }
+        },
+    )
+    m_fused = flashim.load("superglue", "int8", config={"optimize": {"options": {"cuda_graphs": 0}}})
+    img_a, img_b = PAIRS["sacre_coeur"]
+    with torch.inference_mode():
+        fa = extractor.extract(str(img_a), resize=1024, top_k=1024)
+        fb = extractor.extract(str(img_b), resize=1024, top_k=1024)
+        ref = m_unfused.match_features(fa, fb)
+        fused = m_fused.match_features(fa, fb)
+    assert torch.equal(ref.indices_A, fused.indices_A) and torch.equal(ref.indices_B, fused.indices_B)
+    assert torch.equal(ref.confidence, fused.confidence)

@@ -1,5 +1,5 @@
-"""SuperGlue's :class:`~flashim.build.ModelSpec` (variants ``outdoor`` / ``indoor``; presets ``fp32`` / ``bf16``) and
-the ``superpoint-superglue`` pipeline. See :mod:`flashim.models.superglue.quant` for measured INT8 / FP8 evidence."""
+"""SuperGlue's :class:`~flashim.build.ModelSpec` (variants ``outdoor`` / ``indoor``) and the ``superpoint-superglue``
+pipeline. See :mod:`flashim.models.superglue.quant` for measured quantization and speed evidence."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from flashim.config import RunConfig
 from flashim.models.superglue import quant, weights
 from flashim.models.superglue.config import SuperGlueConfig
 from flashim.models.superglue.model import MultiHeadedAttention, SuperGlue
+from flashim.platforms import Feature
 
 
 def _validate_variant(variant: str | None) -> str:
@@ -35,6 +36,39 @@ def _validate(config: RunConfig) -> None:
 
 def _fold_batchnorm(model: SuperGlue, ctx: BuildContext) -> list[str]:
     return model.fold_batchnorm()
+
+
+def _pack_qkv(model: SuperGlue, ctx: BuildContext) -> int:
+    return model.pack_qkv()
+
+
+def _low_precision_similarity(model: SuperGlue, ctx: BuildContext) -> str:
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    model.low_precision_similarity = True
+    return "matmul_nt_fp32"
+
+
+def _fused_int8_glue(model: SuperGlue, ctx: BuildContext) -> int | str:
+    if ctx.config.precision.quant != "int8":
+        return "skipped: not static int8"
+    from flashim.models.superglue import int8_glue
+
+    if (reason := int8_glue.unsupported(model)) is not None:
+        return f"skipped: {reason}"
+    if missing := int8_glue.probe(model):
+        return f"skipped: no kernel on {ctx.platform.describe()} for {', '.join(missing)}"
+    model.int8_glue = True
+    return len(model.gnn.layers)
+
+
+def _cuda_graph(model: SuperGlue, ctx: BuildContext) -> int | str:
+    if ctx.config.engine.kind != "eager":
+        return f"skipped: engine {ctx.config.engine.kind}"
+    if not ctx.platform.supports(Feature.CUDA_GRAPHS):
+        return f"skipped: no CUDA graphs on {ctx.platform.describe()}"
+    model.graphs = int(ctx.option("cuda_graphs", 4))
+    return model.graphs
 
 
 def _set_precision(model: SuperGlue, config: RunConfig) -> None:
@@ -64,6 +98,32 @@ def _regions(model: SuperGlue) -> list[str]:
     return ["kenc", *(f"gnn.layers.{i}" for i in range(len(model.gnn.layers))), "final_proj"]
 
 
+PASSES = {
+    "fold_batchnorm": Pass(_fold_batchnorm, stage="pre_quant", description="exact linear+BN1d fold"),
+    "rotate_residual_stream": Pass(
+        lambda model, ctx: quant.rotate_residual_stream(model),
+        stage="pre_quant",
+        exact=False,
+        description="Hadamard rotations folded into GNN + final_proj weights (evens out 7-15x channel outliers)",
+    ),
+    "pack_qkv": Pass(_pack_qkv, stage="pre_quant", description="pack proj[0..2] into one qkv linear (3x fewer GEMMs)"),
+    "low_precision_similarity": Pass(
+        _low_precision_similarity,
+        exact=False,
+        description="similarity matrix via ops.matmul_nt_fp32 on BF16 tensor cores (FP32 accum and output)",
+    ),
+    "fused_int8_glue": Pass(
+        _fused_int8_glue,
+        description="static int8: [M+N, C] stream with multi-quantize, merge->mlp0 quantize, fused ReLU and residual",
+    ),
+    "cuda_graph": Pass(
+        _cuda_graph,
+        description="eager: kenc + GNN + similarity + Sinkhorn + mutual top-1 replayed from one CUDA graph per (M, N)",
+    ),
+}
+
+_QUANT_CONFIGS = {name: p.config for name, p in quant.PRESETS.items() if p.config is not None}
+
 SPEC = ModelSpec(
     name="superglue",
     role="matcher",
@@ -71,14 +131,37 @@ SPEC = ModelSpec(
     load=_load,
     presets={
         "fp32": {
-            "optimize": {"passes": ["fold_batchnorm"]},
+            "optimize": {"passes": ["fold_batchnorm", "pack_qkv", "cuda_graph"]},
             "inference": {"sinkhorn_iterations": 100, "match_threshold": 0.2},
         },
-        "bf16": {"extends": "fp32", "precision": {"compute_dtype": "bf16"}},
+        "bf16": {
+            "extends": "fp32",
+            "precision": {"compute_dtype": "bf16"},
+            "optimize": {"passes+": ["low_precision_similarity"]},
+        },
+        "int8": {
+            "extends": "fp32",
+            "precision": {"compute_dtype": "bf16", "quant": "int8"},
+            "optimize": {
+                "passes+": [
+                    "rotate_residual_stream",
+                    "low_precision_similarity",
+                    "fused_int8_glue",
+                ]
+            },
+        },
     },
     default_preset="bf16",
+    quant_configs=_QUANT_CONFIGS,
+    calibrations={
+        "int8": quant.CALIBRATION_DIR / f"superglue_{weights.DEFAULT_VARIANT}_int8_mega.safetensors",
+        **{
+            f"{variant}/int8": quant.CALIBRATION_DIR / f"superglue_{variant}_int8_mega.safetensors"
+            for variant in weights.VARIANTS
+        },
+    },
     protected=quant.PROTECTED,
-    passes={"fold_batchnorm": Pass(_fold_batchnorm, stage="pre_quant", description="exact linear+BN1d fold")},
+    passes=PASSES,
     engines={"eager": EngineSpec(), "compile": EngineSpec(_regions, recompile_limit=64)},
     set_precision=_set_precision,
     set_attention=_set_attention,

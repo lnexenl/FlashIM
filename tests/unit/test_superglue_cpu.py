@@ -131,6 +131,34 @@ def test_filter_matches_mutual_and_thresholded():
     assert torch.allclose(conf, torch.tensor([0.8, 0.6]))
 
 
+def test_pack_qkv_and_rotate_residual_stream_preserve_scores():
+    from flashim.models.superglue.quant import rotate_residual_stream
+
+    torch.manual_seed(4)
+    model = SuperGlue(SMALL).eval()
+    model.fold_batchnorm()
+    a, b = _features(18, SMALL.descriptor_dim, 8), _features(14, SMALL.descriptor_dim, 9)
+    ref = model.scores(a, b)
+
+    assert model.pack_qkv() == len(SMALL.gnn_layers)
+    after_pack = model.scores(a, b)
+    assert torch.allclose(ref, after_pack, atol=1e-5)
+
+    rewritten = rotate_residual_stream(model)
+    assert rewritten == len(SMALL.gnn_layers) * 4 + 1  # qkv, merge, mlp.0, mlp.3 per layer + final_proj
+    after_rot = model.scores(a, b)
+    assert torch.allclose(ref, after_rot, atol=2e-4)
+
+    # Same-shape pair exercises the batched [2, M, ...] path too.
+    a2, b2 = _features(16, SMALL.descriptor_dim, 10), _features(16, SMALL.descriptor_dim, 11)
+    model2 = SuperGlue(SMALL).eval()
+    model2.fold_batchnorm()
+    ref2 = model2.scores(a2, b2)
+    rotate_residual_stream(model2)  # also works before pack_qkv
+    model2.pack_qkv()
+    assert torch.allclose(ref2, model2.scores(a2, b2), atol=2e-4)
+
+
 def test_resolve_superglue_and_pipeline():
     cfg = resolve("superglue", "fp32")
     assert cfg.inference["sinkhorn_iterations"] == 100
@@ -146,9 +174,9 @@ def test_resolve_superglue_and_pipeline():
     assert pipe.components["matcher"].variant == "outdoor"
     assert pipe.inference == {"max_matches": 1024, "threshold": 0.2}
 
-    # Quantized presets fall back to bf16 on superglue via build.NEAREST.
+    assert resolve("superglue", "int8").preset == "int8"
+    # fp8 falls back to int8 on superglue via build.NEAREST.
     fallbacks = {}
-    assert resolve("superglue", "int8", fallbacks=fallbacks).preset == "bf16"
+    assert resolve("superglue", "fp8", fallbacks=fallbacks).preset == "int8"
     assert "superglue" in fallbacks
-    assert resolve("superglue", "fp8").preset == "bf16"
     assert resolve("superpoint-superglue", "bf16", overrides={"variant": "indoor"}).variant == "indoor"
