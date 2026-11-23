@@ -19,7 +19,7 @@
   <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/architecture.md">Architecture</a>
 </p>
 
-FlashIM runs image-matching models (dense RoMa v2, Tiny-RoMa; detector-free LoFTR, EfficientLoFTR and XoFTR; sparse RDD, ALIKED, RaCo, SuperPoint, DISK, DeDoDe and others; LightGlue and LoMa matching) faster than their reference
+FlashIM runs image-matching models (dense RoMa v2, Tiny-RoMa; detector-free LoFTR, EfficientLoFTR and XoFTR; sparse RDD, ALIKED, RaCo, SuperPoint, DISK, DeDoDe and others; LightGlue, SuperGlue and LoMa matching) faster than their reference
 implementations, without giving up measured accuracy. Every model is a native PyTorch port checked against the upstream code, and the
 speedups come from quantization (MXFP8, INT8), fused kernels (Triton, TileLang, CUDA C++) and `torch.compile`.
 
@@ -66,6 +66,9 @@ m = eloftr.match("a.jpg", "b.jpg", resize=832)               # semi-dense matche
 
 xoftr = flashim.load("xoftr")                                # XoFTR: cross-modal visible-thermal matcher (default 640 px)
 m = xoftr.match("a.jpg", "b.jpg")                            # Matches at original image resolution
+
+sg = flashim.load("superpoint-superglue")                    # SuperPoint + SuperGlue (outdoor default; variant indoor)
+m = sg.match("a.jpg", "b.jpg", resize=1024)                  # 1024 keypoints per image, match_threshold=0.2
 ```
 
 `match(a, b, *, resize, max_matches, threshold)` is the same for every model: `resize` is the long side of the working
@@ -159,7 +162,8 @@ FlashIM is released under the Apache License 2.0 ([LICENSE](https://github.com/l
 
 The package's license expression is therefore `Apache-2.0 AND MIT AND LicenseRef-DINOv3`. Model weights are downloaded
 from their publishers, never shipped, and keep their upstream licenses, some more restrictive than Apache-2.0: the RoMaV2
-checkpoint contains DINOv3 weights (DINOv3 License), SuperPoint and RIPE are for non-commercial use only; LoMa is MIT
+checkpoint contains DINOv3 weights (DINOv3 License), SuperPoint, SuperGlue (Magic Leap academic/non-profit
+non-commercial research only) and RIPE are for non-commercial use only; LoMa is MIT
 except its LightGlue-derived matcher (Apache-2.0), and its checkpoints hold DINOv2 (Apache-2.0); EfficientLoFTR's
 mirror weights (`vismatch/eloftr`) and vendored test oracle (`ffd4a46440`) are Apache-2.0, while upstream
 `zju3dv/EfficientLoFTR` re-licensed to the ZJU3DV Project Registration License (PRL) v1.0 on 2026-09-15 (commit

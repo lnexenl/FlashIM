@@ -23,8 +23,9 @@ weight lookup (`flashim/models/*/weights.py`).
 | `eloftr/` | https://github.com/zju3dv/EfficientLoFTR @ ffd4a46440 (`src/loftr/`, `src/utils/misc.py`; last Apache-2.0 commit before upstream re-licensed to ZJU3DV PRL v1.0 in `07e9c1401e`) | Apache-2.0 (`repvgg.py`: RepVGG MIT) |
 | `xoftr/` | https://github.com/OnderT/XoFTR (`src/xoftr/` + `src/config/default.py`, trimmed `xoftr/__init__.py`) | Apache-2.0 |
 
-Not vendored: cvg/LightGlue's `lightglue/superpoint.py` (it carries a Magic Leap notice forbidding reproduction and
-distribution) and RIPE. Both are downloaded on demand by their tests (`tests/parity/_fetch.py`). RIPE (https://github.com/fraunhoferhhi/RIPE) is not vendored: its license (Fraunhofer academic use, version 2.0) grants
+Not vendored: cvg/LightGlue's `lightglue/superpoint.py`, Magic Leap's `SuperGluePretrainedNetwork` (`models/superglue.py`,
+both carry a Magic Leap notice forbidding reproduction and distribution) and RIPE. All three are downloaded on demand by
+their tests (`tests/parity/_fetch.py`). RIPE (https://github.com/fraunhoferhhi/RIPE) is not vendored: its license (Fraunhofer academic use, version 2.0) grants
 internal non-commercial use only and no other rights, so its code cannot be shipped here. `tests/parity/ripe` downloads
 the files it needs (pinned by commit and SHA-256) into `~/.cache/flashim/oracles` when you run it, or uses the checkout
 in `$FLASHIM_RIPE_ROOT`; it skips without network access.

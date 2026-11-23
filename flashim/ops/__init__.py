@@ -16,6 +16,7 @@ from flashim.ops._registry import (
     set_strict,
 )
 from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
+from flashim.ops.assignment import log_optimal_transport
 from flashim.ops.attention import (
     bidirectional_cross_attention,
     deformable_attention,
@@ -141,6 +142,7 @@ __all__ = [
     "lightglue_swapped_linear",
     "linear_fp32",
     "local_corr",
+    "log_optimal_transport",
     "matmul_nt_fp32",
     "multiscale_fuse",
     "mxfp8_conv2d",

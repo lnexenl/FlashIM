@@ -31,6 +31,8 @@ SPECS = {
     "orb": "flashim.models.orb.spec:SPEC",
     "xfeat-lightglue": "flashim.models.lightglue.spec:XFEAT_LIGHTGLUE",
     "superpoint-lightglue": "flashim.models.lightglue.spec:SUPERPOINT_LIGHTGLUE",
+    "superglue": "flashim.models.superglue.spec:SPEC",
+    "superpoint-superglue": "flashim.models.superglue.spec:SUPERPOINT_SUPERGLUE",
     "disk-lightglue": "flashim.models.lightglue.spec:DISK_LIGHTGLUE",
     "loma-matcher": "flashim.models.loma.matcher_spec:SPEC",
     "loma-extractor": "flashim.models.loma.extractor_spec:SPEC",
