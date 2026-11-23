@@ -6,6 +6,8 @@ from __future__ import annotations
 from flashim.build import register_spec
 
 SPECS = {
+    "roma": "flashim.models.roma.spec:SPEC",
+    "roma-indoor": "flashim.models.roma.spec:SPEC_INDOOR",
     "romav2": "flashim.models.romav2.spec:SPEC",
     "tiny-roma": "flashim.models.tiny_roma.spec:SPEC",
     "rdd": "flashim.models.rdd.spec:SPEC",

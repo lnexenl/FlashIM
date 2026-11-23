@@ -29,8 +29,8 @@ BACKENDS: tuple[Backend, ...] = (
     Backend(
         "triton",
         tuple(f"triton.{m}" for m in ("aliked", "assignment", "attention", "conv", "correlation", "density", "eloftr",
-                                      "gemm", "image", "lightglue", "norm", "quantize", "raco", "resample", "romav2",
-                                      "tiny_roma")),
+                                      "gemm", "image", "lightglue", "norm", "quantize", "raco", "resample", "roma",
+                                      "romav2", "tiny_roma")),
         packages=("triton",),
     ),
     Backend("tilelang", ("tilelang.conv", "tilelang.gemm"), packages=("tilelang",)),
