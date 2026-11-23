@@ -807,14 +807,16 @@ def layernorm_add(
 
 @triton.jit
 def _layernorm_cat_kernel(
-    x_ptr, val_ptr, w_ptr, b_ptr, scale_ptr, out_ptr, row_scale_ptr, eps,
+    x_ptr, val_ptr, w_ptr, b_ptr, scale_ptr, cs_ptr, out_ptr, row_scale_ptr, eps,
     C: tl.constexpr, BLOCK_C: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr, HAS_BIAS: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr, HAS_BIAS: tl.constexpr, HAS_CHANNEL_SCALE: tl.constexpr,
     ROUND: tl.constexpr, MODE: tl.constexpr,
 ):
     """Single-pass ``cat([x, LayerNorm(value)], dim=-1)`` (``C <= 1024``, one program per row).
 
     ``MODE``: 0 = dense output, 1 = static INT8, 2 = dynamic per-row INT8, 3 = static MXFP8 (requires ``C % 32 == 0``).
+    When ``HAS_CHANNEL_SCALE`` is set, multiplies ``[x, y]`` by per-channel FP32 ``cs_ptr`` (SmoothQuant ``1 / s``)
+    before quantization.
     """
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK_C)
@@ -831,6 +833,9 @@ def _layernorm_cat_kernel(
         y = y + tl.load(b_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     y = _round_to_dense(y, ROUND)
     x = tl.load(x_ptr + base, mask=mask, other=0.0).to(tl.float32)
+    if HAS_CHANNEL_SCALE:
+        x = x * tl.load(cs_ptr + cols, mask=mask, other=1.0).to(tl.float32)
+        y = y * tl.load(cs_ptr + C + cols, mask=mask, other=1.0).to(tl.float32)
 
     out_left = out_ptr + row * (2 * C) + cols
     out_right = out_ptr + row * (2 * C) + C + cols
@@ -865,6 +870,7 @@ def _layernorm_cat_kernel(
 def _launch_layernorm_cat(
     x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float,
     mode: int, out: Tensor, scale: Tensor | None = None, row_scale: Tensor | None = None,
+    channel_scale: Tensor | None = None,
 ) -> None:
     c = value.shape[-1]
     rows = value.numel() // c
@@ -873,11 +879,13 @@ def _launch_layernorm_cat(
         weight if weight is not None else value,
         bias if bias is not None else value,
         scale if scale is not None else value,
+        channel_scale if channel_scale is not None else value,
         out,
         row_scale if row_scale is not None else value,
         float(eps),
         C=c, BLOCK_C=triton.next_power_of_2(c),
         HAS_WEIGHT=weight is not None, HAS_BIAS=bias is not None,
+        HAS_CHANNEL_SCALE=channel_scale is not None,
         ROUND=_ROUND_CODE[value.dtype], MODE=mode,
         num_warps=4 if c >= 256 else 1,
     )
@@ -898,11 +906,12 @@ def layernorm_cat_quantize_int8(
 
 
 def layernorm_cat_quantize_int8_rows(
-    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float,
+    *, channel_scale: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     out = torch.empty((*x.shape[:-1], 2 * x.shape[-1]), device=x.device, dtype=torch.int8)
     row_scale = torch.empty((*x.shape[:-1], 1), device=x.device, dtype=torch.float32)
-    _launch_layernorm_cat(x, value, weight, bias, eps, 2, out, row_scale=row_scale)
+    _launch_layernorm_cat(x, value, weight, bias, eps, 2, out, row_scale=row_scale, channel_scale=channel_scale)
     return out, row_scale
 
 
@@ -916,11 +925,20 @@ def layernorm_cat_quantize_mxfp8(
     return QuantizedTensor(out, exp, (*x.shape[:-1], c2))
 
 
-def _ln_pair_eligible(a: Tensor, b: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float, *_) -> bool:
-    return (
+def _ln_pair_eligible(
+    a: Tensor, b: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float, *_,
+    channel_scale: Tensor | None = None,
+) -> bool:
+    ok = (
         _row_major(a) and _row_major(b) and a.shape == b.shape and a.dtype == b.dtype and a.shape[-1] <= 1024
         and (weight is None or weight.is_contiguous()) and (bias is None or bias.is_contiguous())
     )
+    if channel_scale is not None:
+        ok = (
+            ok and channel_scale.dtype == torch.float32 and channel_scale.is_contiguous()
+            and channel_scale.shape == (2 * a.shape[-1],) and channel_scale.device == a.device
+        )
+    return ok
 
 
 ops.layernorm_add.register(

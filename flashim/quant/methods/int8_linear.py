@@ -134,7 +134,10 @@ class DynamicInt8Linear(nn.Module):
     epilogue; weights as :class:`StaticInt8Linear`. For activations whose outliers are whole tokens (DINOv2's
     "massive activations"), which one static per-tensor scale cannot represent; needs no calibration."""
 
-    def __init__(self, weight_int8: Tensor, weight_scale: Tensor, bias: Tensor | None) -> None:
+    def __init__(
+        self, weight_int8: Tensor, weight_scale: Tensor, bias: Tensor | None,
+        channel_scale: Tensor | None = None,
+    ) -> None:
         super().__init__()
         self.out_features, self.in_features = weight_int8.shape
         device = weight_int8.device
@@ -143,17 +146,25 @@ class DynamicInt8Linear(nn.Module):
         self.register_buffer(
             "bias", None if bias is None else bias.detach().to(device=device, dtype=torch.bfloat16)
         )
+        self.register_buffer(
+            "channel_scale",
+            None if channel_scale is None else channel_scale.to(device=device, dtype=torch.float32).contiguous(),
+        )
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear) -> DynamicInt8Linear:
-        static = StaticInt8Linear.from_linear(linear, torch.ones((), device=linear.weight.device))
-        return cls(static.weight_int8, static.weight_scale, static.bias)
+    def from_linear(cls, linear: nn.Linear, smooth: Tensor | None = None) -> DynamicInt8Linear:
+        static = StaticInt8Linear.from_linear(linear, torch.ones((), device=linear.weight.device), smooth=smooth)
+        return cls(static.weight_int8, static.weight_scale, static.bias, static.channel_scale)
 
     def forward(self, x: Tensor) -> Tensor:
         rows = x.reshape(-1, self.in_features)
+        if self.channel_scale is not None:
+            rows = (rows.float() * self.channel_scale).to(x.dtype)
         values, scale = ops.quantize_int8_rows(rows if rows.is_contiguous() else rows.contiguous())
         out = ops.int8_linear(values, self.weight_int8, scale, self.weight_scale, self.bias)
         return out.reshape(*x.shape[:-1], self.out_features).to(x.dtype)
 
     def extra_repr(self) -> str:
-        return f"in={self.in_features}, out={self.out_features}, int8, dynamic per-token"
+        return f"in={self.in_features}, out={self.out_features}, int8, dynamic per-token" + (
+            ", smoothed" if self.channel_scale is not None else ""
+        )

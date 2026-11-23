@@ -68,6 +68,12 @@ def test_layernorm_add_and_cat_triton(rows, c, dtype):
     assert (f_dyn.int() - r_dyn.int()).abs().max().item() <= 1
     torch.testing.assert_close(fs_dyn, rs_dyn, atol=1e-3, rtol=1e-3)
 
+    cs = torch.rand(2 * c, device="cuda", dtype=torch.float32) * 1.5 + 0.5
+    f_cs, fs_cs = ops.layernorm_cat_quantize_int8_rows.get("triton")(x, v, w, b, 1e-5, channel_scale=cs)
+    r_cs, rs_cs = ops.layernorm_cat_quantize_int8_rows.get("reference")(x, v, w, b, 1e-5, channel_scale=cs)
+    assert (f_cs.int() - r_cs.int()).abs().max().item() <= 1
+    torch.testing.assert_close(fs_cs, rs_cs, atol=1e-3, rtol=1e-3)
+
     if c % 32 == 0 and torch.cuda.get_device_capability()[0] >= 9 or (
         c % 32 == 0 and torch.cuda.get_device_capability() == (8, 9)
     ):

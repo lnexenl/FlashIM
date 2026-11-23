@@ -12,10 +12,13 @@ as ``minima-loftr``).
 - ``fused_fpn_upsample``: Triton ``ops.upsample_add(align_corners=True)`` (0.478 -> 0.112 ms, 87.5% DRAM SOL / 771 GB/s).
 - ``bf16_coarse_similarity``: ``ops.matmul_nt_fp32`` cuBLAS BF16->FP32 GEMM (1.52 -> 1.00 ms on 8190x8085).
 - ``batch_backbone``: runs ``backbone`` once with ``B=2`` for equal-resolution pairs.
-- Quantization: ``int8`` uses dynamic per-token INT8 on all 60 transformer linears + static INT8 on backbone convs
-  (improves MegaDepth agreement +0.85% over all-static INT8 and avoids static-scale clipping on cross-modal inputs);
-  ``fp8`` uses static MXFP8 on both. ``dual_softmax_mutual`` two-pass was tested and discarded on sm_120 (1.051 vs
-  1.017 ms for three-pass, which already runs at 77-92% DRAM SOL).
+- Quantization (see :mod:`flashim.models.loftr.quant` for full localization and tried/rejected schemes):
+  ``int8`` quantizes 80/81 layers (20 static INT8 convs + 60 dynamic per-token INT8 linears with SmoothQuant
+  ``alpha=0.55`` fused into coarse ``mlp.0`` + exact per-head ``H_32`` on ``v_proj -> merge``; only extreme-outlier
+  ``backbone.layer1.0.conv1`` stays NHWC BF16); ``fp8`` quantizes 80/81 layers with mixed precision (47 MXFP8 on
+  ``layer1.1``/``layer2``/``outconv2``/``coarse.0-5.(qkv,merge)``/``fine.*`` + 33 INT8 on ``layer1.0.conv2``/
+  ``layer3``/``outconv``/``coarse.6-7.(qkv,merge)``/``mlp.0``(SmoothQuant)/``mlp.2``). ``dual_softmax_mutual``
+  two-pass was tested and discarded on sm_120 (1.051 vs 1.017 ms for three-pass, already at 77-92% DRAM SOL).
 """
 
 from __future__ import annotations
@@ -28,24 +31,16 @@ from torch import nn
 
 from flashim.build import BuildContext, EngineSpec, ModelSpec, Pass
 from flashim.config import RunConfig
+from flashim.models.loftr import quant as loftr_quant
 from flashim.models.loftr.model import LocalFeatureTransformer, LoFTR, LoFTREncoderLayer
 from flashim.models.sparse_spec import extractor_spec
 
 CALIBRATION_DIR = Path(__file__).parent / "calibration"
 
-# Quantized: the backbone's 3x3 / 1x1 convs after the 1-channel 7x7 stem and every transformer linear (q/k/v/merge/MLP,
-# coarse and fine). Protected: the stem and the coarse -> fine feature projections (``fine_preprocess``), which feed the
-# fine offsets directly.
-_LINEARS = ("q_proj", "k_proj", "v_proj", "merge", "mlp.0", "mlp.2")
-TRANSFORMER_LINEARS = tuple(
-    f"{stage}.layers.*.{leaf}" for stage in ("loftr_coarse", "loftr_fine") for leaf in _LINEARS
-)
-QUANTIZED = (
-    "backbone.layer[123].[01].conv[12]", "backbone.layer[123].[01].downsample.0", "backbone.layer[123]_outconv",
-    "backbone.layer[12]_outconv2.[03]",
-    *TRANSFORMER_LINEARS,
-)
-PROTECTED = ("backbone.conv1", "fine_preprocess.*")
+_LINEARS = loftr_quant._LINEARS
+TRANSFORMER_LINEARS = loftr_quant.TRANSFORMER_LINEARS
+QUANTIZED = loftr_quant.QUANTIZED
+PROTECTED = loftr_quant.PROTECTED
 
 
 def _compile_regions(model: nn.Module) -> tuple[str, ...]:
@@ -213,16 +208,71 @@ def _batch_backbone(model: nn.Module, ctx: BuildContext) -> str:
     return "backbone"
 
 
+def _channels_last_unquantized(model: nn.Module, ctx: BuildContext) -> str:
+    """NHWC weights for every remaining unquantized ``nn.Conv2d`` in ``backbone`` (including ``layer1.0.conv1`` in
+    ``minima-loftr`` ``int8`` / ``fp8``); ``loftr`` keeps :func:`_channels_last` unchanged."""
+    if ctx.config.precision.quant:
+        converted = 0
+        for module in model.backbone.modules():
+            if isinstance(module, nn.Conv2d):
+                module.to(memory_format=torch.channels_last)
+                converted += 1
+        return f"unquantized backbone ({converted} convs)"
+    model.backbone.to(memory_format=torch.channels_last)
+    return "backbone"
+
+
+def _rotate_v_merge(model: nn.Module, ctx: BuildContext) -> int | str:
+    """Pre-quant exact per-head ``H_32`` on ``loftr_coarse`` ``v_proj -> merge`` for dynamically quantized layers."""
+    q = ctx.config.precision.quant
+    if q == "int8":
+        return loftr_quant.rotate_v_merge_hadamard(model)
+    if q == "fp8":
+        return loftr_quant.rotate_v_merge_hadamard(model, layer_indices=(6, 7))
+    return "skipped: not quantized"
+
+
+def _fp8_mixed_int8(model: nn.Module, ctx: BuildContext) -> dict[str, int] | str:
+    """``fp8``: pack the E4M3-sensitive backbone convs (``layer1.0.conv2``, ``layer3``, 1x1 ``outconv``s) as static
+    INT8 and the sensitive coarse transformer linears (layers 6-7 ``q/k/v/merge``, all ``mlp.0`` with SmoothQuant, all
+    ``mlp.2``) as dynamic per-token INT8 (see :mod:`flashim.models.loftr.quant`)."""
+    if ctx.config.precision.quant != "fp8":
+        return "skipped: not fp8"
+    from flashim.quant.apply import quantize_model
+    from flashim.quant.calibration import Int8CalibrationTable
+
+    table = Int8CalibrationTable.load(ctx.spec.calibrations["int8"])
+    sub = quantize_model(model, loftr_quant.MINIMA_FP8_MIXED_INT8_CONFIG, table, protected=ctx.spec.protected)
+    report = getattr(model, "quant_report", None)
+    if report is not None:
+        report.linears.update(sub.linears)
+        report.convs.extend(sub.convs)
+        report.bytes_before += sub.bytes_before
+        report.bytes_after += sub.bytes_after
+        ctx.report.quant = report.summary()
+    return {"convs": len(sub.convs), "linears": len(sub.linears) - len(sub.convs)}
+
+
 def _spec(
     name: str,
     default_variant: str,
     description: str,
     *,
     optimized: bool = False,
-    int8_dynamic: tuple[str, ...] = (),
 ) -> ModelSpec:
     extra_passes = {
         "channels_last": Pass(_channels_last, description="NHWC backbone convolutions (bf16 / fp32)", exact=False),
+        "channels_last_unquantized": Pass(
+            _channels_last_unquantized, description="NHWC unquantized backbone convolutions (all presets)", exact=False
+        ),
+        "rotate_v_merge": Pass(
+            _rotate_v_merge, stage="pre_quant", description="exact per-head H_32 on coarse v_proj -> merge (int8 / fp8)"
+        ),
+        "fp8_mixed_int8": Pass(
+            _fp8_mixed_int8,
+            description="fp8: static/dynamic INT8 on E4M3-sensitive backbone convs and coarse linears",
+            exact=False,
+        ),
         "bf16_linear_attention": Pass(
             _bf16_linear_attention, description="linear-attention GEMMs on BF16 tensor cores (not fp32)", exact=False
         ),
@@ -249,8 +299,8 @@ def _spec(
         ),
     }
     structural: tuple[str, ...] = (
-        ("channels_last", "fused_fpn_upsample", "batch_backbone", "fused_linear_attention",
-         "fused_qkv", "fused_encoder_epilogues", "bf16_coarse_similarity")
+        ("rotate_v_merge", "fp8_mixed_int8", "channels_last_unquantized", "fused_fpn_upsample", "batch_backbone",
+         "fused_linear_attention", "fused_qkv", "fused_encoder_epilogues", "bf16_coarse_similarity")
         if optimized
         else ("channels_last", "bf16_linear_attention", "fold_similarity_temperature")
     )
@@ -261,7 +311,6 @@ def _spec(
         calibration_dir=CALIBRATION_DIR,
         quantized=QUANTIZED,
         protected=PROTECTED,
-        int8_dynamic=int8_dynamic,
         compile_regions=("backbone",),
         role="dense",
         extra_passes=extra_passes,
@@ -279,7 +328,10 @@ def _spec(
         "minima/int8": CALIBRATION_DIR / "loftr_minima_int8.safetensors",
     }
     engines = {"eager": EngineSpec(), "compile": EngineSpec(_compile_regions, recompile_limit=64)}
-    return dataclasses.replace(spec, presets=presets, calibrations=calibrations, engines=engines)
+    quant_configs = loftr_quant.MINIMA_QUANT_CONFIGS if optimized else spec.quant_configs
+    return dataclasses.replace(
+        spec, presets=presets, calibrations=calibrations, engines=engines, quant_configs=quant_configs
+    )
 
 
 SPEC = _spec("loftr", "outdoor", "LoFTR detector-free matcher (variant outdoor | indoor | minima); match(a, b) only")
@@ -288,5 +340,4 @@ SPEC_MINIMA = _spec(
     "minima",
     "MINIMA-LoFTR modality-invariant detector-free matcher (LoFTR architecture, MINIMA weights); match(a, b) only",
     optimized=True,
-    int8_dynamic=TRANSFORMER_LINEARS,
 )

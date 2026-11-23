@@ -121,7 +121,9 @@ class LoFTREncoderLayer(nn.Module):
 
         fc1, fc2 = self.mlp[0], self.mlp[2]
         if isinstance(fc1, DynamicInt8Linear):
-            q, s = ops.layernorm_cat_quantize_int8_rows(x, message, self.norm1.weight, self.norm1.bias, self.norm1.eps)
+            q, s = ops.layernorm_cat_quantize_int8_rows(
+                x, message, self.norm1.weight, self.norm1.bias, self.norm1.eps, channel_scale=fc1.channel_scale
+            )
             h = ops.int8_linear(
                 q.reshape(-1, fc1.in_features), fc1.weight_int8, s.reshape(-1, 1), fc1.weight_scale, fc1.bias, relu=True
             ).reshape(*x.shape[:-1], fc1.out_features).to(x.dtype)

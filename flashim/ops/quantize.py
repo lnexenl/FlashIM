@@ -258,10 +258,14 @@ layernorm_cat_quantize_int8 = Op("layernorm_cat_quantize_int8", _layernorm_cat_q
 
 
 def _layernorm_cat_quantize_int8_rows_reference(
-    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float,
+    *, channel_scale: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """``quantize_int8_rows(cat([x, LayerNorm(value)], dim=-1))`` with dynamic per-row INT8 scale."""
-    return _quantize_int8_rows_reference(_layernorm_cat_reference(x, value, weight, bias, eps))
+    """``quantize_int8_rows(cat([x, LayerNorm(value)], dim=-1) [* channel_scale])`` with dynamic per-row INT8 scale."""
+    cat = _layernorm_cat_reference(x, value, weight, bias, eps)
+    if channel_scale is not None:
+        cat = cat.float() * channel_scale.float()
+    return _quantize_int8_rows_reference(cat)
 
 
 layernorm_cat_quantize_int8_rows = Op("layernorm_cat_quantize_int8_rows", _layernorm_cat_quantize_int8_rows_reference)

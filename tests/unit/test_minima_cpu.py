@@ -133,3 +133,24 @@ def test_loftr_compile_regions():
     conv = m.backbone.layer1[0].conv1
     m.backbone.layer1[0].conv1 = StaticInt8Conv2d.from_conv(conv, torch.tensor(0.05))
     assert loftr_spec._compile_regions(m) == ()
+
+
+def test_loftr_rotate_v_merge_hadamard_exact_cpu():
+    """Per-head H_32 on coarse v_proj -> merge preserves LocalFeatureTransformer output."""
+    import torch
+
+    from flashim.models.loftr import quant as loftr_quant
+
+    torch.manual_seed(0)
+    m_ref = LoFTR().eval()
+    m_rot = LoFTR().eval()
+    m_rot.load_state_dict(m_ref.state_dict())
+    assert loftr_quant.rotate_v_merge_hadamard(m_rot) == 8
+
+    a = torch.randn(1, 12, 256)
+    b = torch.randn(1, 15, 256)
+    with torch.inference_mode():
+        r0, r1 = m_ref.loftr_coarse(a, b)
+        o0, o1 = m_rot.loftr_coarse(a, b)
+    torch.testing.assert_close(o0, r0, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(o1, r1, atol=1e-4, rtol=1e-4)
