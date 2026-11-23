@@ -23,6 +23,7 @@ upstream code or licenses nevertheless apply.
 
 Other models (ALIKED and ALIKE: BSD-3-Clause; DaD, DeDoDe, RoMa, Tiny-RoMa: MIT, DINOv2 parts Apache-2.0, Tiny-RoMa's XFeat backbone Apache-2.0; LoMa: MIT, its
 LightGlue-derived matcher Apache-2.0, built on `flashim/models/lightglue/`; RDD, XFeat, LoFTR, EfficientLoFTR @ `ffd4a46440`, XoFTR, DISK, RaCo, MINIMA: Apache-2.0;
+UFM and UniCeption: BSD-3-Clause, CroCo DPT blocks CC BY-NC-SA 4.0, DINOv2 Apache-2.0;
 MASt3R / DUSt3R / CroCo: CC BY-NC-SA 4.0, non-commercial use only; note that upstream `zju3dv/EfficientLoFTR` re-licensed to ZJU3DV PRL v1.0 in commit `07e9c1401e` on 2026-09-15)
 are independent implementations of the published architectures; the license of each upstream is recorded in
 `flashim/models/<model>/weights.py` (`LICENSES`) next to the checkpoint it applies to.
@@ -30,11 +31,12 @@ are independent implementations of the published architectures; the license of e
 ## Weights (downloaded, never shipped)
 
 Checkpoints are fetched from their publishers (URLs and SHA-256 in `flashim/models/*/weights.py`) and keep their own
-licenses. Five are not open-source licenses: **SuperPoint** (`superpoint_v1.pth`, Magic Leap, non-commercial research),
+licenses. Six are not open-source licenses: **SuperPoint** (`superpoint_v1.pth`, Magic Leap, non-commercial research),
 **SuperGlue** (`superglue_outdoor.pth` / `superglue_indoor.pth`, Magic Leap, academic or non-profit non-commercial
 research use only), **RIPE** (Fraunhofer academic-use license: internal non-commercial use only), **MASt3R**
 (`MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only),
-and **DUSt3R** (`DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only).
+**DUSt3R** (`DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only),
+and **UFM** (`ufm_base.safetensors`, CC BY-NC-SA 4.0, non-commercial use only).
 The DINOv3 weights inside the RoMaV2 checkpoint are under the DINOv3 License.
 
 ## Test references (`tests/oracles/`)

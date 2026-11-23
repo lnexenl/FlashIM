@@ -77,6 +77,7 @@ from flashim.ops.quantize import (
     bias_relu_quantize_int8,
     gelu_quantize,
     gelu_quantize_int8,
+    gelu_quantize_int8_rows,
     layernorm_add,
     layernorm_cat,
     layernorm_cat_quantize_int8,
@@ -99,7 +100,7 @@ from flashim.ops.resample import (
     gather_windows,
     pil_bicubic_resize,
     upsample_add,
-    upsample_bilinear2x,
+    upsample_bilinear,
     upsample_concat,
     upsample_concat_int8,
 )
@@ -143,6 +144,7 @@ __all__ = [
     "gather_windows",
     "gelu_quantize",
     "gelu_quantize_int8",
+    "gelu_quantize_int8_rows",
     "gray_instance_norm",
     "im2col_gather",
     "int8_conv2d",
@@ -198,7 +200,7 @@ __all__ = [
     "tiny_roma_corr_pos_embed",
     "union_softmax_match",
     "upsample_add",
-    "upsample_bilinear2x",
+    "upsample_bilinear",
     "upsample_concat",
     "upsample_concat_int8",
 ]

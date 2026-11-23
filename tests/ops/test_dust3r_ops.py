@@ -62,10 +62,11 @@ def test_reciprocal_nn_cuda_matches_reference(n1: int, n2: int, impl: str):
 def test_upsample_bilinear2x_triton_matches_reference(shape, dtype):
     torch.manual_seed(0)
     x = torch.randn(shape, device="cuda", dtype=dtype).to(memory_format=torch.channels_last)
-    assert ops.upsample_bilinear2x.select(x)[0] == "triton"
+    size = (2 * shape[2], 2 * shape[3])
+    assert ops.upsample_bilinear.select(x, size, align_corners=True)[0] == "triton"
     with torch.inference_mode():
-        out = ops.upsample_bilinear2x.get("triton")(x)
-        ref = ops.upsample_bilinear2x.get("reference")(x)
+        out = ops.upsample_bilinear.get("triton")(x, size, align_corners=True)
+        ref = ops.upsample_bilinear.get("reference")(x, size, align_corners=True)
     assert out.is_contiguous(memory_format=torch.channels_last)
     if dtype == torch.float32:
         # Exact integer-quotient coordinates match FP64 reference to <1e-6 (PyTorch's FP32 scale*ox drifts up to 7e-5).

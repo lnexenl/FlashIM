@@ -1037,6 +1037,22 @@ def test_layernorm_quantize_int8_rows(rows, n):
     assert torch.equal(fast[0], unfused[0]) and torch.equal(fast[1], unfused[1])
 
 
+@pytest.mark.parametrize("rows,n", [(2400, 768), (333, 384), (17, 768)])
+def test_layernorm_quantize_int8_rows_general(rows, n):
+    """Non-exact-multiple channel widths dispatch to ``triton_general`` (sm_120 covers multiples of 256 in ``triton``)."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, n, device=DEV, dtype=torch.bfloat16) * 2.5
+    w = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    b = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    cap = torch.cuda.get_device_capability()
+    exact_mult = 256 if cap == (12, 0) else 512
+    expected = "triton" if cap in ((8, 9), (9, 0), (12, 0)) and n % exact_mult == 0 else "triton_general"
+    assert ops.layernorm_quantize_int8_rows.explain(x, w, b, 1e-6)[expected] == "selected"
+    fast, ref = _both(ops.layernorm_quantize_int8_rows, "triton_general", x, w, b, 1e-6)
+    assert (fast[0].int() - ref[0].int()).abs().max() <= 1 and _mismatch(fast[0], ref[0]) < 1e-4
+    torch.testing.assert_close(fast[1], ref[1], atol=1e-5, rtol=1e-4)
+
+
 @pytest.mark.parametrize("rows,k,n", [(5376, 1024, 4096), (300, 1024, 1024), (17, 256, 96), (3000, 4096, 1024)])
 def test_int8_linear_residual_epilogue(rows, k, n):
     """``residual=`` adds a BF16 tensor to the BF16-rounded GEMM output: equal to the separate add, bit for bit."""
@@ -1109,3 +1125,75 @@ def test_roma_refiner_head(c_orig, c_pad, hw):
     assert fast[0].shape == ref[0].shape == (2, 2, *hw) and fast[1].shape == ref[1].shape == (2, 1, *hw)
     torch.testing.assert_close(fast[0], ref[0], atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(fast[1], ref[1], atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("size,in_size", [((240, 320), (120, 160)), ((420, 560), (240, 320)), ((37, 45), (19, 23))])
+@pytest.mark.parametrize("channels", [128, 256, 40])
+@pytest.mark.parametrize("align_corners", [True, False])
+@pytest.mark.parametrize("layout", ["nchw", "nhwc"])
+def test_upsample_bilinear(size, in_size, channels, align_corners, layout):
+    """Standalone bilinear upsampling (and optional static INT8 quantize) vs torch reference."""
+    torch.manual_seed(0)
+    fmt = torch.channels_last if layout == "nhwc" else torch.contiguous_format
+    x = (torch.randn(1, channels, *in_size, device=DEV) * 2).bfloat16().contiguous(memory_format=fmt)
+    assert ops.upsample_bilinear.explain(x, size, align_corners=align_corners)["triton"] == "selected"
+    fast, ref = _both(ops.upsample_bilinear, "triton", x, size, align_corners=align_corners)
+    assert fast.shape == ref.shape and fast.dtype == ref.dtype and fast.is_contiguous(memory_format=torch.channels_last)
+    # FP32 vs FP64 coordinate scale + FMA contraction order: at most 1 BF16 ulp of the operands.
+    tol = torch.maximum(fast.float().abs(), ref.float().abs()) * 2**-7 + x.float().abs().amax() * 1e-4
+    assert ((fast.float() - ref.float()).abs() <= tol).all()
+
+    scale = torch.tensor(0.03, device=DEV)
+    q_fast, q_ref = _both(ops.upsample_bilinear, "triton", x, size, align_corners=align_corners, out_scale=scale)
+    assert q_fast.values.shape == (1, *size, channels) and q_fast.values.is_contiguous() and q_fast.scale is scale
+    unfused = ops.quantize_int8.get("triton")(fast.permute(0, 2, 3, 1), scale)
+    assert (q_fast.values.int() - unfused.values.int()).abs().max() <= 1 and _mismatch(q_fast.values, unfused.values) < 1e-4
+    assert (q_fast.values.int() - q_ref.values.int()).abs().max() <= 1 and _mismatch(q_fast.values, q_ref.values) < 1e-3
+
+
+@pytest.mark.parametrize("batch,heads,tokens,dim", [(2, 16, 1201, 64), (1, 12, 2400, 64), (2, 8, 77, 64)])
+def test_quantize_int8_rows_heads(batch, heads, tokens, dim):
+    """Per-token dynamic INT8 directly from ``[B, H, N, D]`` attention output: bit-identical to reference."""
+    torch.manual_seed(0)
+    x = torch.randn(batch, heads, tokens, dim, device=DEV, dtype=torch.bfloat16) * 3
+    x[0, 3, tokens // 2] *= 200
+    x[-1, :, -1] = 0
+    assert ops.quantize_int8_rows_heads.explain(x)["triton"] == "selected"
+    fast, ref = _both(ops.quantize_int8_rows_heads, "triton", x)
+    assert fast[0].shape == (batch * tokens, heads * dim) and fast[1].shape == (batch * tokens, 1)
+    assert torch.equal(fast[0], ref[0]) and torch.equal(fast[1], ref[1])
+
+
+@pytest.mark.parametrize("rows,k", [(2402, 4096), (2400, 3072), (333, 1024)])
+@pytest.mark.parametrize("approximate", ["none", "tanh"])
+def test_gelu_quantize_int8_rows(rows, k, approximate):
+    """Fused GELU + per-row dynamic INT8 vs reference (exact within <=1 INT8 step where libdevice erf differs)."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, k, device=DEV, dtype=torch.bfloat16) * 2
+    assert ops.gelu_quantize_int8_rows.explain(x, approximate)["triton"] == "selected"
+    fast, ref = _both(ops.gelu_quantize_int8_rows, "triton", x, approximate)
+    assert fast[0].shape == ref[0].shape and fast[1].shape == ref[1].shape
+    assert (fast[0].int() - ref[0].int()).abs().max() <= 1 and _mismatch(fast[0], ref[0]) < 1e-4
+    torch.testing.assert_close(fast[1], ref[1], atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("rows,cols,block", [(2402, 4096, 64), (2400, 3072, 64), (2402, 4096, 128), (37, 128, 32)])
+@pytest.mark.parametrize("with_cs", [False, True])
+def test_rotate_quantize_int8_rows(rows, cols, block, with_cs):
+    """Fused block-orthogonal rotation + per-row dynamic INT8 vs reference."""
+    from flashim.quant.rotation import signed_hadamard
+
+    torch.manual_seed(0)
+    x = torch.randn(rows, cols, device=DEV, dtype=torch.bfloat16) * 2
+    r = signed_hadamard(block, device=DEV, dtype=torch.bfloat16).contiguous()
+    cs = (torch.rand(cols, device=DEV, dtype=torch.float32) * 2.0 + 0.1) if with_cs else None
+    assert ops.rotate_quantize_int8_rows.select(x, r, channel_scale=cs)[0] == "triton"
+    fast, ref = _both(ops.rotate_quantize_int8_rows, "triton", x, r, channel_scale=cs)
+    assert fast[0].shape == ref[0].shape and fast[1].shape == ref[1].shape
+    torch.testing.assert_close(fast[1], ref[1], atol=2e-4, rtol=5e-3)
+    diff = (fast[0].int() - ref[0].int()).abs()
+    assert diff.max().item() <= 2
+    # Exact +-0.125 H_64 without cs is near bit-exact; cs rounds (x * cs) to BF16 before tl.dot, and H_32/H_128
+    # have BF16-rounded +-1/sqrt(B) entries.
+    tol_frac = 0.08 if with_cs else (1e-3 if block == 64 else 0.02)
+    assert (diff > 0).float().mean().item() < tol_frac

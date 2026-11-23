@@ -42,7 +42,7 @@ Tried and rejected schemes (10-pair / 100-pair MegaDepth-1500 screens):
 - SageAttention (``sage`` / ``sage-fp8`` / ``sage-fp8-warp``): 1.4-2.0x slower at N=768 and collapses agreement to 0.0000
 
 Measured accuracy & speed of selected presets (RTX 5070 Ti ``sm_120``, FP16 compute + FP16 NHWC DPT + fused FP16
-encoder/decoder INT8 blocks + Triton ``upsample_bilinear2x`` + fused ``dust3r_pts3d_conf`` + CUDA BVH
+encoder/decoder INT8 blocks + Triton ``upsample_bilinear`` + fused ``dust3r_pts3d_conf`` + CUDA BVH
 ``reciprocal_nn`` + CUDA graphs):
 
 - **20-pair MegaDepth-1500** (``--pairs-per-scene 4``, vs ``fp32`` TF32-off; ``fidelity.py`` uses TF32-on FP32;

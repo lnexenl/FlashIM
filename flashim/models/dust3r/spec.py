@@ -87,12 +87,12 @@ def _fused_rope(model: nn.Module, ctx: BuildContext) -> int | str:
 
 class _UpsampleBilinear2x(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return ops.upsample_bilinear2x(x)
+        return ops.upsample_bilinear(x, (2 * x.shape[2], 2 * x.shape[3]), align_corners=True)
 
 
 class _FastFeatureFusionBlock(nn.Module):
     """Wraps a :class:`FeatureFusionBlock` (sharing its exact submodules) to dispatch 2x bilinear upsampling
-    through :data:`flashim.ops.upsample_bilinear2x` (4.4x faster on NHWC FP16 without modifying ``mast3r/croco.py``)."""
+    through :data:`flashim.ops.upsample_bilinear` (4.4x faster on NHWC FP16 without modifying ``mast3r/croco.py``)."""
 
     def __init__(self, block: FeatureFusionBlock) -> None:
         super().__init__()
@@ -105,12 +105,12 @@ class _FastFeatureFusionBlock(nn.Module):
         if len(xs) == 2:
             output = output + self.resConfUnit1(xs[1])
         output = self.resConfUnit2(output)
-        output = ops.upsample_bilinear2x(output)
+        output = ops.upsample_bilinear(output, (2 * output.shape[2], 2 * output.shape[3]), align_corners=True)
         return self.out_conv(output)
 
 
 def _fast_dpt_upsample(model: nn.Module, ctx: BuildContext) -> int | str:
-    """Replace DPT's 2x ``F.interpolate(..., align_corners=True)`` calls with :data:`flashim.ops.upsample_bilinear2x`
+    """Replace DPT's 2x ``F.interpolate(..., align_corners=True)`` calls with :data:`flashim.ops.upsample_bilinear`
     (4.4-4.5x faster on NHWC FP16, saving ~1.1 ms per pair across all reduced-precision presets)."""
     if ctx.config.precision.compute_dtype == "fp32":
         return "skipped: fp32"
@@ -170,7 +170,7 @@ PASSES = {
     ),
     "fast_dpt_upsample": Pass(
         _fast_dpt_upsample,
-        description="replace DPT 2x bilinear upsampling with NHWC Triton ops.upsample_bilinear2x (4.4x faster)",
+        description="replace DPT 2x bilinear upsampling with NHWC Triton ops.upsample_bilinear (4.4x faster)",
     ),
     "cuda_graph": Pass(
         _cuda_graph,

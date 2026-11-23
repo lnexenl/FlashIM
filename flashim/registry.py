@@ -43,6 +43,7 @@ SPECS = {
     "loma": "flashim.models.loma.spec:LOMA",
     "mast3r": "flashim.models.mast3r.spec:SPEC",
     "dust3r": "flashim.models.dust3r.spec:SPEC",
+    "ufm": "flashim.models.ufm.spec:SPEC",
 }
 
 # RaCo keypoints + the descriptors of any model that can describe given keypoints (raco-superpoint, raco-disk, ...).

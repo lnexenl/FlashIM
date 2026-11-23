@@ -661,115 +661,118 @@ ops.gather_windows.register(
 )(gather_windows)
 
 
-# -- 2x bilinear upsampling (align_corners=True) for NHWC maps (DUSt3R / DPT) ----------------------------
+# -- standalone bilinear upsampling (+ optional static INT8 output quantization) --------------------------------------
 
 
 @triton.jit
-def _upsample_bilinear2x_nhwc_kernel(
-    x_ptr,
-    out_ptr,
-    H,
-    W,
-    C,
-    sb,
-    sh,
-    sw,
-    ob,
-    oh,
-    ow,
-    BLOCK_X: tl.constexpr,
-    BLOCK_C: tl.constexpr,
+def _upsample_bilinear_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    H_in, W_in, H_out, W_out,
+    sx_b, sx_h, sx_w, sx_c,
+    scale_h, scale_w,
+    C: tl.constexpr, BLOCK_X: tl.constexpr, BLOCK_C: tl.constexpr,
+    ALIGN_CORNERS: tl.constexpr, INT8: tl.constexpr, NHWC: tl.constexpr,
 ):
-    """Exact 2x ``align_corners=True`` bilinear upsampling on channels-last ``[B, C, H, W]`` -> ``[B, C, 2H, 2W]``.
+    """One ``[BLOCK_X pixels of one row, BLOCK_C channels]`` tile of bilinear upsampling (channels-last output).
 
-    One program handles ``BLOCK_X`` adjacent output pixels along one row ``(b, oy)`` and ``BLOCK_C`` contiguous
-    channels so every tap load is coalesced (128-bit vector loads along ``C``) and ``(y0, y1, wy0, wy1)`` are
-    scalars shared across the tile. Source coordinates are computed in FP64 to match PyTorch's
-    ``area_pixel_compute_source_index`` bit-accurately.
+    ``ALIGN_CORNERS`` uses exact integer quotient/remainder + ``tl.div_rn`` (no FP64) to match PyTorch's FP64
+    coordinate calculation without sm_120's 1/64 FP64 penalty. ``INT8`` fuses BF16 rounding + static INT8
+    quantization (``_store_quantized`` arithmetic) into the write pass.
     """
-    pid_x = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    pid_by = tl.program_id(2)
-    out_h = 2 * H
-    out_w = 2 * W
-    b = pid_by // out_h
-    oy = pid_by - b * out_h
+    row = tl.program_id(1)
+    b = (row // H_out).to(tl.int64)
+    y = row % H_out
+    x = tl.program_id(0) * BLOCK_X + tl.arange(0, BLOCK_X)
+    x_ok = x < W_out
+    x_c = tl.where(x_ok, x, 0)
+    c = tl.program_id(2) * BLOCK_C + tl.arange(0, BLOCK_C)
+    m = x_ok[:, None] & (c < C)[None, :]
 
-    den_h = out_h - 1
-    den_w = out_w - 1
+    if ALIGN_CORNERS:
+        den_h = tl.maximum(H_out - 1, 1)
+        num_y = y * (H_in - 1)
+        y0 = num_y // den_h
+        y1 = tl.minimum(y0 + 1, H_in - 1)
+        ly1 = tl.div_rn((num_y - y0 * den_h).to(tl.float32), den_h.to(tl.float32))
+        ly0 = 1.0 - ly1
+        den_w = tl.maximum(W_out - 1, 1)
+        num_x = x_c * (W_in - 1)
+        x0 = num_x // den_w
+        x1 = tl.minimum(x0 + 1, W_in - 1)
+        lx1 = tl.div_rn((num_x - x0 * den_w).to(tl.float32), den_w.to(tl.float32))
+        lx0 = 1.0 - lx1
+    else:
+        y0, y1, ly0, ly1 = _bilinear_source(y, H_in, scale_h)
+        x0, x1, lx0, lx1 = _bilinear_source(x_c, W_in, scale_w)
 
-    num_y = oy * (H - 1)
-    y0 = num_y // den_h
-    y1 = tl.minimum(y0 + 1, H - 1)
-    wy1 = tl.div_rn((num_y - y0 * den_h).to(tl.float32), den_h.to(tl.float32))
-    wy0 = 1.0 - wy1
-
-    ox = pid_x * BLOCK_X + tl.arange(0, BLOCK_X)
-    ox_ok = ox < out_w
-    num_x = ox * (W - 1)
-    x0 = num_x // den_w
-    x1 = tl.minimum(x0 + 1, W - 1)
-    wx1 = tl.div_rn((num_x - x0 * den_w).to(tl.float32), den_w.to(tl.float32))
-    wx0 = 1.0 - wx1
-
-    c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    c_ok = c < C
-    ok = ox_ok[:, None] & c_ok[None, :]
-
-    base_y0 = x_ptr + b.to(tl.int64) * sb + y0.to(tl.int64) * sh
-    base_y1 = x_ptr + b.to(tl.int64) * sb + y1.to(tl.int64) * sh
-    x0_off = x0[:, None].to(tl.int64) * sw + c[None, :]
-    x1_off = x1[:, None].to(tl.int64) * sw + c[None, :]
-
-    v00 = tl.load(base_y0 + x0_off, mask=ok, other=0.0).to(tl.float32)
-    v01 = tl.load(base_y0 + x1_off, mask=ok, other=0.0).to(tl.float32)
-    v10 = tl.load(base_y1 + x0_off, mask=ok, other=0.0).to(tl.float32)
-    v11 = tl.load(base_y1 + x1_off, mask=ok, other=0.0).to(tl.float32)
-
-    val = wy0 * (wx0[:, None] * v00 + wx1[:, None] * v01) + wy1 * (wx0[:, None] * v10 + wx1[:, None] * v11)
-    out_off = b.to(tl.int64) * ob + oy.to(tl.int64) * oh + ox[:, None].to(tl.int64) * ow + c[None, :]
-    tl.store(out_ptr + out_off, val.to(out_ptr.dtype.element_ty), mask=ok)
+    base = x_ptr + b * sx_b
+    r0 = base + y0.to(tl.int64) * sx_h
+    r1 = base + y1.to(tl.int64) * sx_h
+    cc = c[None, :] if NHWC else c[None, :].to(tl.int64) * sx_c
+    v00 = tl.load(r0 + (x0.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v01 = tl.load(r0 + (x1.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v10 = tl.load(r1 + (x0.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v11 = tl.load(r1 + (x1.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    lx0, lx1 = lx0[:, None], lx1[:, None]
+    val = ly0 * (lx0 * v00 + lx1 * v01) + ly1 * (lx0 * v10 + lx1 * v11)
+    out_off = ((row.to(tl.int64) * W_out + x_c) * C)[:, None] + c[None, :]
+    if INT8:
+        scaled = libdevice.rint(val.to(tl.bfloat16).to(tl.float32) * (1.0 / tl.load(scale_ptr)))
+        tl.store(out_ptr + out_off, tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8), mask=m)
+    else:
+        tl.store(out_ptr + out_off, val.to(out_ptr.dtype.element_ty), mask=m)
 
 
-def upsample_bilinear2x(x: Tensor) -> Tensor:
-    """Exact 2x ``align_corners=True`` bilinear upsampling for NHWC maps.
+def upsample_bilinear(
+    x: Tensor, size: tuple[int, int], *, align_corners: bool = True, out_scale: Tensor | None = None
+) -> Tensor | Int8Tensor:
+    """Standalone bilinear upsampling (channels-last output) with optional fused static INT8 output quantization.
 
-    Tile picks measured on sm_120 (RTX 5070 Ti, FP16 NHWC, DUSt3R DPT shapes): ``(8, 256, 8 warps)`` hits 46.6 us on
-    ``[1, 256, 96, 128]`` (4.43x vs PyTorch 206.7 us, ~670 GB/s); ``(16, 64, 4 warps)`` hits 92.0 us on
-    ``[1, 128, 192, 256]`` (4.53x vs PyTorch 416.5 us, ~680 GB/s). Uses exact integer quotient/remainder +
-    ``tl.div_rn`` (no FP64) for exact coordinates without sm_120's 1/64 FP64 penalty.
+    Tile picks for NHWC dense output measured on sm_120 (RTX 5070 Ti, FP16 NHWC, DUSt3R DPT shapes):
+    ``(8, 256, 8 warps)`` hits 46.6 us on ``[1, 256, 96, 128]`` (4.43x vs PyTorch); ``(16, 64, 4 warps)`` hits
+    92.0 us on ``[1, 128, 192, 256]`` (4.53x vs PyTorch).
     """
-    batch, channels, h, w = x.shape
-    out_h, out_w = 2 * h, 2 * w
-    out = torch.empty(batch, channels, out_h, out_w, device=x.device, dtype=x.dtype, memory_format=torch.channels_last)
-    if channels >= 256:
+    batch, channels, hi, wi = x.shape
+    ho, wo = size
+    sh, sw = (0.0, 0.0) if align_corners else (hi / ho, wi / wo)
+    nhwc = x.stride(1) == 1
+    if out_scale is None:
+        out = torch.empty((batch, channels, ho, wo), device=x.device, dtype=x.dtype, memory_format=torch.channels_last)
+    else:
+        out = torch.empty((batch, ho, wo, channels), device=x.device, dtype=torch.int8)
+    if out_scale is None and nhwc and channels >= 256:
         block_x, block_c, num_warps = 8, 256, 8
-    elif channels >= 64:
+    elif out_scale is None and nhwc and channels >= 64:
         block_x, block_c, num_warps = 16, 64, 4
     else:
-        block_x, block_c, num_warps = 16, max(16, triton.next_power_of_2(channels)), 4
-    grid = (triton.cdiv(out_w, block_x), triton.cdiv(channels, block_c), batch * out_h)
-    _upsample_bilinear2x_nhwc_kernel[grid](
-        x, out, h, w, channels,
-        x.stride(0), x.stride(2), x.stride(3),
-        out.stride(0), out.stride(2), out.stride(3),
-        BLOCK_X=block_x, BLOCK_C=block_c, num_warps=num_warps,
+        block_c = min(128, max(16, triton.next_power_of_2(channels)))
+        block_x = 16 if block_c >= 64 else 32
+        num_warps = 4
+    grid = (triton.cdiv(wo, block_x), batch * ho, triton.cdiv(channels, block_c))
+    _upsample_bilinear_kernel[grid](
+        x, out, out if out_scale is None else out_scale,
+        hi, wi, ho, wo,
+        x.stride(0), x.stride(2), x.stride(3), x.stride(1),
+        sh, sw, C=channels, BLOCK_X=block_x, BLOCK_C=block_c,
+        ALIGN_CORNERS=align_corners, INT8=out_scale is not None, NHWC=nhwc, num_warps=num_warps,
     )
-    return out
+    return out if out_scale is None else Int8Tensor(out, out_scale)
 
 
-def _eligible_upsample_bilinear2x(x: Tensor) -> bool:
+def _eligible_upsample_bilinear(
+    x: Tensor, size: tuple[int, int], *, align_corners: bool = True, out_scale: Tensor | None = None
+) -> bool:
     return (
         x.is_cuda
         and x.ndim == 4
-        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and x.shape[2] >= 2
-        and x.shape[3] >= 2
-        and x.stride(1) == 1
-        and x.numel() * 4 < 2**31
+        and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and len(size) == 2
+        and size[0] > 0
+        and size[1] > 0
+        and (out_scale is None or (out_scale.is_cuda and out_scale.numel() == 1))
     )
 
 
-ops.upsample_bilinear2x.register(
-    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible_upsample_bilinear2x
-)(upsample_bilinear2x)
+ops.upsample_bilinear.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible_upsample_bilinear
+)(upsample_bilinear)

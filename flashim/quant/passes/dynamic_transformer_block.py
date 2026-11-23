@@ -28,9 +28,14 @@ from flashim.utils import set_submodule
 def _dynamic_linears(block: TransformerBlock) -> bool:
     linears = (block.attn.qkv, block.attn.proj, block.mlp.fc1, block.mlp.fc2)
     return (
-        all(isinstance(m, DynamicInt8Linear) for m in linears[:3])
+        all(isinstance(m, DynamicInt8Linear) for m in linears[:2])
+        and isinstance(linears[2], (DynamicInt8Linear, StaticMXFP8Linear))
         and isinstance(linears[3], (DynamicInt8Linear, StaticMXFP8Linear))
-        and all(getattr(m, "channel_scale", None) is None and getattr(m, "block_rotate", None) is None for m in linears[:3])
+        and not (isinstance(linears[2], StaticMXFP8Linear) and isinstance(linears[3], StaticMXFP8Linear))
+        and all(
+            getattr(m, "channel_scale", None) is None and getattr(m, "block_rotate", None) is None
+            for m in linears[:3]
+        )
     )
 
 
@@ -48,6 +53,8 @@ def is_fusable(block: nn.Module) -> bool:
 
 class DynamicInt8TransformerBlock(nn.Module):
     """:class:`~flashim.layers.TransformerBlock` (same submodule names) with the fusions of this module's docstring."""
+
+    fuse_gelu_quantize: bool = False
 
     def __init__(self, block: TransformerBlock, device: torch.device | None = None) -> None:
         super().__init__()
@@ -73,8 +80,11 @@ class DynamicInt8TransformerBlock(nn.Module):
             s = torch.ones(64, 1, device=device)
             ln = ops.layernorm_quantize_int8_rows.supports(rows, self.norm1.weight, self.norm1.bias, self.norm1.eps)
             extra = {"out_dtype": token_dtype} if token_dtype == torch.float16 else {}
-            gelu = self._exact_gelu and ops.int8_linear.supports(
-                q, fc1.weight_int8, s, fc1.weight_scale, fc1.bias, gelu=True, **extra)
+            gelu = (
+                self._exact_gelu
+                and isinstance(fc1, DynamicInt8Linear)
+                and ops.int8_linear.supports(q, fc1.weight_int8, s, fc1.weight_scale, fc1.bias, gelu=True, **extra)
+            )
             residual = ops.int8_linear.supports(
                 q, qkv.weight_int8[:channels], s, qkv.weight_scale[:channels], None, residual=rows, **extra)
             self._plan[key] = (ln, gelu, residual)
@@ -88,6 +98,18 @@ class DynamicInt8TransformerBlock(nn.Module):
         if fused:
             return ops.layernorm_quantize_int8_rows(x, norm.weight, norm.bias, norm.eps)
         return ops.quantize_int8_rows(norm(x))
+
+    def _quantize_fc2_input(self, h: Tensor, *, apply_act: bool) -> tuple[Tensor, Tensor]:
+        fc2_cs, fc2_rot = self.mlp.fc2.channel_scale, self.mlp.fc2.block_rotate
+        if apply_act and fc2_rot is None and fc2_cs is None and self.fuse_gelu_quantize and isinstance(self.mlp.act, nn.GELU):
+            return ops.gelu_quantize_int8_rows(h, self.mlp.act.approximate)
+        if apply_act:
+            h = self.mlp.act(h)
+        if fc2_rot is not None:
+            return ops.rotate_quantize_int8_rows(h, fc2_rot, channel_scale=fc2_cs)
+        if fc2_cs is not None:
+            return ops.quantize_int8_rows(h, channel_scale=fc2_cs)
+        return ops.quantize_int8_rows(h)
 
     def forward(self, x: Tensor, rope: tuple[Tensor, Tensor] | None = None) -> Tensor:
         if x.dtype not in (torch.bfloat16, torch.float16) or not x.is_contiguous():
@@ -110,6 +132,15 @@ class DynamicInt8TransformerBlock(nn.Module):
             if residual
             else flat + self._linear(attn.proj, q, s, **out_kw)
         )
+        if isinstance(self.mlp.fc1, StaticMXFP8Linear):
+            h = self.mlp.fc1.matmul(self.mlp.fc1.quantize_layernorm(x1, None, self.norm2), bias=True).to(x1.dtype)
+            q, s = self._quantize_fc2_input(h, apply_act=True)
+            x2 = (
+                self._linear(self.mlp.fc2, q, s, residual=x1, **out_kw)
+                if residual
+                else x1 + self._linear(self.mlp.fc2, q, s, **out_kw)
+            )
+            return x2.view(batch, tokens, channels)
         q, s = self._norm_quantize(self.norm2, x1, ln)
         if isinstance(self.mlp.fc2, StaticMXFP8Linear):
             h = self._linear(self.mlp.fc1, q, s, **out_kw)
@@ -119,18 +150,10 @@ class DynamicInt8TransformerBlock(nn.Module):
             else:
                 x2 = x1 + self.mlp.fc2(self.mlp.act(h)).to(x1.dtype)
             return x2.view(batch, tokens, channels)
-        fc2_cs = self.mlp.fc2.channel_scale
-        fc2_rot = self.mlp.fc2.block_rotate
         if gelu:
-            h = self._linear(self.mlp.fc1, q, s, gelu=True, **out_kw)
+            q, s = self._quantize_fc2_input(self._linear(self.mlp.fc1, q, s, gelu=True, **out_kw), apply_act=False)
         else:
-            h = self.mlp.act(self._linear(self.mlp.fc1, q, s, **out_kw))
-        if fc2_rot is not None:
-            q, s = ops.rotate_quantize_int8_rows(h, fc2_rot, channel_scale=fc2_cs)
-        elif fc2_cs is not None:
-            q, s = ops.quantize_int8_rows(h, channel_scale=fc2_cs)
-        else:
-            q, s = ops.quantize_int8_rows(h)
+            q, s = self._quantize_fc2_input(self._linear(self.mlp.fc1, q, s, **out_kw), apply_act=True)
         x2 = (
             self._linear(self.mlp.fc2, q, s, residual=x1, **out_kw)
             if residual
