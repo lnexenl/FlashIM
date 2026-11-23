@@ -42,7 +42,7 @@ from flashim.ops.gemm import (
     mxfp8_linear,
     mxfp8_scaled_mm,
 )
-from flashim.ops.image import jpeg_fancy_upsample
+from flashim.ops.image import gray_instance_norm, jpeg_fancy_upsample
 from flashim.ops.lightglue import lightglue_qkv_rope, lightglue_swapped_linear
 from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
@@ -62,6 +62,7 @@ from flashim.ops.quantize import (
 from flashim.ops.raco import raco_head5x5, raco_resblock
 from flashim.ops.resample import pil_bicubic_resize, upsample_add, upsample_concat, upsample_concat_int8
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
+from flashim.ops.tiny_roma import tiny_roma_corr_pos_embed
 
 __all__ = [
     "OPS",
@@ -84,6 +85,7 @@ __all__ = [
     "dual_softmax_mutual",
     "gelu_quantize",
     "gelu_quantize_int8",
+    "gray_instance_norm",
     "im2col_gather",
     "int8_conv2d",
     "int8_conv2d_maxpool",
@@ -121,6 +123,7 @@ __all__ = [
     "rope_qk_interleaved",
     "sdpa",
     "set_strict",
+    "tiny_roma_corr_pos_embed",
     "upsample_add",
     "upsample_concat",
     "upsample_concat_int8",
