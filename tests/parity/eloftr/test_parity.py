@@ -50,6 +50,8 @@ def _import_upstream():
             info=lambda *a, **k: None, warning=lambda *a, **k: None, log=lambda *a, **k: None
         )
         stubs["loguru"]._Logger = object
+    elif not hasattr(sys.modules["loguru"], "_Logger"):
+        sys.modules["loguru"]._Logger = object
     if "pytorch_lightning.utilities" in stubs:
         stubs["pytorch_lightning.utilities"].rank_zero_only = types.SimpleNamespace(rank=0)
     if "kornia.utils.grid" not in sys.modules:

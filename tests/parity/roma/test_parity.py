@@ -34,9 +34,11 @@ PAIR = (ASSETS / "toronto_A.jpg", ASSETS / "toronto_B.jpg")
 def romatch_pkg():
     if not (ORACLE / "romatch").exists():
         pytest.skip("vendored RoMa oracle not present")
-    if "loguru" not in sys.modules:
+    stubbed_loguru = "loguru" not in sys.modules
+    if stubbed_loguru:
         stub = types.ModuleType("loguru")
         stub.logger = logging.getLogger("romatch")
+        stub._Logger = object
         sys.modules["loguru"] = stub
     sys.path.insert(0, str(ORACLE))
     try:
@@ -47,6 +49,8 @@ def romatch_pkg():
         import romatch.utils.utils as r_ut
     finally:
         sys.path.remove(str(ORACLE))
+        if stubbed_loguru:
+            sys.modules.pop("loguru", None)
 
     # Upstream's get_autocast_params unconditionally enables autocast on CUDA; disable it for true FP32 parity.
     def _no_autocast(device=None, enabled=False, dtype=None):
