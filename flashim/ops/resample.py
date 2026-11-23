@@ -70,3 +70,11 @@ def _pil_bicubic_resize_reference(image: Tensor, sizes: Sequence[tuple[int, int]
 
 
 pil_bicubic_resize = Op("pil_bicubic_resize", _pil_bicubic_resize_reference)
+
+
+def _upsample_bilinear2x_reference(x: Tensor) -> Tensor:
+    """2x bilinear upsampling with ``align_corners=True`` on ``[B, C, H, W]``."""
+    return F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=True)
+
+
+upsample_bilinear2x = Op("upsample_bilinear2x", _upsample_bilinear2x_reference)

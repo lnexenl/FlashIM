@@ -31,8 +31,9 @@ from flashim.ops.conv import (
     int8_conv2d_maxpool,
     mxfp8_conv2d,
 )
-from flashim.ops.correlation import dual_softmax_mutual, fast_reciprocal_nn, local_corr
+from flashim.ops.correlation import dual_softmax_mutual, fast_reciprocal_nn, local_corr, reciprocal_nn
 from flashim.ops.density import kde_density
+from flashim.ops.dust3r import dust3r_pts3d_conf
 from flashim.ops.gemm import (
     int8_linear,
     int8_linear_quantize,
@@ -62,7 +63,13 @@ from flashim.ops.quantize import (
     rotate_quantize_int8_rows,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
-from flashim.ops.resample import pil_bicubic_resize, upsample_add, upsample_concat, upsample_concat_int8
+from flashim.ops.resample import (
+    pil_bicubic_resize,
+    upsample_add,
+    upsample_bilinear2x,
+    upsample_concat,
+    upsample_concat_int8,
+)
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 
 __all__ = [
@@ -84,6 +91,7 @@ __all__ = [
     "depthwise5x5_relu_pointwise_int8",
     "depthwise5x5_relu_pointwise_mxfp8",
     "dual_softmax_mutual",
+    "dust3r_pts3d_conf",
     "fast_reciprocal_nn",
     "gelu_quantize",
     "gelu_quantize_int8",
@@ -118,6 +126,7 @@ __all__ = [
     "quantize_mxfp8",
     "raco_head5x5",
     "raco_resblock",
+    "reciprocal_nn",
     "reset_call_counts",
     "romav2_refiner_heads",
     "romav2_refiner_input",
@@ -128,6 +137,7 @@ __all__ = [
     "sdpa",
     "set_strict",
     "upsample_add",
+    "upsample_bilinear2x",
     "upsample_concat",
     "upsample_concat_int8",
 ]
