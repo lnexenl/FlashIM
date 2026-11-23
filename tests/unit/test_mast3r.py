@@ -36,7 +36,7 @@ def _tiny_config() -> MASt3RConfig:
 
 def test_registered_in_flashim():
     cfg = flashim.resolve("mast3r", "bf16")
-    assert cfg.precision.compute_dtype == "bf16"
+    assert cfg.precision.compute_dtype == "fp16"
     assert SPEC.name == "mast3r"
     assert set(SPEC.presets) >= {"fp32", "bf16"}
 

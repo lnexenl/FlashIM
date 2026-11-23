@@ -143,11 +143,14 @@ PASSES = {
 PRESETS = {
     "fp32": {},
     "bf16": {
-        "precision": {"compute_dtype": "bf16"},
+        # FP16 (10-bit mantissa) instead of BF16 (7-bit): MASt3R's CroCo residual stream reaches 344.38 at
+        # enc_blocks.23 (190x below FP16 max 65504, zero non-finite outputs across 50 MegaDepth pairs), where BF16
+        # ULP=2.0 degrades 2px match agreement by -0.209 and 3D point error by 10x vs FP16 at equal latency (quant.py).
+        "precision": {"compute_dtype": "fp16"},
         "optimize": {"passes": ["fused_rope", "channels_last_dpt", "fp16_nn"]},
     },
     "int8": {
-        "precision": {"compute_dtype": "bf16", "quant": "int8"},
+        "precision": {"compute_dtype": "fp16", "quant": "int8"},
         "optimize": {
             "passes": [
                 "rotate_residual_stream",
@@ -161,7 +164,7 @@ PRESETS = {
         },
     },
     "fp8": {
-        "precision": {"compute_dtype": "bf16", "quant": "fp8"},
+        "precision": {"compute_dtype": "fp16", "quant": "fp8"},
         "optimize": {
             "passes": [
                 "rotate_residual_stream",

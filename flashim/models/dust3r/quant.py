@@ -76,16 +76,15 @@ from pathlib import Path
 import torch
 from torch import Tensor, nn
 
-from flashim import ops
-from flashim.models.mast3r.croco import DecoderBlock
 from flashim.models.mast3r.quant import (
     BACKBONE_LINEARS,
     DEC_LINEARS,
     ENC_FC2_LINEARS,
     ENC_NON_FC2_LINEARS,
+    DynamicInt8DecoderBlock,
     attach_fc2_hadamard,
+    fuse_dynamic_decoder_blocks,
 )
-from flashim.quant.methods.int8_linear import DynamicInt8Linear
 from flashim.quant.rotation import hadamard, layernorm_orthogonal
 from flashim.quant.scheme import (
     INT8_TOKEN_ACTIVATIONS,
@@ -94,7 +93,6 @@ from flashim.quant.scheme import (
     QuantConfig,
     QuantScheme,
 )
-from flashim.utils import set_submodule
 
 CALIBRATION_DIR = Path(__file__).parent / "calibration"
 FP8_CALIBRATION = CALIBRATION_DIR / "dust3r_fp8.safetensors"
@@ -273,177 +271,12 @@ def rotate_dust3r(
     return len(rotated)
 
 
-def _is_fusable_decoder_block(block: nn.Module) -> bool:
-    if not isinstance(block, DecoderBlock):
-        return False
-    ca = block.cross_attn
-    linears = (block.attn.qkv, block.attn.proj, ca.projq, ca.projk, ca.projv, ca.proj, block.mlp.fc1, block.mlp.fc2)
-    return (
-        all(isinstance(m, DynamicInt8Linear) for m in linears)
-        and all(
-            getattr(m, "channel_scale", None) is None and getattr(m, "block_rotate", None) is None
-            for m in linears[:-1]
-        )
-        and ca.projk.bias is not None
-        and ca.projv.bias is not None
-    )
-
-
-class DynamicInt8DecoderBlock(nn.Module):
-    """Fused :class:`DecoderBlock` for per-token dynamic INT8 linears in BF16 or FP16 (bit-identical to unfused)."""
-
-    def __init__(self, block: DecoderBlock, device: torch.device | None = None) -> None:
-        super().__init__()
-        self.norm1 = block.norm1
-        self.attn = block.attn
-        self.norm2 = block.norm2
-        self.norm_y = block.norm_y
-        self.cross_attn = block.cross_attn
-        self.norm3 = block.norm3
-        self.mlp = block.mlp
-        self._exact_gelu = isinstance(self.mlp.act, nn.GELU) and self.mlp.act.approximate == "none"
-        self._has_norm_y = isinstance(self.norm_y, nn.LayerNorm) and self.norm_y.bias is not None
-
-        pk, pv = block.cross_attn.projk, block.cross_attn.projv
-        self.register_buffer("kv_weight_int8", torch.cat((pk.weight_int8, pv.weight_int8), dim=0).contiguous())
-        self.register_buffer("kv_weight_scale", torch.cat((pk.weight_scale, pv.weight_scale), dim=0).contiguous())
-        self.register_buffer("kv_bias", torch.cat((pk.bias, pv.bias), dim=0).contiguous())
-
-        self._plan: dict[tuple[torch.device, torch.dtype], tuple[bool, bool, bool]] = {}
-        if device is not None:
-            self.plan(device, self.norm1.weight.dtype)
-
-    def plan(self, device: torch.device, token_dtype: torch.dtype = torch.float16) -> tuple[bool, bool, bool]:
-        key = (device, token_dtype)
-        if key not in self._plan:
-            channels = self.norm1.weight.shape[0]
-            qkv, fc1 = self.attn.qkv, self.mlp.fc1
-            rows = torch.zeros(64, channels, device=device, dtype=token_dtype)
-            q = torch.zeros(64, channels, device=device, dtype=torch.int8)
-            s = torch.ones(64, 1, device=device)
-            ln = ops.layernorm_quantize_int8_rows.supports(rows, self.norm1.weight, self.norm1.bias, self.norm1.eps)
-            extra = {"out_dtype": token_dtype} if token_dtype == torch.float16 else {}
-            gelu = self._exact_gelu and ops.int8_linear.supports(
-                q, fc1.weight_int8, s, fc1.weight_scale, fc1.bias, gelu=True, **extra
-            )
-            residual = ops.int8_linear.supports(
-                q, qkv.weight_int8[:channels], s, qkv.weight_scale[:channels], None, residual=rows, **extra
-            )
-            self._plan[key] = (ln, gelu, residual)
-        return self._plan[key]
-
-    @staticmethod
-    def _linear(lin: DynamicInt8Linear, q: Tensor, s: Tensor, **epilogue) -> Tensor:
-        return ops.int8_linear(q, lin.weight_int8, s, lin.weight_scale, lin.bias, **epilogue)
-
-    @staticmethod
-    def _norm_quantize(norm: nn.LayerNorm, x: Tensor, fused: bool) -> tuple[Tensor, Tensor]:
-        if fused:
-            return ops.layernorm_quantize_int8_rows(x, norm.weight, norm.bias, norm.eps)
-        return ops.quantize_int8_rows(norm(x))
-
-    def forward(
-        self,
-        x: Tensor,
-        y: Tensor,
-        x_rope: tuple[Tensor, Tensor],
-        y_rope: tuple[Tensor, Tensor],
-    ) -> Tensor:
-        if (
-            x.dtype not in (torch.bfloat16, torch.float16)
-            or y.dtype != x.dtype
-            or not x.is_contiguous()
-            or not y.is_contiguous()
-        ):
-            return self._unfused(x, y, x_rope, y_rope)
-        ln, gelu, residual = self.plan(x.device, x.dtype)
-        out_kw = {"out_dtype": x.dtype} if x.dtype == torch.float16 else {}
-        batch, nx, channels = x.shape
-        ny = y.shape[1]
-        x_flat = x.reshape(-1, channels)
-        y_flat = y.reshape(-1, channels)
-
-        # 1. Self-attention
-        attn = self.attn
-        head_dim = channels // attn.num_heads
-        q, s = self._norm_quantize(self.norm1, x_flat, ln)
-        qkv = self._linear(attn.qkv, q, s, **out_kw).reshape(batch, nx, 3, attn.num_heads, head_dim)
-        qh, kh, vh = (t.transpose(1, 2) for t in qkv.unbind(2))
-        qh, kh = ops.rope_qk_2d.get(attn.rope_impl)(qh, kh, *x_rope)
-        out = ops.sdpa.get(attn.sdpa_impl)(qh, kh, vh)
-        q, s = ops.quantize_int8_rows_heads(out)
-        x1 = (
-            self._linear(attn.proj, q, s, residual=x_flat, **out_kw)
-            if residual
-            else x_flat + self._linear(attn.proj, q, s, **out_kw)
-        )
-
-        # 2. Cross-attention (packed projk + projv)
-        ca = self.cross_attn
-        c_head_dim = channels // ca.num_heads
-        q_q, s_q = self._norm_quantize(self.norm2, x1, ln)
-        if self._has_norm_y:
-            q_kv, s_kv = self._norm_quantize(self.norm_y, y_flat, ln)
-        else:
-            q_kv, s_kv = ops.quantize_int8_rows(self.norm_y(y_flat))
-        qh = self._linear(ca.projq, q_q, s_q, **out_kw).reshape(batch, nx, ca.num_heads, c_head_dim).transpose(1, 2)
-        kv = ops.int8_linear(q_kv, self.kv_weight_int8, s_kv, self.kv_weight_scale, self.kv_bias, **out_kw)
-        kv = kv.reshape(batch, ny, 2, ca.num_heads, c_head_dim)
-        kh, vh = kv[:, :, 0].transpose(1, 2), kv[:, :, 1].transpose(1, 2)
-        qh, kh = ops.rope_qk_2d.get(ca.rope_impl)(qh, kh, x_rope[0], x_rope[1], y_rope[0], y_rope[1])
-        out_c = ops.sdpa.get(ca.sdpa_impl)(qh, kh, vh)
-        q, s = ops.quantize_int8_rows_heads(out_c)
-        x2 = (
-            self._linear(ca.proj, q, s, residual=x1, **out_kw)
-            if residual
-            else x1 + self._linear(ca.proj, q, s, **out_kw)
-        )
-
-        # 3. MLP
-        q, s = self._norm_quantize(self.norm3, x2, ln)
-        h = (
-            self._linear(self.mlp.fc1, q, s, gelu=True, **out_kw)
-            if gelu
-            else self.mlp.act(self._linear(self.mlp.fc1, q, s, **out_kw))
-        )
-        fc2_cs = self.mlp.fc2.channel_scale
-        fc2_rot = self.mlp.fc2.block_rotate
-        if fc2_rot is not None:
-            q, s = ops.rotate_quantize_int8_rows(h, fc2_rot, channel_scale=fc2_cs)
-        elif fc2_cs is not None:
-            q, s = ops.quantize_int8_rows(h, channel_scale=fc2_cs)
-        else:
-            q, s = ops.quantize_int8_rows(h)
-        x3 = (
-            self._linear(self.mlp.fc2, q, s, residual=x2, **out_kw)
-            if residual
-            else x2 + self._linear(self.mlp.fc2, q, s, **out_kw)
-        )
-        return x3.view(batch, nx, channels)
-
-    def _unfused(self, x: Tensor, y: Tensor, x_rope: tuple[Tensor, Tensor], y_rope: tuple[Tensor, Tensor]) -> Tensor:
-        x = x + self.attn(self.norm1(x), x_rope)
-        y_norm = self.norm_y(y)
-        x = x + self.cross_attn(self.norm2(x), y_norm, y_norm, x_rope, y_rope)
-        return x + self.mlp(self.norm3(x))
-
-
-def fuse_dynamic_decoder_blocks(model: nn.Module) -> list[str]:
-    """Replace every fusable :class:`DecoderBlock` of DUSt3R by a :class:`DynamicInt8DecoderBlock`."""
-    fused = []
-    for name, module in list(model.named_modules()):
-        if _is_fusable_decoder_block(module):
-            dev = next(module.parameters()).device
-            set_submodule(model, name, DynamicInt8DecoderBlock(module, dev))
-            fused.append(name)
-    return fused
-
-
 __all__ = [
     "FP8_CALIBRATION",
     "FP8_CONFIG",
     "INT8_CONFIG",
     "PROTECTED",
+    "DynamicInt8DecoderBlock",
     "attach_fc2_hadamard",
     "fuse_dynamic_decoder_blocks",
     "rotate_dust3r",

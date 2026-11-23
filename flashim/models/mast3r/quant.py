@@ -48,19 +48,26 @@ Tried and rejected schemes (20-pair PIL ``bf16`` baseline = 0.7381; default deco
   0.7133 (PIL; 16.41 ms)
 
 Selected presets (verified with ``benchmarks/accuracy/fidelity.py --models mast3r --presets bf16 int8 fp8
---pairs-per-scene 4`` and RTX 5070 Ti ``match_prepared`` median ms on Toronto 384x512 / Sacre 352x512+512x384):
+--pairs-per-scene 4`` and 50 MegaDepth-1500 pairs [10/scene x 5 scenes] on RTX 5070 Ti ``sm_120``,
+``match_prepared`` median ms on Toronto 384x512):
 
-- ``bf16``: match_agree 0.7324, match_ratio 0.9967 | 26.35 ms / 27.37 ms (vs ``fp32`` 108.43 ms / 105.37 ms).
-- ``int8`` (calibration-free: ``rotate_mast3r`` + dynamic per-token INT8 on all 289 backbone linears with Triton
-  ``H_64`` on all 48 ``mlp.fc2`` + fused encoder/decoder blocks; 4 ``head_local_features`` linears BF16):
-  match_agree 0.7237 (-0.0087 vs ``bf16``; +0.0911 over prior SmoothQuant ``int8``), match_ratio 1.0003 |
-  17.00 ms / 18.68 ms (1.55x / 1.47x faster than optimized ``bf16``).
-- ``fp8`` (hybrid: ``rotate_mast3r`` + static MXFP8 cuBLAS ``F.scaled_mm`` on all 24 ``enc_blocks.*.mlp.fc2``
-  ``[1536, 4096->1024]`` linears — 33% of encoder GEMM FLOPs and the shape where cuBLAS MXFP8 beats Triton INT8 ~2x
-  — fused into ``DynamicInt8TransformerBlock`` via ``gelu_quantize``, + rotated dynamic INT8 on the other 265
-  backbone linears with Triton ``H_64`` on all 24 decoder ``mlp.fc2``; 4 ``head_local_features`` linears BF16):
-  match_agree 0.7139 (-0.0185 vs ``bf16``; +0.1013 over prior ``fp8``), match_ratio 0.9993 |
-  16.71 ms / 18.08 ms (1.58x / 1.51x faster than optimized ``bf16``).
+Why ``bf16`` / ``int8`` / ``fp8`` use **FP16** ``compute_dtype`` (as DUSt3R):
+MASt3R's CroCo encoder residual stream reaches peak magnitude **344.38** at ``enc_blocks.23`` (190x below FP16 max
+65504; zero non-finite outputs across 50 MegaDepth pairs), where BF16 ULP = **2.0** vs FP16 ULP = **0.25** (8x
+finer). Switching ``compute_dtype`` from BF16 to FP16 cuts 3D point error 1.7-10x and boosts 2 px match agreement
+by +0.09 to +0.21 at equal speed (50 MegaDepth-1500 pairs vs FP32 TF32-off, ``epi@5px`` = 92.63%):
+
+- ``bf16`` (FP16 compute): agree@2/4 0.9497/0.9785 (vs BF16 0.7411/0.8882, **+0.2086**), pts3d rel p50/p90
+  0.052%/0.158% (vs 0.513%/1.270%, **10x lower**), desc_cos 0.999997 (vs 0.999805), epi@5px 92.65%, 29.31 ms.
+- ``int8`` (FP16 compute; calibration-free: ``rotate_mast3r`` + dynamic per-token INT8 on all 289 backbone linears
+  with Triton ``H_64`` on all 48 ``mlp.fc2`` + fused FP16 encoder/decoder blocks; 4 ``head_local_features`` linears
+  FP16): agree@2/4 0.8374/0.9283 (vs BF16 0.7395/0.8940, **+0.0979**), pts3d rel p50/p90 0.232%/0.712%
+  (vs 0.534%/1.274%, **2.3x lower**), desc_cos 0.999884, epi@5px 92.71%, 18.60 ms.
+- ``fp8`` (FP16 compute; hybrid: ``rotate_mast3r`` + static MXFP8 cuBLAS ``F.scaled_mm`` on all 24
+  ``enc_blocks.*.mlp.fc2`` ``[1536, 4096->1024]`` linears + rotated dynamic INT8 on the other 265 backbone linears
+  with Triton ``H_64`` on all 24 decoder ``mlp.fc2``; 4 ``head_local_features`` linears FP16): agree@2/4
+  0.8195/0.9166 (vs BF16 0.7274/0.8865, **+0.0921**), pts3d rel p50/p90 0.313%/0.942% (vs 0.530%/1.410%,
+  **1.7x lower**), desc_cos 0.999873, epi@5px 92.84%, 17.44 ms (vs BF16 17.55 ms).
 """
 
 from __future__ import annotations
@@ -387,26 +394,28 @@ class DynamicInt8DecoderBlock(nn.Module):
         self.register_buffer("kv_weight_scale", torch.cat((pk.weight_scale, pv.weight_scale), dim=0).contiguous())
         self.register_buffer("kv_bias", torch.cat((pk.bias, pv.bias), dim=0).contiguous())
 
-        self._plan: dict[torch.device, tuple[bool, bool, bool]] = {}
+        self._plan: dict[tuple[torch.device, torch.dtype], tuple[bool, bool, bool]] = {}
         if device is not None:
-            self.plan(device)
+            self.plan(device, self.norm1.weight.dtype)
 
-    def plan(self, device: torch.device) -> tuple[bool, bool, bool]:
-        if device not in self._plan:
+    def plan(self, device: torch.device, token_dtype: torch.dtype = torch.bfloat16) -> tuple[bool, bool, bool]:
+        key = (device, token_dtype)
+        if key not in self._plan:
             channels = self.norm1.weight.shape[0]
             qkv, fc1 = self.attn.qkv, self.mlp.fc1
-            rows = torch.zeros(64, channels, device=device, dtype=torch.bfloat16)
+            rows = torch.zeros(64, channels, device=device, dtype=token_dtype)
             q = torch.zeros(64, channels, device=device, dtype=torch.int8)
             s = torch.ones(64, 1, device=device)
             ln = ops.layernorm_quantize_int8_rows.supports(rows, self.norm1.weight, self.norm1.bias, self.norm1.eps)
+            extra = {"out_dtype": token_dtype} if token_dtype == torch.float16 else {}
             gelu = self._exact_gelu and ops.int8_linear.supports(
-                q, fc1.weight_int8, s, fc1.weight_scale, fc1.bias, gelu=True
+                q, fc1.weight_int8, s, fc1.weight_scale, fc1.bias, gelu=True, **extra
             )
             residual = ops.int8_linear.supports(
-                q, qkv.weight_int8[:channels], s, qkv.weight_scale[:channels], None, residual=rows
+                q, qkv.weight_int8[:channels], s, qkv.weight_scale[:channels], None, residual=rows, **extra
             )
-            self._plan[device] = (ln, gelu, residual)
-        return self._plan[device]
+            self._plan[key] = (ln, gelu, residual)
+        return self._plan[key]
 
     @staticmethod
     def _linear(lin: DynamicInt8Linear, q: Tensor, s: Tensor, **epilogue) -> Tensor:
@@ -425,9 +434,15 @@ class DynamicInt8DecoderBlock(nn.Module):
         x_rope: tuple[Tensor, Tensor],
         y_rope: tuple[Tensor, Tensor],
     ) -> Tensor:
-        if x.dtype != torch.bfloat16 or y.dtype != torch.bfloat16 or not x.is_contiguous() or not y.is_contiguous():
+        if (
+            x.dtype not in (torch.bfloat16, torch.float16)
+            or y.dtype != x.dtype
+            or not x.is_contiguous()
+            or not y.is_contiguous()
+        ):
             return self._unfused(x, y, x_rope, y_rope)
-        ln, gelu, residual = self.plan(x.device)
+        ln, gelu, residual = self.plan(x.device, x.dtype)
+        out_kw = {"out_dtype": x.dtype} if x.dtype == torch.float16 else {}
         batch, nx, channels = x.shape
         ny = y.shape[1]
         x_flat = x.reshape(-1, channels)
@@ -437,12 +452,16 @@ class DynamicInt8DecoderBlock(nn.Module):
         attn = self.attn
         head_dim = channels // attn.num_heads
         q, s = self._norm_quantize(self.norm1, x_flat, ln)
-        qkv = self._linear(attn.qkv, q, s).reshape(batch, nx, 3, attn.num_heads, head_dim)
+        qkv = self._linear(attn.qkv, q, s, **out_kw).reshape(batch, nx, 3, attn.num_heads, head_dim)
         qh, kh, vh = (t.transpose(1, 2) for t in qkv.unbind(2))
         qh, kh = ops.rope_qk_2d.get(attn.rope_impl)(qh, kh, *x_rope)
         out = ops.sdpa.get(attn.sdpa_impl)(qh, kh, vh)
         q, s = ops.quantize_int8_rows_heads(out)
-        x1 = self._linear(attn.proj, q, s, residual=x_flat) if residual else x_flat + self._linear(attn.proj, q, s)
+        x1 = (
+            self._linear(attn.proj, q, s, residual=x_flat, **out_kw)
+            if residual
+            else x_flat + self._linear(attn.proj, q, s, **out_kw)
+        )
 
         # 2. Cross-attention (packed projk + projv)
         ca = self.cross_attn
@@ -452,18 +471,26 @@ class DynamicInt8DecoderBlock(nn.Module):
             q_kv, s_kv = self._norm_quantize(self.norm_y, y_flat, ln)
         else:
             q_kv, s_kv = ops.quantize_int8_rows(self.norm_y(y_flat))
-        qh = self._linear(ca.projq, q_q, s_q).reshape(batch, nx, ca.num_heads, c_head_dim).transpose(1, 2)
-        kv = ops.int8_linear(q_kv, self.kv_weight_int8, s_kv, self.kv_weight_scale, self.kv_bias)
+        qh = self._linear(ca.projq, q_q, s_q, **out_kw).reshape(batch, nx, ca.num_heads, c_head_dim).transpose(1, 2)
+        kv = ops.int8_linear(q_kv, self.kv_weight_int8, s_kv, self.kv_weight_scale, self.kv_bias, **out_kw)
         kv = kv.reshape(batch, ny, 2, ca.num_heads, c_head_dim)
         kh, vh = kv[:, :, 0].transpose(1, 2), kv[:, :, 1].transpose(1, 2)
         qh, kh = ops.rope_qk_2d.get(ca.rope_impl)(qh, kh, x_rope[0], x_rope[1], y_rope[0], y_rope[1])
         out_c = ops.sdpa.get(ca.sdpa_impl)(qh, kh, vh)
         q, s = ops.quantize_int8_rows_heads(out_c)
-        x2 = self._linear(ca.proj, q, s, residual=x1) if residual else x1 + self._linear(ca.proj, q, s)
+        x2 = (
+            self._linear(ca.proj, q, s, residual=x1, **out_kw)
+            if residual
+            else x1 + self._linear(ca.proj, q, s, **out_kw)
+        )
 
         # 3. MLP
         q, s = self._norm_quantize(self.norm3, x2, ln)
-        h = self._linear(self.mlp.fc1, q, s, gelu=True) if gelu else self.mlp.act(self._linear(self.mlp.fc1, q, s))
+        h = (
+            self._linear(self.mlp.fc1, q, s, gelu=True, **out_kw)
+            if gelu
+            else self.mlp.act(self._linear(self.mlp.fc1, q, s, **out_kw))
+        )
         fc2_cs = self.mlp.fc2.channel_scale
         fc2_rot = self.mlp.fc2.block_rotate
         if fc2_rot is not None:
@@ -472,7 +499,11 @@ class DynamicInt8DecoderBlock(nn.Module):
             q, s = ops.quantize_int8_rows(h, channel_scale=fc2_cs)
         else:
             q, s = ops.quantize_int8_rows(h)
-        x3 = self._linear(self.mlp.fc2, q, s, residual=x2) if residual else x2 + self._linear(self.mlp.fc2, q, s)
+        x3 = (
+            self._linear(self.mlp.fc2, q, s, residual=x2, **out_kw)
+            if residual
+            else x2 + self._linear(self.mlp.fc2, q, s, **out_kw)
+        )
         return x3.view(batch, nx, channels)
 
     def _unfused(self, x: Tensor, y: Tensor, x_rope: tuple[Tensor, Tensor], y_rope: tuple[Tensor, Tensor]) -> Tensor:
