@@ -33,6 +33,14 @@ from flashim.ops.conv import (
 )
 from flashim.ops.correlation import dual_softmax_mutual, local_corr
 from flashim.ops.density import kde_density
+from flashim.ops.eloftr import (
+    eloftr_agg_norm,
+    eloftr_leaky_relu_quantize,
+    eloftr_pool_norm,
+    eloftr_post_norm_add,
+    eloftr_upsample_add_leaky_relu,
+    eloftr_upsample_gather_windows,
+)
 from flashim.ops.gemm import (
     int8_linear,
     int8_linear_quantize,
@@ -83,6 +91,12 @@ __all__ = [
     "depthwise5x5_relu_pointwise_int8",
     "depthwise5x5_relu_pointwise_mxfp8",
     "dual_softmax_mutual",
+    "eloftr_agg_norm",
+    "eloftr_leaky_relu_quantize",
+    "eloftr_pool_norm",
+    "eloftr_post_norm_add",
+    "eloftr_upsample_add_leaky_relu",
+    "eloftr_upsample_gather_windows",
     "gelu_quantize",
     "gelu_quantize_int8",
     "gray_instance_norm",

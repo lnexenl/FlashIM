@@ -20,6 +20,7 @@ weight lookup (`flashim/models/*/weights.py`).
 | `rdd/` | https://github.com/xtcpete/rdd @ 02ff372 (`convnext.py`: Meta, MIT: `LICENSE_ConvNeXt`; Deformable-DETR parts: SenseTime, Apache-2.0) | Apache-2.0 |
 | `raco/` | https://github.com/fabio-sim/LightGlue-ONNX (from cvg/RaCo) | Apache-2.0 |
 | `loma/` | https://github.com/davnords/LoMa @ 415caed (`src/loma/`; `descriptor/transformer/`: DINOv2, Meta; offline loader `loma_oracle.py`, see `loma/README.md`) | MIT (matcher in `loma.py`: Apache-2.0, from LightGlue; DINOv2: Apache-2.0) |
+| `eloftr/` | https://github.com/zju3dv/EfficientLoFTR @ ffd4a46440 (`src/loftr/`, `src/utils/misc.py`; last Apache-2.0 commit before upstream re-licensed to ZJU3DV PRL v1.0 in `07e9c1401e`) | Apache-2.0 (`repvgg.py`: RepVGG MIT) |
 
 Not vendored: cvg/LightGlue's `lightglue/superpoint.py` (it carries a Magic Leap notice forbidding reproduction and
 distribution) and RIPE. Both are downloaded on demand by their tests (`tests/parity/_fetch.py`). RIPE (https://github.com/fraunhoferhhi/RIPE) is not vendored: its license (Fraunhofer academic use, version 2.0) grants
