@@ -296,6 +296,7 @@ def _int8_gemm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
+    OUT_FP16: tl.constexpr = False,
 ):
     """``int8[M,K] x int8[N,K]^T`` with INT32 accumulation; epilogue ``acc * (a_scale * w_scale[n]) + bias`` (then ReLU
     with ``RELU``: it commutes with the BF16 rounding, so it equals a separate ReLU pass bit for bit). ``ROW_SCALE``:
@@ -341,13 +342,14 @@ def _int8_gemm_kernel(
         out = tl.maximum(out, 0.0)
     offsets = offs_m[:, None].to(tl.int64) * N + offs_n[None, :]
     mask = mask_m[:, None] & mask_n[None, :]
+    out_tl = tl.float16 if OUT_FP16 else tl.bfloat16
     if GELU or RESIDUAL:
-        out = out.to(tl.bfloat16).to(tl.float32)
+        out = out.to(out_tl).to(tl.float32)
         if GELU:
-            out = gelu_erf(out).to(tl.bfloat16).to(tl.float32)
+            out = gelu_erf(out).to(out_tl).to(tl.float32)
         if RESIDUAL:
             out = tl.load(res_ptr + offsets, mask=mask, other=0.0).to(tl.float32) + out
-    tl.store(out_ptr + offsets, out.to(tl.bfloat16), mask=mask)
+    tl.store(out_ptr + offsets, out.to(out_tl), mask=mask)
 
 
 def _int8_gemm_config(
@@ -385,13 +387,14 @@ def _int8_gemm_config(
 
 def int8_gemm_bf16(
     a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, config=None, *, relu: bool = False,
-    gelu: bool = False, residual: Tensor | None = None,
+    gelu: bool = False, residual: Tensor | None = None, out_dtype: torch.dtype | None = None,
 ) -> Tensor:
-    """``[rows, K] int8 x [N, K] int8^T`` -> BF16 ``[rows, N]`` with the dequantizing epilogue fused; ``a_scale``: one
-    FP32 value or ``[rows, 1]`` (contiguous) per-row scales; ``gelu`` / ``residual``: see :func:`_int8_gemm_kernel`."""
+    """``[rows, K] int8 x [N, K] int8^T`` -> BF16/FP16 ``[rows, N]`` with the dequantizing epilogue fused; ``a_scale``:
+    one FP32 value or ``[rows, 1]`` (contiguous) per-row scales; ``gelu`` / ``residual``: see :func:`_int8_gemm_kernel`."""
     rows, k = a.shape
     n = weight.shape[0]
-    out = torch.empty(rows, n, device=a.device, dtype=torch.bfloat16)
+    dtype = out_dtype if out_dtype is not None else (residual.dtype if residual is not None else torch.bfloat16)
+    out = torch.empty(rows, n, device=a.device, dtype=dtype)
     cap = platform_for(a.device).capability
     block_m, block_n, block_k, num_warps, num_stages = config or _int8_gemm_config(
         rows, n, cap in ((8, 9), (9, 0)), cap == (8, 7), k=k, sm90=cap == (9, 0), sm120=cap == (12, 0),
@@ -416,6 +419,7 @@ def int8_gemm_bf16(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         GROUP_M=8,
+        OUT_FP16=dtype == torch.float16,
         num_warps=num_warps,
         num_stages=num_stages,
         **(gelu_launch_kwargs(a.device) if gelu else {}),
@@ -765,13 +769,18 @@ def _mxfp8_scaled_mm_impl(a, b_t, a_scale, b_scale, bias=None):
 
 
 # The fused-epilogue Triton GEMM beats cuBLAS ``_int_mm`` + separate dequant passes at every shape.
-def _int8_linear_eligible(a, weight, a_scale, w_scale, bias, *, relu=False, gelu=False, residual=None) -> bool:
+def _int8_linear_eligible(
+    a, weight, a_scale, w_scale, bias, *, relu=False, gelu=False, residual=None, out_dtype=None
+) -> bool:
     """The epilogues are exact where they equal the unfused torch ops: ``gelu`` needs a libdevice whose ``erf`` is
-    torch's (:mod:`~flashim.backends.triton._libdevice`), ``residual`` a contiguous BF16 ``[rows, N]``; one activation."""
+    torch's (:mod:`~flashim.backends.triton._libdevice`), ``residual`` a contiguous BF16/FP16 ``[rows, N]``; one activation."""
+    dtype = out_dtype if out_dtype is not None else (residual.dtype if residual is not None else torch.bfloat16)
+    if dtype not in (torch.bfloat16, torch.float16):
+        return False
     if gelu and (relu or torch_gelu_libdevice(a.device) is None):
         return False
     return residual is None or (
-        residual.dtype == torch.bfloat16 and residual.is_contiguous() and residual.shape == (a.shape[0], weight.shape[0])
+        residual.dtype == dtype and residual.is_contiguous() and residual.shape == (a.shape[0], weight.shape[0])
     )
 
 
@@ -779,8 +788,12 @@ def _int8_linear_eligible(a, weight, a_scale, w_scale, bias, *, relu=False, gelu
     "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON], priority=1,
     when=_int8_linear_eligible,
 )
-def _int8_linear_impl(a, weight, a_scale, w_scale, bias, *, relu: bool = False, gelu: bool = False, residual=None):
-    return int8_gemm_bf16(a.contiguous(), weight, a_scale, w_scale, bias, relu=relu, gelu=gelu, residual=residual)
+def _int8_linear_impl(
+    a, weight, a_scale, w_scale, bias, *, relu: bool = False, gelu: bool = False, residual=None, out_dtype=None
+):
+    return int8_gemm_bf16(
+        a.contiguous(), weight, a_scale, w_scale, bias, relu=relu, gelu=gelu, residual=residual, out_dtype=out_dtype
+    )
 
 
 def _static_gemm_eligible(a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None) -> bool:

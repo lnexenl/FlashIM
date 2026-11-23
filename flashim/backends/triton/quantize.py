@@ -600,10 +600,10 @@ def quantize_int8_rows_heads(value: Tensor) -> tuple[Tensor, Tensor]:
 @triton.jit
 def _layernorm_quantize_int8_rows_kernel(
     x_ptr, w_ptr, b_ptr, out_ptr, scale_ptr, eps, N: tl.constexpr, BLOCK: tl.constexpr, T: tl.constexpr,
-    ITERS: tl.constexpr,
+    ITERS: tl.constexpr, OUT_FP16: tl.constexpr = False,
 ):
     """One program per row: ATen's LayerNorm statistics and affine step (:mod:`._layernorm_stats`), the result rounded
-    to BF16, then the per-row quantization of :func:`_quantize_int8_rows_kernel` on that rounded row."""
+    to BF16/FP16, then the per-row quantization of :func:`_quantize_int8_rows_kernel` on that rounded row."""
     row = tl.program_id(0).to(tl.int64)
     base = row * N
     mean, var = torch_layernorm_stats(x_ptr, base, N, T, ITERS)
@@ -612,7 +612,7 @@ def _layernorm_quantize_int8_rows_kernel(
     x = tl.load(x_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
     w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(b_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    y = torch_layernorm_apply(x, w, b, mean, var, eps).to(tl.bfloat16).to(tl.float32)
+    y = torch_layernorm_apply(x, w, b, mean, var, eps).to(tl.float16 if OUT_FP16 else tl.bfloat16).to(tl.float32)
     scale = tl.max(tl.abs(tl.where(mask, y, 0.0)), 0) * (1.0 / 127.0)
     scale = tl.where(scale > 1.1920928955078125e-07, scale, 1.1920928955078125e-07)
     scaled = libdevice.rint(tl.math.div_rn(y, scale))
@@ -627,7 +627,8 @@ def layernorm_quantize_int8_rows(value: Tensor, weight: Tensor, bias: Tensor, ep
     scale = torch.empty((*value.shape[:-1], 1), device=value.device, dtype=torch.float32)
     _layernorm_quantize_int8_rows_kernel[(rows,)](
         value, weight, bias, out, scale, float(eps), N=n, BLOCK=triton.next_power_of_2(n), T=LN_THREADS,
-        ITERS=triton.cdiv(n // 4, LN_THREADS), num_warps=LN_THREADS // 32, enable_fp_fusion=False,
+        ITERS=triton.cdiv(n // 4, LN_THREADS), OUT_FP16=value.dtype == torch.float16,
+        num_warps=LN_THREADS // 32, enable_fp_fusion=False,
     )
     return out, scale
 
@@ -802,7 +803,8 @@ def _layernorm_rows_eligible(value, weight, bias, eps) -> bool:
     n = value.shape[-1]
     mult = 256 if cap == (12, 0) else LN_EXACT_MULTIPLE
     return (
-        value.dtype == weight.dtype == torch.bfloat16 and bias is not None and bias.dtype == torch.bfloat16
+        value.dtype == weight.dtype and value.dtype in (torch.bfloat16, torch.float16)
+        and bias is not None and bias.dtype == value.dtype
         and _row_major(value) and n % mult == 0 and n <= 4096
     )
 
@@ -872,7 +874,9 @@ def _layernorm_gelu_eligible(value, weight, bias, eps, scale, *, channel_scale=N
     """``nn.LayerNorm``-exact statistics as :func:`_layernorm_rows_eligible`, a libdevice under which the fused GELU is
     torch's, and ``channel_scale`` as :func:`_quantize_int8_eligible` takes it."""
     return (
-        _layernorm_rows_eligible(value, weight, bias, eps) and torch_gelu_libdevice(value.device) is not None
+        value.dtype == torch.bfloat16
+        and _layernorm_rows_eligible(value, weight, bias, eps)
+        and torch_gelu_libdevice(value.device) is not None
         and (channel_scale is None or _quantize_int8_eligible(value, scale, channel_scale=channel_scale))
     )
 

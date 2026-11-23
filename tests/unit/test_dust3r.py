@@ -9,9 +9,9 @@ from flashim.layers import TransformerBlock
 from flashim.models.dust3r import quant
 from flashim.models.dust3r.config import DUSt3RConfig
 from flashim.models.dust3r.model import DUSt3R
+from flashim.models.dust3r.quant import DynamicInt8DecoderBlock
 from flashim.models.dust3r.spec import SPEC
 from flashim.models.mast3r.croco import CroCoStereoBackbone
-from flashim.models.mast3r.quant import DynamicInt8DecoderBlock
 from flashim.quant.apply import quantize_model
 from flashim.quant.passes.dynamic_transformer_block import DynamicInt8TransformerBlock, fuse_dynamic_blocks
 
@@ -34,7 +34,7 @@ def _tiny_config() -> DUSt3RConfig:
 
 def test_registered_in_flashim():
     cfg = flashim.resolve("dust3r", "bf16")
-    assert cfg.precision.compute_dtype == "bf16"
+    assert cfg.precision.compute_dtype == "fp16"
     assert SPEC.name == "dust3r"
     assert set(SPEC.presets) >= {"fp32", "bf16"}
 

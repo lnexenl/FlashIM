@@ -89,3 +89,34 @@ def test_dust3r_pts3d_conf_triton_matches_reference(shape, dtype):
         p_r, c_r = ops.dust3r_pts3d_conf.get("reference")(raw, 1.0)
     torch.testing.assert_close(p_t, p_r, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(c_t, c_r, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("gelu,with_res", [(False, False), (True, False), (False, True)])
+def test_int8_linear_fp16_matches_reference(gelu: bool, with_res: bool):
+    torch.manual_seed(0)
+    a = torch.randint(-127, 128, (256, 512), device="cuda", dtype=torch.int8)
+    w = torch.randint(-127, 128, (768, 512), device="cuda", dtype=torch.int8)
+    a_s = torch.rand(256, 1, device="cuda", dtype=torch.float32) * 0.02 + 1e-4
+    w_s = torch.rand(768, device="cuda", dtype=torch.float32) * 0.02 + 1e-4
+    bias = torch.randn(768, device="cuda", dtype=torch.bfloat16) * 0.1
+    res = torch.randn(256, 768, device="cuda", dtype=torch.float16) if with_res else None
+    with torch.inference_mode():
+        out = ops.int8_linear.get("triton")(a, w, a_s, w_s, bias, gelu=gelu, residual=res, out_dtype=torch.float16)
+        ref = ops.int8_linear.get("reference")(a, w, a_s, w_s, bias, gelu=gelu, residual=res, out_dtype=torch.float16)
+    assert out.dtype == torch.float16
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dim", [768, 1024])
+def test_layernorm_quantize_int8_rows_fp16_matches_reference(dim: int):
+    torch.manual_seed(0)
+    x = torch.randn(128, dim, device="cuda", dtype=torch.float16)
+    w = torch.randn(dim, device="cuda", dtype=torch.float16)
+    b = torch.randn(dim, device="cuda", dtype=torch.float16)
+    with torch.inference_mode():
+        q_t, s_t = ops.layernorm_quantize_int8_rows.get("triton")(x, w, b, 1e-6)
+        q_r, s_r = ops.layernorm_quantize_int8_rows.get("reference")(x, w, b, 1e-6)
+    assert torch.equal(q_t, q_r)
+    assert torch.equal(s_t, s_r)

@@ -181,11 +181,14 @@ PASSES = {
 PRESETS = {
     "fp32": {},
     "bf16": {
-        "precision": {"compute_dtype": "bf16"},
+        # FP16 (10-bit mantissa) instead of BF16 (7-bit): DUSt3R's CroCo residual stream reaches 648.65 (100x below
+        # FP16 max 65504, zero non-finite outputs across 100 MegaDepth pairs), where BF16 ULP=4.0 degrades epipolar
+        # precision (-4.3% @5px) and pose AUC while FP16 matches FP32 at equal/faster latency (see quant.py).
+        "precision": {"compute_dtype": "fp16"},
         "optimize": {"passes": ["fused_rope", "fp16_dpt", "fast_dpt_upsample", "cuda_graph"]},
     },
     "int8": {
-        "precision": {"compute_dtype": "bf16", "quant": "int8"},
+        "precision": {"compute_dtype": "fp16", "quant": "int8"},
         "optimize": {
             "passes": [
                 "fc2_hadamard",
@@ -199,7 +202,7 @@ PRESETS = {
         },
     },
     "fp8": {
-        "precision": {"compute_dtype": "bf16", "quant": "fp8"},
+        "precision": {"compute_dtype": "fp16", "quant": "fp8"},
         "optimize": {
             "passes": [
                 "fc2_hadamard",
