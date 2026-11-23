@@ -505,6 +505,54 @@ def quantize_int8_rows(value: Tensor, *, channel_scale: Tensor | None = None) ->
 
 
 @triton.jit
+def _rotate_quantize_int8_rows_kernel(
+    x_ptr, r_ptr, cs_ptr, out_ptr, scale_ptr,
+    K: tl.constexpr, B: tl.constexpr, G: tl.constexpr, G_PAD: tl.constexpr, CHANNEL_SCALE: tl.constexpr,
+):
+    """One program per row: load ``[G, B]`` (with optional FP32 ``channel_scale``), apply the block orthogonal
+    transform ``R [B, B]`` on BF16 tensor cores (FP32 accumulation; ``H_64`` entries ``+-0.125`` are exact in BF16),
+    compute the row ``amax / 127`` scale, and store INT8 values + FP32 scale in one pass."""
+    row = tl.program_id(0).to(tl.int64)
+    g = tl.arange(0, G_PAD)
+    b = tl.arange(0, B)
+    g_ok = g < G
+    cols = g[:, None] * B + b[None, :]
+    x = tl.load(x_ptr + row * K + cols, mask=g_ok[:, None], other=0.0)
+    if CHANNEL_SCALE:
+        cs = tl.load(cs_ptr + cols, mask=g_ok[:, None], other=0.0).to(tl.float32)
+        x = (x.to(tl.float32) * cs).to(tl.bfloat16)
+    else:
+        x = x.to(tl.bfloat16)
+    r = tl.load(r_ptr + b[:, None] * B + b[None, :]).to(tl.bfloat16)
+    y = tl.dot(x, r)
+    y = tl.where(g_ok[:, None], y, 0.0)
+    scale = tl.max(tl.abs(y)) * (1.0 / 127.0)
+    scale = tl.where(scale > 1.1920928955078125e-07, scale, 1.1920928955078125e-07)
+    scaled = libdevice.rint(tl.math.div_rn(y, scale))
+    q = tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8)
+    tl.store(out_ptr + row * K + cols, q, mask=g_ok[:, None])
+    tl.store(scale_ptr + row, scale)
+
+
+def rotate_quantize_int8_rows(
+    value: Tensor, matrix: Tensor, *, channel_scale: Tensor | None = None
+) -> tuple[Tensor, Tensor]:
+    k = value.shape[-1]
+    b = matrix.shape[0]
+    g = k // b
+    g_pad = max(16, triton.next_power_of_2(g))
+    rows = value.numel() // k
+    out = torch.empty(value.shape, device=value.device, dtype=torch.int8)
+    scale = torch.empty((*value.shape[:-1], 1), device=value.device, dtype=torch.float32)
+    _rotate_quantize_int8_rows_kernel[(rows,)](
+        value, matrix, channel_scale if channel_scale is not None else scale, out, scale,
+        K=k, B=b, G=g, G_PAD=g_pad, CHANNEL_SCALE=channel_scale is not None,
+        num_warps=4,
+    )
+    return out, scale
+
+
+@triton.jit
 def _quantize_int8_rows_heads_kernel(
     value_ptr, out_ptr, scale_ptr, total_tokens, N,
     H: tl.constexpr, D: tl.constexpr, C: tl.constexpr, BLOCK_C: tl.constexpr, ROWS: tl.constexpr,
@@ -775,6 +823,26 @@ ops.quantize_int8_rows.register(
         ))
     ),
 )(quantize_int8_rows)
+
+
+def _rotate_quantize_rows_eligible(value: Tensor, matrix: Tensor, *, channel_scale: Tensor | None = None) -> bool:
+    if not (_row_major(value) and matrix.ndim == 2 and matrix.is_contiguous() and matrix.shape[0] == matrix.shape[1]):
+        return False
+    b, k = matrix.shape[0], value.shape[-1]
+    if not (16 <= b <= 128 and b == triton.next_power_of_2(b) and k % b == 0 and k <= 8192):
+        return False
+    return channel_scale is None or (
+        channel_scale.ndim == 1
+        and channel_scale.shape[0] == k
+        and channel_scale.dtype == torch.float32
+        and channel_scale.is_contiguous()
+    )
+
+
+ops.rotate_quantize_int8_rows.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 0)), requires=[Feature.TRITON],
+    when=_rotate_quantize_rows_eligible,
+)(rotate_quantize_int8_rows)
 ops.quantize_int8_rows_heads.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON],
     when=lambda value: (

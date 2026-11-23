@@ -59,6 +59,7 @@ from flashim.ops.quantize import (
     quantize_int8_rows,
     quantize_int8_rows_heads,
     quantize_mxfp8,
+    rotate_quantize_int8_rows,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
 from flashim.ops.resample import pil_bicubic_resize, upsample_add, upsample_concat, upsample_concat_int8
@@ -123,6 +124,7 @@ __all__ = [
     "rope_qk",
     "rope_qk_2d",
     "rope_qk_interleaved",
+    "rotate_quantize_int8_rows",
     "sdpa",
     "set_strict",
     "upsample_add",

@@ -13,10 +13,6 @@ from flashim.models.mast3r import quant
 from flashim.models.mast3r.config import MASt3RConfig
 from flashim.models.mast3r.model import MASt3R
 from flashim.platforms import Feature
-from flashim.quant.calibration import Int8CalibrationTable
-from flashim.quant.methods.int8_linear import DynamicInt8Linear
-from flashim.quant.passes.transformer_block import enable_fused_epilogues
-from flashim.utils import set_submodule
 
 
 def _load(config: RunConfig) -> MASt3R:
@@ -36,46 +32,23 @@ def _apply_inference(model: MASt3R, inference: Mapping) -> None:
             setattr(model, key, inference[key])
 
 
-def _fold_smoothquant(model: nn.Module, ctx: BuildContext) -> int | str:
-    """Fold calibrated SmoothQuant scales into preceding LayerNorm and V-projection weights before quantization
-    (encoder + decoder for ``int8``, decoder only for hybrid ``fp8``)."""
+def _rotate_residual_stream(model: nn.Module, ctx: BuildContext) -> dict[str, int] | str:
+    """Fold exact LayerNorm-commuting orthogonal rotations (``Q_1024``, ``Q_768``, per-head ``H_64`` on ``V->proj``)
+    into the weights before quantization and mark dynamic-INT8 ``mlp.fc2`` linears for online block-64 Hadamard
+    quantization."""
     qname = ctx.config.precision.quant
     if qname not in ("int8", "fp8"):
         return f"skipped: quant={qname!r}"
-    path = ctx.config.precision.calibration if qname == "int8" and ctx.config.precision.calibration else quant.INT8_CALIBRATION
-    if not path.is_file():
-        return "skipped: missing int8 smooth table"
-    table = Int8CalibrationTable.load(path)
-    return quant.fold_smoothquant(
-        model, table.smooth, include_encoder=(qname == "int8"), include_decoder=True
-    )
-
-
-def _apply_decoder_smooth_fp8(model: nn.Module, ctx: BuildContext) -> int | str:
-    """Hybrid ``fp8``: apply the remaining unfolded SmoothQuant factors (``decoder_embed`` and decoder
-    ``mlp.fc2``) to the decoder's dynamic INT8 linears."""
-    if ctx.config.precision.quant != "fp8":
-        return "skipped: not fp8"
-    if not quant.INT8_CALIBRATION.is_file():
-        return "skipped: missing int8 smooth table"
-    table = Int8CalibrationTable.load(quant.INT8_CALIBRATION)
-    applied = 0
-    for name in ("decoder_embed", *(f"{b}.{i}.mlp.fc2" for b in ("dec_blocks", "dec_blocks2") for i in range(len(model.dec_blocks)))):
-        if name not in table.smooth:
-            continue
-        mod = model.get_submodule(name)
-        if not isinstance(mod, nn.Linear):
-            continue
-        set_submodule(model, name, DynamicInt8Linear.from_linear(mod, smooth=table.smooth[name]))
-        applied += 1
-    return applied
+    rotated = quant.rotate_mast3r(model)
+    fc2_had = quant.attach_fc2_hadamard(model, include_encoder=(qname == "int8"))
+    return {"rotated_tensors": rotated, "fc2_hadamard": fc2_had}
 
 
 def _fused_dynamic_vit_blocks(model: nn.Module, ctx: BuildContext) -> list[str] | str:
-    """int8: fuse LayerNorm + per-row INT8 quantization, GELU epilogue and residual add into each encoder
-    ``TransformerBlock`` (:class:`DynamicInt8TransformerBlock`); bit-identical."""
-    if ctx.config.precision.quant != "int8":
-        return "skipped: not int8"
+    """int8 / fp8: fuse LayerNorm + per-row INT8 quantization, GELU epilogue (or hybrid MXFP8 ``gelu_quantize`` on
+    ``fc2``) and residual add into each encoder ``TransformerBlock`` (:class:`DynamicInt8TransformerBlock`)."""
+    if ctx.config.precision.quant not in ("int8", "fp8"):
+        return f"skipped: quant={ctx.config.precision.quant!r}"
     from flashim.quant.passes.dynamic_transformer_block import fuse_dynamic_blocks
 
     return fuse_dynamic_blocks(model) or "skipped: no dynamic INT8 transformer blocks"
@@ -87,13 +60,6 @@ def _fused_dynamic_dec_blocks(model: nn.Module, ctx: BuildContext) -> list[str] 
     if ctx.config.precision.quant not in ("int8", "fp8"):
         return f"skipped: quant={ctx.config.precision.quant!r}"
     return quant.fuse_dynamic_decoder_blocks(model) or "skipped: no fusable decoder blocks"
-
-
-def _fused_head_mlp(model: nn.Module, ctx: BuildContext) -> list[str] | str:
-    """fp8: fuse ``fc1`` bias + GELU + ``fc2`` static MXFP8 quantization on the two local-feature MLPs."""
-    if ctx.config.precision.quant != "fp8":
-        return "skipped: not fp8"
-    return quant.fuse_mxfp8_head_mlps(model) or "skipped: no fusable MXFP8 head MLPs"
 
 
 def _fp16_nn(model: MASt3R, ctx: BuildContext) -> bool | str:
@@ -112,14 +78,6 @@ def _cuda_graph(model: MASt3R, ctx: BuildContext) -> int | str:
         return f"skipped: no CUDA graphs on {ctx.platform.describe()}"
     model.graphs = int(ctx.option("cuda_graphs", 4))
     return model.graphs
-
-
-def _fused_block_epilogues(model: nn.Module, ctx: BuildContext) -> list[str] | str:
-    """fp8: fuse biases and residual adds into GEMM epilogues and quantize kernels on encoder
-    ``QuantizedTransformerBlock``s."""
-    if ctx.config.precision.quant != "fp8":
-        return "skipped: not fp8"
-    return enable_fused_epilogues(model) or "skipped: no fusable MXFP8 blocks"
 
 
 def _fused_rope(model: nn.Module, ctx: BuildContext) -> int | str:
@@ -148,36 +106,19 @@ def _channels_last_dpt(model: nn.Module, ctx: BuildContext) -> list[str] | str:
 
 
 PASSES = {
-    "fold_smoothquant": Pass(
-        _fold_smoothquant,
+    "rotate_residual_stream": Pass(
+        _rotate_residual_stream,
         stage="pre_quant",
         exact=False,
-        description="fold SmoothQuant channel scales into LayerNorm and V-projection weights",
-    ),
-    "apply_decoder_smooth_fp8": Pass(
-        _apply_decoder_smooth_fp8,
-        stage="pre_quant",
-        exact=False,
-        description="fp8: pre-pack decoder_embed and decoder mlp.fc2 as smoothed DynamicInt8Linear",
+        description="fold LayerNorm-commuting orthogonal rotations (Q_1024/Q_768/H_64) and attach online H_64 on fc2",
     ),
     "fused_dynamic_vit_blocks": Pass(
         _fused_dynamic_vit_blocks,
-        description="int8: encoder ViT LayerNorm+quantize, GELU and residual epilogues",
+        description="int8/fp8: encoder ViT LayerNorm+quantize, GELU/MXFP8-fc2 and residual epilogues",
     ),
     "fused_dynamic_dec_blocks": Pass(
         _fused_dynamic_dec_blocks,
         description="int8/fp8: decoder packed KV, LayerNorm+quantize, head-transpose+quantize and residual epilogues",
-    ),
-    "fused_head_mlp": Pass(
-        _fused_head_mlp,
-        exact=False,
-        description="fp8: fuse fc1 bias + GELU + fc2 MXFP8 quantization in local-feature MLPs",
-    ),
-    "fused_block_epilogues": Pass(
-        _fused_block_epilogues,
-        stage="post_quant",
-        exact=False,
-        description="fp8: encoder ViT biases / residual adds fused into GEMM epilogues and quantize kernels",
     ),
     "fused_rope": Pass(
         _fused_rope,
@@ -209,7 +150,7 @@ PRESETS = {
         "precision": {"compute_dtype": "bf16", "quant": "int8"},
         "optimize": {
             "passes": [
-                "fold_smoothquant",
+                "rotate_residual_stream",
                 "fused_rope",
                 "fused_dynamic_vit_blocks",
                 "fused_dynamic_dec_blocks",
@@ -223,12 +164,10 @@ PRESETS = {
         "precision": {"compute_dtype": "bf16", "quant": "fp8"},
         "optimize": {
             "passes": [
-                "fold_smoothquant",
-                "apply_decoder_smooth_fp8",
+                "rotate_residual_stream",
                 "fused_rope",
-                "fused_block_epilogues",
+                "fused_dynamic_vit_blocks",
                 "fused_dynamic_dec_blocks",
-                "fused_head_mlp",
                 "channels_last_dpt",
                 "fp16_nn",
                 "cuda_graph",
@@ -245,7 +184,7 @@ SPEC = ModelSpec(
     presets=PRESETS,
     default_preset="bf16",
     quant_configs={"int8": quant.INT8_CONFIG, "fp8": quant.FP8_CONFIG},
-    calibrations={"int8": quant.INT8_CALIBRATION, "fp8": quant.FP8_CALIBRATION},
+    calibrations={"fp8": quant.FP8_CALIBRATION},
     protected=quant.PROTECTED,
     passes=PASSES,
     engines={

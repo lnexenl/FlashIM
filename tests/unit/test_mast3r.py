@@ -118,3 +118,82 @@ def test_dynamic_int8_quant_and_block_fusion():
     assert torch.isfinite(out1["desc"]).all() and torch.isfinite(out2["pts3d_in_other_view"]).all()
     assert torch.equal(out1["desc"], d1) and torch.equal(out1["desc_conf"], c1)
     assert torch.equal(out2["desc"], d2) and torch.equal(out2["desc_conf"], c2)
+
+
+def test_layernorm_orthogonal_commutes_with_layernorm():
+    from flashim.quant.rotation import layernorm_orthogonal
+
+    torch.manual_seed(0)
+    for d, block_size in ((64, None), (768, None), (1024, None), (1024, 16)):
+        q = layernorm_orthogonal(d, block_size=block_size, dtype=torch.float64)
+        eye = torch.eye(d, dtype=torch.float64)
+        torch.testing.assert_close(q.T @ q, eye, atol=1e-12, rtol=0.0)
+        torch.testing.assert_close(q @ torch.ones(d, dtype=torch.float64), torch.ones(d, dtype=torch.float64), atol=1e-12, rtol=0.0)
+        x = torch.randn(3, d, dtype=torch.float64) * 5.0 + 2.0
+        ln_x = torch.nn.functional.layer_norm(x, (d,))
+        ln_xq = torch.nn.functional.layer_norm(x @ q, (d,))
+        torch.testing.assert_close(ln_xq, ln_x @ q, atol=1e-12, rtol=1e-12)
+
+
+def test_rotate_mast3r_exact_fp32():
+    from flashim.models.mast3r import quant
+
+    torch.manual_seed(0)
+    cfg = _tiny_config()
+    ref_model = MASt3R(cfg).eval()
+    rot_model = MASt3R(cfg).eval()
+    rot_model.load_state_dict(ref_model.state_dict(), strict=True)
+    assert quant.rotate_mast3r(rot_model) > 0
+
+    x1, x2 = torch.randn(1, 3, 48, 64), torch.randn(1, 3, 64, 48)
+    with torch.inference_mode():
+        r1, r2 = ref_model(x1, x2)
+        o1, o2 = rot_model(x1, x2)
+    for k in ("pts3d", "conf", "desc", "desc_conf"):
+        torch.testing.assert_close(o1[k], r1[k], atol=1e-4, rtol=1e-4)
+    for k in ("pts3d_in_other_view", "conf", "desc", "desc_conf"):
+        torch.testing.assert_close(o2[k], r2[k], atol=1e-4, rtol=1e-4)
+
+
+def test_dynamic_int8_block_rotate_cpu():
+    from flashim.models.mast3r import quant
+    from flashim.quant.methods.int8_linear import DynamicInt8Linear
+    from flashim.quant.rotation import hadamard
+    from flashim.utils import set_submodule
+
+    torch.manual_seed(0)
+    cfg = _tiny_config()
+    model = MASt3R(cfg).eval()
+    quant.rotate_mast3r(model)
+    r16 = hadamard(16)
+    for name, mod in list(model.named_modules()):
+        if isinstance(mod, torch.nn.Linear) and name.endswith(".mlp.fc2"):
+            set_submodule(model, name, DynamicInt8Linear.from_linear(mod, block_rotate=r16))
+        elif isinstance(mod, torch.nn.Linear) and any(
+            name.startswith(p) for p in ("enc_blocks.", "dec_blocks.", "dec_blocks2.", "decoder_embed")
+        ):
+            set_submodule(model, name, DynamicInt8Linear.from_linear(mod))
+    assert len(fuse_dynamic_blocks(model)) == cfg.enc_depth
+    assert len(quant.fuse_dynamic_decoder_blocks(model)) == 2 * cfg.dec_depth
+    x1, x2 = torch.randn(1, 3, 48, 64), torch.randn(1, 3, 48, 64)
+    with torch.inference_mode():
+        out1, out2 = model(x1, x2)
+    assert torch.isfinite(out1["desc"]).all() and torch.isfinite(out2["pts3d_in_other_view"]).all()
+
+
+def test_dynamic_vit_block_hybrid_mxfp8_fc2_cpu():
+    from flashim.quant.methods.int8_linear import DynamicInt8Linear
+    from flashim.quant.methods.linear import StaticMXFP8Linear
+    from flashim.quant.passes.dynamic_transformer_block import DynamicInt8TransformerBlock, is_fusable
+
+    torch.manual_seed(0)
+    block = TransformerBlock(64, 4, eps=1e-6, layer_scale=False).to(torch.bfloat16).eval()
+    block.attn.qkv = DynamicInt8Linear.from_linear(block.attn.qkv)
+    block.attn.proj = DynamicInt8Linear.from_linear(block.attn.proj)
+    block.mlp.fc1 = DynamicInt8Linear.from_linear(block.mlp.fc1)
+    block.mlp.fc2 = StaticMXFP8Linear.from_linear(block.mlp.fc2, torch.zeros(block.mlp.fc2.in_features // 32, dtype=torch.int8))
+    assert is_fusable(block)
+    fused = DynamicInt8TransformerBlock(block, torch.device("cpu"))
+    x = torch.randn(1, 12, 64, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        torch.testing.assert_close(fused(x), block(x), atol=5e-2, rtol=5e-2)

@@ -160,6 +160,23 @@ def _quantize_int8_rows_reference(value: Tensor, *, channel_scale: Tensor | None
 quantize_int8_rows = Op("quantize_int8_rows", _quantize_int8_rows_reference)
 
 
+def _rotate_quantize_int8_rows_reference(
+    value: Tensor, matrix: Tensor, *, channel_scale: Tensor | None = None
+) -> tuple[Tensor, Tensor]:
+    """Optional per-channel ``channel_scale``, block-wise orthogonal rotation by ``matrix [B, B]`` along the last
+    dimension (``x.reshape(..., K // B, B) @ matrix``), then per-row dynamic INT8 quantization as
+    :func:`quantize_int8_rows`. Used with ``W @ block_diag(matrix, ...)`` folded into a consuming linear's weights
+    to spread post-activation channel and weight outliers before INT8 quantization."""
+    x = value.float() * channel_scale.float() if channel_scale is not None else value.float()
+    b = matrix.shape[0]
+    k = value.shape[-1]
+    rotated = (x.reshape(*value.shape[:-1], k // b, b) @ matrix.float()).reshape(value.shape)
+    return _quantize_int8_rows_reference(rotated)
+
+
+rotate_quantize_int8_rows = Op("rotate_quantize_int8_rows", _rotate_quantize_int8_rows_reference)
+
+
 def _quantize_int8_rows_heads_reference(value: Tensor) -> tuple[Tensor, Tensor]:
     """``quantize_int8_rows(value.transpose(1, 2).reshape(B * N, H * D))`` of an attention output ``[B, H, N, D]``:
     produces the token-major INT8 ``[B * N, H * D]`` activation and FP32 per-row scales ``[B * N, 1]`` for the

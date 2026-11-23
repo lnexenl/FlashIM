@@ -134,6 +134,33 @@ def test_quantize_int8_rows_channel_scale_triton(rows, cols):
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("rows,cols,block", [(1536, 4096, 64), (768, 3072, 64), (768, 7168, 64), (37, 128, 64)])
+@pytest.mark.parametrize("with_cs", [False, True])
+def test_rotate_quantize_int8_rows_triton(rows, cols, block, with_cs):
+    from flashim.quant.rotation import hadamard
+
+    torch.manual_seed(0)
+    x = torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16)
+    r = hadamard(block, device="cuda", dtype=torch.bfloat16).contiguous()
+    cs = (torch.rand(cols, device="cuda", dtype=torch.float32) * 2.0 + 0.1) if with_cs else None
+    assert ops.rotate_quantize_int8_rows.select(x, r, channel_scale=cs)[0] == "triton"
+    with torch.inference_mode():
+        tq, ts = ops.rotate_quantize_int8_rows.get("triton")(x, r, channel_scale=cs)
+        rq, rs = ops.rotate_quantize_int8_rows.get("reference")(x, r, channel_scale=cs)
+    # BF16 tensor-core dot (with exact +-0.125 H_64) vs FP32 reference:
+    # - without channel_scale, BF16 x * exact H_64 accumulates in FP32 -> bit-exact (<= 1 bin on rare ties);
+    # - with channel_scale, the kernel rounds (x * cs) to BF16 before tl.dot -> within +-1 bin (~5% of bins).
+    torch.testing.assert_close(ts, rs, atol=1e-4, rtol=5e-3)
+    diff = (tq.int() - rq.int()).abs()
+    assert diff.max().item() <= 2
+    assert (diff > 0).float().mean().item() < (0.08 if with_cs else 1e-4)
+    if with_cs:
+        bq, bs = ops.rotate_quantize_int8_rows.get("reference")((x.float() * cs).to(torch.bfloat16), r)
+        torch.testing.assert_close(ts, bs, atol=1e-6, rtol=1e-6)
+        assert (tq.int() - bq.int()).abs().max().item() <= 1
+
+
+@pytest.mark.cuda
 @pytest.mark.parametrize("shape", [(2, 16, 768, 64), (1, 12, 768, 64), (1, 12, 608, 64), (2, 8, 37, 64)])
 def test_quantize_int8_rows_heads_triton(shape):
     torch.manual_seed(0)

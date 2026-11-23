@@ -135,7 +135,12 @@ class DynamicInt8Linear(nn.Module):
     "massive activations"), which one static per-tensor scale cannot represent; needs no calibration."""
 
     def __init__(
-        self, weight_int8: Tensor, weight_scale: Tensor, bias: Tensor | None, channel_scale: Tensor | None = None
+        self,
+        weight_int8: Tensor,
+        weight_scale: Tensor,
+        bias: Tensor | None,
+        channel_scale: Tensor | None = None,
+        block_rotate: Tensor | None = None,
     ) -> None:
         super().__init__()
         self.out_features, self.in_features = weight_int8.shape
@@ -149,16 +154,42 @@ class DynamicInt8Linear(nn.Module):
             "channel_scale",
             None if channel_scale is None else channel_scale.to(device=device, dtype=torch.float32).contiguous(),
         )
+        self.register_buffer(
+            "block_rotate",
+            None if block_rotate is None else block_rotate.to(device=device, dtype=torch.bfloat16).contiguous(),
+        )
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, smooth: Tensor | None = None) -> DynamicInt8Linear:
-        static = StaticInt8Linear.from_linear(linear, torch.ones((), device=linear.weight.device), smooth=smooth)
-        return cls(static.weight_int8, static.weight_scale, static.bias, static.channel_scale)
+    def from_linear(
+        cls, linear: nn.Linear, smooth: Tensor | None = None, block_rotate: Tensor | None = None
+    ) -> DynamicInt8Linear:
+        if block_rotate is None:
+            static = StaticInt8Linear.from_linear(linear, torch.ones((), device=linear.weight.device), smooth=smooth)
+            return cls(static.weight_int8, static.weight_scale, static.bias, static.channel_scale)
+        weight = linear.weight.detach()
+        if not torch.isfinite(weight).all():
+            raise ValueError("Cannot quantize non-finite weights")
+        bias = None if linear.bias is None else linear.bias.detach()
+        channel_scale = None
+        w = weight.float()
+        if smooth is not None:
+            s = smooth.to(device=weight.device, dtype=torch.float32)
+            w, channel_scale = w * s, 1 / s
+        b = block_rotate.shape[0]
+        r = block_rotate.to(device=weight.device, dtype=torch.float32)
+        n, k = w.shape
+        w = (w.reshape(n, k // b, b) @ r).reshape(n, k)
+        scale = weight_scales(w)
+        return cls(quantize_symmetric(w, scale[:, None]), scale, bias, channel_scale, block_rotate=r)
 
     def forward(self, x: Tensor) -> Tensor:
         rows = x.reshape(-1, self.in_features)
         rows = rows if rows.is_contiguous() else rows.contiguous()
-        if self.channel_scale is not None:
+        if self.block_rotate is not None:
+            values, scale = ops.rotate_quantize_int8_rows(
+                rows, self.block_rotate, channel_scale=self.channel_scale
+            )
+        elif self.channel_scale is not None:
             values, scale = ops.quantize_int8_rows(rows, channel_scale=self.channel_scale)
         else:
             values, scale = ops.quantize_int8_rows(rows)
@@ -167,4 +198,6 @@ class DynamicInt8Linear(nn.Module):
 
     def extra_repr(self) -> str:
         suffix = ", smoothed" if self.channel_scale is not None else ""
+        if self.block_rotate is not None:
+            suffix += f", rotated({self.block_rotate.shape[0]})"
         return f"in={self.in_features}, out={self.out_features}, int8, dynamic per-token{suffix}"

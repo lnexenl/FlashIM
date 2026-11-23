@@ -21,14 +21,16 @@ from torch import Tensor, nn
 from flashim import ops
 from flashim.layers import TransformerBlock
 from flashim.quant.methods.int8_linear import DynamicInt8Linear
+from flashim.quant.methods.linear import StaticMXFP8Linear
 from flashim.utils import set_submodule
 
 
 def _dynamic_linears(block: TransformerBlock) -> bool:
     linears = (block.attn.qkv, block.attn.proj, block.mlp.fc1, block.mlp.fc2)
     return (
-        all(isinstance(m, DynamicInt8Linear) for m in linears)
-        and all(getattr(m, "channel_scale", None) is None for m in linears[:3])
+        all(isinstance(m, DynamicInt8Linear) for m in linears[:3])
+        and isinstance(linears[3], (DynamicInt8Linear, StaticMXFP8Linear))
+        and all(getattr(m, "channel_scale", None) is None and getattr(m, "block_rotate", None) is None for m in linears[:3])
     )
 
 
@@ -102,12 +104,26 @@ class DynamicInt8TransformerBlock(nn.Module):
         q, s = ops.quantize_int8_rows_heads(out)
         x1 = self._linear(attn.proj, q, s, residual=flat) if residual else flat + self._linear(attn.proj, q, s)
         q, s = self._norm_quantize(self.norm2, x1, ln)
+        if isinstance(self.mlp.fc2, StaticMXFP8Linear):
+            h = self._linear(self.mlp.fc1, q, s)
+            if isinstance(self.mlp.act, nn.GELU):
+                packed = self.mlp.fc2.quantize_gelu(h, self.mlp.act.approximate)
+                x2 = x1 + self.mlp.fc2.matmul(packed, bias=True).to(x1.dtype)
+            else:
+                x2 = x1 + self.mlp.fc2(self.mlp.act(h)).to(x1.dtype)
+            return x2.view(batch, tokens, channels)
         fc2_cs = self.mlp.fc2.channel_scale
+        fc2_rot = self.mlp.fc2.block_rotate
         if gelu:
             h = self._linear(self.mlp.fc1, q, s, gelu=True)
         else:
             h = self.mlp.act(self._linear(self.mlp.fc1, q, s))
-        q, s = ops.quantize_int8_rows(h, channel_scale=fc2_cs) if fc2_cs is not None else ops.quantize_int8_rows(h)
+        if fc2_rot is not None:
+            q, s = ops.rotate_quantize_int8_rows(h, fc2_rot, channel_scale=fc2_cs)
+        elif fc2_cs is not None:
+            q, s = ops.quantize_int8_rows(h, channel_scale=fc2_cs)
+        else:
+            q, s = ops.quantize_int8_rows(h)
         x2 = self._linear(self.mlp.fc2, q, s, residual=x1) if residual else x1 + self._linear(self.mlp.fc2, q, s)
         return x2.view(batch, tokens, channels)
 

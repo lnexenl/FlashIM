@@ -1,41 +1,70 @@
-"""MASt3R quantization targets, SmoothQuant folding, protected modules and measured accuracy evidence.
+"""MASt3R quantization targets, LayerNorm-commuting orthogonal rotation, block fusion and measured accuracy evidence.
 
-Measured on 6 MegaDepth-1500 pairs (512 px working resolution, PIL inputs, vs FP32):
+Outlier diagnosis (on MegaDepth-1500 calibration activations and FP32 weights):
 
-- ``bf16`` (reference reduced precision): ag@1px 0.7299, ag@2px 0.8910, desc_cos 0.99956, pts3d_rel 0.00916.
-- Unsmoothed per-token dynamic INT8 (all 293 linears): ag@1px 0.5170, ag@2px 0.7972, desc_cos 0.99612,
-  pts3d_rel 0.01904 — degraded by severe channel outliers (max/median channel amax up to 1865x on
-  ``enc_blocks.0.mlp.fc2``, 176x on ``enc_blocks.1.mlp.fc2``, 131x on ``enc_blocks.1.attn.qkv``, 120x on
-  ``dec_blocks.0.mlp.fc2``).
-- SmoothQuant + per-token dynamic INT8 (all 293 linears):
-  - alpha=0.25: ag@1px 0.5614, ag@2px 0.8209, desc_cos 0.99771, pts3d_rel 0.01796
-  - alpha=0.35: ag@1px 0.5970, ag@2px 0.8414, desc_cos 0.99827, pts3d_rel 0.01411
-  - alpha=0.50: ag@1px 0.6189, ag@2px 0.8380, desc_cos 0.99866, pts3d_rel 0.01318
-  - alpha=0.60: ag@1px 0.6250, ag@2px 0.8489, desc_cos 0.99881, pts3d_rel 0.01322  (selected for ``int8``)
-  - alpha=0.75: ag@1px 0.5733, ag@2px 0.8148, desc_cos 0.99811, pts3d_rel 0.01322
-- Pure static MXFP8 (all 293 linears): ag@1px 0.4757, ag@2px 0.7911, desc_cos 0.99348, pts3d_rel 0.02151.
-  Dynamic per-(token, block-32) MXFP8 (0.4454 / 0.7825 / 0.99335) and SmoothQuant-folded MXFP8 on the decoder
-  (0.4816 / 0.8037 / 0.99517) do not recover it: E4M3's 3-bit mantissa is too coarse for the decoder's
-  cross-attention projections, whereas the ViT-L encoder (0.6692 / 0.8601 / 0.99873) and local-feature MLPs
-  (0.6691 / 0.8605 / 0.99925) tolerate MXFP8 well.
-- Hybrid ``fp8`` (static MXFP8 on ViT-L encoder + local-feature MLPs, SmoothQuant alpha=0.6 dynamic INT8 on
-  the ViT-B cross-attention decoder): ag@1px ~0.61, ag@2px ~0.84, desc_cos ~0.9983 — all 293 linears quantized
-  in 8-bit with zero BF16 fallback.
+- **Channel & weight kurtosis outliers**: ``enc_blocks.0.mlp.fc2`` activation channel amax ratio 3860x,
+  ``enc_blocks.1.norm1.weight`` ratio 69.7x; massive per-row weight kurtosis in cross-attention and local-feature
+  head (``dec_blocks2.6.cross_attn.projk`` kurtosis 611.1, max/med 210.5; ``head1.fc2`` kurtosis 447.9, mean row
+  max/med 29.4 across all 6400 output channels; ``enc_blocks.0.attn.proj`` kurtosis 348.3).
+- **Solution**:
+  1. Fold exact LayerNorm-commuting orthogonal rotations (:func:`~flashim.quant.rotation.layernorm_orthogonal`:
+     ``Q_1024`` on the encoder residual stream, ``Q_768`` on the decoder residual stream, ``Q^T Q = I`` and
+     ``Q 1 = 1`` so ``LN_0(x Q) = LN_0(x) Q`` identically after folding LayerNorm affine parameters into
+     consuming linears and 1x1 DPT convs) plus per-head Sylvester Hadamard ``H_64`` on attention ``V -> proj`` at
+     zero runtime cost. Slashes cross-attention weight kurtosis from 611.1 to 3.7 and lifts decoder W8A8 alone from
+     0.6007 to 0.6982 (+0.0975).
+  2. Apply an online block-64 Sylvester Hadamard transform (``H_64``) fused into per-row dynamic INT8 quantization
+     (:data:`flashim.ops.rotate_quantize_int8_rows`, Triton BF16 tensor-core ``tl.dot``: 15.0 us on ``[1536, 4096]``
+     vs 61.9 us for plain ``quantize_int8_rows``, 12.5 us vs 45.0 us on ``[768, 3072]``) on post-GELU ``mlp.fc2``
+     layers where residual-stream rotation cannot cross GELU.
+  3. Keep only the 4 final ``head_local_features`` linears (``fc1``/``fc2`` on each view) in BF16 after logging
+     every algorithmic alternative on all 293 linears (all-293 INT8 peaked at 0.7137 / 0.7162 due to ``head.fc2``'s
+     447.9 weight kurtosis projecting directly to 24-D normalized descriptors). All 24 encoder blocks and 24 decoder
+     blocks (289 / 293 transformer linears, 98.6%) run quantized and fused.
 
-Measured on 20 MegaDepth-1500 pairs via ``benchmarks/accuracy/fidelity.py`` (512 px, 2 px original-image radius
-where 1 px at 512 px corresponds to ~3.125 px original, vs FP32) and RTX 5070 Ti (sm_120) end-to-end
-``match_prepared`` speed (384x512 Toronto / 352x512+512x384 Sacre):
+Measured on 20 MegaDepth-1500 pairs (``benchmarks/accuracy/fidelity.py --models mast3r --pairs-per-scene 4``,
+512 px working resolution, 2 px original-image radius vs FP32; PIL and default decoders) and RTX 5070 Ti (sm_120)
+CUDA-graphed ``match_prepared`` speed (Toronto 384x512):
 
-- ``bf16``: match_agree 0.7324 (PIL 0.7386), match_ratio 0.9967 | 26.68 ms / 27.66 ms (baseline 60.53 ms)
-- ``int8`` (SmoothQuant alpha=0.6 dynamic INT8): match_agree 0.6326 (PIL 0.6339, vs 0.5418 unsmoothed),
-  match_ratio 0.9975 | 16.35 ms / 18.07 ms (1.63x faster than optimized bf16; 3.70x vs bf16 baseline)
-- ``fp8`` (hybrid MXFP8 encoder/head + SmoothQuant INT8 decoder): match_agree 0.6126 (PIL 0.6141, vs 0.5004 pure
-  MXFP8), match_ratio 0.9984 | 15.85 ms / 17.97 ms (1.68x faster than optimized bf16; 3.82x vs bf16 baseline)
+Tried and rejected schemes (20-pair PIL ``bf16`` baseline = 0.7381; default decoder ``bf16`` = 0.7324):
+
+- Unsmoothed per-token dynamic INT8 (all 293L): match_agree 0.5418 (-0.1963)
+- SmoothQuant-only dynamic INT8 (all 293L, alpha=0.25/0.35/0.50/0.60/0.75): 0.5614..0.6339 (-0.1042 at a=0.60),
+  16.35 ms (old ``int8``)
+- Pure static / dynamic / rotated MXFP8 (all 293L): 0.5004..0.5610 — E4M3's 3-bit mantissa fails decoder
+- Pure RowWise FP8 E4M3 (``torch._scaled_mm``, FP32 per-row/per-col scales, rotated + H_64, all 293L): 0.5532
+  (and 1.6-2.7x slower than Triton INT8 GEMM on RTX 5070 Ti across every MASt3R shape)
+- Hybrid MXFP8 on encoder+head + SmoothQuant INT8 decoder (old ``fp8``): 0.6141 (default 0.6126), 15.85 ms
+- Rotated hybrid MXFP8 on encoder+head + rotated INT8 decoder (full/block-16/unrot, static or dynamic MXFP8):
+  0.6414..0.6496; encoder-only MXFP8 (``enc_0..23``): 0.6734..0.6960; ``enc_12..23`` MXFP8 + head BF16: 0.7020
+  (amax), 0.6846 (p999), 0.6735 (p995 — percentile clipping strictly worse than amax); ``enc_16..23`` MXFP8 + head
+  BF16: 0.7113 (-0.0268, 17.12 ms)
+- Rotated RowWise FP8 on ``enc_2..23`` / ``enc_0..23`` / ``enc_12..23`` + rotated INT8: 0.6778..0.7040 (and slower)
+- Rotated dynamic INT8 (all 293L, no ``fc2`` fix): 0.6375 (-0.1006)
+- Rotated dynamic INT8 + SmoothQuant on ``fc2`` only (all 293L, alpha=0.50/0.60/0.75): 0.6809 / 0.6703 / 0.6317
+- Rotated dynamic INT8 + online unsigned ``H_128`` / ``H_256`` on ``fc2`` (all 293L): 0.6990 / 0.6989 (DC spike on
+  positive GELU); signed ``H_16..1024`` (all 293L): 0.6989..0.7137; ``SQ(0.5)+sH_64`` (all 293L): 0.7162 (-0.0219)
+- Rotated dynamic INT8 + Triton ``H_64`` on all 293L (0 BF16): 0.7033 (PIL; 15.45 ms); with ``head_fc2`` (2L) BF16:
+  0.7133 (PIL; 16.41 ms)
+
+Selected presets (verified with ``benchmarks/accuracy/fidelity.py --models mast3r --presets bf16 int8 fp8
+--pairs-per-scene 4`` and RTX 5070 Ti ``match_prepared`` median ms on Toronto 384x512 / Sacre 352x512+512x384):
+
+- ``bf16``: match_agree 0.7324, match_ratio 0.9967 | 26.35 ms / 27.37 ms (vs ``fp32`` 108.43 ms / 105.37 ms).
+- ``int8`` (calibration-free: ``rotate_mast3r`` + dynamic per-token INT8 on all 289 backbone linears with Triton
+  ``H_64`` on all 48 ``mlp.fc2`` + fused encoder/decoder blocks; 4 ``head_local_features`` linears BF16):
+  match_agree 0.7237 (-0.0087 vs ``bf16``; +0.0911 over prior SmoothQuant ``int8``), match_ratio 1.0003 |
+  17.00 ms / 18.68 ms (1.55x / 1.47x faster than optimized ``bf16``).
+- ``fp8`` (hybrid: ``rotate_mast3r`` + static MXFP8 cuBLAS ``F.scaled_mm`` on all 24 ``enc_blocks.*.mlp.fc2``
+  ``[1536, 4096->1024]`` linears — 33% of encoder GEMM FLOPs and the shape where cuBLAS MXFP8 beats Triton INT8 ~2x
+  — fused into ``DynamicInt8TransformerBlock`` via ``gelu_quantize``, + rotated dynamic INT8 on the other 265
+  backbone linears with Triton ``H_64`` on all 24 decoder ``mlp.fc2``; 4 ``head_local_features`` linears BF16):
+  match_agree 0.7139 (-0.0185 vs ``bf16``; +0.1013 over prior ``fp8``), match_ratio 0.9993 |
+  16.71 ms / 18.08 ms (1.58x / 1.51x faster than optimized ``bf16``).
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -44,7 +73,7 @@ from torch import Tensor, nn
 from flashim import ops
 from flashim.models.mast3r.croco import DecoderBlock
 from flashim.quant.methods.int8_linear import DynamicInt8Linear
-from flashim.quant.methods.linear import StaticMXFP8Linear
+from flashim.quant.rotation import hadamard, layernorm_orthogonal
 from flashim.quant.scheme import (
     INT8_TOKEN_ACTIVATIONS,
     INT8_WEIGHTS,
@@ -56,15 +85,14 @@ from flashim.utils import set_submodule
 
 CALIBRATION_DIR = Path(__file__).parent / "calibration"
 FP8_CALIBRATION = CALIBRATION_DIR / "mast3r_fp8.safetensors"
-INT8_CALIBRATION = CALIBRATION_DIR / "mast3r_int8.safetensors"
-SMOOTH_ALPHA = 0.6
 
-ENC_LINEARS = (
+ENC_NON_FC2_LINEARS = (
     "enc_blocks.*.attn.qkv",
     "enc_blocks.*.attn.proj",
     "enc_blocks.*.mlp.fc1",
-    "enc_blocks.*.mlp.fc2",
 )
+ENC_FC2_LINEARS = ("enc_blocks.*.mlp.fc2",)
+ENC_LINEARS = (*ENC_NON_FC2_LINEARS, *ENC_FC2_LINEARS)
 DEC_LINEARS = (
     "decoder_embed",
     "dec_blocks.*.attn.qkv",
@@ -90,7 +118,8 @@ HEAD_MLP_LINEARS = (
     "downstream_head2.head_local_features.fc1",
     "downstream_head2.head_local_features.fc2",
 )
-ALL_TRANSFORMER_LINEARS = (*ENC_LINEARS, *DEC_LINEARS, *HEAD_MLP_LINEARS)
+BACKBONE_LINEARS = (*ENC_LINEARS, *DEC_LINEARS)
+ALL_TRANSFORMER_LINEARS = (*BACKBONE_LINEARS, *HEAD_MLP_LINEARS)
 
 # Never quantized: input patch embedding and the 3D-point/confidence DPT conv heads.
 PROTECTED = (
@@ -99,10 +128,11 @@ PROTECTED = (
     "downstream_head2.dpt.*",
 )
 
+# Calibration-free rotated dynamic INT8 on all 289 encoder+decoder linears (4 head_local_features linears stay BF16).
 INT8_CONFIG = QuantConfig(
     {
         "transformer": QuantScheme(
-            targets=ALL_TRANSFORMER_LINEARS,
+            targets=BACKBONE_LINEARS,
             weights=INT8_WEIGHTS,
             input_activations=INT8_TOKEN_ACTIVATIONS,
         ),
@@ -110,17 +140,17 @@ INT8_CONFIG = QuantConfig(
     name="int8",
 )
 
-# Hybrid FP8: MXFP8 (cuBLAS scaled_mm) on the ViT-L encoder and local-feature MLPs; SmoothQuant per-token dynamic
-# INT8 on the ViT-B cross-attention decoder where E4M3's 3-bit mantissa loses match accuracy.
+# Hybrid FP8: static MXFP8 (cuBLAS scaled_mm) on the 24 large encoder MLP fc2 projections [4096->1024], rotated
+# per-token dynamic INT8 on the remaining 265 encoder/decoder linears (4 head_local_features linears stay BF16).
 FP8_CONFIG = QuantConfig(
     {
         "mxfp8": QuantScheme(
-            targets=(*ENC_LINEARS, *HEAD_MLP_LINEARS),
+            targets=ENC_FC2_LINEARS,
             weights=MXFP8,
             input_activations=MXFP8,
         ),
-        "decoder_int8": QuantScheme(
-            targets=DEC_LINEARS,
+        "backbone_int8": QuantScheme(
+            targets=(*ENC_NON_FC2_LINEARS, *DEC_LINEARS),
             weights=INT8_WEIGHTS,
             input_activations=INT8_TOKEN_ACTIVATIONS,
         ),
@@ -129,109 +159,188 @@ FP8_CONFIG = QuantConfig(
 )
 
 
-def is_foldable_smooth_target(name: str) -> bool:
-    """Linears whose SmoothQuant input scaling ``1 / s`` folds into a preceding LayerNorm or V projection at zero
-    runtime cost."""
-    if name.startswith("enc_blocks."):
-        return name.endswith((".attn.qkv", ".attn.proj", ".mlp.fc1"))
-    if name.startswith(("dec_blocks.", "dec_blocks2.")):
-        return name.endswith(
-            (".attn.qkv", ".attn.proj", ".cross_attn.projq", ".cross_attn.projk", ".cross_attn.projv",
-             ".cross_attn.proj", ".mlp.fc1")
-        )
-    return False
-
-
 @torch.no_grad()
-def fold_smoothquant(
+def rotate_mast3r(
     model: nn.Module,
-    smooth: Mapping[str, Tensor],
     *,
-    include_encoder: bool = True,
-    include_decoder: bool = True,
+    enc_block: int | None = None,
+    dec_block: int | None = None,
+    rotate_enc: bool = True,
+    rotate_dec: bool = True,
+    rotate_v: bool = True,
 ) -> int:
-    """Fold SmoothQuant scales stored under ``fold::<linear_name>`` into preceding LayerNorm / V-projection weights
-    so the quantized linears need no per-channel input scaling at runtime. Exact in real arithmetic."""
-    folded = 0
+    """Fold exact LayerNorm-commuting orthogonal rotations (:func:`~flashim.quant.rotation.layernorm_orthogonal`) into
+    MASt3R's encoder / decoder residual streams and per-head Sylvester Hadamard rotations into attention ``V -> proj``.
 
-    def _get(name: str, device: torch.device) -> Tensor | None:
-        key = f"fold::{name}"
-        if key not in smooth:
-            return None
-        return smooth[key].to(device=device, dtype=torch.float32)
+    Every LayerNorm's affine weight and bias are folded into its consuming linear(s) / 1x1 DPT conv(s) first so the
+    remaining un-affined ``LayerNorm`` satisfies ``LN_0(x Q) = LN_0(x) Q`` identically (``Q^T Q = I``, ``Q 1 = 1``).
+    Exact in real arithmetic (preserves ``pts3d``, ``conf``, ``desc``, ``desc_conf``) with zero runtime overhead.
+    Returns the number of rotated weight tensors.
+    """
+    dev = next(model.parameters()).device
+    q_enc = layernorm_orthogonal(model.enc_embed_dim, block_size=enc_block, device=dev, dtype=torch.float64)
+    q_dec = layernorm_orthogonal(model.dec_embed_dim, block_size=dec_block, device=dev, dtype=torch.float64)
+    enc_hd = model.enc_embed_dim // model.enc_num_heads
+    dec_hd = model.dec_embed_dim // model.dec_num_heads
+    enc_vh = torch.block_diag(*([hadamard(enc_hd, device=dev, dtype=torch.float64)] * model.enc_num_heads))
+    dec_vh = torch.block_diag(*([hadamard(dec_hd, device=dev, dtype=torch.float64)] * model.dec_num_heads))
+    rotated: set[int] = set()
 
-    def _fold_ln(norm: nn.LayerNorm, linear: nn.Linear, s: Tensor) -> None:
-        norm.weight.copy_((norm.weight.float() / s).to(norm.weight.dtype))
-        if norm.bias is not None:
-            norm.bias.copy_((norm.bias.float() / s).to(norm.bias.dtype))
-        linear.weight.copy_((linear.weight.float() * s).to(linear.weight.dtype))
+    def fold_ln(norm: nn.LayerNorm, consumers: list[tuple[nn.Module, slice | None]]) -> None:
+        w, b = norm.weight.double(), norm.bias.double()
+        for mod, sl in consumers:
+            if isinstance(mod, nn.Linear):
+                wt = mod.weight.double()
+                if sl is None:
+                    if mod.bias is not None:
+                        mod.bias.copy_((mod.bias.double() + wt @ b).to(mod.bias.dtype))
+                    mod.weight.copy_((wt * w[None, :]).to(mod.weight.dtype))
+                else:
+                    ws = wt[:, sl]
+                    if mod.bias is not None:
+                        mod.bias.copy_((mod.bias.double() + ws @ b).to(mod.bias.dtype))
+                    wt[:, sl] = ws * w[None, :]
+                    mod.weight.copy_(wt.to(mod.weight.dtype))
+            elif isinstance(mod, nn.Conv2d) and mod.kernel_size == (1, 1):
+                wt = mod.weight.double()[:, :, 0, 0]
+                if mod.bias is not None:
+                    mod.bias.copy_((mod.bias.double() + wt @ b).to(mod.bias.dtype))
+                mod.weight[:, :, 0, 0].copy_((wt * w[None, :]).to(mod.weight.dtype))
+            else:
+                raise TypeError(f"Unsupported LayerNorm consumer: {type(mod).__name__}")
+        norm.weight.fill_(1.0)
+        norm.bias.zero_()
 
-    def _fold_qkv_v(qkv: nn.Linear, proj: nn.Linear, s: Tensor) -> None:
-        dim = proj.in_features
-        v_slice = slice(2 * dim, 3 * dim)
-        qkv.weight[v_slice].copy_((qkv.weight[v_slice].float() / s[:, None]).to(qkv.weight.dtype))
-        if qkv.bias is not None:
-            qkv.bias[v_slice].copy_((qkv.bias[v_slice].float() / s).to(qkv.bias.dtype))
-        proj.weight.copy_((proj.weight.float() * s).to(proj.weight.dtype))
+    def read_lin(lin: nn.Linear, q: Tensor, sl: slice | None = None) -> None:
+        wt = lin.weight.double()
+        if sl is None:
+            lin.weight.copy_((wt @ q).to(lin.weight.dtype))
+        else:
+            wt[:, sl] = wt[:, sl] @ q
+            lin.weight.copy_(wt.to(lin.weight.dtype))
+        rotated.add(id(lin))
 
-    if include_encoder:
-        for i, blk in enumerate(model.enc_blocks):
-            prefix = f"enc_blocks.{i}"
-            dev = blk.norm1.weight.device
-            if (s := _get(f"{prefix}.attn.qkv", dev)) is not None:
-                _fold_ln(blk.norm1, blk.attn.qkv, s)
-                folded += 1
-            if (s := _get(f"{prefix}.attn.proj", dev)) is not None:
-                _fold_qkv_v(blk.attn.qkv, blk.attn.proj, s)
-                folded += 1
-            if (s := _get(f"{prefix}.mlp.fc1", dev)) is not None:
-                _fold_ln(blk.norm2, blk.mlp.fc1, s)
-                folded += 1
+    def read_c1(conv: nn.Conv2d, q: Tensor) -> None:
+        conv.weight[:, :, 0, 0].copy_((conv.weight.double()[:, :, 0, 0] @ q).to(conv.weight.dtype))
+        rotated.add(id(conv))
 
-    if include_decoder:
+    def write_lin(lin: nn.Linear, q: Tensor, sl: slice | None = None) -> None:
+        if sl is None:
+            lin.weight.copy_((q.T @ lin.weight.double()).to(lin.weight.dtype))
+            if lin.bias is not None:
+                lin.bias.copy_((q.T @ lin.bias.double()).to(lin.bias.dtype))
+        else:
+            lin.weight[sl].copy_((q.T @ lin.weight[sl].double()).to(lin.weight.dtype))
+            if lin.bias is not None:
+                lin.bias[sl].copy_((q.T @ lin.bias[sl].double()).to(lin.bias.dtype))
+        rotated.add(id(lin))
+
+    def write_conv(conv: nn.Conv2d, q: Tensor) -> None:
+        wt = conv.weight.double()
+        conv.weight.copy_((q.T @ wt.reshape(wt.shape[0], -1)).reshape_as(wt).to(conv.weight.dtype))
+        if conv.bias is not None:
+            conv.bias.copy_((q.T @ conv.bias.double()).to(conv.bias.dtype))
+        rotated.add(id(conv))
+
+    if rotate_enc:
+        write_conv(model.patch_embed.proj, q_enc)
+        for blk in model.enc_blocks:
+            fold_ln(blk.norm1, [(blk.attn.qkv, None)])
+            read_lin(blk.attn.qkv, q_enc)
+            write_lin(blk.attn.proj, q_enc)
+            fold_ln(blk.norm2, [(blk.mlp.fc1, None)])
+            read_lin(blk.mlp.fc1, q_enc)
+            write_lin(blk.mlp.fc2, q_enc)
+            if rotate_v:
+                dim = model.enc_embed_dim
+                write_lin(blk.attn.qkv, enc_vh, slice(2 * dim, 3 * dim))
+                read_lin(blk.attn.proj, enc_vh)
+        ed = model.enc_embed_dim
+        fold_ln(
+            model.enc_norm,
+            [
+                (model.decoder_embed, None),
+                (model.downstream_head1.head_local_features.fc1, slice(0, ed)),
+                (model.downstream_head2.head_local_features.fc1, slice(0, ed)),
+                (model.downstream_head1.dpt.act_postprocess[0][0], None),
+                (model.downstream_head2.dpt.act_postprocess[0][0], None),
+            ],
+        )
+        read_lin(model.decoder_embed, q_enc)
+        read_lin(model.downstream_head1.head_local_features.fc1, q_enc, slice(0, ed))
+        read_lin(model.downstream_head2.head_local_features.fc1, q_enc, slice(0, ed))
+        read_c1(model.downstream_head1.dpt.act_postprocess[0][0], q_enc)
+        read_c1(model.downstream_head2.dpt.act_postprocess[0][0], q_enc)
+
+    if rotate_dec:
+        write_lin(model.decoder_embed, q_dec)
         for branch in ("dec_blocks", "dec_blocks2"):
-            for i, blk in enumerate(getattr(model, branch)):
-                prefix = f"{branch}.{i}"
-                dev = blk.norm1.weight.device
-                if (s := _get(f"{prefix}.attn.qkv", dev)) is not None:
-                    _fold_ln(blk.norm1, blk.attn.qkv, s)
-                    folded += 1
-                if (s := _get(f"{prefix}.attn.proj", dev)) is not None:
-                    _fold_qkv_v(blk.attn.qkv, blk.attn.proj, s)
-                    folded += 1
-                if (s := _get(f"{prefix}.cross_attn.projq", dev)) is not None:
-                    _fold_ln(blk.norm2, blk.cross_attn.projq, s)
-                    folded += 1
-                sk = _get(f"{prefix}.cross_attn.projk", dev)
-                sv = _get(f"{prefix}.cross_attn.projv", dev)
-                if sk is not None and sv is not None:
-                    s_kv = torch.sqrt(sk * sv)
-                    blk.norm_y.weight.copy_((blk.norm_y.weight.float() / s_kv).to(blk.norm_y.weight.dtype))
-                    if blk.norm_y.bias is not None:
-                        blk.norm_y.bias.copy_((blk.norm_y.bias.float() / s_kv).to(blk.norm_y.bias.dtype))
-                    blk.cross_attn.projk.weight.copy_(
-                        (blk.cross_attn.projk.weight.float() * s_kv).to(blk.cross_attn.projk.weight.dtype)
-                    )
-                    blk.cross_attn.projv.weight.copy_(
-                        (blk.cross_attn.projv.weight.float() * s_kv).to(blk.cross_attn.projv.weight.dtype)
-                    )
-                    folded += 2
-                if (s := _get(f"{prefix}.cross_attn.proj", dev)) is not None:
-                    pv = blk.cross_attn.projv
-                    pv.weight.copy_((pv.weight.float() / s[:, None]).to(pv.weight.dtype))
-                    if pv.bias is not None:
-                        pv.bias.copy_((pv.bias.float() / s).to(pv.bias.dtype))
-                    blk.cross_attn.proj.weight.copy_(
-                        (blk.cross_attn.proj.weight.float() * s).to(blk.cross_attn.proj.weight.dtype)
-                    )
-                    folded += 1
-                if (s := _get(f"{prefix}.mlp.fc1", dev)) is not None:
-                    _fold_ln(blk.norm3, blk.mlp.fc1, s)
-                    folded += 1
-    return folded
+            for blk in getattr(model, branch):
+                fold_ln(blk.norm1, [(blk.attn.qkv, None)])
+                read_lin(blk.attn.qkv, q_dec)
+                write_lin(blk.attn.proj, q_dec)
+                fold_ln(blk.norm2, [(blk.cross_attn.projq, None)])
+                read_lin(blk.cross_attn.projq, q_dec)
+                if isinstance(blk.norm_y, nn.LayerNorm):
+                    fold_ln(blk.norm_y, [(blk.cross_attn.projk, None), (blk.cross_attn.projv, None)])
+                read_lin(blk.cross_attn.projk, q_dec)
+                read_lin(blk.cross_attn.projv, q_dec)
+                write_lin(blk.cross_attn.proj, q_dec)
+                fold_ln(blk.norm3, [(blk.mlp.fc1, None)])
+                read_lin(blk.mlp.fc1, q_dec)
+                write_lin(blk.mlp.fc2, q_dec)
+                if rotate_v:
+                    dim = model.dec_embed_dim
+                    write_lin(blk.attn.qkv, dec_vh, slice(2 * dim, 3 * dim))
+                    read_lin(blk.attn.proj, dec_vh)
+                    write_lin(blk.cross_attn.projv, dec_vh)
+                    read_lin(blk.cross_attn.proj, dec_vh)
+        ed, dd = model.enc_embed_dim, model.dec_embed_dim
+        fold_ln(
+            model.dec_norm,
+            [
+                (model.downstream_head1.head_local_features.fc1, slice(ed, ed + dd)),
+                (model.downstream_head2.head_local_features.fc1, slice(ed, ed + dd)),
+                (model.downstream_head1.dpt.act_postprocess[3][0], None),
+                (model.downstream_head2.dpt.act_postprocess[3][0], None),
+            ],
+        )
+        read_lin(model.downstream_head1.head_local_features.fc1, q_dec, slice(ed, ed + dd))
+        read_lin(model.downstream_head2.head_local_features.fc1, q_dec, slice(ed, ed + dd))
+        read_c1(model.downstream_head1.dpt.act_postprocess[3][0], q_dec)
+        read_c1(model.downstream_head2.dpt.act_postprocess[3][0], q_dec)
+        for head in (model.downstream_head1, model.downstream_head2):
+            read_c1(head.dpt.act_postprocess[1][0], q_dec)
+            read_c1(head.dpt.act_postprocess[2][0], q_dec)
+
+    return len(rotated)
 
 
-# -- dynamic INT8 decoder-block fusion & MXFP8 local-feature MLP fusion ----------------------------------
+def attach_fc2_hadamard(model: nn.Module, *, include_encoder: bool = True, block_size: int = 64) -> int:
+    """Attach a Sylvester Hadamard matrix (``_flashim_block_rotate``) to each quantized backbone ``mlp.fc2``
+    linear so :func:`~flashim.quant.apply.quantize_model` folds ``W @ block_diag(H)`` into its weights and uses
+    :data:`flashim.ops.rotate_quantize_int8_rows` at runtime."""
+    dev = next(model.parameters()).device
+    blocks: list[nn.Module] = [*model.dec_blocks, *model.dec_blocks2]
+    if include_encoder:
+        blocks = [*model.enc_blocks, *blocks]
+    cache: dict[int, Tensor] = {}
+    attached = 0
+    for blk in blocks:
+        fc2 = blk.mlp.fc2
+        if not isinstance(fc2, nn.Linear):
+            continue
+        b = block_size if fc2.in_features % block_size == 0 else min(block_size, fc2.in_features)
+        if b < 16 or (b & (b - 1)) != 0 or fc2.in_features % b != 0:
+            continue
+        if b not in cache:
+            cache[b] = hadamard(b, device=dev, dtype=torch.bfloat16).contiguous()
+        fc2._flashim_block_rotate = cache[b]
+        attached += 1
+    return attached
+
+
+# -- dynamic INT8 decoder-block fusion -------------------------------------------------------------------
 
 
 def _is_fusable_decoder_block(block: nn.Module) -> bool:
@@ -241,7 +350,7 @@ def _is_fusable_decoder_block(block: nn.Module) -> bool:
     linears = (block.attn.qkv, block.attn.proj, ca.projq, ca.projk, ca.projv, ca.proj, block.mlp.fc1, block.mlp.fc2)
     return (
         all(isinstance(m, DynamicInt8Linear) for m in linears)
-        and all(getattr(m, "channel_scale", None) is None for m in linears[:-1])
+        and all(getattr(m, "channel_scale", None) is None and getattr(m, "block_rotate", None) is None for m in linears[:-1])
         and ca.projk.bias is not None
         and ca.projv.bias is not None
     )
@@ -356,7 +465,13 @@ class DynamicInt8DecoderBlock(nn.Module):
         q, s = self._norm_quantize(self.norm3, x2, ln)
         h = self._linear(self.mlp.fc1, q, s, gelu=True) if gelu else self.mlp.act(self._linear(self.mlp.fc1, q, s))
         fc2_cs = self.mlp.fc2.channel_scale
-        q, s = ops.quantize_int8_rows(h, channel_scale=fc2_cs) if fc2_cs is not None else ops.quantize_int8_rows(h)
+        fc2_rot = self.mlp.fc2.block_rotate
+        if fc2_rot is not None:
+            q, s = ops.rotate_quantize_int8_rows(h, fc2_rot, channel_scale=fc2_cs)
+        elif fc2_cs is not None:
+            q, s = ops.quantize_int8_rows(h, channel_scale=fc2_cs)
+        else:
+            q, s = ops.quantize_int8_rows(h)
         x3 = self._linear(self.mlp.fc2, q, s, residual=x2) if residual else x2 + self._linear(self.mlp.fc2, q, s)
         return x3.view(batch, nx, channels)
 
@@ -375,39 +490,4 @@ def fuse_dynamic_decoder_blocks(model: nn.Module) -> list[str]:
             dev = next(module.parameters()).device
             set_submodule(model, name, DynamicInt8DecoderBlock(module, dev))
             fused.append(name)
-    return fused
-
-
-class FusedMXFP8LocalFeatureMlp(nn.Module):
-    """Two-layer MXFP8 GELU MLP with ``fc1``'s bias, GELU and ``fc2``'s static E4M3 quantization fused into one
-    Triton kernel (:meth:`StaticMXFP8Linear.quantize_gelu`)."""
-
-    def __init__(self, mlp: nn.Module) -> None:
-        super().__init__()
-        self.fc1: StaticMXFP8Linear = mlp.fc1
-        self.act: nn.GELU = mlp.act
-        self.fc2: StaticMXFP8Linear = mlp.fc2
-
-    def forward(self, x: Tensor) -> Tensor:
-        shape = x.shape
-        hidden = self.fc1.matmul(self.fc1.quantize(x.reshape(-1, shape[-1])))
-        quantized = self.fc2.quantize_gelu(hidden, self.act.approximate, input_bias=self.fc1.bias)
-        return self.fc2.matmul(quantized, bias=True).to(x.dtype).reshape(*shape[:-1], self.fc2.out_features)
-
-
-def fuse_mxfp8_head_mlps(model: nn.Module) -> list[str]:
-    """Fuse ``head_local_features`` MLPs whose ``fc1`` / ``fc2`` are :class:`StaticMXFP8Linear`."""
-    fused = []
-    for head_name in ("downstream_head1", "downstream_head2"):
-        head = getattr(model, head_name, None)
-        mlp = getattr(head, "head_local_features", None)
-        if (
-            mlp is not None
-            and isinstance(getattr(mlp, "fc1", None), StaticMXFP8Linear)
-            and isinstance(getattr(mlp, "fc2", None), StaticMXFP8Linear)
-            and isinstance(getattr(mlp, "act", None), nn.GELU)
-            and mlp.fc1.bias is not None
-        ):
-            head.head_local_features = FusedMXFP8LocalFeatureMlp(mlp)
-            fused.append(f"{head_name}.head_local_features")
     return fused
