@@ -9,7 +9,7 @@ from typing import Any
 
 from torch import nn
 
-from flashim.build import PRECISIONS, BuildContext, EngineSpec, ModelSpec, Pass, dtype
+from flashim.build import BuildContext, EngineSpec, ModelSpec, Pass, dtype
 from flashim.config import RunConfig
 from flashim.models.superglue import quant, weights
 from flashim.models.superglue.config import SuperGlueConfig
@@ -191,6 +191,11 @@ def _apply_pipeline_inference(pipeline: nn.Module, inference: Mapping[str, Any])
     _apply_inference(pipeline.matcher, inference)
 
 
+# Ship fp32 / bf16 / int8 on the pipeline (omitting fp8 so fp8 -> int8 via build.NEAREST): neither component benefits
+# from MXFP8 (superglue has no fp8; superpoint fp8 is slower than int8 and drops AUC@5 by -0.0133 MegaDepth / -0.0144
+# ScanNet due to 41.6x block-32 channel outliers in conv1b; see quant.py).
+_PIPELINE_PRESETS = ("fp32", "bf16", "int8")
+
 SUPERPOINT_SUPERGLUE = ModelSpec(
     name="superpoint-superglue",
     role="pipeline",
@@ -208,7 +213,7 @@ SUPERPOINT_SUPERGLUE = ModelSpec(
             },
             "inference": {"max_matches": 1024, "threshold": 0.2},
         }
-        for preset in PRECISIONS
+        for preset in _PIPELINE_PRESETS
     },
     default_preset="bf16",
     compose=_compose_pipeline,

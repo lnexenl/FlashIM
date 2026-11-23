@@ -43,7 +43,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | [`loma-<variant>`](models/loma.md) | LoMa: DaD keypoints + LoMa-trained DeDoDe descriptors + LoMa's LightGlue-style matcher (`loma-b128`, `loma-b`, `loma-l`, `loma-g`, `loma-r`; `loma` = `loma-b`) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | [`loma-extractor`](models/loma.md), [`loma-matcher`](models/loma.md) | LoMa's components (variant `b128` \| `b` \| `l` \| `g` \| `r`) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `superglue` | SuperGlue attentional GNN + Sinkhorn OT sparse matcher (variants `outdoor`, `indoor`; Magic Leap non-commercial) | `fp32`, **`bf16`**, `int8` |
-| `superpoint-superglue` | SuperPoint (`nms=4`, `threshold=0.005`) + SuperGlue (Magic Leap non-commercial; variant `outdoor` \| `indoor`) | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `superpoint-superglue` | SuperPoint (`nms=4`, `threshold=0.005`) + SuperGlue (Magic Leap non-commercial; variant `outdoor` \| `indoor`) | `fp32`, **`bf16`**, `int8` |
 | `omniglue` | OmniGlue: SuperPoint (`sp_v6`, MIT) + DINOv2 ViT-B/14 + 18-layer DINO-masked GNN + Sinkhorn matcher (Apache-2.0) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `omniglue-extractor`, `omniglue-matcher` | OmniGlue's components (`omniglue-matcher` omits `fp8` and degrades `fp8` -> `int8`) | `fp32`, **`bf16`**, `int8` *(extractor adds `fp8`)* |
 

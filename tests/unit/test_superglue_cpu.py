@@ -175,8 +175,14 @@ def test_resolve_superglue_and_pipeline():
     assert pipe.inference == {"max_matches": 1024, "threshold": 0.2}
 
     assert resolve("superglue", "int8").preset == "int8"
-    # fp8 falls back to int8 on superglue via build.NEAREST.
+    # fp8 falls back to int8 on both superglue and superpoint-superglue via build.NEAREST.
     fallbacks = {}
     assert resolve("superglue", "fp8", fallbacks=fallbacks).preset == "int8"
     assert "superglue" in fallbacks
+    pipe_fb = {}
+    pipe_fp8 = resolve("superpoint-superglue", "fp8", fallbacks=pipe_fb)
+    assert pipe_fp8.preset == "int8"
+    assert pipe_fp8.components["extractor"].preset == "int8"
+    assert pipe_fp8.components["matcher"].preset == "int8"
+    assert "superpoint-superglue" in pipe_fb
     assert resolve("superpoint-superglue", "bf16", overrides={"variant": "indoor"}).variant == "indoor"

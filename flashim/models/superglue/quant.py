@@ -20,6 +20,14 @@ calibrated on 32 separate MegaDepth training pairs, same FP32 SuperPoint feature
   and much lower agreement (0.7647-0.7875 vs 0.9124; even excluding ``mlp.3`` gives 0.8009, MLP-only 0.7829,
   layers 0-8 0.8014) due to E4M3's 3-bit mantissa compounding across 18 unnormalized residual layers. ``fp8``
   therefore falls back to ``int8`` via ``build.NEAREST``.
+- On the ``superpoint-superglue`` pipeline, pairing ``superpoint fp8`` with ``superglue int8`` dropped 1500-pair
+  AUC@5 vs ``bf16`` by -0.0133 on MegaDepth-1500 and -0.0144 on ScanNet-1500 (vs ``int8``: -0.0028 / +0.0068).
+  Per-layer SuperPoint diagnosis showed ``conv1b`` (64->64, unnormalized) has 41.6x block-32 activation channel
+  outliers (ch_max/med 28.1x) and 10.2x block-32 weight ratios, dropping ``kp_overlap`` to 0.7635 on its own; both
+  exact ReLU/MaxPool-commuting SmoothQuant (best kp_overlap 0.8296 at 4.31 ms) and skipping ``conv1b``/``conv2b``
+  (0.841-0.892 at 5.59-6.03 ms, slower than BF16 5.59 ms) are strictly dominated by ``superpoint int8`` (0.9101
+  kp_overlap, 0.9980 desc_cos, 4.41 ms at 1024 px / 1.99 ms at 640x480). ``superpoint-superglue`` therefore omits
+  ``fp8`` as well (degrading ``fp8 -> int8`` via ``build.NEAREST``) without modifying shared ``superpoint``.
 """
 
 from __future__ import annotations
