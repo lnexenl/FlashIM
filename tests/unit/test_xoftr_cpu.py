@@ -96,8 +96,32 @@ def test_match_interface_scaling_and_max_matches():
 
 
 def test_registry_and_resolve():
+    from flashim.models.xoftr.quant import FP8_INT8, PROTECTED
+    from flashim.models.xoftr.spec import SPEC
+    from flashim.platforms import Platform
+    from flashim.quant.scheme import INT8_ACTIVATIONS, INT8_WEIGHTS, QuantConfig, QuantScheme
+
     assert "xoftr" in flashim.available_models()
     for preset in ("fp32", "bf16", "int8", "fp8"):
         cfg = flashim.resolve("xoftr", preset)
         assert cfg.model == "xoftr"
         assert cfg.precision.compute_dtype == ("fp32" if preset == "fp32" else "bf16")
+
+    # Pre-sm_89 GPUs without FP8 fall back to int8 automatically.
+    sm87 = Platform("cuda", 0, capability=(8, 7))
+    assert flashim.resolve("xoftr", "fp8", platform=sm87).preset == "int8"
+
+    # Mixed fp8 targets are disjoint, non-protected, and match the expected 3 MXFP8 + 8 INT8 convs.
+    model = XoFTR()
+    conv_names = [n for n, m in model.named_modules() if isinstance(m, torch.nn.Conv2d)]
+    mx_cfg = SPEC.quant_configs["fp8"]
+    i8_cfg = QuantConfig({"conv": QuantScheme(FP8_INT8, INT8_WEIGHTS, INT8_ACTIVATIONS)}, name="fp8_int8")
+    mx_cfg.check_protected(conv_names, PROTECTED)
+    i8_cfg.check_protected(conv_names, PROTECTED)
+    mx_hits = {n for n in conv_names if mx_cfg.scheme_for(n) is not None}
+    i8_hits = {n for n in conv_names if i8_cfg.scheme_for(n) is not None}
+    assert mx_hits.isdisjoint(i8_hits)
+    assert len(mx_hits) == 3 and len(i8_hits) == 8
+    assert all(n.startswith("backbone.layer3.0.") for n in mx_hits)
+    assert "backbone.layer3.1.conv2" not in (mx_hits | i8_hits)
+    assert "backbone.layer3_outconv" not in (mx_hits | i8_hits)

@@ -110,7 +110,7 @@ def test_fp32_matches_oracle(oracle, flashim_fp32, pair, monkeypatch):
     assert max_conf_diff < 1e-3, f"max conf diff {max_conf_diff}"
 
 
-@pytest.mark.parametrize(("preset", "min_agree"), [("bf16", 0.90), ("int8", 0.85), ("fp8", 0.80)])
+@pytest.mark.parametrize(("preset", "min_agree"), [("bf16", 0.90), ("int8", 0.85), ("fp8", 0.85)])
 def test_reduced_precision_tracks_fp32(flashim_fp32, preset, min_agree):
     pair = (ASSETS / "sacre_coeur1.jpg", ASSETS / "sacre_coeur2.jpg")
     if not all(p.exists() for p in pair):

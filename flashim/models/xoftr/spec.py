@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -18,23 +19,49 @@ from flashim.models.xoftr.model import (
     WindowSelfAttention,
     XoFTR,
 )
-from flashim.models.xoftr.quant import PROTECTED, QUANTIZED
+from flashim.models.xoftr.quant import FP8_INT8, FP8_MXFP8, PROTECTED, QUANTIZED
+from flashim.quant.scheme import INT8_ACTIVATIONS, INT8_WEIGHTS, MXFP8, QuantConfig, QuantScheme
 
 
 def _load(config: RunConfig) -> XoFTR:
     return XoFTR.from_pretrained(checkpoint=config.checkpoint, device=config.device, **config.arch)
 
 
+def _fp8_mixed_int8(model: nn.Module, ctx: BuildContext) -> list[str] | str:
+    """``fp8``: pack the MXFP8-sensitive backbone convs (``FP8_INT8``) with static INT8 while keeping ``FP8_MXFP8``
+    in MXFP8 and the two 1/8-res coarse-exit convs in BF16 (see :mod:`flashim.models.xoftr.quant`)."""
+    if ctx.config.precision.quant != "fp8":
+        return "skipped: not fp8"
+    from flashim.quant.apply import quantize_model
+    from flashim.quant.calibration import Int8CalibrationTable
+
+    table = Int8CalibrationTable.load(ctx.spec.calibrations["int8"])
+    int8_cfg = QuantConfig({"conv": QuantScheme(FP8_INT8, INT8_WEIGHTS, INT8_ACTIVATIONS)}, name="fp8_int8")
+    sub = quantize_model(model, int8_cfg, table, protected=ctx.spec.protected)
+    report = getattr(model, "quant_report", None)
+    if report is not None:
+        report.linears.update(sub.linears)
+        report.convs.extend(sub.convs)
+        report.bytes_before += sub.bytes_before
+        report.bytes_after += sub.bytes_after
+        ctx.report.quant = report.summary()
+    return sorted(sub.convs)
+
+
 def _channels_last(model: nn.Module, ctx: BuildContext) -> str:
     """NHWC weights for unquantized cuDNN convolutions. When the backbone is quantized (``int8`` / ``fp8``), still
-    converts the unquantized stem, ``layer1.0`` and fine 1x1 convs (measured -0.42 ms on 480x640, and gives
-    ``ops.gather_windows`` coalesced channel reads)."""
+    converts every remaining unquantized ``nn.Conv2d`` in ``backbone`` (stem, ``layer1.0``, plus ``layer3.1.conv2`` and
+    ``layer3_outconv`` in ``fp8``) and fine 1x1 convs (measured -0.42 ms on 480x640, and gives ``ops.gather_windows``
+    coalesced channel reads)."""
     if ctx.config.precision.quant:
-        model.backbone.conv1.to(memory_format=torch.channels_last)
-        model.backbone.layer1[0].to(memory_format=torch.channels_last)
+        converted = 0
+        for module in model.backbone.modules():
+            if isinstance(module, nn.Conv2d):
+                module.to(memory_format=torch.channels_last)
+                converted += 1
         model.fine_process.out_conv_m.to(memory_format=torch.channels_last)
         model.fine_process.out_conv_f.to(memory_format=torch.channels_last)
-        return "stem+layer1.0+fine_out"
+        return f"unquantized backbone ({converted} convs)+fine_out"
     model.backbone.to(memory_format=torch.channels_last)
     model.fine_process.out_conv_m.to(memory_format=torch.channels_last)
     model.fine_process.out_conv_f.to(memory_format=torch.channels_last)
@@ -105,7 +132,7 @@ def _fold_window_gamma(model: nn.Module, ctx: BuildContext) -> int | str:
     return count
 
 
-SPEC = extractor_spec(
+_BASE_SPEC = extractor_spec(
     name="xoftr",
     description="XoFTR cross-modal (visible-thermal) detector-free matcher; match(a, b) only",
     load=_load,
@@ -115,6 +142,11 @@ SPEC = extractor_spec(
     compile_regions=("backbone",),
     role="dense",
     extra_passes={
+        "fp8_mixed_int8": Pass(
+            _fp8_mixed_int8,
+            description="fp8: static INT8 on MXFP8-sensitive backbone convs (leaves layer3.1.conv2 + layer3_outconv BF16)",
+            exact=False,
+        ),
         "channels_last": Pass(_channels_last, description="NHWC unquantized convolutions", exact=False),
         "bf16_linear_attention": Pass(
             _bf16_linear_attention, description="linear-attention GEMMs on BF16 tensor cores (not fp32)", exact=False
@@ -140,6 +172,7 @@ SPEC = extractor_spec(
         ),
     },
     structural_passes=(
+        "fp8_mixed_int8",
         "channels_last",
         "bf16_linear_attention",
         "fold_similarity_temperature",
@@ -148,4 +181,12 @@ SPEC = extractor_spec(
         "pack_window_qkv",
         "fold_window_gamma",
     ),
+)
+
+SPEC = replace(
+    _BASE_SPEC,
+    quant_configs={
+        **_BASE_SPEC.quant_configs,
+        "fp8": QuantConfig({"conv": QuantScheme(FP8_MXFP8, MXFP8, MXFP8)}, ignore=(), name="fp8"),
+    },
 )
