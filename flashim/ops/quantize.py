@@ -170,6 +170,24 @@ def _layernorm_quantize_int8_rows_reference(
 layernorm_quantize_int8_rows = Op("layernorm_quantize_int8_rows", _layernorm_quantize_int8_rows_reference)
 
 
+def _quantize_int8_rows_heads_reference(value: Tensor) -> tuple[Tensor, Tensor]:
+    """``quantize_int8_rows(value.transpose(1, 2).reshape(B * N, H * D))`` of an attention output ``[B, H, N, D]``:
+    per-row dynamic INT8 without materializing the transposed dense copy."""
+    batch, heads, tokens, dim = value.shape
+    return _quantize_int8_rows_reference(value.transpose(1, 2).reshape(batch * tokens, heads * dim))
+
+
+quantize_int8_rows_heads = Op("quantize_int8_rows_heads", _quantize_int8_rows_heads_reference)
+
+
+def _gelu_quantize_int8_rows_reference(value: Tensor, approximate: str = "none") -> tuple[Tensor, Tensor]:
+    """``quantize_int8_rows(F.gelu(value, approximate=approximate))`` in ``value.dtype``."""
+    return _quantize_int8_rows_reference(F.gelu(value, approximate=approximate))
+
+
+gelu_quantize_int8_rows = Op("gelu_quantize_int8_rows", _gelu_quantize_int8_rows_reference)
+
+
 # -- static INT8 for several consumers / from other layouts ------------------------------------------
 
 

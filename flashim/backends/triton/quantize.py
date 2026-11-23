@@ -534,6 +534,151 @@ def layernorm_quantize_int8_rows(value: Tensor, weight: Tensor, bias: Tensor, ep
     return out, scale
 
 
+@triton.jit
+def _layernorm_quantize_int8_rows_general_kernel(
+    x_ptr, w_ptr, b_ptr, out_ptr, scale_ptr, eps, N: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """Single-pass FP32 LayerNorm + per-row dynamic INT8 for channel widths that are not multiples of 512
+    (e.g. ViT-B / UFM info_sharing N = 768). Standard two-moment FP32 statistics (differs from ATen Welford
+    in < 1e-6 of quantized INT8 outputs; 3.4x faster than unfused LayerNorm + quantize on sm_120)."""
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < N
+    x = tl.load(x_ptr + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.sum(x, 0) / N
+    diff = tl.where(mask, x - mean, 0.0)
+    var = tl.sum(diff * diff, 0) / N
+    rstd = libdevice.rsqrt(var + eps)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(b_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y = (diff * rstd * w + b).to(tl.bfloat16).to(tl.float32)
+    y = tl.where(mask, y, 0.0)
+    scale = tl.max(tl.abs(y), 0) * (1.0 / 127.0)
+    scale = tl.where(scale > 1.1920928955078125e-07, scale, 1.1920928955078125e-07)
+    scaled = libdevice.rint(tl.math.div_rn(y, scale))
+    tl.store(out_ptr + row * N + cols, tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8), mask=mask)
+    tl.store(scale_ptr + row, scale)
+
+
+def layernorm_quantize_int8_rows_general(value: Tensor, weight: Tensor, bias: Tensor, eps: float) -> tuple[Tensor, Tensor]:
+    n = value.shape[-1]
+    rows = value.numel() // n
+    out = torch.empty(value.shape, device=value.device, dtype=torch.int8)
+    scale = torch.empty((*value.shape[:-1], 1), device=value.device, dtype=torch.float32)
+    _layernorm_quantize_int8_rows_general_kernel[(rows,)](
+        value, weight, bias, out, scale, float(eps), N=n, BLOCK=triton.next_power_of_2(n), num_warps=4,
+    )
+    return out, scale
+
+
+@triton.jit
+def _quantize_int8_rows_heads_kernel(
+    x_ptr, out_ptr, scale_ptr, total_tokens, TOKENS,
+    HEADS: tl.constexpr, D: tl.constexpr, C: tl.constexpr, BLOCK_C: tl.constexpr, ROWS: tl.constexpr,
+):
+    """Per-token dynamic INT8 directly from contiguous ``x [B, H, N, D]`` -> ``out [B*N, H*D]`` + ``scale [B*N, 1]``,
+    eliminating the ``transpose(1, 2).contiguous()`` BF16 copy. Bit-identical to ``_quantize_int8_rows_kernel``."""
+    tok = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    tok_ok = tok < total_tokens
+    b = (tok // TOKENS).to(tl.int64)
+    n = (tok % TOKENS).to(tl.int64)
+    c = tl.arange(0, BLOCK_C)
+    c_ok = c < C
+    h = (c // D).to(tl.int64)
+    d = (c % D).to(tl.int64)
+    mask = tok_ok[:, None] & c_ok[None, :]
+    src_off = ((b[:, None] * HEADS + h[None, :]) * TOKENS + n[:, None]) * D + d[None, :]
+    val = tl.load(x_ptr + src_off, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.max(tl.abs(val), 1) * (1.0 / 127.0)
+    scale = tl.where(scale > 1.1920928955078125e-07, scale, 1.1920928955078125e-07)
+    scaled = libdevice.rint(tl.math.div_rn(val, scale[:, None]))
+    dst_off = tok[:, None].to(tl.int64) * C + c[None, :]
+    tl.store(out_ptr + dst_off, tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8), mask=mask)
+    tl.store(scale_ptr + tok, scale, mask=tok_ok)
+
+
+def quantize_int8_rows_heads(value: Tensor) -> tuple[Tensor, Tensor]:
+    batch, heads, tokens, dim = value.shape
+    c = heads * dim
+    total_tokens = batch * tokens
+    out = torch.empty((total_tokens, c), device=value.device, dtype=torch.int8)
+    scale = torch.empty((total_tokens, 1), device=value.device, dtype=torch.float32)
+    block_c = triton.next_power_of_2(c)
+    rows = max(1, 4096 // block_c)
+    _quantize_int8_rows_heads_kernel[(triton.cdiv(total_tokens, rows),)](
+        value, out, scale, total_tokens, tokens,
+        HEADS=heads, D=dim, C=c, BLOCK_C=block_c, ROWS=rows, num_warps=4 if block_c <= 2048 else 8,
+    )
+    return out, scale
+
+
+@triton.jit
+def _gelu_quantize_int8_rows_kernel(
+    x_ptr, out_ptr, scale_ptr, rows,
+    K: tl.constexpr, BLOCK_K: tl.constexpr, ROWS: tl.constexpr, TANH: tl.constexpr,
+):
+    """Fused GELU (rounded to BF16) + per-row dynamic INT8 quantization, single pass over ``[rows, K]``."""
+    row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    cols = tl.arange(0, BLOCK_K)
+    mask = (row < rows)[:, None] & (cols < K)[None, :]
+    offsets = row[:, None].to(tl.int64) * K + cols[None, :]
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    y = _gelu(x, TANH).to(tl.bfloat16).to(tl.float32)
+    y = tl.where(mask, y, 0.0)
+    scale = tl.max(tl.abs(y), 1) * (1.0 / 127.0)
+    scale = tl.where(scale > 1.1920928955078125e-07, scale, 1.1920928955078125e-07)
+    scaled = libdevice.rint(tl.math.div_rn(y, scale[:, None]))
+    tl.store(out_ptr + offsets, tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8), mask=mask)
+    tl.store(scale_ptr + row, scale, mask=row < rows)
+
+
+@triton.jit
+def _gelu_quantize_int8_rows_tiled_kernel(
+    x_ptr, out_ptr, scale_ptr, rows,
+    K: tl.constexpr, BLOCK_K: tl.constexpr, TANH: tl.constexpr,
+):
+    """Two-pass tiled GELU + per-row dynamic INT8 for non-power-of-two ``K`` (e.g. 3072) to avoid padded-lane waste."""
+    row = tl.program_id(0).to(tl.int64)
+    base = row * K
+    amax = tl.zeros([BLOCK_K], dtype=tl.float32)
+    for k0 in tl.static_range(0, K, BLOCK_K):
+        cols = k0 + tl.arange(0, BLOCK_K)
+        mask = cols < K
+        x = tl.load(x_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+        y = _gelu(x, TANH).to(tl.bfloat16).to(tl.float32)
+        amax = tl.maximum(amax, tl.abs(tl.where(mask, y, 0.0)))
+    scale = tl.max(amax, 0) * (1.0 / 127.0)
+    scale = tl.where(scale > 1.1920928955078125e-07, scale, 1.1920928955078125e-07)
+    tl.store(scale_ptr + row, scale)
+    for k0 in tl.static_range(0, K, BLOCK_K):
+        cols = k0 + tl.arange(0, BLOCK_K)
+        mask = cols < K
+        x = tl.load(x_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+        y = _gelu(x, TANH).to(tl.bfloat16).to(tl.float32)
+        scaled = libdevice.rint(tl.math.div_rn(y, scale))
+        tl.store(out_ptr + base + cols, tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8), mask=mask)
+
+
+def gelu_quantize_int8_rows(value: Tensor, approximate: str = "none") -> tuple[Tensor, Tensor]:
+    k = value.shape[-1]
+    rows = value.numel() // k
+    out = torch.empty(value.shape, device=value.device, dtype=torch.int8)
+    scale = torch.empty((*value.shape[:-1], 1), device=value.device, dtype=torch.float32)
+    tanh = approximate == "tanh"
+    block_k = triton.next_power_of_2(k)
+    if block_k != k and k >= 2048:
+        _gelu_quantize_int8_rows_tiled_kernel[(rows,)](
+            value, out, scale, rows, K=k, BLOCK_K=1024, TANH=tanh, num_warps=4,
+        )
+    else:
+        rpp = max(1, 4096 // block_k)
+        _gelu_quantize_int8_rows_kernel[(triton.cdiv(rows, rpp),)](
+            value, out, scale, rows, K=k, BLOCK_K=block_k, ROWS=rpp, TANH=tanh,
+            num_warps=4 if block_k <= 2048 else 8,
+        )
+    return out, scale
+
+
 # -- static INT8 for several consumers / from other layouts (LightGlue's INT8 glue) ----------------------
 
 
@@ -705,16 +850,41 @@ def _layernorm_rows_eligible(value, weight, bias, eps) -> bool:
     )
 
 
-# Bit-exact against ``nn.LayerNorm`` + ``quantize_int8_rows`` as measured on an L20 (sm_89) and an H20 (sm_90) only:
-# other architectures run the torch reference until someone has checked them.
+# Bit-exact against ``nn.LayerNorm`` + ``quantize_int8_rows`` as measured on L20 (sm_89), H20 (sm_90),
+# and RTX 5070 Ti (sm_120, N >= 1024 where it beats unfused 23.8 -> 20.1 us; N = 512 is slower on sm_120).
+def _layernorm_rows_sm120_eligible(value, weight, bias, eps) -> bool:
+    return _layernorm_rows_eligible(value, weight, bias, eps) and value.shape[-1] >= 1024
+
+
 ops.layernorm_quantize_int8_rows.register(
     "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)), requires=[Feature.TRITON],
     when=_layernorm_rows_eligible,
 )(layernorm_quantize_int8_rows)
+ops.layernorm_quantize_int8_rows.register(
+    "triton_sm120", device=DeviceSpec("cuda", min_capability=(12, 0), max_capability=(12, 0)),
+    requires=[Feature.TRITON], when=_layernorm_rows_sm120_eligible,
+)(layernorm_quantize_int8_rows)
+ops.layernorm_quantize_int8_rows.register(
+    "triton_general", device=DeviceSpec("cuda"), requires=[Feature.TRITON],
+    when=lambda value, weight, bias, eps: (
+        value.dtype == weight.dtype == torch.bfloat16 and bias is not None and bias.dtype == torch.bfloat16
+        and _row_major(value) and value.shape[-1] % LN_EXACT_MULTIPLE != 0 and value.shape[-1] <= 2048
+    ),
+)(layernorm_quantize_int8_rows_general)
 ops.quantize_int8_rows.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON],
     when=lambda value: _row_major(value) and value.shape[-1] <= 8192,
 )(quantize_int8_rows)
+ops.quantize_int8_rows_heads.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON],
+    when=lambda value: value.ndim == 4 and _row_major(value) and value.shape[1] * value.shape[3] <= 8192,
+)(quantize_int8_rows_heads)
+ops.gelu_quantize_int8_rows.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON],
+    when=lambda value, approximate="none": (
+        value.dtype == torch.bfloat16 and _row_major(value) and value.shape[-1] <= 8192
+    ),
+)(gelu_quantize_int8_rows)
 
 
 def _quantize_multi_eligible(value: Tensor, scales: list[Tensor], outs: list[Tensor]) -> bool:

@@ -995,8 +995,8 @@ def test_int8_linear_per_row_scale(impl):
 
 # -- ViT glue: LayerNorm + per-row INT8, and the GELU / residual epilogues of the INT8 GEMM -------------------------------
 _EXACT_LN_ARCH = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((8, 9), (9, 0)),
-    reason="the torch-exact LayerNorm kernel is registered for sm_89 / sm_90 (the archs it was checked on)",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((8, 9), (9, 0), (12, 0)),
+    reason="the torch-exact LayerNorm kernel is registered for sm_89 / sm_90 / sm_120 (the archs it was checked on)",
 )
 
 
@@ -1010,14 +1010,30 @@ def test_layernorm_quantize_int8_rows(rows, n):
     x[:, 5] += 40  # an outlier channel
     w = torch.randn(n, device=DEV, dtype=torch.bfloat16)
     b = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    impl = "triton_sm120" if torch.cuda.get_device_capability() == (12, 0) else "triton"
+    if impl == "triton_sm120" and n < 1024:
+        pytest.skip("sm_120 only dispatches exact LayerNorm+quantize for N >= 1024")
     assert ops.layernorm_quantize_int8_rows.supports(x, w, b, 1e-6)
-    fast, ref = _both(ops.layernorm_quantize_int8_rows, "triton", x, w, b, 1e-6)
+    fast, ref = _both(ops.layernorm_quantize_int8_rows, impl, x, w, b, 1e-6)
     assert torch.equal(fast[0], ref[0]) and torch.equal(fast[1], ref[1])
     norm = torch.nn.LayerNorm(n, eps=1e-6).to(DEV, torch.bfloat16)
     norm.weight.data.copy_(w)
     norm.bias.data.copy_(b)
     unfused = ops.quantize_int8_rows(norm(x))
     assert torch.equal(fast[0], unfused[0]) and torch.equal(fast[1], unfused[1])
+
+
+@pytest.mark.parametrize("rows,n", [(2400, 768), (333, 384), (17, 768)])
+def test_layernorm_quantize_int8_rows_general(rows, n):
+    """Non-512-multiple channel widths (e.g. ViT-B / UFM info_sharing N=768) dispatch to ``triton_general``."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, n, device=DEV, dtype=torch.bfloat16) * 2.5
+    w = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    b = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    assert ops.layernorm_quantize_int8_rows.explain(x, w, b, 1e-6)["triton_general"] == "selected"
+    fast, ref = _both(ops.layernorm_quantize_int8_rows, "triton_general", x, w, b, 1e-6)
+    assert (fast[0].int() - ref[0].int()).abs().max() <= 1 and _mismatch(fast[0], ref[0]) < 1e-4
+    torch.testing.assert_close(fast[1], ref[1], atol=1e-5, rtol=1e-4)
 
 
 @pytest.mark.parametrize("rows,k,n", [(5376, 1024, 4096), (300, 1024, 1024), (17, 256, 96), (3000, 4096, 1024)])
@@ -1050,3 +1066,53 @@ def test_int8_linear_gelu_epilogue(rows, k, n):
     fused = ops.int8_linear.get("triton")(q, w, scale, w_scale, bias, gelu=True)
     assert torch.equal(fused, F.gelu(plain))
     assert ops.int8_linear.get("reference")(q, w, scale, w_scale, bias, gelu=True).shape == plain.shape
+
+
+@pytest.mark.parametrize("size,in_size", [((240, 320), (120, 160)), ((420, 560), (240, 320)), ((37, 45), (19, 23))])
+@pytest.mark.parametrize("channels", [128, 256, 40])
+@pytest.mark.parametrize("align_corners", [True, False])
+@pytest.mark.parametrize("layout", ["nchw", "nhwc"])
+def test_upsample_bilinear(size, in_size, channels, align_corners, layout):
+    """Standalone bilinear upsampling (and optional static INT8 quantize) vs torch reference."""
+    torch.manual_seed(0)
+    fmt = torch.channels_last if layout == "nhwc" else torch.contiguous_format
+    x = (torch.randn(1, channels, *in_size, device=DEV) * 2).bfloat16().contiguous(memory_format=fmt)
+    assert ops.upsample_bilinear.explain(x, size, align_corners=align_corners)["triton"] == "selected"
+    fast, ref = _both(ops.upsample_bilinear, "triton", x, size, align_corners=align_corners)
+    assert fast.shape == ref.shape and fast.dtype == ref.dtype and fast.is_contiguous(memory_format=torch.channels_last)
+    # FP32 vs FP64 coordinate scale + FMA contraction order: at most 1 BF16 ulp of the operands.
+    tol = torch.maximum(fast.float().abs(), ref.float().abs()) * 2**-7 + x.float().abs().amax() * 1e-4
+    assert ((fast.float() - ref.float()).abs() <= tol).all()
+
+    scale = torch.tensor(0.03, device=DEV)
+    q_fast, q_ref = _both(ops.upsample_bilinear, "triton", x, size, align_corners=align_corners, out_scale=scale)
+    assert q_fast.values.shape == (1, *size, channels) and q_fast.values.is_contiguous() and q_fast.scale is scale
+    unfused = ops.quantize_int8.get("triton")(fast.permute(0, 2, 3, 1), scale)
+    assert (q_fast.values.int() - unfused.values.int()).abs().max() <= 1 and _mismatch(q_fast.values, unfused.values) < 1e-4
+    assert (q_fast.values.int() - q_ref.values.int()).abs().max() <= 1 and _mismatch(q_fast.values, q_ref.values) < 1e-3
+
+
+@pytest.mark.parametrize("batch,heads,tokens,dim", [(2, 16, 1201, 64), (1, 12, 2400, 64), (2, 8, 77, 64)])
+def test_quantize_int8_rows_heads(batch, heads, tokens, dim):
+    """Per-token dynamic INT8 directly from ``[B, H, N, D]`` attention output: bit-identical to reference."""
+    torch.manual_seed(0)
+    x = torch.randn(batch, heads, tokens, dim, device=DEV, dtype=torch.bfloat16) * 3
+    x[0, 3, tokens // 2] *= 200
+    x[-1, :, -1] = 0
+    assert ops.quantize_int8_rows_heads.explain(x)["triton"] == "selected"
+    fast, ref = _both(ops.quantize_int8_rows_heads, "triton", x)
+    assert fast[0].shape == (batch * tokens, heads * dim) and fast[1].shape == (batch * tokens, 1)
+    assert torch.equal(fast[0], ref[0]) and torch.equal(fast[1], ref[1])
+
+
+@pytest.mark.parametrize("rows,k", [(2402, 4096), (2400, 3072), (333, 1024)])
+@pytest.mark.parametrize("approximate", ["none", "tanh"])
+def test_gelu_quantize_int8_rows(rows, k, approximate):
+    """Fused GELU + per-row dynamic INT8 vs reference (exact within <=1 INT8 step where libdevice erf differs)."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, k, device=DEV, dtype=torch.bfloat16) * 2
+    assert ops.gelu_quantize_int8_rows.explain(x, approximate)["triton"] == "selected"
+    fast, ref = _both(ops.gelu_quantize_int8_rows, "triton", x, approximate)
+    assert fast[0].shape == ref[0].shape and fast[1].shape == ref[1].shape
+    assert (fast[0].int() - ref[0].int()).abs().max() <= 1 and _mismatch(fast[0], ref[0]) < 1e-4
+    torch.testing.assert_close(fast[1], ref[1], atol=1e-6, rtol=1e-5)

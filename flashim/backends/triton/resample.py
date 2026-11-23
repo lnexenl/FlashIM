@@ -504,3 +504,105 @@ def _eligible_pil_resize(image: Tensor, sizes: Sequence[tuple[int, int]]) -> boo
 ops.pil_bicubic_resize.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible_pil_resize
 )(pil_bicubic_resize)
+
+
+# -- standalone bilinear upsampling (+ optional static INT8 output quantization) --------------------------------------
+
+
+@triton.jit
+def _upsample_bilinear_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    H_in, W_in, H_out, W_out,
+    sx_b, sx_h, sx_w, sx_c,
+    scale_h, scale_w,
+    C: tl.constexpr, BLOCK_X: tl.constexpr, BLOCK_C: tl.constexpr,
+    ALIGN_CORNERS: tl.constexpr, INT8: tl.constexpr,
+):
+    """One ``[BLOCK_X pixels of one row, BLOCK_C channels]`` tile of bilinear upsampling (channels-last output).
+    ``INT8`` fuses BF16 rounding + static INT8 quantization (``_store_quantized`` arithmetic) into the write pass."""
+    row = tl.program_id(1)
+    b = (row // H_out).to(tl.int64)
+    y = row % H_out
+    x = tl.program_id(0) * BLOCK_X + tl.arange(0, BLOCK_X)
+    x_ok = x < W_out
+    x_c = tl.where(x_ok, x, 0)
+    c = tl.program_id(2) * BLOCK_C + tl.arange(0, BLOCK_C)
+    m = x_ok[:, None] & (c < C)[None, :]
+
+    if ALIGN_CORNERS:
+        fy = y.to(tl.float32) * scale_h
+        y0 = fy.to(tl.int32)
+        y1 = tl.minimum(y0 + 1, H_in - 1)
+        ly1 = fy - y0.to(tl.float32)
+        ly0 = 1.0 - ly1
+        fx = x_c.to(tl.float32) * scale_w
+        x0 = fx.to(tl.int32)
+        x1 = tl.minimum(x0 + 1, W_in - 1)
+        lx1 = fx - x0.to(tl.float32)
+        lx0 = 1.0 - lx1
+    else:
+        y0, y1, ly0, ly1 = _bilinear_source(y, H_in, scale_h)
+        x0, x1, lx0, lx1 = _bilinear_source(x_c, W_in, scale_w)
+
+    base = x_ptr + b * sx_b
+    r0 = base + y0.to(tl.int64) * sx_h
+    r1 = base + y1.to(tl.int64) * sx_h
+    cc = c[None, :].to(tl.int64) * sx_c
+    v00 = tl.load(r0 + (x0.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v01 = tl.load(r0 + (x1.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v10 = tl.load(r1 + (x0.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v11 = tl.load(r1 + (x1.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    lx0, lx1 = lx0[:, None], lx1[:, None]
+    val = ly0 * (lx0 * v00 + lx1 * v01) + ly1 * (lx0 * v10 + lx1 * v11)
+    out_off = ((row.to(tl.int64) * W_out + x_c) * C)[:, None] + c[None, :]
+    if INT8:
+        scaled = libdevice.rint(val.to(tl.bfloat16).to(tl.float32) * (1.0 / tl.load(scale_ptr)))
+        tl.store(out_ptr + out_off, tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8), mask=m)
+    else:
+        tl.store(out_ptr + out_off, val.to(out_ptr.dtype.element_ty), mask=m)
+
+
+def upsample_bilinear(
+    x: Tensor, size: tuple[int, int], *, align_corners: bool = True, out_scale: Tensor | None = None
+) -> Tensor | Int8Tensor:
+    batch, channels, hi, wi = x.shape
+    ho, wo = size
+    if align_corners:
+        sh = (hi - 1) / (ho - 1) if ho > 1 else 0.0
+        sw = (wi - 1) / (wo - 1) if wo > 1 else 0.0
+    else:
+        sh, sw = hi / ho, wi / wo
+    if out_scale is None:
+        out = torch.empty((batch, channels, ho, wo), device=x.device, dtype=x.dtype, memory_format=torch.channels_last)
+    else:
+        out = torch.empty((batch, ho, wo, channels), device=x.device, dtype=torch.int8)
+    block_c = min(128, triton.next_power_of_2(channels))
+    block_x = 16 if block_c >= 64 else 32
+    grid = (triton.cdiv(wo, block_x), batch * ho, triton.cdiv(channels, block_c))
+    _upsample_bilinear_kernel[grid](
+        x, out, out if out_scale is None else out_scale,
+        hi, wi, ho, wo,
+        x.stride(0), x.stride(2), x.stride(3), x.stride(1),
+        sh, sw, C=channels, BLOCK_X=block_x, BLOCK_C=block_c,
+        ALIGN_CORNERS=align_corners, INT8=out_scale is not None, num_warps=4,
+    )
+    return out if out_scale is None else Int8Tensor(out, out_scale)
+
+
+def _eligible_upsample_bilinear(
+    x: Tensor, size: tuple[int, int], *, align_corners: bool = True, out_scale: Tensor | None = None
+) -> bool:
+    return (
+        x.is_cuda
+        and x.ndim == 4
+        and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and len(size) == 2
+        and size[0] > 0
+        and size[1] > 0
+        and (out_scale is None or (out_scale.is_cuda and out_scale.numel() == 1))
+    )
+
+
+ops.upsample_bilinear.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible_upsample_bilinear
+)(upsample_bilinear)

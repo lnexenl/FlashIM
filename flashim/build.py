@@ -309,16 +309,20 @@ def _quantize(model: nn.Module, ctx: BuildContext) -> None:
 
     spec, config = ctx.spec, ctx.config
     quant = spec.quant_configs[config.precision.quant]
-    int8 = any(scheme.weights.type == "int" for scheme in quant.config_groups.values())
-    if not int8 and not ctx.platform.supports(Feature.MXFP8_SCALED_MM):
+    static_schemes = [
+        s for s in quant.config_groups.values() if s.input_activations is not None and not s.input_activations.dynamic
+    ]
+    int8 = any(scheme.weights.type == "int" for scheme in static_schemes)
+    has_mxfp8 = any(scheme.weights.type == "float" for scheme in quant.config_groups.values())
+    if has_mxfp8 and not ctx.platform.supports(Feature.MXFP8_SCALED_MM):
         message = f"{spec.name}: no native MXFP8 GEMM on {ctx.platform.describe()}; quantized linears are emulated"
         if config.optimize.strict:
             raise RuntimeError(message)
         logger.warning(message)
         ctx.report.emulated_quant = True
-    table = _load_calibration(spec, config, int8)
+    table = _load_calibration(spec, config, int8) if static_schemes else None
     model.quant_report = quantize_model(model, quant, table, protected=spec.protected)
-    model.calibration_metadata = dict(table.metadata)
+    model.calibration_metadata = dict(table.metadata) if table is not None else {}
     ctx.report.quant = model.quant_report.summary()
 
 

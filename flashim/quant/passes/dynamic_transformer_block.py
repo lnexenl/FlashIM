@@ -44,6 +44,8 @@ class DynamicInt8TransformerBlock(nn.Module):
     """:class:`~flashim.layers.TransformerBlock` (same submodule names) with the fusions of this module's docstring.
     ``rope`` is not supported (DINOv2 has none): such a call runs the original block."""
 
+    fuse_gelu_quantize: bool = False
+
     def __init__(self, block: TransformerBlock, device: torch.device | None = None) -> None:
         super().__init__()
         if not is_fusable(block):
@@ -92,12 +94,18 @@ class DynamicInt8TransformerBlock(nn.Module):
         q, s = self._norm_quantize(self.norm1, flat, ln)
         qkv = self._linear(attn.qkv, q, s).reshape(batch, tokens, 3, attn.num_heads, channels // attn.num_heads)
         qh, kh, vh = (t.transpose(1, 2) for t in qkv.unbind(2))
-        out = ops.sdpa.get(attn.sdpa_impl)(qh, kh, vh).transpose(1, 2).reshape(-1, channels)
-        q, s = ops.quantize_int8_rows(out if out.is_contiguous() else out.contiguous())
+        out = ops.sdpa.get(attn.sdpa_impl)(qh, kh, vh)
+        if out.is_contiguous():
+            q, s = ops.quantize_int8_rows_heads(out)
+        else:
+            out_flat = out.transpose(1, 2).reshape(-1, channels)
+            q, s = ops.quantize_int8_rows(out_flat if out_flat.is_contiguous() else out_flat.contiguous())
         x1 = self._linear(attn.proj, q, s, residual=flat) if residual else flat + self._linear(attn.proj, q, s)
         q, s = self._norm_quantize(self.norm2, x1, ln)
         if gelu:
             q, s = ops.quantize_int8_rows(self._linear(self.mlp.fc1, q, s, gelu=True))
+        elif self.fuse_gelu_quantize and isinstance(self.mlp.act, nn.GELU):
+            q, s = ops.gelu_quantize_int8_rows(self._linear(self.mlp.fc1, q, s), self.mlp.act.approximate)
         else:
             q, s = ops.quantize_int8_rows(self.mlp.act(self._linear(self.mlp.fc1, q, s)))
         x2 = self._linear(self.mlp.fc2, q, s, residual=x1) if residual else x1 + self._linear(self.mlp.fc2, q, s)

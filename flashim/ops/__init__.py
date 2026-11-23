@@ -49,6 +49,7 @@ from flashim.ops.quantize import (
     bias_relu_quantize_int8,
     gelu_quantize,
     gelu_quantize_int8,
+    gelu_quantize_int8_rows,
     layernorm_gelu_quantize_int8,
     layernorm_quantize,
     layernorm_quantize_int8,
@@ -57,10 +58,17 @@ from flashim.ops.quantize import (
     quantize_int8_heads,
     quantize_int8_multi,
     quantize_int8_rows,
+    quantize_int8_rows_heads,
     quantize_mxfp8,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
-from flashim.ops.resample import pil_bicubic_resize, upsample_add, upsample_concat, upsample_concat_int8
+from flashim.ops.resample import (
+    pil_bicubic_resize,
+    upsample_add,
+    upsample_bilinear,
+    upsample_concat,
+    upsample_concat_int8,
+)
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 
 __all__ = [
@@ -84,6 +92,7 @@ __all__ = [
     "dual_softmax_mutual",
     "gelu_quantize",
     "gelu_quantize_int8",
+    "gelu_quantize_int8_rows",
     "im2col_gather",
     "int8_conv2d",
     "int8_conv2d_maxpool",
@@ -111,6 +120,7 @@ __all__ = [
     "quantize_int8_heads",
     "quantize_int8_multi",
     "quantize_int8_rows",
+    "quantize_int8_rows_heads",
     "quantize_mxfp8",
     "raco_head5x5",
     "raco_resblock",
@@ -122,6 +132,7 @@ __all__ = [
     "sdpa",
     "set_strict",
     "upsample_add",
+    "upsample_bilinear",
     "upsample_concat",
     "upsample_concat_int8",
 ]
