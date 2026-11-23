@@ -134,3 +134,74 @@ def test_gpu_decoder_444_and_gray_identical(tmp_path):
     image.convert("CMYK").save(tmp_path / "cmyk.jpg")  # nvJPEG cannot decode it: PIL's path
     for name in ("s444.jpg", "gray.jpg", "cmyk.jpg"):
         assert torch.equal(load_image(tmp_path / name, device, "nvjpeg"), load_image(tmp_path / name, device, "pil"))
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("non_default_stream", [False, True])
+@pytest.mark.parametrize("fancy", [True, False])
+def test_gpu_decoder_interleaved_stream_safety(non_default_stream, fancy):
+    """Interleaving ``decode_jpeg_cuda`` with in-flight GPU work must neither corrupt the decoded image (WAW on a
+    block recycled from the caller's caching-allocator pool) nor corrupt an in-flight reader on the caller's stream
+    (WAR when nvJPEG overwrites a freed input or previous decode still queued on the caller's stream)."""
+    from flashim.image_io import decode_jpeg_cuda
+
+    device = torch.device("cuda")
+    paths = [ASSETS / "sacre_coeur1.jpg", ASSETS / "sacre_coeur2.jpg", ASSETS / "toronto_A.jpg", ASSETS / "toronto_B.jpg"]
+    refs = []
+    for p in paths:
+        torch.cuda.synchronize()
+        ref = decode_jpeg_cuda(p, device, fancy=fancy)
+        torch.cuda.synchronize()
+        assert ref is not None
+        refs.append(ref.cpu())
+
+    a = torch.randn(4096, 4096, device=device, dtype=torch.bfloat16)
+    b = torch.randn(4096, 4096, device=device, dtype=torch.bfloat16)
+    caller = torch.cuda.Stream(device=device) if non_default_stream else torch.cuda.default_stream(device)
+    side = torch.cuda.Stream(device=device)
+
+    def _queue_work():
+        c = a @ b
+        for _ in range(3):
+            c = c @ b
+
+    with torch.cuda.stream(caller):
+        for repeat in range(4):
+            for p, ref in zip(paths, refs):
+                ref_gpu = ref.to(device)
+                with torch.cuda.stream(side):
+                    _ = a @ b
+
+                # 1. WAW hazard: caller stream writes 0x55 into a block of the exact output size, frees it back to
+                #    caller's allocator pool while still in flight, then decode_jpeg_cuda runs immediately.
+                _queue_work()
+                junk = torch.empty(ref.shape, device=device, dtype=torch.uint8)
+                junk.fill_(0x55)
+                del junk
+                out = decode_jpeg_cuda(p, device, fancy=fancy)
+                assert out is not None
+                assert torch.equal(out, ref_gpu), f"WAW corruption on {p.name} (repeat={repeat})"
+
+                # 2. WAR hazard on caller-allocated input: caller queues a reduction over a freed tensor before decode.
+                src = torch.ones(ref.shape, device=device, dtype=torch.uint8)
+                expected_ones = src.numel()
+                _queue_work()
+                s_ones = src.sum(dtype=torch.int64)
+                del src
+                out2 = decode_jpeg_cuda(p, device, fancy=fancy)
+                assert out2 is not None
+                assert int(s_ones.item()) == expected_ones, f"WAR corruption of caller input on {p.name}"
+                assert torch.equal(out2, ref_gpu), f"decode corruption on {p.name} (repeat={repeat})"
+
+                # 3. WAR hazard on previous decode output (guards record_stream): queue a read of out2 on caller
+                #    behind slow work, drop out2, then immediately decode again.
+                expected_sum = int(ref.sum(dtype=torch.int64).item())
+                _queue_work()
+                s_prev = out2.sum(dtype=torch.int64)
+                del out2
+                out3 = decode_jpeg_cuda(p, device, fancy=fancy)
+                assert out3 is not None
+                assert int(s_prev.item()) == expected_sum, f"WAR corruption of previous decode on {p.name}"
+                assert torch.equal(out3, ref_gpu), f"back-to-back decode corruption on {p.name}"
+    torch.cuda.synchronize()
