@@ -23,6 +23,7 @@ weight lookup (`flashim/models/*/weights.py`).
 | `loma/` | https://github.com/davnords/LoMa @ 415caed (`src/loma/`; `descriptor/transformer/`: DINOv2, Meta; offline loader `loma_oracle.py`, see `loma/README.md`) | MIT (matcher in `loma.py`: Apache-2.0, from LightGlue; DINOv2: Apache-2.0) |
 | `eloftr/` | https://github.com/zju3dv/EfficientLoFTR @ ffd4a46440 (`src/loftr/`, `src/utils/misc.py`; last Apache-2.0 commit before upstream re-licensed to ZJU3DV PRL v1.0 in `07e9c1401e`) | Apache-2.0 (`repvgg.py`: RepVGG MIT) |
 | `xoftr/` | https://github.com/OnderT/XoFTR (`src/xoftr/` + `src/config/default.py`, trimmed `xoftr/__init__.py`) | Apache-2.0 |
+| `minima/` | https://github.com/LSXI7/MINIMA (`LoFTR_minima` submodule `src/loftr/`; `minima-roma` parity reuses `roma/`) | Apache-2.0 |
 
 Not vendored: cvg/LightGlue's `lightglue/superpoint.py`, Magic Leap's `SuperGluePretrainedNetwork` (`models/superglue.py`,
 both carry a Magic Leap notice forbidding reproduction and distribution) and RIPE. All three are downloaded on demand by

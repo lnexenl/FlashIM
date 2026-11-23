@@ -96,9 +96,12 @@ bidirectional_cross_attention = Op("bidirectional_cross_attention", _bidirection
 def _elu_linear_attention_reference(
     q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6, gemm_dtype: torch.dtype | None = None
 ) -> Tensor:
-    """ELU+1 kernel linear attention on ``q [B, L, H, D]``, ``k [B, S, H, D]``, ``v [B, S, H, D]`` -> ``[B, L, H, D]``
-    in ``q.dtype``. ``gemm_dtype`` runs the two contractions on operands cast to that dtype while ELU, normalizer and
-    scaling stay FP32."""
+    """ELU+1 kernel linear attention on ``q [B, L, H, D]``, ``k [B, S, H, D]``, ``v [B, S, H, V]`` -> ``[B, L, H, V]``
+    in ``q.dtype``. Values are scaled by ``1 / S`` before accumulating ``K^T V`` and multiplied back by ``S`` on output
+    (LoFTR overflow guard). ``gemm_dtype`` runs the two contractions on operands cast to that dtype while ELU,
+    normalizer and scaling stay FP32."""
+    if q.shape[1] == 0 or k.shape[1] == 0:
+        return q.new_zeros((q.shape[0], q.shape[1], q.shape[2], v.shape[3]))
     qf, kf, vf = torch.nn.functional.elu(q.float()) + 1.0, torch.nn.functional.elu(k.float()) + 1.0, v.float()
     length = vf.shape[1]
     z = 1.0 / (torch.einsum("nlhd,nhd->nlh", qf, kf.sum(dim=1)) + eps)

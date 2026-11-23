@@ -40,6 +40,12 @@ Rejected / diagnostic quantization schemes (10 hard ``calibration_local`` pairs;
   (27..36) 90.8 ms / 98.25% (p90 0.469) -> VGG19-BN stays BF16 in ``fp8`` (3-bit E4M3 mantissa degrades fine features).
 - BF16 on ``decoder.proj["16"]``: hurts GP Cholesky in ``int8`` (p90 0.372 -> 0.428 px, < 2 px 98.57% -> 98.23%);
   casting only ``proj["8","4","2","1"]`` keeps GP FP32 and saves the same ~3.0 ms across ``bf16``/``int8``/``fp8``.
+- ``minima-roma`` (modality-invariant weights, 10 MegaDepth-1500 pairs + MINIMA RGB-Depth demo, sm_120):
+  ``bf16`` 135.7 ms, 99.83% < 2 px (med 0.023 px; demo 88.63%), ``fp8`` 97.6 ms, 99.23% < 2 px (med 0.058 px;
+  demo 87.94%), ``int8`` 75.8 ms calibrated on 16 RGB MegaDepth pairs + 8 synthetic modality-augmented calibration
+  pairs (inverted / autocontrast / edge / equalized) achieves 99.13% < 2 px on MegaDepth (med 0.057 px, p90 0.237 px)
+  and improves cross-modal RGB-Depth demo fidelity from 78.19% (med 0.473 px, RGB-only calibration) to 80.85% < 2 px
+  (med 0.423 px) at identical speed. Keeping VGG19-BN in BF16 under ``minima-roma`` ``int8`` was rejected (demo 76.89%).
 """
 
 from __future__ import annotations

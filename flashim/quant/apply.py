@@ -68,7 +68,8 @@ def quantize_model(
         if scheme.weights.type == "int" and act is not None and act.dynamic and act.strategy == "token":
             if not isinstance(module, nn.Linear):
                 raise ValueError(f"Dynamic per-token INT8 targets linears only, not {name!r}")
-            packed = DynamicInt8Linear.from_linear(module)
+            smooth = calibration.smooth.get(name) if isinstance(calibration, Int8CalibrationTable) else None
+            packed = DynamicInt8Linear.from_linear(module, smooth=smooth)
             report.bytes_before += nbytes(module)
             report.bytes_after += nbytes(packed)
             set_submodule(model, name, packed)

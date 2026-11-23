@@ -10,7 +10,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | model | what it is | presets |
 |---|---|---|
 | [`romav2`](models/romav2.md) | RoMa v2 dense matcher (DINOv3 ViT-L/16, MV-ViT, DPT head, conv refiners) | `bf16`, `int8`, **`fp8`** |
-| `roma`, `roma-indoor` | RoMa (v1) dense matcher (VGG19-BN, DINOv2 ViT-L/14, GP + Transformer decoder, conv refiners; `roma` = outdoor) | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `roma`, `roma-indoor`, `minima-roma` | RoMa (v1) dense matcher (VGG19-BN, DINOv2 ViT-L/14, GP + Transformer decoder, conv refiners; `roma` = outdoor, `minima-roma` = MINIMA modality-invariant weights) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `tiny-roma` | Tiny-RoMa dense matcher (`tiny_roma_v1_outdoor`: XFeat backbone + coarse/fine conv refiners) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | [`rdd`](models/rdd.md) | RDD sparse detector + descriptor (ConvNeXt-tiny, multi-scale deformable transformer) | `fp32`, `bf16`, **`fp8`** |
 | [`aliked`](models/aliked.md) | ALIKED sparse detector + descriptor (deformable-conv encoder, SDDH) | **`fp32`**, `bf16` |
@@ -25,7 +25,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | `dedode-g` | DeDoDe v2 detector L + descriptor G (VGG19 + DINOv2 ViT-L/14) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `dad` | DaD detector (VGG11) + DeDoDe-G descriptors | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `ripe` | RIPE (VGG19 + ConvRefiner heatmap, hypercolumn 256-d descriptors) | `fp32`, **`bf16`**, `int8`, `fp8` |
-| `loftr` | LoFTR detector-free, semi-dense matcher (variants `outdoor`, `indoor`); `match(a, b)` only | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `loftr`, `minima-loftr` | LoFTR detector-free, semi-dense matcher (variants `outdoor`, `indoor`, `minima`); `match(a, b)` only | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `eloftr` | EfficientLoFTR detector-free, semi-dense matcher (RepVGG + aggregated RoPE attention; variants `full`, `opt`); `match(a, b)` only | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `xoftr` | XoFTR cross-modal (visible-thermal) detector-free matcher (default 640 px); `match(a, b)` only | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `sift`, `orb` | OpenCV baselines (CPU detection, GPU matching) | `fp32` |

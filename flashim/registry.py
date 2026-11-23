@@ -8,6 +8,7 @@ from flashim.build import register_spec
 SPECS = {
     "roma": "flashim.models.roma.spec:SPEC",
     "roma-indoor": "flashim.models.roma.spec:SPEC_INDOOR",
+    "minima-roma": "flashim.models.roma.spec:SPEC_MINIMA",
     "romav2": "flashim.models.romav2.spec:SPEC",
     "tiny-roma": "flashim.models.tiny_roma.spec:SPEC",
     "rdd": "flashim.models.rdd.spec:SPEC",
@@ -29,6 +30,7 @@ SPECS = {
     "loftr": "flashim.models.loftr.spec:SPEC",
     "eloftr": "flashim.models.eloftr.spec:SPEC",
     "xoftr": "flashim.models.xoftr.spec:SPEC",
+    "minima-loftr": "flashim.models.loftr.spec:SPEC_MINIMA",
     "sift": "flashim.models.sift.spec:SPEC",
     "orb": "flashim.models.orb.spec:SPEC",
     "xfeat-lightglue": "flashim.models.lightglue.spec:XFEAT_LIGHTGLUE",

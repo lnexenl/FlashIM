@@ -69,4 +69,4 @@ def test_every_model_pins_its_release():
                 assert checkpoint.url.startswith("https://"), checkpoint
                 assert re.fullmatch(r"[0-9a-f]{64}", checkpoint.sha256), checkpoint
                 assert found.setdefault(checkpoint.filename, checkpoint.sha256) == checkpoint.sha256, checkpoint
-    assert len(found) == 41
+    assert len(found) == 43

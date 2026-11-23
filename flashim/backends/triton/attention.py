@@ -667,164 +667,231 @@ ops.bidirectional_cross_attention.register(
 
 
 @triton.jit
-def _elu_linear_kv_kernel(
-    k_ptr,
-    v_ptr,
-    kv_part_ptr,
-    ksum_part_ptr,
-    ks_b,
-    ks_s,
-    ks_h,
-    vs_b,
-    vs_s,
-    vs_h,
-    H,
-    S,
-    inv_s,
-    SPLITS: tl.constexpr,
-    D: tl.constexpr,
-    BLOCK_S: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BF16_GEMM: tl.constexpr,
+def _linear_attn_small_kernel(
+    q_ptr, k_ptr, v_ptr, out_ptr,
+    qs_n, qs_l, qs_h, ks_n, ks_s, ks_h, vs_n, vs_s, vs_h,
+    H, L, S, eps,
+    D: tl.constexpr, V: tl.constexpr,
+    BLOCK_L: tl.constexpr, BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_V: tl.constexpr,
+    BF16_DOT: tl.constexpr,
 ):
-    bh = tl.program_id(0).to(tl.int64)
-    split = tl.program_id(1)
-    b = bh // H
-    h = bh - b * H
-    chunk = (S + SPLITS - 1) // SPLITS
-    s_start = split * chunk
-    s_end = tl.minimum(s_start + chunk, S)
-
+    """Single-pass ELU+1 linear attention for short sequences (``L, S <= 64``, e.g. LoFTR fine 5x5 windows)."""
+    nh = tl.program_id(0)
+    n = (nh // H).to(tl.int64)
+    h = (nh % H).to(tl.int64)
+    l_idx = tl.arange(0, BLOCK_L)
+    s_idx = tl.arange(0, BLOCK_S)
     d_idx = tl.arange(0, BLOCK_D)
+    v_idx = tl.arange(0, BLOCK_V)
+    l_ok = l_idx < L
+    s_ok = s_idx < S
     d_ok = d_idx < D
-    kv_acc = tl.zeros((BLOCK_D, BLOCK_D), dtype=tl.float32)
-    ksum_acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    v_ok = v_idx < V
 
-    for s0 in range(s_start, s_end, BLOCK_S):
-        s_idx = s0 + tl.arange(0, BLOCK_S)
-        s_ok = s_idx < s_end
-        mask = s_ok[:, None] & d_ok[None, :]
-        k = tl.load(k_ptr + b * ks_b + s_idx[:, None] * ks_s + h * ks_h + d_idx[None, :], mask=mask, other=0.0).to(
-            tl.float32
-        )
-        v = tl.load(v_ptr + b * vs_b + s_idx[:, None] * vs_s + h * vs_h + d_idx[None, :], mask=mask, other=0.0).to(
-            tl.float32
-        )
-        phi_k = tl.where(s_ok[:, None] & d_ok[None, :], tl.where(k > 0.0, k + 1.0, tl.exp(k)), 0.0)
-        ksum_acc += tl.sum(phi_k, axis=0)
-        v_scaled = v * inv_s
-        if BF16_GEMM:
-            kv_acc += tl.dot(tl.trans(phi_k.to(tl.bfloat16)), v_scaled.to(tl.bfloat16))
-        else:
-            kv_acc += tl.dot(tl.trans(phi_k), v_scaled, input_precision="ieee")
+    k_ptrs = k_ptr + n * ks_n + h * ks_h + s_idx[:, None].to(tl.int64) * ks_s + d_idx[None, :]
+    v_ptrs = v_ptr + n * vs_n + h * vs_h + s_idx[:, None].to(tl.int64) * vs_s + v_idx[None, :]
+    k = tl.load(k_ptrs, mask=s_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
+    v = tl.load(v_ptrs, mask=s_ok[:, None] & v_ok[None, :], other=0.0).to(tl.float32)
+    # elu(x) + 1 = x + 1 for x > 0 else exp(x); zero out padded positions after the feature map.
+    kf = tl.where(s_ok[:, None] & d_ok[None, :], tl.where(k > 0.0, k + 1.0, tl.exp(k)), 0.0)
+    k_sum = tl.sum(kf, axis=0)
+    inv_s = 1.0 / S
+    v_scaled = v * inv_s
+    if BF16_DOT:
+        kv = tl.dot(tl.trans(kf.to(tl.bfloat16)), v_scaled.to(tl.bfloat16))
+    else:
+        kv = tl.dot(tl.trans(kf), v_scaled, input_precision="ieee")
 
-    part_id = bh * SPLITS + split
-    tl.store(
-        kv_part_ptr + part_id * (D * D) + d_idx[:, None] * D + d_idx[None, :],
-        kv_acc,
-        mask=d_ok[:, None] & d_ok[None, :],
-    )
-    tl.store(ksum_part_ptr + part_id * D + d_idx, ksum_acc, mask=d_ok)
+    q_ptrs = q_ptr + n * qs_n + h * qs_h + l_idx[:, None].to(tl.int64) * qs_l + d_idx[None, :]
+    q = tl.load(q_ptrs, mask=l_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
+    qf = tl.where(l_ok[:, None] & d_ok[None, :], tl.where(q > 0.0, q + 1.0, tl.exp(q)), 0.0)
+    denom = tl.sum(qf * k_sum[None, :], axis=1) + eps
+    if BF16_DOT:
+        acc = tl.dot(qf.to(tl.bfloat16), kv.to(tl.bfloat16))
+    else:
+        acc = tl.dot(qf, kv, input_precision="ieee")
+    out = acc * (S / denom)[:, None]
+    out_ptrs = out_ptr + ((n * L + l_idx[:, None].to(tl.int64)) * H + h) * V + v_idx[None, :]
+    tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=l_ok[:, None] & v_ok[None, :])
 
 
 @triton.jit
-def _elu_linear_q_kernel(
-    q_ptr,
-    kv_ptr,
-    ksum_ptr,
-    out_ptr,
-    qs_b,
-    qs_l,
-    qs_h,
-    os_b,
-    os_l,
-    os_h,
-    H,
-    L,
-    S_f,
-    eps,
-    D: tl.constexpr,
-    BLOCK_L: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BF16_GEMM: tl.constexpr,
+def _linear_attn_kv_split_kernel(
+    k_ptr, v_ptr, partial_kv_ptr, partial_ksum_ptr,
+    ks_n, ks_s, ks_h, vs_n, vs_s, vs_h,
+    H, S, NUM_SPLITS,
+    D: tl.constexpr, V: tl.constexpr,
+    BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_V: tl.constexpr,
+    BF16_DOT: tl.constexpr,
 ):
-    l_block = tl.program_id(0)
-    bh = tl.program_id(1).to(tl.int64)
-    b = bh // H
-    h = bh - b * H
-    l_idx = l_block * BLOCK_L + tl.arange(0, BLOCK_L)
+    """Split-S accumulation of ``k_sum = sum_s (elu(k) + 1)`` and ``kv = sum_s (elu(k) + 1)^T (v / S)``."""
+    split = tl.program_id(0)
+    nh = tl.program_id(1)
+    n = (nh // H).to(tl.int64)
+    h = (nh % H).to(tl.int64)
     d_idx = tl.arange(0, BLOCK_D)
+    v_idx = tl.arange(0, BLOCK_V)
+    d_ok = d_idx < D
+    v_ok = v_idx < V
+    inv_s = 1.0 / S
+
+    k_sum = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    kv = tl.zeros((BLOCK_D, BLOCK_V), dtype=tl.float32)
+    k_base = k_ptr + n * ks_n + h * ks_h
+    v_base = v_ptr + n * vs_n + h * vs_h
+
+    step = NUM_SPLITS * BLOCK_S
+    for s0 in range(split * BLOCK_S, S, step):
+        s_idx = s0 + tl.arange(0, BLOCK_S)
+        s_ok = s_idx < S
+        k = tl.load(k_base + s_idx[:, None].to(tl.int64) * ks_s + d_idx[None, :], mask=s_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
+        v = tl.load(v_base + s_idx[:, None].to(tl.int64) * vs_s + v_idx[None, :], mask=s_ok[:, None] & v_ok[None, :], other=0.0).to(tl.float32)
+        kf = tl.where(s_ok[:, None] & d_ok[None, :], tl.where(k > 0.0, k + 1.0, tl.exp(k)), 0.0)
+        k_sum += tl.sum(kf, axis=0)
+        v_scaled = v * inv_s
+        if BF16_DOT:
+            kv += tl.dot(tl.trans(kf.to(tl.bfloat16)), v_scaled.to(tl.bfloat16))
+        else:
+            kv += tl.dot(tl.trans(kf), v_scaled, input_precision="ieee")
+
+    slot = nh.to(tl.int64) * NUM_SPLITS + split
+    tl.store(partial_ksum_ptr + slot * BLOCK_D + d_idx, k_sum, mask=d_ok)
+    tl.store(
+        partial_kv_ptr + slot * (BLOCK_D * BLOCK_V) + d_idx[:, None] * BLOCK_V + v_idx[None, :],
+        kv,
+        mask=d_ok[:, None] & v_ok[None, :],
+    )
+
+
+@triton.jit
+def _linear_attn_reduce_kernel(
+    partial_kv_ptr, partial_ksum_ptr, kv_ptr, ksum_ptr,
+    NUM_SPLITS, BLOCK_D: tl.constexpr, BLOCK_V: tl.constexpr,
+):
+    nh = tl.program_id(0).to(tl.int64)
+    d_idx = tl.arange(0, BLOCK_D)
+    v_idx = tl.arange(0, BLOCK_V)
+    k_sum = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    kv = tl.zeros((BLOCK_D, BLOCK_V), dtype=tl.float32)
+    for split in range(NUM_SPLITS):
+        slot = nh * NUM_SPLITS + split
+        k_sum += tl.load(partial_ksum_ptr + slot * BLOCK_D + d_idx)
+        kv += tl.load(partial_kv_ptr + slot * (BLOCK_D * BLOCK_V) + d_idx[:, None] * BLOCK_V + v_idx[None, :])
+    tl.store(ksum_ptr + nh * BLOCK_D + d_idx, k_sum)
+    tl.store(kv_ptr + nh * (BLOCK_D * BLOCK_V) + d_idx[:, None] * BLOCK_V + v_idx[None, :], kv)
+
+
+@triton.jit
+def _linear_attn_q_kernel(
+    q_ptr, kv_ptr, ksum_ptr, out_ptr,
+    qs_n, qs_l, qs_h,
+    H, L, S, eps,
+    D: tl.constexpr, V: tl.constexpr,
+    BLOCK_L: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_V: tl.constexpr,
+    BF16_DOT: tl.constexpr,
+):
+    """``((elu(q) + 1) @ kv) * (S / ((elu(q) + 1) . k_sum + eps))`` in one fused pass over ``q``."""
+    pid_l = tl.program_id(0)
+    nh = tl.program_id(1)
+    n = (nh // H).to(tl.int64)
+    h = (nh % H).to(tl.int64)
+    l_idx = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    d_idx = tl.arange(0, BLOCK_D)
+    v_idx = tl.arange(0, BLOCK_V)
     l_ok = l_idx < L
     d_ok = d_idx < D
-    mask = l_ok[:, None] & d_ok[None, :]
+    v_ok = v_idx < V
 
-    kv = tl.load(kv_ptr + bh * (D * D) + d_idx[:, None] * D + d_idx[None, :], mask=d_ok[:, None] & d_ok[None, :], other=0.0)
-    ksum = tl.load(ksum_ptr + bh * D + d_idx, mask=d_ok, other=0.0)
-    q = tl.load(q_ptr + b * qs_b + l_idx[:, None] * qs_l + h * qs_h + d_idx[None, :], mask=mask, other=0.0).to(tl.float32)
-    phi_q = tl.where(q > 0.0, q + 1.0, tl.exp(q))
-    z = S_f / (tl.sum(phi_q * ksum[None, :], axis=1) + eps)
-    if BF16_GEMM:
-        out = tl.dot(phi_q.to(tl.bfloat16), kv.to(tl.bfloat16)) * z[:, None]
+    k_sum = tl.load(ksum_ptr + nh.to(tl.int64) * BLOCK_D + d_idx, mask=d_ok, other=0.0)
+    kv = tl.load(
+        kv_ptr + nh.to(tl.int64) * (BLOCK_D * BLOCK_V) + d_idx[:, None] * BLOCK_V + v_idx[None, :],
+        mask=d_ok[:, None] & v_ok[None, :],
+        other=0.0,
+    )
+    q_ptrs = q_ptr + n * qs_n + h * qs_h + l_idx[:, None].to(tl.int64) * qs_l + d_idx[None, :]
+    q = tl.load(q_ptrs, mask=l_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
+    qf = tl.where(l_ok[:, None] & d_ok[None, :], tl.where(q > 0.0, q + 1.0, tl.exp(q)), 0.0)
+    denom = tl.sum(qf * k_sum[None, :], axis=1) + eps
+    if BF16_DOT:
+        acc = tl.dot(qf.to(tl.bfloat16), kv.to(tl.bfloat16))
     else:
-        out = tl.dot(phi_q, kv, input_precision="ieee") * z[:, None]
-    tl.store(out_ptr + b * os_b + l_idx[:, None] * os_l + h * os_h + d_idx[None, :], out.to(out_ptr.dtype.element_ty), mask=mask)
+        acc = tl.dot(qf, kv, input_precision="ieee")
+    out = acc * (S / denom)[:, None]
+    out_ptrs = out_ptr + ((n * L + l_idx[:, None].to(tl.int64)) * H + h) * V + v_idx[None, :]
+    tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=l_ok[:, None] & v_ok[None, :])
 
 
 def elu_linear_attention(
     q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6, gemm_dtype: torch.dtype | None = None
 ) -> Tensor:
-    batch, seq_l, heads, dim = q.shape
-    seq_s = k.shape[1]
-    bf16_gemm = gemm_dtype == torch.bfloat16
-    splits = 16 if seq_s >= 1024 else 1
-    block_d = max(16, triton.next_power_of_2(dim))
-    kv_part = torch.empty((batch * heads, splits, dim, dim), device=q.device, dtype=torch.float32)
-    ksum_part = torch.empty((batch * heads, splits, dim), device=q.device, dtype=torch.float32)
-    _elu_linear_kv_kernel[(batch * heads, splits)](
-        k,
-        v,
-        kv_part,
-        ksum_part,
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        heads,
-        seq_s,
-        1.0 / seq_s,
-        SPLITS=splits,
-        D=dim,
-        BLOCK_S=128,
-        BLOCK_D=block_d,
-        BF16_GEMM=bf16_gemm,
-        num_warps=4,
-    )
-    kv = kv_part.sum(dim=1) if splits > 1 else kv_part[:, 0]
-    ksum = ksum_part.sum(dim=1) if splits > 1 else ksum_part[:, 0]
-    out = torch.empty((batch, seq_l, heads, dim), device=q.device, dtype=q.dtype)
-    block_l = 64
-    _elu_linear_q_kernel[(triton.cdiv(seq_l, block_l), batch * heads)](
-        q,
-        kv,
-        ksum,
-        out,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        heads,
-        seq_l,
-        float(seq_s),
-        eps,
-        D=dim,
-        BLOCK_L=block_l,
-        BLOCK_D=block_d,
-        BF16_GEMM=bf16_gemm,
-        num_warps=4,
+    """Fused ELU+1 linear attention ``[N, L, H, D]`` x ``[N, S, H, D]`` x ``[N, S, H, V]`` -> ``[N, L, H, V]``."""
+    n, seq_l, heads, d = q.shape
+    seq_s, v_dim = k.shape[1], v.shape[3]
+    device = q.device
+    out = torch.empty((n, seq_l, heads, v_dim), device=device, dtype=q.dtype)
+    if seq_l == 0 or seq_s == 0:
+        return out.zero_()
+
+    block_d = max(16, triton.next_power_of_2(d))
+    block_v = max(16, triton.next_power_of_2(v_dim))
+    bf16_dot = gemm_dtype == torch.bfloat16
+
+    if seq_l <= 64 and seq_s <= 64:
+        block_l = max(16, triton.next_power_of_2(seq_l))
+        block_s = max(16, triton.next_power_of_2(seq_s))
+        _linear_attn_small_kernel[(n * heads,)](
+            q, k, v, out,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            heads, seq_l, seq_s, float(eps),
+            D=d, V=v_dim, BLOCK_L=block_l, BLOCK_S=block_s, BLOCK_D=block_d, BLOCK_V=block_v,
+            BF16_DOT=bf16_dot, num_warps=4,
+        )
+        return out
+
+    # Swept over BLOCK_S/BLOCK_L in {64, 128, 256}, splits in {8, 16, 32}, warps in {4, 8} on sm_120
+    # for (1, 8190, 8, 32) BF16: (64, 128, 32, 4) measured 31.4 us (vs 196 us BF16 torch, 382 us FP32).
+    block_s = 64
+    block_l = 64 if (not bf16_dot and max(block_d, block_v) > 32) else 128
+    max_splits = 32 if n * heads <= 16 else 8
+    num_splits = max(1, min(triton.cdiv(seq_s, block_s), max_splits))
+
+    if num_splits == 1:
+        kv = torch.empty((n * heads, block_d, block_v), device=device, dtype=torch.float32)
+        k_sum = torch.empty((n * heads, block_d), device=device, dtype=torch.float32)
+        _linear_attn_kv_split_kernel[(1, n * heads)](
+            k, v, kv, k_sum,
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            heads, seq_s, 1,
+            D=d, V=v_dim, BLOCK_S=block_s, BLOCK_D=block_d, BLOCK_V=block_v,
+            BF16_DOT=bf16_dot, num_warps=4,
+        )
+    else:
+        partial_kv = torch.empty((n * heads, num_splits, block_d, block_v), device=device, dtype=torch.float32)
+        partial_ksum = torch.empty((n * heads, num_splits, block_d), device=device, dtype=torch.float32)
+        _linear_attn_kv_split_kernel[(num_splits, n * heads)](
+            k, v, partial_kv, partial_ksum,
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            heads, seq_s, num_splits,
+            D=d, V=v_dim, BLOCK_S=block_s, BLOCK_D=block_d, BLOCK_V=block_v,
+            BF16_DOT=bf16_dot, num_warps=4,
+        )
+        kv = torch.empty((n * heads, block_d, block_v), device=device, dtype=torch.float32)
+        k_sum = torch.empty((n * heads, block_d), device=device, dtype=torch.float32)
+        _linear_attn_reduce_kernel[(n * heads,)](
+            partial_kv, partial_ksum, kv, k_sum,
+            num_splits, BLOCK_D=block_d, BLOCK_V=block_v, num_warps=4,
+        )
+
+    _linear_attn_q_kernel[(triton.cdiv(seq_l, block_l), n * heads)](
+        q, kv, k_sum, out,
+        q.stride(0), q.stride(1), q.stride(2),
+        heads, seq_l, seq_s, float(eps),
+        D=d, V=v_dim, BLOCK_L=block_l, BLOCK_D=block_d, BLOCK_V=block_v,
+        BF16_DOT=bf16_dot, num_warps=4,
     )
     return out
 
@@ -832,22 +899,21 @@ def elu_linear_attention(
 def _elu_linear_attn_eligible(
     q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6, gemm_dtype: torch.dtype | None = None
 ) -> bool:
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
+        return False  # forward-only kernel
     return (
-        not torch.is_grad_enabled()
-        and q.ndim == 4
-        and k.ndim == 4
-        and v.shape == k.shape
-        and q.shape[0] == k.shape[0]
-        and q.shape[2] == k.shape[2]
+        q.ndim == k.ndim == v.ndim == 4
+        and q.shape[0] == k.shape[0] == v.shape[0]
+        and q.shape[2] == k.shape[2] == v.shape[2]
+        and k.shape[1] == v.shape[1]
         and q.shape[3] == k.shape[3]
         and q.dtype in _FLOATS
         and k.dtype in _FLOATS
         and v.dtype in _FLOATS
         and gemm_dtype in (None, torch.bfloat16)
-        and q.stride(-1) == 1
-        and k.stride(-1) == 1
-        and v.stride(-1) == 1
+        and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
         and 0 < q.shape[3] <= 64
+        and 0 < v.shape[3] <= 64
     )
 
 

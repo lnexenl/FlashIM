@@ -58,7 +58,7 @@ m.indices_A, m.features_A                                    # match indices int
 loma = flashim.load("loma-g")                                # LoMa: DaD + LoMa descriptors + matcher (b128, b, l, g, r)
 m = loma.match("a.jpg", "b.jpg", max_matches=4096)           # 4096 keypoints per image (default 2048)
 
-roma = flashim.load("roma")                                  # RoMa (v1) dense matcher (outdoor; "roma-indoor" for indoor)
+roma = flashim.load("roma")                                  # RoMa (v1) dense matcher (outdoor; "roma-indoor", "minima-roma")
 m = roma.match("a.jpg", "b.jpg", max_matches=5000)           # 5000 balanced samples of the dense warp (560 -> 864)
 
 tiny = flashim.load("tiny-roma", "int8")                     # Tiny-RoMa dense matcher (fp32, bf16, int8, fp8)
@@ -69,6 +69,9 @@ m = eloftr.match("a.jpg", "b.jpg", resize=832)               # semi-dense matche
 
 xoftr = flashim.load("xoftr")                                # XoFTR: cross-modal visible-thermal matcher (default 640 px)
 m = xoftr.match("a.jpg", "b.jpg")                            # Matches at original image resolution
+
+minima = flashim.load("minima-loftr")                        # MINIMA modality-invariant LoFTR ("minima-roma" for RoMa)
+m = minima.match("a.jpg", "b.jpg", resize=840)               # cross-modal & RGB semi-dense matches
 
 sg = flashim.load("superpoint-superglue")                    # SuperPoint + SuperGlue (outdoor default; variant indoor)
 m = sg.match("a.jpg", "b.jpg", resize=1024)                  # 1024 keypoints per image, match_threshold=0.2
@@ -167,10 +170,11 @@ The package's license expression is therefore `Apache-2.0 AND MIT AND LicenseRef
 from their publishers, never shipped, and keep their upstream licenses, some more restrictive than Apache-2.0: the RoMaV2
 checkpoint contains DINOv3 weights (DINOv3 License), SuperPoint, SuperGlue (Magic Leap academic/non-profit
 non-commercial research only) and RIPE are for non-commercial use only; RoMa (v1) is MIT with frozen DINOv2 weights
-(Apache-2.0); LoMa is MIT except its LightGlue-derived matcher (Apache-2.0), and its checkpoints hold DINOv2
-(Apache-2.0); EfficientLoFTR's mirror weights (`vismatch/eloftr`) and vendored test oracle (`ffd4a46440`) are
-Apache-2.0, while upstream `zju3dv/EfficientLoFTR` re-licensed to the ZJU3DV Project Registration License (PRL) v1.0 on
-2026-09-15 (commit `07e9c1401e`). Details, and
+(Apache-2.0); MINIMA (`minima-loftr`, `minima-roma`) is Apache-2.0 (with frozen DINOv2 Apache-2.0 for `minima-roma`);
+LoMa is MIT except its LightGlue-derived matcher (Apache-2.0), and its checkpoints hold DINOv2 (Apache-2.0);
+EfficientLoFTR's mirror weights (`vismatch/eloftr`) and vendored test oracle (`ffd4a46440`) are Apache-2.0, while
+upstream `zju3dv/EfficientLoFTR` re-licensed to the ZJU3DV Project Registration License (PRL) v1.0 on 2026-09-15
+(commit `07e9c1401e`). Details, and
 the licenses of vendored test code and assets: [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl/FlashIM/blob/main/THIRD_PARTY_NOTICES.md).
 
 <p align="center">

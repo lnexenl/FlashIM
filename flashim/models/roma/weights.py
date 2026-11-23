@@ -10,6 +10,7 @@ from flashim.models.dedode.weights import CHECKPOINTS as _DEDODE_CHECKPOINTS
 from flashim.models.weights_util import Checkpoint, find_weights
 
 RELEASES = "https://github.com/Parskatt/storage/releases/download/roma"
+MINIMA_RELEASES = "https://github.com/LSXI7/storage/releases/download/MINIMA"
 
 CHECKPOINTS = {
     "outdoor": Checkpoint(
@@ -22,19 +23,24 @@ CHECKPOINTS = {
         f"{RELEASES}/roma_indoor.pth",
         "4d3dca889ae1ef245123dc62aab914475c7bbf41f2c8002606450fb6cf2d91e6",
     ),
+    "minima": Checkpoint(
+        "minima_roma.pth",
+        f"{MINIMA_RELEASES}/minima_roma.pth",
+        "17f3923bd780e8f1450792706e0643f70c8864ad11bf5fd4f2b54714bac23538",
+    ),
 }
 DINOV2 = _DEDODE_CHECKPOINTS["dinov2"]
 
 LICENSES = {
     "code": "MIT (Parskatt/RoMa); DINOv2 Apache-2.0; FlashIM re-implementation",
-    "weights": "RoMa outdoor / indoor (MIT), DINOv2 ViT-L/14 (Apache-2.0, frozen)",
+    "weights": "RoMa outdoor / indoor (MIT), MINIMA-RoMa (Apache-2.0, LSXI7/MINIMA), DINOv2 ViT-L/14 (Apache-2.0, frozen)",
 }
 
 
 def load_state_dict(
     variant: str = "outdoor", path: str | Path | None = None, map_location: str | torch.device = "cpu"
 ) -> dict[str, torch.Tensor]:
-    """``roma_{outdoor,indoor}.pth`` from ``checkpoint`` / ``$FLASHIM_ROMA_CHECKPOINT`` or the torch hub cache."""
+    """``roma_{outdoor,indoor}.pth`` or ``minima_roma.pth`` from ``checkpoint`` / ``$FLASHIM_ROMA_CHECKPOINT`` or hub."""
     if variant not in CHECKPOINTS:
         raise ValueError(f"Unknown RoMa variant {variant!r}; choose from {sorted(CHECKPOINTS)}")
     file = find_weights(CHECKPOINTS[variant], path=path, env="FLASHIM_ROMA_CHECKPOINT")

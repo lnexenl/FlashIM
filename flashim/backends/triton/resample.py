@@ -21,9 +21,12 @@ from flashim.quant.tensor import Int8Tensor
 
 
 @triton.jit
-def _bilinear_source(dst, n_in, scale):
-    """PyTorch's ``align_corners=False`` source index: ``max(scale * (dst + 0.5) - 0.5, 0)``, its two taps, weights."""
-    src = tl.maximum(scale * (dst.to(tl.float32) + 0.5) - 0.5, 0.0)
+def _bilinear_source(dst, n_in, scale, ALIGN_CORNERS: tl.constexpr = False):
+    """PyTorch's bilinear source index (``align_corners=False`` or ``True``), its two taps, and linear weights."""
+    if ALIGN_CORNERS:
+        src = dst.to(tl.float32) * scale
+    else:
+        src = tl.maximum(scale * (dst.to(tl.float32) + 0.5) - 0.5, 0.0)
     i0 = src.to(tl.int32)
     i1 = tl.where(i0 < n_in - 1, i0 + 1, i0)
     lam1 = src - i0.to(tl.float32)
@@ -108,9 +111,62 @@ def upsample_concat_int8(features: Tensor, coarse: Tensor, scale: Tensor) -> Int
     return Int8Tensor(_launch(coarse, features, out, concat=True, scale=scale), scale)
 
 
-def upsample_add(coarse: Tensor, delta: Tensor) -> Tensor:
-    out = torch.empty(delta.shape, device=delta.device, dtype=torch.float32, memory_format=torch.channels_last)
-    return _launch(coarse, delta, out, concat=False)
+@triton.jit
+def _upsample_add_nhwc_kernel(
+    coarse_ptr, other_ptr, out_ptr,
+    H, W, h, w, scale_h, scale_w,
+    cs_b, cs_c, cs_h, cs_w, os_b, os_c, os_h, os_w,
+    C: tl.constexpr, BLOCK_X: tl.constexpr, PC: tl.constexpr,
+    ALIGN_CORNERS: tl.constexpr, ROUND_BF16: tl.constexpr,
+):
+    """Row-wise bilinear upsample + add for channels-last output (supports ``align_corners=True`` and BF16 output)."""
+    row = tl.program_id(1)
+    b = (row // H).to(tl.int64)
+    y = row % H
+    x = tl.program_id(0) * BLOCK_X + tl.arange(0, BLOCK_X)
+    x_ok = x < W
+    x = tl.where(x_ok, x, 0)
+    y0, y1, ly0, ly1 = _bilinear_source(y, h, scale_h, ALIGN_CORNERS)
+    x0, x1, lx0, lx1 = _bilinear_source(x, w, scale_w, ALIGN_CORNERS)
+    base = coarse_ptr + b * cs_b
+    r0, r1 = base + y0.to(tl.int64) * cs_h, base + y1.to(tl.int64) * cs_h
+    c = tl.arange(0, PC)
+    m = x_ok[:, None] & (c < C)[None, :]
+    cc = c[None, :] * cs_c
+    v00 = tl.load(r0 + (x0 * cs_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v01 = tl.load(r0 + (x1 * cs_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v10 = tl.load(r1 + (x0 * cs_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v11 = tl.load(r1 + (x1 * cs_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    d = tl.load(other_ptr + b * os_b + y.to(tl.int64) * os_h + (x.to(tl.int64) * os_w)[:, None] + c[None, :] * os_c,
+                mask=m, other=0.0).to(tl.float32)
+    lx0, lx1 = lx0[:, None], lx1[:, None]
+    sample = ly0 * (lx0 * v00 + lx1 * v01) + ly1 * (lx0 * v10 + lx1 * v11)
+    if ROUND_BF16:
+        value = sample.to(tl.bfloat16) + d.to(tl.bfloat16)
+    else:
+        value = (sample + d).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + ((row.to(tl.int64) * W + x) * C)[:, None] + c[None, :], value, mask=m)
+
+
+def upsample_add(
+    coarse: Tensor, delta: Tensor, *, align_corners: bool = False, out_dtype: torch.dtype | None = None
+) -> Tensor:
+    if not align_corners and out_dtype is None:
+        out = torch.empty(delta.shape, device=delta.device, dtype=torch.float32, memory_format=torch.channels_last)
+        return _launch(coarse, delta, out, concat=False)
+    batch, channels, height, width = delta.shape
+    h, w = coarse.shape[2:]
+    dtype = out_dtype or torch.float32
+    out = torch.empty(delta.shape, device=delta.device, dtype=dtype, memory_format=torch.channels_last)
+    scale_h = (h - 1) / (height - 1) if (align_corners and height > 1) else (0.0 if align_corners else h / height)
+    scale_w = (w - 1) / (width - 1) if (align_corners and width > 1) else (0.0 if align_corners else w / width)
+    block_x = 8 if channels >= 256 else 16
+    _upsample_add_nhwc_kernel[(triton.cdiv(width, block_x), batch * height)](
+        coarse, delta, out, height, width, h, w, scale_h, scale_w, *coarse.stride(), *delta.stride(),
+        C=channels, BLOCK_X=block_x, PC=triton.next_power_of_2(channels),
+        ALIGN_CORNERS=align_corners, ROUND_BF16=dtype == torch.bfloat16, num_warps=4,
+    )
+    return out
 
 
 # -- exact 2x upsampling at the memory roofline (sm_89 / sm_90) ---------------------------------------------------------
@@ -273,8 +329,14 @@ def _eligible_concat(features: Tensor, coarse: Tensor) -> bool:
     return features.ndim == 4 and coarse.ndim == 4 and features.shape[0] == coarse.shape[0] and features.is_cuda
 
 
-def _eligible_add(coarse: Tensor, delta: Tensor) -> bool:
-    return coarse.ndim == 4 and delta.ndim == 4 and coarse.shape[:2] == delta.shape[:2] and delta.is_cuda
+def _eligible_add(
+    coarse: Tensor, delta: Tensor, *, align_corners: bool = False, out_dtype: torch.dtype | None = None
+) -> bool:
+    if not (coarse.ndim == 4 and delta.ndim == 4 and coarse.shape[:2] == delta.shape[:2] and delta.is_cuda):
+        return False
+    if align_corners or out_dtype is not None:
+        return delta.shape[1] <= 512 and (out_dtype in (None, torch.float32, torch.bfloat16, torch.float16))
+    return True
 
 
 ops.upsample_concat.register(
@@ -294,7 +356,11 @@ def _rows_eligible_concat(features: Tensor, coarse: Tensor, scale: Tensor) -> bo
     )
 
 
-def _rows_eligible_add(coarse: Tensor, delta: Tensor) -> bool:
+def _rows_eligible_add(
+    coarse: Tensor, delta: Tensor, *, align_corners: bool = False, out_dtype: torch.dtype | None = None
+) -> bool:
+    if align_corners or out_dtype is not None:
+        return False
     # Wide channels-last maps only (the decoders' 256-channel deltas; with 64 channels the row kernel differs in the last bit on sm_90). With NCHW operands the tile kernel's codegen
     # contracts the FP32 sum differently (last-bit differences), and with 1 channel (RIPE's logit map) the row kernel
     # differs from it in the last bit too and is 8x slower (a 1-wide channel tile).
