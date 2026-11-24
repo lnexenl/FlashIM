@@ -1,9 +1,16 @@
-"""Relative-pose accuracy of a FlashIM sparse matcher on MegaDepth-1500.
+"""Relative-pose accuracy of a FlashIM matcher on MegaDepth-1500 or ScanNet-1500 via ``model.match``.
 
-Unified sparse protocol (one setting for every model, so results compare across models): per pair one
-``match`` at a 1200px long side with 4096 keypoints per image and each model's own matcher, keypoints
-mapped back to the *original* images' intrinsics; poselib essential-matrix LO-RANSAC with a 1.0px
-threshold (``--estimator poselib --ransac-thr 1.0``); AUC@5/10/20 of ``max(e_t, e_R)``.
+Unified protocol (comparable across models): per pair one ``match`` call, keypoints in the evaluation image's pixels;
+poselib essential-matrix LO-RANSAC with a 1.0px threshold (``--estimator poselib --ransac-thr 1.0``); AUC@5/10/20 of
+``max(e_t, e_R)``.
+
+- **MegaDepth-1500** (``--dataset mega1500``, default): 1200px long side and 4096 keypoints by default (override per
+  model with ``--resize`` / ``--top-k``; ``--resize 0`` leaves the model's own native working resolution untouched,
+  required for fixed-resolution dense models like RoMa), keypoints evaluated against the original images' intrinsics.
+- **ScanNet-1500** (``--dataset scannet1500``): reuses ``run.py``'s data layout (``test.npz``, ``scans_test``,
+  ``intrinsic_color.txt``, relative pose ``T``) and evaluates at the standard **640x480** ScanNet resolution: raw
+  1296x968 RGB frames are resized to 640x480 and each camera's 3x3 intrinsics ``K`` are scaled by ``(640/w0, 480/h0)``
+  so ``--ransac-thr 1.0`` is in standard 640x480 pixels and every model returns keypoints directly in 640x480 pixels.
 
 The oracles differ (XFeat: 1200px, poselib, 1.0px; RDD: 1600px, OpenCV, 0.5; LoFTR: 840px, OpenCV; DaD:
 poselib, 2.0px), so each published number needs its own setting to be reproduced: ``--resize``,
@@ -12,9 +19,11 @@ summed mean focal lengths, so ``--estimator opencv --ransac-thr 0.5`` is RDD's `
 ``--bgr`` (RDD and XFeat feed OpenCV's BGR arrays to the network; FlashIM feeds RGB by default).
 
 Seeds: poselib takes the seed; OpenCV's RANSAC ignores ``cv2.setRNGSeed``, so the OpenCV path shuffles each pair's
-matches with the seed instead (LoMa's / RoMa's MegaDepth benchmarks shuffle before each RANSAC run). OpenCV results
-before this were one RANSAC draw whatever ``--seeds`` said. ``--save-matches`` keeps every pair's matches;
-``--from-matches`` re-runs pose estimation alone on them (no GPU), e.g. with more seeds.
+matches with the seed instead (LoMa's / RoMa's MegaDepth benchmarks shuffle before each RANSAC run). For dense models
+whose ``_match`` takes a ``generator`` (RoMa, Tiny-RoMa, UFM), each pair receives a deterministic
+``torch.Generator`` seeded by ``seeds[0] + pair_index`` so presets are directly comparable on the same sampling draws.
+``--save-matches`` keeps every pair's matches; ``--from-matches`` re-runs pose estimation alone on them (no GPU),
+e.g. with more seeds.
 
 The images reach the model as PIL arrays decoded by the loader threads (the published numbers); ``--decoder`` instead
 passes each file through ``load_image(decoder=...)`` on the main thread, as ``match(path_a, path_b)`` does, to measure a
@@ -22,6 +31,8 @@ decoder's effect on accuracy (``nvjpeg`` vs ``pil``). ``--save-errors`` keeps th
 for paired bootstraps between runs.
 
     python benchmarks/accuracy/run_sparse.py --model xfeat --preset fp32 --seed 17
+    python benchmarks/accuracy/run_sparse.py --dataset scannet1500 --model roma-indoor --preset bf16 \
+        --resize 0 --top-k 5000 --seeds 17 29 42 --save-errors e.npy
     python benchmarks/accuracy/run_sparse.py --model rdd --resize 1600 --estimator opencv --ransac-thr 0.5 --bgr
     python benchmarks/accuracy/run_sparse.py --model loma-b --preset bf16 --resize 1024 --estimator opencv \
         --ransac-thr 0.5 --save-matches m.npz
@@ -37,8 +48,10 @@ import os
 os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 4))
 
 import argparse
+import inspect
 import json
 import logging
+import os.path as osp
 import sys
 import time
 from concurrent.futures import Future
@@ -47,6 +60,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
+from PIL import Image
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -64,6 +79,7 @@ from flashim.models.romav2.model import IMAGE_DECODERS, load_image
 from flashim.paths import DATA
 
 logger = logging.getLogger(__name__)
+SCANNET_WH = (640, 480)  # standard ScanNet-1500 evaluation resolution (width, height)
 
 
 def _poselib_pose(seed: int, kpts1, kpts2, K1, K2, pixel_thr: float, conf: float = 0.99999):
@@ -140,9 +156,24 @@ class MultiSeedPool:
         return [pool.errors() for pool in self.pools]
 
 
+def _accepts_generator(model) -> bool:
+    """Whether ``model._match`` takes a ``generator`` keyword (dense KDE samplers: RoMa, Tiny-RoMa, UFM)."""
+    try:
+        return "generator" in inspect.signature(model._match).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _match_pair(model, img_a, img_b, match_kwargs: dict, use_generator: bool, gen_seed: int):
+    if not use_generator:
+        return model.match(img_a, img_b, **match_kwargs)
+    gen = torch.Generator(device=model.device).manual_seed(gen_seed)
+    return model.match(img_a, img_b, **match_kwargs, generator=gen)
+
+
 def mega1500_sparse(
     model, data_root: Path, pool: PosePool, max_pairs: int, loader: dict, match_kwargs: dict, bgr: bool,
-    decoder: str = "",
+    decoder: str = "", seed_base: int = 0,
 ) -> int:
     def jobs():
         for scene_name in MEGA_SCENES:
@@ -165,11 +196,95 @@ def mega1500_sparse(
     def load(job):
         return (*job, *((None, None) if decoder else (read(job[0]), read(job[1]))))
 
+    use_gen = _accepts_generator(model)
     count = 0
     for path_a, path_b, K1, K2, R, t, img_a, img_b in tqdm(prefetch(jobs(), load, **loader), desc="mega1500", leave=False):
         if decoder:
             img_a, img_b = read(path_a), read(path_b)
-        result = model.match(img_a, img_b, **match_kwargs)
+        result = _match_pair(model, img_a, img_b, match_kwargs, use_gen, seed_base + count)
+        pool.submit(result.keypoints_A.cpu().numpy(), result.keypoints_B.cpu().numpy(), K1, K2, R, t)
+        count += 1
+    return count
+
+
+def _read_scannet_rgb(path: str, size_wh: tuple[int, int]) -> tuple[np.ndarray, int, int]:
+    """Decode RGB image and resize to ``size_wh`` ``(W, H)``, returning ``(array[H,W,3], orig_w, orig_h)``."""
+    with Image.open(path) as im:
+        rgb = im.convert("RGB")
+        orig_w, orig_h = rgb.size
+        if (orig_w, orig_h) != size_wh:
+            rgb = rgb.resize(size_wh, Image.Resampling.BILINEAR)
+        return np.asarray(rgb), orig_w, orig_h
+
+
+def scannet1500_sparse(
+    model, data_root: Path, pool: PosePool, max_pairs: int, loader: dict, match_kwargs: dict, bgr: bool,
+    decoder: str = "", seed_base: int = 0,
+) -> int:
+    """ScanNet-1500 relative pose evaluation at the standard 640x480 resolution (reuses ``run.py``'s layout)."""
+    data = np.load(osp.join(data_root, "test.npz"))
+    pairs, rel_pose = data["name"], data["rel_pose"]
+    if max_pairs > 0:
+        pairs, rel_pose = pairs[:max_pairs], rel_pose[:max_pairs]
+
+    target_w, target_h = SCANNET_WH
+    intrinsics_cache: dict[int, np.ndarray] = {}
+
+    def scene_intrinsics(scene_id: int, scene_dir: str) -> np.ndarray:
+        K = intrinsics_cache.get(scene_id)
+        if K is None:
+            with open(osp.join(scene_dir, "intrinsic", "intrinsic_color.txt")) as handle:
+                K = np.stack([np.array([float(v) for v in row.split()]) for row in handle.read().split("\n") if row])
+            K = K[:3, :3].copy()
+            intrinsics_cache[scene_id] = K
+        return K
+
+    def scale_K(K: np.ndarray, orig_w: int, orig_h: int) -> np.ndarray:
+        K_scaled = K.copy()
+        K_scaled[0, :] *= target_w / orig_w
+        K_scaled[1, :] *= target_h / orig_h
+        return K_scaled
+
+    def jobs():
+        for scene, pose in zip(pairs, rel_pose):
+            scene_id = int(scene[0])
+            scene_dir = osp.join(data_root, "scans_test", f"scene0{scene_id}_00")
+            T = pose.reshape(3, 4)
+            K = scene_intrinsics(scene_id, scene_dir)
+            yield (
+                osp.join(scene_dir, "color", f"{scene[2]}.jpg"),
+                osp.join(scene_dir, "color", f"{scene[3]}.jpg"),
+                K,
+                T[:3, :3].copy(),
+                T[:3, 3].copy(),
+            )
+
+    def read_decoded(path: str):
+        image = load_image(path, model.device, decoder)
+        orig_h, orig_w = image.shape[-2:]
+        if (orig_w, orig_h) != (target_w, target_h):
+            image = F.interpolate(image, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        return (image.flip(1) if bgr else image), orig_w, orig_h
+
+    def load(job):
+        if decoder:
+            return (*job, None, None, None, None)
+        img_a, wa, ha = _read_scannet_rgb(job[0], SCANNET_WH)
+        img_b, wb, hb = _read_scannet_rgb(job[1], SCANNET_WH)
+        if bgr:
+            img_a, img_b = np.ascontiguousarray(img_a[..., ::-1]), np.ascontiguousarray(img_b[..., ::-1])
+        return (*job, scale_K(job[2], wa, ha), scale_K(job[2], wb, hb), img_a, img_b)
+
+    use_gen = _accepts_generator(model)
+    count = 0
+    for path_a, path_b, K_raw, R, t, K1, K2, img_a, img_b in tqdm(
+        prefetch(jobs(), load, **loader), total=len(pairs), desc="scannet1500", leave=False
+    ):
+        if decoder:
+            img_a, wa, ha = read_decoded(path_a)
+            img_b, wb, hb = read_decoded(path_b)
+            K1, K2 = scale_K(K_raw, wa, ha), scale_K(K_raw, wb, hb)
+        result = _match_pair(model, img_a, img_b, match_kwargs, use_gen, seed_base + count)
         pool.submit(result.keypoints_A.cpu().numpy(), result.keypoints_B.cpu().numpy(), K1, K2, R, t)
         count += 1
     return count
@@ -211,13 +326,14 @@ def replay_matches(path: str, pool, offset: float) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dataset", choices=("mega1500", "scannet1500"), default="mega1500")
     parser.add_argument("--model", default="rdd")
     parser.add_argument("--preset", default="fp8")
     parser.add_argument("--engine", default="eager")
-    parser.add_argument("--resize", type=int, default=1200, help="long side fed to the model")
+    parser.add_argument("--resize", type=int, default=1200, help="long side fed to the model (0 = model default)")
     parser.add_argument("--top-k", type=int, default=4096, help="max_matches (0 = all)")
     parser.add_argument("--estimator", choices=("poselib", "opencv"), default="poselib")
-    parser.add_argument("--ransac-thr", type=float, default=1.0, help="inlier threshold in pixels of the original image")
+    parser.add_argument("--ransac-thr", type=float, default=1.0, help="inlier threshold in pixels of the evaluation image")
     parser.add_argument("--bgr", action="store_true", help="feed BGR like RDD's / XFeat's own benchmark scripts")
     parser.add_argument("--data-root", default="")
     parser.add_argument("--seed", type=int, default=0, help="RANSAC seed offset")
@@ -244,7 +360,8 @@ def main() -> None:
     cv2.setNumThreads(ncpu)
     torch.set_num_threads(ncpu)
     torch.backends.cudnn.benchmark = False
-    data_root = Path(args.data_root) if args.data_root else DATA / "megadepth"
+    default_root = DATA / "megadepth" if args.dataset == "mega1500" else DATA / "scannet" / "scans"
+    data_root = Path(args.data_root) if args.data_root else default_root
     started = time.time()
     seeds = args.seeds or [args.seed]
     pool = MultiSeedPool(args.workers, seeds, args.estimator, args.ransac_thr)
@@ -255,24 +372,30 @@ def main() -> None:
         extra = parse_overrides(json.loads(args.extra)) if args.extra else None
         model = flashim.load(args.model, args.preset, engine=args.engine, config=extra, overrides=args.overrides)
         recorder = MatchRecorder(pool) if args.save_matches else pool
-        pairs = mega1500_sparse(
+        runner = mega1500_sparse if args.dataset == "mega1500" else scannet1500_sparse
+        pairs = runner(
             model, data_root, recorder, args.max_pairs, {"workers": args.loaders, "depth": args.prefetch},
-            {"resize": args.resize, "max_matches": args.top_k or None}, args.bgr, args.decoder,
+            {"resize": args.resize or None, "max_matches": args.top_k or None}, args.bgr, args.decoder,
+            seed_base=seeds[0],
         )
         if args.save_matches:
             recorder.save(args.save_matches)
     errors = pool.errors()
     if args.save_errors:
+        Path(args.save_errors).parent.mkdir(parents=True, exist_ok=True)
         np.save(args.save_errors, np.asarray(errors, dtype=np.float32))
     per_seed = [summarize(e) for e in errors]
     mean = {key: float(np.mean([s[key] for s in per_seed])) for key in per_seed[0]}
+    build_report = getattr(model, "build_report", None)
     result = {
-        "dataset": "mega1500",
+        "dataset": args.dataset,
         "model": args.model,
         "preset": args.preset,
         "engine": args.engine,
-        "resize": args.resize,
+        "resize": args.resize or None,
         "top_k": args.top_k,
+        "overrides": args.overrides or None,
+        "fallbacks": dict(build_report.fallbacks) if build_report is not None else None,
         "estimator": args.estimator,
         "ransac_thr": args.ransac_thr,
         "bgr": args.bgr,
@@ -288,7 +411,7 @@ def main() -> None:
         "seconds": time.time() - started,
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
-        "flashim_git": _git(Path(__file__).parent, "rev-parse", "HEAD"),
+        "flashim_git": _git(Path(flashim.__file__).parent, "rev-parse", "HEAD"),
         "calibration": getattr(model, "calibration_metadata", None) if model is not None else None,
         "packing": model.quant_report.summary() if getattr(model, "quant_report", None) else None,
     }
