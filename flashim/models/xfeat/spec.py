@@ -28,5 +28,6 @@ SPEC = extractor_spec(
     calibration_dir=Path(__file__).parent / "calibration",
     quantized=QUANTIZED,
     protected=PROTECTED,
-    compile_regions=("block1", "block2", "block3", "block4", "block5", "block_fusion"),
+    compile_regions=("skip1", "block1", "block2", "block3", "block4", "block5", "block_fusion", "heatmap_head", "keypoint_head"),
+    cuda_graph=True,
 )

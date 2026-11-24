@@ -8,10 +8,13 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim import ops
 from flashim.layers.conv import conv_relu
 from flashim.models import sparse
 from flashim.models.superpoint import weights
 from flashim.platforms import default_device
+from flashim.quant.methods.conv2d import StaticInt8Conv2d, StaticMXFP8Conv2d
+from flashim.quant.tensor import Int8Tensor
 
 
 class SuperPoint(sparse.SparseExtractor):
@@ -24,6 +27,8 @@ class SuperPoint(sparse.SparseExtractor):
 
     div_by = 8
     fp32_modules = ()
+    fused_stem_op: ops.BoundOp | None = None  # bound ``ops.conv3x3_small_cin_relu`` (pass ``fused_stem_conv``)
+    fused_pool_epilogue: bool = False  # enabled by ``fused_pool_epilogue`` pass (int8, bit-identical)
 
     def __init__(self, descriptor_dim: int = 256, nms_radius: int = 4, detection_threshold: float = 0.0005,
                  remove_borders: int = 4) -> None:
@@ -53,13 +58,32 @@ class SuperPoint(sparse.SparseExtractor):
         model.load_state_dict(weights.load_state_dict(checkpoint), strict=True, assign=True)
         return model.to(torch.device(device or default_device())).eval()
 
+    def _conv_pool(self, conv: nn.Module, x: Tensor, consumer: nn.Module) -> Tensor:
+        if self.fused_pool_epilogue and isinstance(conv, StaticInt8Conv2d) and conv.pools_into(self.pool, consumer):
+            q, _ = conv._quantized_input(x)
+            pooled = ops.int8_conv2d_maxpool_only(
+                q.values, conv.weight_int8, conv.input_scale, conv.weight_scale, conv.bias,
+                *conv._geometry_args(), relu=True, out_scale=consumer.input_scale,
+            )
+            return Int8Tensor(pooled, consumer.input_scale)
+        return self.pool(conv_relu(conv, x))
+
     def encode(self, image: Tensor) -> Tensor:
-        x = conv_relu(self.conv1a, sparse.rgb_to_gray(image).to(self.compute_dtype), feeds=self.conv1b)
-        x = self.pool(conv_relu(self.conv1b, x))
+        gray = sparse.rgb_to_gray(image).to(self.compute_dtype)
+        if self.fused_stem_op is not None:
+            if isinstance(self.conv1b, StaticInt8Conv2d):
+                x = self.fused_stem_op(gray, out_scale=self.conv1b.input_scale)
+            elif isinstance(self.conv1b, StaticMXFP8Conv2d):
+                x = self.fused_stem_op(gray, out_exponent=self.conv1b.channel_exponent)
+            else:
+                x = self.fused_stem_op(gray)
+        else:
+            x = conv_relu(self.conv1a, gray, feeds=self.conv1b)
+        x = self._conv_pool(self.conv1b, x, self.conv2a)
         x = conv_relu(self.conv2a, x, feeds=self.conv2b)
-        x = self.pool(conv_relu(self.conv2b, x))
+        x = self._conv_pool(self.conv2b, x, self.conv3a)
         x = conv_relu(self.conv3a, x, feeds=self.conv3b)
-        x = self.pool(conv_relu(self.conv3b, x))
+        x = self._conv_pool(self.conv3b, x, self.conv4a)
         return conv_relu(self.conv4b, conv_relu(self.conv4a, x, feeds=self.conv4b))
 
     def score_map(self, x: Tensor) -> Tensor:
@@ -71,7 +95,7 @@ class SuperPoint(sparse.SparseExtractor):
     def dense_descriptors(self, x: Tensor) -> Tensor:
         return F.normalize(self.convDb(conv_relu(self.convDa, x, feeds=self.convDb)).float(), dim=1)
 
-    def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
+    def _detect_trunk(self, image: Tensor) -> tuple[Tensor, Tensor]:
         x = self.encode(image)
         scores = sparse.simple_nms(self.score_map(x), self.nms_radius)
         if self.remove_borders:
@@ -80,11 +104,15 @@ class SuperPoint(sparse.SparseExtractor):
             scores[:, :, :pad] = -1
             scores[:, -pad:] = -1
             scores[:, :, -pad:] = -1
+        return scores, self.dense_descriptors(x)
+
+    def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
+        scores, dense_desc = self._run_graphed("detect_trunk", self._detect_trunk, image)
         _, ys, xs = torch.where(scores > self.detection_threshold)
         keypoints = torch.stack((xs, ys), -1)
         keypoints, kp_scores, _ = sparse.select_top_k(keypoints, scores[0, ys, xs], top_k)
         keypoints = keypoints.float()
-        return keypoints, kp_scores, sparse.sample_descriptors(keypoints, self.dense_descriptors(x), 8)
+        return keypoints, kp_scores, sparse.sample_descriptors(keypoints, dense_desc, 8)
 
     def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
         return sparse.sample_descriptors(keypoints.float(), self.dense_descriptors(self.encode(image)), 8)

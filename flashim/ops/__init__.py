@@ -15,12 +15,19 @@ from flashim.ops._registry import (
     reset_call_counts,
     set_strict,
 )
-from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
+from flashim.ops.aliked import (
+    aliked_bilinear_sample,
+    aliked_sample_patches,
+    aliked_score_head,
+    deform_patches_int8,
+    multiscale_fuse,
+)
 from flashim.ops.attention import deformable_attention, linear_attention, rope_qk, rope_qk_interleaved, sdpa
 from flashim.ops.conv import (
     conv2d_at_points,
     conv2d_single_output,
     conv2d_small_cin_quantize_int8,
+    conv3x3_small_cin_relu,
     depthwise5x5_relu_int8,
     depthwise5x5_relu_mxfp8,
     depthwise5x5_relu_pointwise,
@@ -29,6 +36,7 @@ from flashim.ops.conv import (
     im2col_gather,
     int8_conv2d,
     int8_conv2d_maxpool,
+    int8_conv2d_maxpool_only,
     mxfp8_conv2d,
 )
 from flashim.ops.correlation import dual_softmax_mutual, local_corr, mutual_nn_match
@@ -44,6 +52,9 @@ from flashim.ops.gemm import (
 )
 from flashim.ops.image import jpeg_fancy_upsample
 from flashim.ops.lightglue import lightglue_qkv_rope, lightglue_swapped_linear
+from flashim.ops.matching import hamming_distances, hamming_ratio_mutual_match, ratio_mutual_match
+from flashim.ops.nms import simple_nms, strict_nms_mask
+from flashim.ops.norm import instance_norm_prelu, rgb_mean_instance_norm
 from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
     bias_relu_quantize_int8,
@@ -62,6 +73,7 @@ from flashim.ops.quantize import (
 from flashim.ops.raco import raco_head5x5, raco_resblock, raco_score_head
 from flashim.ops.resample import (
     bilinear_sample_points,
+    multiscale_score,
     pil_bicubic_resize,
     upsample_add,
     upsample_concat,
@@ -74,6 +86,9 @@ __all__ = [
     "BoundOp",
     "DeviceSpec",
     "Op",
+    "aliked_bilinear_sample",
+    "aliked_sample_patches",
+    "aliked_score_head",
     "bias_relu_quantize_int8",
     "bilinear_sample_points",
     "call_counts",
@@ -81,6 +96,7 @@ __all__ = [
     "conv2d_at_points",
     "conv2d_single_output",
     "conv2d_small_cin_quantize_int8",
+    "conv3x3_small_cin_relu",
     "deform_patches_int8",
     "deformable_attention",
     "depthwise5x5_relu_int8",
@@ -91,9 +107,13 @@ __all__ = [
     "dual_softmax_mutual",
     "gelu_quantize",
     "gelu_quantize_int8",
+    "hamming_distances",
+    "hamming_ratio_mutual_match",
     "im2col_gather",
+    "instance_norm_prelu",
     "int8_conv2d",
     "int8_conv2d_maxpool",
+    "int8_conv2d_maxpool_only",
     "int8_linear",
     "int8_linear_quantize",
     "jpeg_fancy_upsample",
@@ -109,6 +129,7 @@ __all__ = [
     "local_corr",
     "matmul_nt_fp32",
     "multiscale_fuse",
+    "multiscale_score",
     "mutual_nn_match",
     "mxfp8_conv2d",
     "mxfp8_gelu_mlp",
@@ -124,13 +145,17 @@ __all__ = [
     "raco_head5x5",
     "raco_resblock",
     "raco_score_head",
+    "ratio_mutual_match",
     "reset_call_counts",
+    "rgb_mean_instance_norm",
     "romav2_refiner_heads",
     "romav2_refiner_input",
     "rope_qk",
     "rope_qk_interleaved",
     "sdpa",
     "set_strict",
+    "simple_nms",
+    "strict_nms_mask",
     "upsample_add",
     "upsample_concat",
     "upsample_concat_int8",

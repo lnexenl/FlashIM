@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim import ops
 from flashim.layers.conv import sequential_forward
 from flashim.models import sparse
 from flashim.models.xfeat import weights
@@ -102,7 +103,7 @@ class XFeat(sparse.SparseExtractor):
 
     def dense(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """``(feats [B, 64, H/8, W/8], keypoint logits [B, 65, H/8, W/8], reliability [B, 1, H/8, W/8])``."""
-        gray = self.norm(image.mean(dim=1, keepdim=True)).to(self.compute_dtype)
+        gray, unfolded = ops.rgb_mean_instance_norm(image, self.norm.eps, dtype=self.compute_dtype, unfold=8)
         x1 = self.block1(gray)
         x2 = self.block2(x1 + self.skip1(gray))
         x3 = self.block3(x2)
@@ -113,7 +114,7 @@ class XFeat(sparse.SparseExtractor):
         x5 = F.interpolate(x5, size, mode="bilinear")
         feats = self.block_fusion(x3 + x4 + x5)
         heatmap = self._head(self.heatmap_head, feats)
-        keypoints = self._head(self.keypoint_head, self._unfold2d(gray, 8))
+        keypoints = self._head(self.keypoint_head, unfolded)
         return feats.float(), keypoints.float(), heatmap.float()
 
     @staticmethod
@@ -128,17 +129,27 @@ class XFeat(sparse.SparseExtractor):
         feats = F.normalize(self.dense(image)[0], dim=1)
         return F.normalize(_sample(feats, keypoints, h, w, "bicubic"), dim=-1)
 
-    def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
-        h, w = image.shape[-2:]
+    def _detect_trunk(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         feats, logits, reliability = self.dense(image)
         feats = F.normalize(feats, dim=1)
         heatmap = self.keypoint_heatmap(logits)
         pos = (heatmap == F.max_pool2d(heatmap, 5, 1, 2)) & (heatmap > self.detection_threshold)
+        return feats, heatmap, reliability, pos
+
+    def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
+        h, w = image.shape[-2:]
+        feats, heatmap, reliability, pos = self._run_graphed("detect_trunk", self._detect_trunk, image)
         ys, xs = pos[0, 0].nonzero(as_tuple=True)
         keypoints = torch.stack((xs, ys), -1)
-        scores = _sample(heatmap, keypoints, h, w, "nearest")[:, 0] * _sample(reliability, keypoints, h, w, "bilinear")[:, 0]
+        if h % 2 == 0 and w % 2 == 0:
+            # Exact match to `_sample(heatmap, keypoints, h, w, "nearest")` (align_corners=False maps integer x to
+            # x * w/(w-1) - 0.5, which rounds to x for 0 <= x < w-1 and to w (out-of-bounds -> 0) at x == w-1 when even).
+            hm_scores = torch.where((xs < w - 1) & (ys < h - 1), heatmap[0, 0, ys, xs], torch.zeros_like(xs, dtype=heatmap.dtype))
+        else:
+            hm_scores = _sample(heatmap, keypoints, h, w, "nearest")[:, 0]
+        scores = hm_scores * _sample(reliability, keypoints, h, w, "bilinear")[:, 0]
         keypoints, scores, _ = sparse.select_top_k(keypoints, scores, top_k)
-        valid = scores > 0
-        keypoints, scores = keypoints[valid], scores[valid]
+        keep = (scores > 0).nonzero()[:, 0]  # single host sync instead of 2 boolean-mask syncs
+        keypoints, scores = keypoints[keep], scores[keep]
         descriptors = F.normalize(_sample(feats, keypoints, h, w, "bicubic"), dim=-1)
         return keypoints.float(), scores, descriptors
