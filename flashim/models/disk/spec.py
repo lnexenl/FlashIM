@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from flashim.build import Pass
+from flashim.build import BuildContext, Pass
 from flashim.config import RunConfig
-from flashim.models.disk.model import DISK
+from flashim.models.disk.model import DISK, Conv, UpBlock
 from flashim.models.sparse_spec import extractor_spec
 
 # Quantized: the 5x5 convs of the four down blocks after the input conv and of the first three up blocks. Protected: the
@@ -16,8 +16,31 @@ QUANTIZED = ("unet.path_down.[1234].1.3", "unet.path_up.[012].conv.3")
 PROTECTED = ("unet.path_down.0.1.3", "unet.path_up.3.conv.3.desc", "unet.path_up.3.conv.3.heat")
 
 
-def _split(model: DISK, ctx) -> str:
+def _split(model: DISK, ctx: BuildContext) -> str:
     return model.split_head_conv()
+
+
+def _fused_instance_norm_prelu(model: DISK, ctx: BuildContext) -> list[str] | str:
+    """Replace ``nn.InstanceNorm2d`` + ``nn.PReLU`` prologues with fused Triton ``ops.instance_norm_prelu``
+    (parallel Chan/Welford stats + normalize + PReLU + layout conversion). Skipped for ``fp32`` so the oracle parity
+    preset matches PyTorch's ``batch_norm_collect_statistics`` rounding."""
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    convs = [name for name, mod in model.named_modules() if isinstance(mod, Conv)]
+    for name in convs:
+        model.get_submodule(name).fused_prologue = True
+    return convs
+
+
+def _fused_upblock(model: DISK, ctx: BuildContext) -> list[str] | str:
+    """Replace ``UpBlock.conv_input`` (``contiguous`` + ``F.interpolate`` + ``torch.cat``) with fused Triton
+    ``ops.upsample_concat(..., coarse_first=True)``. Skipped for ``fp32`` (reference numerics)."""
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    ups = [name for name, mod in model.named_modules() if isinstance(mod, UpBlock)]
+    for name in ups:
+        model.get_submodule(name).fused_upsample = True
+    return ups
 
 
 def _load(config: RunConfig) -> DISK:
@@ -48,6 +71,14 @@ SPEC = extractor_spec(
             _split, stage="pre_quant",
             description="head conv split by output channel: FP32 heatmap (1ch) / FP32 descriptors (128ch)",
         ),
+        "fused_instance_norm_prelu": Pass(
+            _fused_instance_norm_prelu, exact=False,
+            description="fused Triton InstanceNorm2d + PReLU (+ layout conversion) for bf16/int8/fp8",
+        ),
+        "fused_upblock": Pass(
+            _fused_upblock, exact=False,
+            description="fused Triton upsample_concat in UpBlock for bf16/int8/fp8",
+        ),
     },
-    structural_passes=("split_head_conv",),
+    structural_passes=("split_head_conv", "fused_instance_norm_prelu", "fused_upblock"),
 )

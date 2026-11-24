@@ -45,6 +45,8 @@ from flashim.ops.gemm import (
 from flashim.ops.image import jpeg_fancy_upsample
 from flashim.ops.lightglue import lightglue_qkv_rope, lightglue_swapped_linear
 from flashim.ops.matching import hamming_distances, hamming_ratio_mutual_match, ratio_mutual_match
+from flashim.ops.nms import simple_nms, strict_nms_mask
+from flashim.ops.norm import instance_norm_prelu, rgb_mean_instance_norm
 from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
     bias_relu_quantize_int8,
@@ -88,6 +90,7 @@ __all__ = [
     "hamming_distances",
     "hamming_ratio_mutual_match",
     "im2col_gather",
+    "instance_norm_prelu",
     "int8_conv2d",
     "int8_conv2d_maxpool",
     "int8_linear",
@@ -119,12 +122,15 @@ __all__ = [
     "raco_resblock",
     "ratio_mutual_match",
     "reset_call_counts",
+    "rgb_mean_instance_norm",
     "romav2_refiner_heads",
     "romav2_refiner_input",
     "rope_qk",
     "rope_qk_interleaved",
     "sdpa",
     "set_strict",
+    "simple_nms",
+    "strict_nms_mask",
     "upsample_add",
     "upsample_concat",
     "upsample_concat_int8",

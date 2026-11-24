@@ -14,11 +14,12 @@ from flashim.ops._registry import Op
 from flashim.quant.tensor import Int8Tensor, quantize_int8_static
 
 
-def _upsample_concat_reference(features: Tensor, coarse: Tensor) -> Tensor:
-    """``cat((features, upsample(coarse)), 1)``: ``coarse`` ``[B, Cc, h, w]`` upsampled bilinearly (``align_corners=False``,
-    in FP32) to ``features``' ``[B, Cf, H, W]`` size and cast to its dtype -> ``[B, Cf + Cc, H, W]``."""
-    upsampled = F.interpolate(coarse.float(), size=features.shape[-2:], mode="bilinear", align_corners=False)
-    return torch.cat((features, upsampled.to(features.dtype)), dim=1)
+def _upsample_concat_reference(features: Tensor, coarse: Tensor, *, coarse_first: bool = False) -> Tensor:
+    """``cat((features, upsample(coarse)), 1)`` (or ``cat((upsample(coarse), features), 1)`` when ``coarse_first``):
+    ``coarse`` ``[B, Cc, h, w]`` upsampled bilinearly (``align_corners=False``, in FP32) to ``features``'
+    ``[B, Cf, H, W]`` size and cast to its dtype -> ``[B, Cf + Cc, H, W]``."""
+    upsampled = F.interpolate(coarse.float(), size=features.shape[-2:], mode="bilinear", align_corners=False).to(features.dtype)
+    return torch.cat((upsampled, features), dim=1) if coarse_first else torch.cat((features, upsampled), dim=1)
 
 
 upsample_concat = Op("upsample_concat", _upsample_concat_reference)

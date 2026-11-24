@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim import ops
 from flashim.layers.conv import sequential_forward
 from flashim.models import sparse
 from flashim.models.xfeat import weights
@@ -102,7 +103,7 @@ class XFeat(sparse.SparseExtractor):
 
     def dense(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """``(feats [B, 64, H/8, W/8], keypoint logits [B, 65, H/8, W/8], reliability [B, 1, H/8, W/8])``."""
-        gray = self.norm(image.mean(dim=1, keepdim=True)).to(self.compute_dtype)
+        gray, unfolded = ops.rgb_mean_instance_norm(image, self.norm.eps, dtype=self.compute_dtype, unfold=8)
         x1 = self.block1(gray)
         x2 = self.block2(x1 + self.skip1(gray))
         x3 = self.block3(x2)
@@ -113,7 +114,7 @@ class XFeat(sparse.SparseExtractor):
         x5 = F.interpolate(x5, size, mode="bilinear")
         feats = self.block_fusion(x3 + x4 + x5)
         heatmap = self._head(self.heatmap_head, feats)
-        keypoints = self._head(self.keypoint_head, self._unfold2d(gray, 8))
+        keypoints = self._head(self.keypoint_head, unfolded)
         return feats.float(), keypoints.float(), heatmap.float()
 
     @staticmethod

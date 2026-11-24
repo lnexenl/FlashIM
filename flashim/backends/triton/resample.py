@@ -45,13 +45,14 @@ def _upsample_combine_kernel(
     coarse_ptr, other_ptr, out_ptr, scale_ptr,
     C_OTHER, C_COARSE, H, W, h, w, scale_h, scale_w,
     cs_b, cs_c, cs_h, cs_w, os_b, os_c, os_h, os_w,
-    CONCAT: tl.constexpr, INT8: tl.constexpr, BLOCK_P: tl.constexpr, BLOCK_C: tl.constexpr,
+    CONCAT: tl.constexpr, INT8: tl.constexpr, COARSE_FIRST: tl.constexpr,
+    BLOCK_P: tl.constexpr, BLOCK_C: tl.constexpr,
 ):
     """One ``[BLOCK_P pixels, BLOCK_C channels]`` tile of the channels-last output. ``CONCAT``: channels below
-    ``C_OTHER`` are copied from ``other``, the rest are bilinear samples of ``coarse``; else ``out = sample + other``.
-    ``INT8``: the BF16-rounded value quantized with the static scale at ``scale_ptr``, the rounding of
-    ``ops.quantize_int8``'s Triton kernel (reciprocal multiply, half to even, +-127): bit-identical to the BF16 output
-    followed by that quantize pass."""
+    ``C_OTHER`` are copied from ``other``, the rest are bilinear samples of ``coarse`` (reversed when ``COARSE_FIRST``);
+    else ``out = sample + other``. ``INT8``: the BF16-rounded value quantized with the static scale at ``scale_ptr``,
+    the rounding of ``ops.quantize_int8``'s Triton kernel (reciprocal multiply, half to even, +-127): bit-identical
+    to the BF16 output followed by that quantize pass."""
     p = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
     b = tl.program_id(2).to(tl.int64)
     y, x = p // W, p % W
@@ -63,12 +64,21 @@ def _upsample_combine_kernel(
     out_off = ((b * H * W + p)[:, None] * c_out + c[None, :])
     other_off = b * os_b + y[:, None].to(tl.int64) * os_h + x[:, None].to(tl.int64) * os_w
     if CONCAT:
-        from_other = c < C_OTHER
-        copy = tl.load(other_ptr + other_off + c[None, :] * os_c, mask=p_ok[:, None] & from_other[None, :], other=0.0)
-        cc = tl.where(from_other, 0, c - C_OTHER)
-        ok = p_ok[:, None] & (~from_other & (c < c_out))[None, :]
-        sample = _bilinear_tile(coarse_ptr + b * cs_b, cs_c, cs_h, cs_w, cc, y0, y1, x0, x1, ly0, ly1, lx0, lx1, ok)
-        value = tl.where(from_other[None, :], copy.to(tl.float32), sample)
+        if COARSE_FIRST:
+            from_coarse = c < C_COARSE
+            oc = tl.where(from_coarse, 0, c - C_COARSE)
+            copy = tl.load(other_ptr + other_off + oc[None, :] * os_c,
+                           mask=p_ok[:, None] & (~from_coarse & (c < c_out))[None, :], other=0.0)
+            ok = p_ok[:, None] & from_coarse[None, :]
+            sample = _bilinear_tile(coarse_ptr + b * cs_b, cs_c, cs_h, cs_w, c, y0, y1, x0, x1, ly0, ly1, lx0, lx1, ok)
+            value = tl.where(from_coarse[None, :], sample, copy.to(tl.float32))
+        else:
+            from_other = c < C_OTHER
+            copy = tl.load(other_ptr + other_off + c[None, :] * os_c, mask=p_ok[:, None] & from_other[None, :], other=0.0)
+            cc = tl.where(from_other, 0, c - C_OTHER)
+            ok = p_ok[:, None] & (~from_other & (c < c_out))[None, :]
+            sample = _bilinear_tile(coarse_ptr + b * cs_b, cs_c, cs_h, cs_w, cc, y0, y1, x0, x1, ly0, ly1, lx0, lx1, ok)
+            value = tl.where(from_other[None, :], copy.to(tl.float32), sample)
     else:
         ok = p_ok[:, None] & (c < C_COARSE)[None, :]
         sample = _bilinear_tile(coarse_ptr + b * cs_b, cs_c, cs_h, cs_w, c, y0, y1, x0, x1, ly0, ly1, lx0, lx1, ok)
@@ -79,7 +89,9 @@ def _upsample_combine_kernel(
     tl.store(out_ptr + out_off, value.to(out_ptr.dtype.element_ty), mask=p_ok[:, None] & (c < c_out)[None, :])
 
 
-def _launch(coarse: Tensor, other: Tensor, out: Tensor, concat: bool, scale: Tensor | None = None) -> Tensor:
+def _launch(
+    coarse: Tensor, other: Tensor, out: Tensor, concat: bool, scale: Tensor | None = None, *, coarse_first: bool = False
+) -> Tensor:
     batch, c_other, height, width = other.shape
     c_coarse, h, w = coarse.shape[1:]
     channels = c_other + c_coarse if concat else c_coarse
@@ -87,19 +99,20 @@ def _launch(coarse: Tensor, other: Tensor, out: Tensor, concat: bool, scale: Ten
     grid = (triton.cdiv(height * width, block_p), triton.cdiv(channels, block_c), batch)
     _upsample_combine_kernel[grid](
         coarse, other, out, out if scale is None else scale, c_other if concat else 0, c_coarse, height, width, h, w,
-        h / height, w / width, *coarse.stride(), *other.stride(), CONCAT=concat, INT8=scale is not None,
+        h / height, w / width, *coarse.stride(), *other.stride(),
+        CONCAT=concat, INT8=scale is not None, COARSE_FIRST=coarse_first,
         BLOCK_P=block_p, BLOCK_C=block_c, num_warps=4,
     )
     return out
 
 
-def upsample_concat(features: Tensor, coarse: Tensor) -> Tensor:
+def upsample_concat(features: Tensor, coarse: Tensor, *, coarse_first: bool = False) -> Tensor:
     batch, c_features, height, width = features.shape
     out = torch.empty(
         batch, c_features + coarse.shape[1], height, width, device=features.device, dtype=features.dtype,
         memory_format=torch.channels_last,
     )
-    return _launch(coarse, features, out, concat=True)
+    return _launch(coarse, features, out, concat=True, coarse_first=coarse_first)
 
 
 def upsample_concat_int8(features: Tensor, coarse: Tensor, scale: Tensor) -> Int8Tensor:
@@ -269,7 +282,7 @@ def upsample_add_rows(coarse: Tensor, delta: Tensor) -> Tensor:
     return out
 
 
-def _eligible_concat(features: Tensor, coarse: Tensor) -> bool:
+def _eligible_concat(features: Tensor, coarse: Tensor, *, coarse_first: bool = False) -> bool:
     return features.ndim == 4 and coarse.ndim == 4 and features.shape[0] == coarse.shape[0] and features.is_cuda
 
 
