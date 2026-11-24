@@ -25,6 +25,7 @@ from flashim.quant.methods.int8_linear import StaticInt8Linear
 from flashim.quant.methods.linear import StaticMXFP8Linear
 
 STATIC_LINEARS = (StaticMXFP8Linear, StaticInt8Linear)
+_INHERIT = object()
 
 
 def is_transformer_block(module: nn.Module) -> bool:
@@ -32,7 +33,7 @@ def is_transformer_block(module: nn.Module) -> bool:
 
 
 class QuantizedAttention(nn.Module):
-    def __init__(self, attn: nn.Module, rope_impl: str | None = "reference") -> None:
+    def __init__(self, attn: nn.Module, rope_impl: str | None | object = _INHERIT) -> None:
         super().__init__()
         self.qkv, self.proj, self.num_heads = attn.qkv, attn.proj, attn.num_heads
         dim = self.proj.in_features
@@ -41,7 +42,7 @@ class QuantizedAttention(nn.Module):
             raise ValueError("QuantizedAttention requires standard packed QKV")
         if head_dim % 32 or head_dim & (head_dim - 1):
             raise ValueError(f"head_dim must be a power of two divisible by 32, got {head_dim}")
-        self.rope_impl = rope_impl
+        self.rope_impl: str | None = getattr(attn, "rope_impl", "reference") if rope_impl is _INHERIT else rope_impl
         # ``ops.sdpa`` implementation: "reference" (torch SDPA), "sage" (INT8 QK attention) or None = dispatch.
         self.sdpa_impl: str | None = getattr(attn, "sdpa_impl", "reference")
 
@@ -68,7 +69,7 @@ class QuantizedTransformerBlock(nn.Module):
 
     fused_epilogues = False
 
-    def __init__(self, block: nn.Module, rope_impl: str | None = "reference") -> None:
+    def __init__(self, block: nn.Module, rope_impl: str | None | object = _INHERIT) -> None:
         super().__init__()
         if not is_transformer_block(block):
             raise TypeError(f"Not a flashim.layers.TransformerBlock: {type(block).__name__}")
@@ -129,6 +130,16 @@ class QuantizedTransformerBlock(nn.Module):
         if fc1 is not None and attended.dtype == x_flat.dtype:
             # the norm kernel also writes the residual stream x + attended (same rounding as the BF16 add it replaces)
             normed, x_attn = fc1.quantize_layernorm(attended, x_flat, self.norm2, return_sum=True)
+            fc2, act = self._native(self.mlp.fc2), self.mlp.act
+            if (
+                isinstance(fc2, StaticInt8Linear)
+                and isinstance(self.ls2, nn.Identity)
+                and isinstance(act, nn.GELU)
+                and x_attn.dtype == torch.bfloat16
+                and x_attn.is_contiguous()
+            ):
+                packed = fc2.quantize_gelu(fc1.forward_prequantized(normed).to(x_flat.dtype), act.approximate)
+                return fc2.forward_prequantized(packed, residual=x_attn).to(x_flat.dtype).reshape(shape)
             hidden = self._mlp_after_fc1(fc1.forward_prequantized(normed), x_flat.dtype)
         else:
             x_attn = x_flat + attended

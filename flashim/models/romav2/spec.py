@@ -81,17 +81,60 @@ def _fused_mx_blocks(model: RoMaV2, ctx: BuildContext) -> int:
 
 
 def _fused_rope(model: RoMaV2, ctx: BuildContext) -> int:
-    """DINOv3's RoPE through ``ops.rope_qk`` dispatch (one fused kernel for q and k) instead of the pinned upstream
-    math. Not exact: the kernel's FMA contraction moves 24% of the rotated elements by one BF16 ulp. Measured on a
-    Jetson AGX Orin, 16 x 2505 x 64 BF16: 1.54 -> 0.46 ms per call, 42 calls per mega1500 pair."""
-    pinned = [module for module in model.f.modules() if getattr(module, "rope_impl", None) == "reference"]
+    """DINOv3 and MV-ViT RoPE through ``ops.rope_qk`` dispatch (one fused kernel for q and k) instead of the pinned
+    reference math. On quantized blocks (BF16 tables) the Triton kernel is bit-identical to reference; on unquantized
+    DINOv3 (FP32 tables) FMA contraction may move elements by one BF16 ulp. Measured on sm_120 (DINOv3 + MV-ViT fp8,
+    mega1500): ~7 ms saved in eager."""
+    pinned = [module for module in model.modules() if getattr(module, "rope_impl", None) == "reference"]
     for module in pinned:
         module.rope_impl = None
     return len(pinned)
 
 
+def _fold_layer_scale(model: RoMaV2, ctx: BuildContext) -> list[str]:
+    """Fold DINOv3 LayerScale into ``attn.proj`` / ``mlp.fc2`` before quantization (absorbed into per-channel weight
+    scales). Enables ``fused_block_epilogues`` (fp8) and ``int8_linear(residual=)`` on ``fc2`` (int8)."""
+    from flashim.quant.passes.transformer_block import fold_layer_scale
+
+    return fold_layer_scale(model)
+
+
+def _fused_block_epilogues(model: RoMaV2, ctx: BuildContext) -> list[str]:
+    """Fuse MXFP8 transformer block biases and residual adds into cuBLAS / LayerNorm / GELU kernels
+    (``QuantizedTransformerBlock.fused_epilogues``) and standalone ``StaticMXFP8Linear`` biases into cuBLAS."""
+    from flashim.quant.methods.linear import enable_fused_bias
+    from flashim.quant.passes.transformer_block import enable_fused_epilogues
+
+    enabled = enable_fused_epilogues(model)
+    enable_fused_bias(model)
+    return enabled
+
+
 def _batched_directions(model: RoMaV2, ctx: BuildContext) -> None:
     model.batched_directions = True
+
+
+SAGE_IMPLS = {(8, 9): "sage-fp8", (9, 0): "sage-fp8-sm90", (12, 0): "sage-fp8"}
+
+
+def _sage_platform(platform) -> bool:
+    import importlib.util
+
+    return platform.capability in SAGE_IMPLS and importlib.util.find_spec("sageattention") is not None
+
+
+def _sage_attention(model: RoMaV2, ctx: BuildContext) -> dict | str:
+    """Quantized presets: SageAttention (QK INT8, PV FP8) on DINOv3 and MV-ViT blocks; ``optimize.attention`` overrides
+    it. Measured on sm_120 (mega1500, eager): fp8 144.5 -> 135.7 ms (-8.8 ms), int8 117.7 -> 110.5 ms (-7.2 ms)."""
+    if ctx.config.precision.quant is None:
+        return "skipped: not quantized"
+    from flashim import ops
+
+    impl = SAGE_IMPLS[ctx.platform.capability]
+    if impl not in {i.name for i in ops.sdpa.impls}:
+        return f"skipped: {impl} not registered"
+    _set_attention(model, impl)
+    return {"impl": impl}
 
 
 def _set_attention(model: nn.Module, impl: str) -> None:
@@ -121,12 +164,15 @@ def _validate(config: RunConfig) -> None:
 def _overlay(preset: quant.Preset) -> dict:
     passes = ["fold_refiners"] if preset.fold_refiners else []
     passes += ["fold_fine_features"] if preset.fold_fine_features else []
+    passes += ["fold_layer_scale"] if preset.fold_layer_scale else []
     passes += [f"fused_bf16_s{stride}" for stride in preset.fused_bf16_refiners]
     passes += [name for name, on in (
         ("fused_refiner_io", preset.fused_refiner_io),
         ("fused_mx_blocks", preset.fused_mx_blocks),
         ("batched_directions", preset.batched_directions),
         ("fused_rope", preset.fused_rope),
+        ("fused_block_epilogues", preset.fused_block_epilogues),
+        ("sage_attention", preset.sage_attention),
     ) if on]
     return {
         "precision": {"compute_dtype": "bf16", "quant": preset.name if preset.config is not None else None},
@@ -152,6 +198,9 @@ SPEC = ModelSpec(
         "fold_fine_features": Pass(
             _fold_fine_features, stage="pre_quant", exact=False, description="channels-last VGG fine features, BN folded"
         ),
+        "fold_layer_scale": Pass(
+            _fold_layer_scale, stage="pre_quant", exact=False, description="ViT LayerScale folded into proj / fc2"
+        ),
         **{
             f"fused_bf16_s{s}": Pass(_fused_bf16(s), exact=False, description=f"fused BF16 stride-{s} refiner blocks")
             for s in (4, 2, 1)
@@ -159,7 +208,15 @@ SPEC = ModelSpec(
         "fused_refiner_io": Pass(_fused_refiner_io, exact=False, description="fused refiner input + output heads"),
         "fused_mx_blocks": Pass(_fused_mx_blocks, exact=False, description="dw + quantize + pw MXFP8 in one kernel"),
         "batched_directions": Pass(_batched_directions, description="both match directions as one batch"),
-        "fused_rope": Pass(_fused_rope, exact=False, description="DINOv3 RoPE as one fused kernel"),
+        "fused_rope": Pass(_fused_rope, exact=False, description="DINOv3 + MV-ViT RoPE as one fused kernel"),
+        "fused_block_epilogues": Pass(
+            _fused_block_epilogues, stage="post_quant", exact=False,
+            description="MXFP8 ViT biases / residual adds fused into GEMM / LayerNorm / GELU kernels",
+        ),
+        "sage_attention": Pass(
+            _sage_attention, requires=_sage_platform, exact=False,
+            description="quantized ViT attention on SageAttention (QK INT8, PV FP8)",
+        ),
     },
     engines={
         "eager": EngineSpec(),

@@ -83,7 +83,8 @@ def test_romav2_presets_match_the_legacy_flags():
     fast = resolve("romav2", "fp8")
     assert fast.precision.quant == "fp8" and PRESETS["fp8"].batched_directions
     assert fast.optimize.passes == (
-        "fold_refiners", "fused_bf16_s1", "fused_refiner_io", "fused_mx_blocks", "batched_directions",
+        "fold_refiners", "fold_fine_features", "fold_layer_scale", "fused_bf16_s1", "fused_refiner_io",
+        "fused_mx_blocks", "batched_directions", "fused_rope", "fused_block_epilogues", "sage_attention",
     )
     assert resolve("romav2", "bf16").optimize.passes == ()
     with pytest.raises(ValueError, match="needs a quantized preset"):

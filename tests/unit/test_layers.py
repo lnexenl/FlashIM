@@ -65,6 +65,32 @@ def test_new_transformer_model_gets_quantized_block_fusion(fmt):
     assert ((out - ref).norm() / ref.norm()) < 0.1
 
 
+def test_quantized_transformer_block_preserves_rope_impl_and_int8_residual():
+    from flashim.quant.passes.transformer_block import fold_layer_scale
+
+    torch.manual_seed(0)
+    b_none = layers.TransformerBlock(64, 2, layer_scale=False, rope_impl=None).eval()
+    b_ref = layers.TransformerBlock(64, 2, layer_scale=True, rope_impl="reference").eval()
+    model = nn.ModuleList([b_none, b_ref]).eval()
+    x = torch.randn(1, 8, 64, dtype=torch.bfloat16)
+    model.to(torch.bfloat16)
+    fold_layer_scale(model)
+    targets = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    with torch.inference_mode(), Int8Calibrator(model, targets) as cal:
+        for b in model:
+            b(x)
+    config = QuantConfig({"blocks": QuantScheme(("0.*", "1.*"), INT8_WEIGHTS, INT8_ACTIVATIONS)})
+    quantize_model(model, config, cal.table())
+    assert model[0].attn.rope_impl is None
+    assert model[1].attn.rope_impl == "reference"
+    # INT8 fc2 residual epilogue is bit-identical to separate x_attn + fc2(...)
+    with torch.inference_mode():
+        y_fused = model[0](x)
+        model[0].ls2 = nn.Sequential(nn.Identity())  # bypass nn.Identity check to run separate add
+        y_separate = model[0](x)
+    assert torch.equal(y_fused, y_separate)
+
+
 def test_new_conv_model_gets_separable_block_passes():
     torch.manual_seed(0)
     model = TinyConvNet().eval()
