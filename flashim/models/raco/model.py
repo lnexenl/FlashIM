@@ -57,6 +57,8 @@ class RaCo(nn.Module):
         self.engine: str | None = None
         self.compute_dtype = torch.float32
         self._fused_ranker: tuple | None = None
+        self._fused_block1: ops.BoundOp | None = None
+        self._fused_score_head: ops.BoundOp | None = None
         self.ranker_backend: str | None = None
         self._ranker_buffers: dict[tuple[int, int], Tensor] = {}
 
@@ -85,30 +87,68 @@ class RaCo(nn.Module):
         mean, std = (device_constant(v, image).view(1, 3, 1, 1) for v in (self.config.mean, self.config.std))
         return (image - mean) / std
 
-    def detector_logits(self, image: Tensor) -> Tensor:
+    def _input_nhwc4(self, image: Tensor) -> Tensor:
+        h, w = image.shape[-2:]
+        buffer = self._ranker_buffers.get((h, w))
+        if buffer is None:  # 4 channels per pixel (3 valid): the input's zero padding is written once
+            buffer = self._ranker_buffers[(h, w)] = torch.zeros(h, w, 4, device=image.device, dtype=torch.bfloat16)
+        buffer[..., :3] = image[0].permute(1, 2, 0)
+        return buffer
+
+    def detector_logits(self, image: Tensor, *, _nhwc4: Tensor | None = None) -> Tensor:
         """Keypoint logit map ``[B, 1, H, W]`` for a normalized image (H, W multiples of 32)."""
-        x = image.to(self.compute_dtype)
-        x1 = self.block1(x)
+        if self._fused_block1 is not None and image.shape[0] == 1 and self.compute_dtype == torch.bfloat16:
+            buf = self._input_nhwc4(image) if _nhwc4 is None else _nhwc4
+            x1 = self._fused_block1(buf, 3).permute(2, 0, 1)[None]
+        else:
+            x1 = self.block1(image.to(self.compute_dtype))
         x2 = self.block2(F.avg_pool2d(x1, 2))
         x3 = self.block3(F.avg_pool2d(x2, 4))
         x4 = self.block4(F.avg_pool2d(x3, 4))
 
         head_weight = self.score_head[0].weight.reshape(self.score_head[0].out_channels, -1)
         head, _ = ops.multiscale_fuse(
-            self.gate(self.conv1(x1)),
+            self.conv1(x1),
             self.gate(self.conv2(x2)),
             self.gate(self.conv3(x3)),
             self.gate(self.conv4(x4)),
             head_weight,
             normalize=False,
+            selu_f1=True,
         )
+        if self._fused_score_head is not None:
+            return self._fused_score_head(head)
         return self.score_head[2:](head)
 
-    def ranker_map(self, image: Tensor) -> Tensor:
+    def ranker_map(self, image: Tensor, *, _nhwc4: Tensor | None = None) -> Tensor:
         """Ranker score map ``[B, 1, H, W]`` (FP32) for a normalized image."""
         if self._fused_ranker is not None and image.shape[0] == 1:
-            return self._fused_ranker_map(image)
+            return self._fused_ranker_map(image, _nhwc4=_nhwc4)
         return self.ranker_head(image.to(self.compute_dtype)).float()
+
+    def use_fused_detector(self, backend: str = "auto") -> list[str]:
+        """Fuse detector ``score_head[2:]`` (exact FP32 ``ops.raco_score_head``) and, when BF16 with folded BatchNorm,
+        ``block1`` (``ops.raco_resblock`` with a zero shortcut)."""
+        enabled = []
+        self._fused_score_head = ops.raco_score_head.bind(
+            self.score_head[2].weight, self.score_head[4].weight, self.score_head[6].weight
+        ).warmup()
+        if self._fused_score_head.primary != "reference":
+            enabled.append(f"score_head:{self._fused_score_head.primary}")
+        else:
+            self._fused_score_head = None
+        if self.compute_dtype == torch.bfloat16 and not isinstance(self.block1.bn1, nn.BatchNorm2d):
+            pin = None if backend == "auto" else backend
+            w1 = self.block1.conv1.weight
+            zero_wm = torch.zeros(w1.shape[0], w1.shape[1], 1, 1, device=w1.device, dtype=w1.dtype)
+            zero_bm = torch.zeros(w1.shape[0], device=w1.device, dtype=w1.dtype)
+            self._fused_block1 = ops.raco_resblock.bind(
+                self.block1.conv1.weight, self.block1.conv1.bias,
+                self.block1.conv2.weight, self.block1.conv2.bias,
+                zero_wm, zero_bm, impl=pin,
+            ).warmup()
+            enabled.append(f"block1:{self._fused_block1.primary}")
+        return enabled
 
     def use_fused_ranker(self, backend: str = "auto") -> None:
         """Run the ranker's residual blocks and 5x5 head through the fused ops (``ops.raco_resblock`` /
@@ -134,13 +174,9 @@ class RaCo(nn.Module):
         self.ranker_backend = resblocks[0].primary
         self._fused_ranker = (resblocks, ops.raco_head5x5.bind(head.weight, head.bias))
 
-    def _fused_ranker_map(self, image: Tensor) -> Tensor:
+    def _fused_ranker_map(self, image: Tensor, *, _nhwc4: Tensor | None = None) -> Tensor:
         resblocks, head = self._fused_ranker
-        h, w = image.shape[-2:]
-        buffer = self._ranker_buffers.get((h, w))
-        if buffer is None:  # 4 channels per pixel (3 valid): the input's zero padding is written once
-            buffer = self._ranker_buffers[(h, w)] = torch.zeros(h, w, 4, device=image.device, dtype=torch.bfloat16)
-        buffer[..., :3] = image[0].permute(1, 2, 0)
+        buffer = self._input_nhwc4(image) if _nhwc4 is None else _nhwc4
         current, cin = buffer, 3
         for block in resblocks:
             current = block(current, cin)
@@ -157,11 +193,11 @@ class RaCo(nn.Module):
     def config_for(self, num_keypoints: int | None) -> RaCoConfig:
         return self.config if num_keypoints is None else dataclasses.replace(self.config, num_keypoints=num_keypoints)
 
-    def detect(self, image: Tensor, num_keypoints: int | None = None) -> Tensor:
+    def detect(self, image: Tensor, num_keypoints: int | None = None, *, _nhwc4: Tensor | None = None) -> Tensor:
         """Detector candidates ``[B, N_candidates, 2]`` (``(x, y)`` pixel-index, soft-argmax refined) for a
         normalized image."""
         cfg = self.config_for(num_keypoints)
-        logits = self.detector_logits(image)
+        logits = self.detector_logits(image, _nhwc4=_nhwc4)
         return kp.detect_candidates(logits, cfg.num_candidates, cfg.nms_radius, cfg.subpixel_temperature)
 
     def rank(self, ranker_map: Tensor, candidates: Tensor, num_keypoints: int | None = None) -> tuple[Tensor, Tensor]:
@@ -177,4 +213,11 @@ class RaCo(nn.Module):
         ranker_scores [B, K])``. Keypoints are ``(x, y)`` in RaCo's pixel-edge convention (pixel index + 0.5),
         highest ranker score first. ``num_keypoints`` overrides the configured count (the candidate pool follows)."""
         image = self.normalize(image)
-        return self.rank(self.ranker_map(image), self.detect(image, num_keypoints), num_keypoints)
+        nhwc4 = (
+            self._input_nhwc4(image)
+            if image.shape[0] == 1 and (self._fused_ranker is not None or self._fused_block1 is not None)
+            else None
+        )
+        return self.rank(
+            self.ranker_map(image, _nhwc4=nhwc4), self.detect(image, num_keypoints, _nhwc4=nhwc4), num_keypoints
+        )

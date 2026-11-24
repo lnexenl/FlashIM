@@ -59,7 +59,7 @@ from flashim.ops.quantize import (
     quantize_int8_rows,
     quantize_mxfp8,
 )
-from flashim.ops.raco import raco_head5x5, raco_resblock
+from flashim.ops.raco import raco_head5x5, raco_resblock, raco_score_head
 from flashim.ops.resample import (
     bilinear_sample_points,
     pil_bicubic_resize,
@@ -122,6 +122,7 @@ __all__ = [
     "quantize_mxfp8",
     "raco_head5x5",
     "raco_resblock",
+    "raco_score_head",
     "reset_call_counts",
     "romav2_refiner_heads",
     "romav2_refiner_input",
