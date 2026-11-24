@@ -114,7 +114,9 @@ class StaticMXFP8Linear(nn.Module):
 
         ``bias=False`` leaves the bias out (for consumers that fold it into their own kernel); ``bias=True`` adds
         it in the GEMM epilogue (FP32 accumulator + bias, one rounding)."""
-        out = self.gemm(quantized, self.bias if bias else None)
+        # cuBLAS block-scaled scaled_mm takes BF16 bias directly; passing bias_bf16 avoids a per-call FP32->BF16 copy.
+        gemm_bias = (self.bias_bf16 if self.kernel_name == "cublas" else self.bias) if bias else None
+        out = self.gemm(quantized, gemm_bias)
         return out[:, : self.out_features].reshape(*quantized.logical_shape[:-1], self.out_features)
 
     def forward_prequantized(self, quantized: QuantizedTensor) -> Tensor:
