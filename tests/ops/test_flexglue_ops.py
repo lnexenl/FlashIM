@@ -73,3 +73,50 @@ def test_kde_density_batched():
     for i in range(2):
         single = ops.kde_density.get("triton")(x[i], std=0.1)
         assert torch.equal(batched[i], single)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("b,n,h,d,cos_b", [(2, 4096, 8, 64, 1), (1, 17, 4, 32, 1), (2, 77, 8, 48, 2)])
+@torch.inference_mode()
+def test_qkv_norm_rope_interleaved(dtype, b, n, h, d, cos_b):
+    torch.manual_seed(0)
+    qkv = torch.randn(b, n, 3 * h * d, device="cuda", dtype=dtype)
+    qw, qb = torch.randn(d, device="cuda", dtype=dtype), torch.randn(d, device="cuda", dtype=dtype)
+    kw, kb = torch.randn(d, device="cuda", dtype=dtype), torch.randn(d, device="cuda", dtype=dtype)
+    theta = torch.randn(cos_b, n, d // 2, device="cuda", dtype=torch.float32)
+    cos = theta.cos().repeat_interleave(2, dim=-1)
+    sin = theta.sin().repeat_interleave(2, dim=-1)
+
+    assert ops.qkv_norm_rope_interleaved.explain(qkv, qw, qb, kw, kb, 1e-5, cos, sin, h)["triton"] == "selected"
+    rq, rk, rv = ops.qkv_norm_rope_interleaved.get("reference")(qkv, qw, qb, kw, kb, 1e-5, cos, sin, h)
+    tq, tk, tv = ops.qkv_norm_rope_interleaved.get("triton")(qkv, qw, qb, kw, kb, 1e-5, cos, sin, h)
+
+    assert torch.equal(tv, rv)
+    tol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+    assert torch.allclose(tq.float(), rq.float(), atol=tol, rtol=tol)
+    assert torch.allclose(tk.float(), rk.float(), atol=tol, rtol=tol)
+    if dtype == torch.bfloat16:
+        # At most a tiny fraction of 1-ulp BF16 rounding differences from LayerNorm reduction order.
+        diff_q = (tq != rq).float().mean().item()
+        diff_k = (tk != rk).float().mean().item()
+        assert diff_q < 0.01 and diff_k < 0.01
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("b,n,h,d", [(2, 4096, 8, 64), (4, 33, 4, 48)])
+@torch.inference_mode()
+def test_qk_norm_swap_heads(dtype, b, n, h, d):
+    torch.manual_seed(0)
+    qk = torch.randn(b, n, h * d, device="cuda", dtype=dtype)
+    v = torch.randn(b, n, h * d, device="cuda", dtype=dtype)
+    w, bias = torch.randn(d, device="cuda", dtype=dtype), torch.randn(d, device="cuda", dtype=dtype)
+
+    assert ops.qk_norm_swap_heads.explain(qk, v, w, bias, 1e-5, h)["triton"] == "selected"
+    rq, rk, rv = ops.qk_norm_swap_heads.get("reference")(qk, v, w, bias, 1e-5, h)
+    tq, tk, tv = ops.qk_norm_swap_heads.get("triton")(qk, v, w, bias, 1e-5, h)
+
+    assert torch.equal(tv, rv)
+    tol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+    assert torch.allclose(tq.float(), rq.float(), atol=tol, rtol=tol)
+    assert torch.allclose(tk.float(), rk.float(), atol=tol, rtol=tol)
+    assert torch.equal(tk[: b // 2], tq[b // 2 :]) and torch.equal(tk[b // 2 :], tq[: b // 2])

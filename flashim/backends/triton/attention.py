@@ -323,6 +323,222 @@ def rope_qk_interleaved(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple
     return q_out, k_out
 
 
+# -- fused QKV unpack + QK LayerNorm + interleaved RoPE -> contiguous HND --------------------------------
+
+_ROUND_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
+
+
+@triton.jit
+def _round_dtype(val, ROUND: tl.constexpr):
+    if ROUND == 1:
+        return val.to(tl.bfloat16).to(tl.float32)
+    if ROUND == 2:
+        return val.to(tl.float16).to(tl.float32)
+    return val
+
+
+@triton.jit
+def _layernorm_block(x, w, b, d_ok, eps, D: tl.constexpr, HAS_W: tl.constexpr, HAS_B: tl.constexpr,
+                     ROUND: tl.constexpr):
+    mean = tl.sum(x, axis=1) / D
+    centered = tl.where(d_ok[None, :], x - mean[:, None], 0.0)
+    var = tl.sum(centered * centered, axis=1) / D
+    y = centered * tl.rsqrt(var + eps)[:, None]
+    if HAS_W:
+        y = y * w[None, :]
+    if HAS_B:
+        y = y + b[None, :]
+    return _round_dtype(tl.where(d_ok[None, :], y, 0.0), ROUND)
+
+
+@triton.jit
+def _apply_rope_interleaved_block(x, c0, c1, s0, s1, BLOCK_N: tl.constexpr, HALF_D: tl.constexpr,
+                                  BLOCK_D: tl.constexpr):
+    x0, x1 = tl.split(tl.reshape(x, (BLOCK_N, HALF_D, 2)))
+    o0 = libdevice.add_rn(libdevice.mul_rn(x0, c0), libdevice.mul_rn(-x1, s0))
+    o1 = libdevice.add_rn(libdevice.mul_rn(x1, c1), libdevice.mul_rn(x0, s1))
+    return tl.reshape(tl.join(o0, o1), (BLOCK_N, BLOCK_D))
+
+
+@triton.jit
+def _qkv_norm_rope_interleaved_kernel(
+    qkv_ptr, qw_ptr, qb_ptr, kw_ptr, kb_ptr, cos_ptr, sin_ptr,
+    q_out_ptr, k_out_ptr, v_out_ptr,
+    qkv_sb, qkv_sn, cos_sb, cos_sn, sin_sb, sin_sn,
+    H, N, eps, COS_B,
+    D: tl.constexpr, BLOCK_D: tl.constexpr, HALF_D: tl.constexpr, BLOCK_N: tl.constexpr,
+    HAS_QW: tl.constexpr, HAS_QB: tl.constexpr, HAS_KW: tl.constexpr, HAS_KB: tl.constexpr,
+    ROUND: tl.constexpr,
+):
+    """One program per ``(b, h, n_block)``: read stride-3 ``(H, D, 3)`` QKV, apply Q/K LayerNorm, apply FP32
+    interleaved-pair RoPE in registers, and write contiguous ``[B, H, N, D]`` Q, K, V."""
+    bh = tl.program_id(1)
+    b = (bh // H).to(tl.int64)
+    h = (bh % H).to(tl.int64)
+    n = (tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+    d = tl.arange(0, BLOCK_D)
+    n_ok = n < N
+    d_ok = d < D
+    ok = n_ok[:, None] & d_ok[None, :]
+
+    base = b * qkv_sb + n[:, None] * qkv_sn + h * (D * 3)
+    d3 = d[None, :].to(tl.int64) * 3
+    q_raw = tl.load(qkv_ptr + base + d3, mask=ok, other=0.0).to(tl.float32)
+    k_raw = tl.load(qkv_ptr + base + d3 + 1, mask=ok, other=0.0).to(tl.float32)
+    v_raw = tl.load(qkv_ptr + base + d3 + 2, mask=ok, other=0.0)
+
+    qw = tl.load(qw_ptr + d, mask=d_ok, other=1.0).to(tl.float32) if HAS_QW else tl.full((BLOCK_D,), 1.0, tl.float32)
+    qb = tl.load(qb_ptr + d, mask=d_ok, other=0.0).to(tl.float32) if HAS_QB else tl.zeros((BLOCK_D,), tl.float32)
+    kw = tl.load(kw_ptr + d, mask=d_ok, other=1.0).to(tl.float32) if HAS_KW else tl.full((BLOCK_D,), 1.0, tl.float32)
+    kb = tl.load(kb_ptr + d, mask=d_ok, other=0.0).to(tl.float32) if HAS_KB else tl.zeros((BLOCK_D,), tl.float32)
+
+    q_norm = _layernorm_block(q_raw, qw, qb, d_ok, eps, D, HAS_QW, HAS_QB, ROUND)
+    k_norm = _layernorm_block(k_raw, kw, kb, d_ok, eps, D, HAS_KW, HAS_KB, ROUND)
+
+    tb = tl.where(COS_B > 1, b, 0)
+    cos = tl.load(cos_ptr + tb * cos_sb + n[:, None] * cos_sn + d[None, :], mask=ok, other=0.0).to(tl.float32)
+    sin = tl.load(sin_ptr + tb * sin_sb + n[:, None] * sin_sn + d[None, :], mask=ok, other=0.0).to(tl.float32)
+    c0, c1 = tl.split(tl.reshape(cos, (BLOCK_N, HALF_D, 2)))
+    s0, s1 = tl.split(tl.reshape(sin, (BLOCK_N, HALF_D, 2)))
+
+    q_rot = _apply_rope_interleaved_block(q_norm, c0, c1, s0, s1, BLOCK_N, HALF_D, BLOCK_D)
+    k_rot = _apply_rope_interleaved_block(k_norm, c0, c1, s0, s1, BLOCK_N, HALF_D, BLOCK_D)
+
+    out_off = ((b * H + h) * N + n[:, None]) * D + d[None, :]
+    tl.store(q_out_ptr + out_off, q_rot.to(q_out_ptr.dtype.element_ty), mask=ok)
+    tl.store(k_out_ptr + out_off, k_rot.to(k_out_ptr.dtype.element_ty), mask=ok)
+    tl.store(v_out_ptr + out_off, v_raw, mask=ok)
+
+
+def qkv_norm_rope_interleaved(
+    qkv: Tensor,
+    q_weight: Tensor | None,
+    q_bias: Tensor | None,
+    k_weight: Tensor | None,
+    k_bias: Tensor | None,
+    eps: float,
+    cos: Tensor,
+    sin: Tensor,
+    num_heads: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    batch, tokens, three_c = qkv.shape
+    dim = three_c // (3 * num_heads)
+    q_out = torch.empty((batch, num_heads, tokens, dim), device=qkv.device, dtype=qkv.dtype)
+    k_out = torch.empty_like(q_out)
+    v_out = torch.empty_like(q_out)
+    block_d = triton.next_power_of_2(dim)
+    block_n = 16
+    _qkv_norm_rope_interleaved_kernel[(triton.cdiv(tokens, block_n), batch * num_heads)](
+        qkv,
+        q_weight if q_weight is not None else qkv,
+        q_bias if q_bias is not None else qkv,
+        k_weight if k_weight is not None else qkv,
+        k_bias if k_bias is not None else qkv,
+        cos,
+        sin,
+        q_out,
+        k_out,
+        v_out,
+        qkv.stride(0),
+        qkv.stride(1),
+        cos.stride(0),
+        cos.stride(1),
+        sin.stride(0),
+        sin.stride(1),
+        num_heads,
+        tokens,
+        float(eps),
+        cos.shape[0],
+        D=dim,
+        BLOCK_D=block_d,
+        HALF_D=block_d // 2,
+        BLOCK_N=block_n,
+        HAS_QW=q_weight is not None,
+        HAS_QB=q_bias is not None,
+        HAS_KW=k_weight is not None,
+        HAS_KB=k_bias is not None,
+        ROUND=_ROUND_CODE[qkv.dtype],
+        num_warps=4,
+    )
+    return q_out, k_out, v_out
+
+
+@triton.jit
+def _qk_norm_swap_heads_kernel(
+    qk_ptr, v_ptr, w_ptr, b_ptr, q_out_ptr, k_swap_ptr, v_swap_ptr,
+    qk_sb, qk_sn, v_sb, v_sn,
+    HALF_B, H, N, eps,
+    D: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_N: tl.constexpr,
+    HAS_W: tl.constexpr, HAS_B: tl.constexpr, ROUND: tl.constexpr,
+):
+    """Per-head LayerNorm on ``qk [2B, N, H*D]`` and batch-half swap of ``q`` and ``v`` into contiguous
+    ``[2B, H, N, D]`` tensors in one pass."""
+    bh = tl.program_id(1)
+    b = (bh // H).to(tl.int64)
+    h = (bh % H).to(tl.int64)
+    b_swap = tl.where(b < HALF_B, b + HALF_B, b - HALF_B)
+    n = (tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+    d = tl.arange(0, BLOCK_D)
+    n_ok = n < N
+    d_ok = d < D
+    ok = n_ok[:, None] & d_ok[None, :]
+
+    qk_raw = tl.load(qk_ptr + b * qk_sb + n[:, None] * qk_sn + h * D + d[None, :], mask=ok, other=0.0).to(tl.float32)
+    v_raw = tl.load(v_ptr + b * v_sb + n[:, None] * v_sn + h * D + d[None, :], mask=ok, other=0.0)
+    w = tl.load(w_ptr + d, mask=d_ok, other=1.0).to(tl.float32) if HAS_W else tl.full((BLOCK_D,), 1.0, tl.float32)
+    bias = tl.load(b_ptr + d, mask=d_ok, other=0.0).to(tl.float32) if HAS_B else tl.zeros((BLOCK_D,), tl.float32)
+    q_norm = _layernorm_block(qk_raw, w, bias, d_ok, eps, D, HAS_W, HAS_B, ROUND)
+    q_typed = q_norm.to(q_out_ptr.dtype.element_ty)
+
+    out_off = ((b * H + h) * N + n[:, None]) * D + d[None, :]
+    swap_off = ((b_swap * H + h) * N + n[:, None]) * D + d[None, :]
+    tl.store(q_out_ptr + out_off, q_typed, mask=ok)
+    tl.store(k_swap_ptr + swap_off, q_typed, mask=ok)
+    tl.store(v_swap_ptr + swap_off, v_raw, mask=ok)
+
+
+def qk_norm_swap_heads(
+    qk: Tensor,
+    v: Tensor,
+    qk_weight: Tensor | None,
+    qk_bias: Tensor | None,
+    eps: float,
+    num_heads: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    batch, tokens, channels = qk.shape
+    dim = channels // num_heads
+    q_out = torch.empty((batch, num_heads, tokens, dim), device=v.device, dtype=v.dtype)
+    k_swap = torch.empty_like(q_out)
+    v_swap = torch.empty_like(q_out)
+    block_d = triton.next_power_of_2(dim)
+    block_n = 16
+    _qk_norm_swap_heads_kernel[(triton.cdiv(tokens, block_n), batch * num_heads)](
+        qk,
+        v,
+        qk_weight if qk_weight is not None else qk,
+        qk_bias if qk_bias is not None else qk,
+        q_out,
+        k_swap,
+        v_swap,
+        qk.stride(0),
+        qk.stride(1),
+        v.stride(0),
+        v.stride(1),
+        batch // 2,
+        num_heads,
+        tokens,
+        float(eps),
+        D=dim,
+        BLOCK_D=block_d,
+        BLOCK_N=block_n,
+        HAS_W=qk_weight is not None,
+        HAS_B=qk_bias is not None,
+        ROUND=_ROUND_CODE[v.dtype],
+        num_warps=4,
+    )
+    return q_out, k_swap, v_swap
+
+
 # -- registrations ---------------------------------------------------------------------------------------
 
 _FLOATS = (torch.float16, torch.bfloat16, torch.float32)
@@ -367,6 +583,61 @@ def _rope_interleaved_eligible(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -
 ops.rope_qk_interleaved.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_rope_interleaved_eligible
 )(rope_qk_interleaved)
+
+
+def _qkv_norm_rope_eligible(qkv, qw, qb, kw, kb, eps, cos, sin, num_heads) -> bool:
+    if torch.is_grad_enabled() or qkv.ndim != 3 or qkv.dtype not in _FLOATS or qkv.stride(-1) != 1:
+        return False
+    b, n, c3 = qkv.shape
+    if c3 % (3 * num_heads) != 0:
+        return False
+    dim = c3 // (3 * num_heads)
+    return (
+        dim % 2 == 0
+        and 2 <= dim <= 256
+        and cos.ndim == 3
+        and sin.ndim == 3
+        and cos.shape == sin.shape
+        and cos.shape[0] in (1, b)
+        and cos.shape[1] == n
+        and cos.shape[2] == dim
+        and cos.stride(-1) == 1
+        and sin.stride(-1) == 1
+        and cos.dtype in _FLOATS
+        and sin.dtype in _FLOATS
+        and (qw is None or qw.is_contiguous())
+        and (qb is None or qb.is_contiguous())
+        and (kw is None or kw.is_contiguous())
+        and (kb is None or kb.is_contiguous())
+    )
+
+
+ops.qkv_norm_rope_interleaved.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_qkv_norm_rope_eligible
+)(qkv_norm_rope_interleaved)
+
+
+def _qk_norm_swap_eligible(qk, v, qkw, qkb, eps, num_heads) -> bool:
+    if torch.is_grad_enabled() or qk.ndim != 3 or qk.shape != v.shape:
+        return False
+    b, _, c = qk.shape
+    if b % 2 != 0 or b == 0 or c % num_heads != 0:
+        return False
+    dim = c // num_heads
+    return (
+        1 <= dim <= 256
+        and qk.dtype in _FLOATS
+        and v.dtype in _FLOATS
+        and qk.stride(-1) == 1
+        and v.stride(-1) == 1
+        and (qkw is None or qkw.is_contiguous())
+        and (qkb is None or qkb.is_contiguous())
+    )
+
+
+ops.qk_norm_swap_heads.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_qk_norm_swap_eligible
+)(qk_norm_swap_heads)
 
 
 def _deformable_eligible(value, offsets, weights, reference, spatial_shapes, softmax=False) -> bool:

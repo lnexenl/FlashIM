@@ -16,7 +16,14 @@ from flashim.ops._registry import (
     set_strict,
 )
 from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
-from flashim.ops.attention import deformable_attention, rope_qk, rope_qk_interleaved, sdpa
+from flashim.ops.attention import (
+    deformable_attention,
+    qk_norm_swap_heads,
+    qkv_norm_rope_interleaved,
+    rope_qk,
+    rope_qk_interleaved,
+    sdpa,
+)
 from flashim.ops.conv import (
     conv2d_at_points,
     conv2d_single_output,
@@ -109,6 +116,8 @@ __all__ = [
     "mxfp8_scaled_mm",
     "patch_embed_tokens",
     "pil_bicubic_resize",
+    "qk_norm_swap_heads",
+    "qkv_norm_rope_interleaved",
     "quantize_int8",
     "quantize_int8_heads",
     "quantize_int8_multi",

@@ -99,12 +99,19 @@ class SelfBlock(nn.Module):
 
     def forward(self, x: Tensor, encoding: Tensor) -> Tensor:
         qkv = self.Wqkv(x)  # token-major (B, N, H, D) q, k, v; checkpoint layout (H, D, 3)
-        q, k, v = qkv.unflatten(-1, (self.num_heads, -1, 3)).unbind(-1)
-        q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
-        encoding = encoding.transpose(-3, -2)  # broadcast the tables over (N, H) instead of (1, N)
-        q, k = apply_rotary(encoding, q), apply_rotary(encoding, k)
-        q, k = q.to(v.dtype), k.to(v.dtype)  # the fp32 tables promote the rope back to fp32
-        message = self.out_proj(_attention(q, k, v.contiguous(), self.sdpa_impl))
+        q, k, v = ops.qkv_norm_rope_interleaved(
+            qkv,
+            self.q_norm.weight,
+            self.q_norm.bias,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.q_norm.eps,
+            encoding[0, :, 0],
+            encoding[1, :, 0],
+            self.num_heads,
+        )
+        out = ops.sdpa.get(self.sdpa_impl)(q, k, v)
+        message = self.out_proj(out.transpose(1, 2).flatten(-2))
         return x + self.ffn(torch.cat([x, self.message_norm(message)], -1))
 
 
@@ -135,12 +142,11 @@ class CrossBlock(nn.Module):
     def forward_stacked(self, x: Tensor) -> Tensor:
         """``forward`` on both images stacked on the batch, ``x = cat([x0, x1])`` of equal token counts: one call
         per linear and one attention over the 2B pairs (image 0 attends to image 1 and vice versa)."""
-        b = x.shape[0] // 2
-        qk = self.qk_norm(self.to_qk(x).unflatten(-1, (self.num_heads, -1)))
-        v = self.to_v(x).unflatten(-1, (self.num_heads, -1))
-        qk = qk.to(v.dtype)
-        swap = lambda t: torch.cat([t[b:], t[:b]])  # the other image of each pair
-        message = self.to_out(_attention(qk, swap(qk), swap(v), self.sdpa_impl))
+        q, k_swap, v_swap = ops.qk_norm_swap_heads(
+            self.to_qk(x), self.to_v(x), self.qk_norm.weight, self.qk_norm.bias, self.qk_norm.eps, self.num_heads
+        )
+        out = ops.sdpa.get(self.sdpa_impl)(q, k_swap, v_swap)
+        message = self.to_out(out.transpose(1, 2).flatten(-2))
         return x + self.ffn(torch.cat([x, self.message_norm(message)], -1))
 
 
@@ -353,20 +359,29 @@ class FlexGlue(ImageMatcher, nn.Module):
         Runs the transformer layers with the early-stop gate when ``config.early_stop_decay`` is set (a host sync
         per checked layer, as upstream); otherwise every layer runs (deterministic, the upstream default).
         """
-        x0, x1 = (self.input_proj(f.flatten(2).mT.to(self.compute_dtype)) for f in (f0, f1))
-        enc0, enc1 = (self._posenc(f) for f in (f0, f1))
         cfg = self.config
         layer, score = cfg.num_layers, None
-        for k, block in enumerate(self.transformers[: cfg.num_layers], 1):
-            x0, x1 = block(x0, x1, enc0, enc1)
-            if cfg.early_stop_decay is None or k == cfg.num_layers:
-                continue
-            # stop once the whole batch is a confident non-pair
-            score = self.covisibility_score(x0, x1, k)
-            gamma = (1 - cfg.early_stop_decay) ** (len(self.transformers) - k)
-            if (score < cfg.min_covisibility * gamma).all():
-                layer = k
-                break
+        if f0.shape == f1.shape and cfg.early_stop_decay is None:
+            # Keep both images stacked as [2B, N, C] across all layers (no per-layer cat/chunk, one posenc/input_proj).
+            x = self.input_proj(torch.cat((f0, f1), dim=0).flatten(2).mT.to(self.compute_dtype))
+            enc0 = self._posenc(f0)
+            for block in self.transformers[: cfg.num_layers]:
+                x = block.cross_attn.forward_stacked(block.self_attn(x, enc0))
+            x0, x1 = x.chunk(2)
+        else:
+            x0, x1 = (self.input_proj(f.flatten(2).mT.to(self.compute_dtype)) for f in (f0, f1))
+            enc0 = self._posenc(f0)
+            enc1 = enc0 if f0.shape[-2:] == f1.shape[-2:] else self._posenc(f1)
+            for k, block in enumerate(self.transformers[: cfg.num_layers], 1):
+                x0, x1 = block(x0, x1, enc0, enc1)
+                if cfg.early_stop_decay is None or k == cfg.num_layers:
+                    continue
+                # stop once the whole batch is a confident non-pair
+                score = self.covisibility_score(x0, x1, k)
+                gamma = (1 - cfg.early_stop_decay) ** (len(self.transformers) - k)
+                if (score < cfg.min_covisibility * gamma).all():
+                    layer = k
+                    break
         # on a stop, ``score`` is the stopping layer's; otherwise recompute from the final tokens with the head the
         # matches will use (upstream's ``pair_context``), so ``is_covisible`` is never stale
         if layer == cfg.num_layers or score is None:
