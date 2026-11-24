@@ -31,7 +31,7 @@ from flashim.ops.conv import (
     int8_conv2d_maxpool,
     mxfp8_conv2d,
 )
-from flashim.ops.correlation import dual_softmax_mutual, local_corr
+from flashim.ops.correlation import dual_softmax_mutual, local_corr, mutual_nn_match
 from flashim.ops.density import kde_density
 from flashim.ops.gemm import (
     int8_linear,
@@ -59,8 +59,14 @@ from flashim.ops.quantize import (
     quantize_int8_rows,
     quantize_mxfp8,
 )
-from flashim.ops.raco import raco_head5x5, raco_resblock
-from flashim.ops.resample import pil_bicubic_resize, upsample_add, upsample_concat, upsample_concat_int8
+from flashim.ops.raco import raco_head5x5, raco_resblock, raco_score_head
+from flashim.ops.resample import (
+    bilinear_sample_points,
+    pil_bicubic_resize,
+    upsample_add,
+    upsample_concat,
+    upsample_concat_int8,
+)
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 
 __all__ = [
@@ -69,6 +75,7 @@ __all__ = [
     "DeviceSpec",
     "Op",
     "bias_relu_quantize_int8",
+    "bilinear_sample_points",
     "call_counts",
     "configure",
     "conv2d_at_points",
@@ -102,6 +109,7 @@ __all__ = [
     "local_corr",
     "matmul_nt_fp32",
     "multiscale_fuse",
+    "mutual_nn_match",
     "mxfp8_conv2d",
     "mxfp8_gelu_mlp",
     "mxfp8_linear",
@@ -115,6 +123,7 @@ __all__ = [
     "quantize_mxfp8",
     "raco_head5x5",
     "raco_resblock",
+    "raco_score_head",
     "reset_call_counts",
     "romav2_refiner_heads",
     "romav2_refiner_input",

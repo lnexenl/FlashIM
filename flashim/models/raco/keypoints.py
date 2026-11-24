@@ -21,11 +21,16 @@ def detect_candidates(logits: Tensor, count: int, radius: int, temperature: floa
     index = scores.topk(count, dim=1).indices  # [B, count]
     keypoints = torch.stack((index % w, index // w), dim=-1).to(logits.dtype)
 
-    patches = F.unfold(logits, kernel_size=radius, padding=radius // 2)  # [B, radius**2, H*W]
-    patches = patches.gather(2, index[:, None].expand(b, radius**2, -1))
+    pad = radius // 2
+    ys, xs = index // w, index % w
+    steps = torch.arange(radius, device=logits.device)
+    padded = F.pad(logits[:, 0], (pad,) * 4)
+    batch = torch.arange(b, device=logits.device)[:, None, None, None]
+    patches = padded[batch, (ys[..., None] + steps)[..., :, None], (xs[..., None] + steps)[..., None, :]]
+    patches = patches.reshape(b, count, radius * radius).transpose(1, 2)  # [B, radius**2, count]
     probability = F.softmax(patches / temperature, dim=1)
-    steps = torch.linspace(-(radius - 1) / 2, (radius - 1) / 2, radius, device=logits.device)
-    grid_y, grid_x = torch.meshgrid(steps, steps, indexing="ij")
+    offsets_1d = torch.linspace(-(radius - 1) / 2, (radius - 1) / 2, radius, device=logits.device)
+    grid_y, grid_x = torch.meshgrid(offsets_1d, offsets_1d, indexing="ij")
     offsets = torch.stack((grid_x, grid_y), dim=-1).reshape(radius**2, 2)
     return keypoints + torch.einsum("bkn,kd->bnd", probability, offsets)
 

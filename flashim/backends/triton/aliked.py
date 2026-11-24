@@ -155,6 +155,9 @@ def _multiscale_fuse_kernel(
     C,
     H,
     W,
+    s1_c,
+    s1_h,
+    s1_w,
     H2,
     W2,
     H3,
@@ -167,22 +170,28 @@ def _multiscale_fuse_kernel(
     OUT_DTYPE: tl.constexpr,
     WRITE_HEAD: tl.constexpr,
     WRITE_FEATURE: tl.constexpr,
+    SELU_F1: tl.constexpr,
 ):
-    """``f1`` ``[C, H, W]`` copied as-is; ``f2``/``f3``/``f4`` (coarser, same ``C``) bilinearly upsampled
-    (``align_corners=True``) to ``[H, W]``. Writes the concatenated ``[4*C, H, W]`` FP32 (for ``score_head``)
-    and its L2-normalized cast to ``OUT_DTYPE`` (the descriptor feature map). Batch size 1 (ALIKED's
-    ``extract`` contract); requires ``4 * C <= BLOCK_C`` (true for every released variant, dim//4 <= 32)."""
+    """``f1`` ``[C, H, W]`` (arbitrary strides: NCHW or channels-last) copied as-is (with optional SELU);
+    ``f2``/``f3``/``f4`` (coarser, same ``C``) bilinearly upsampled (``align_corners=True``) to ``[H, W]``. Writes
+    the concatenated ``[4*C, H, W]`` FP32 (for ``score_head``) and its L2-normalized cast to ``OUT_DTYPE`` (the
+    descriptor feature map). Batch size 1 (ALIKED's ``extract`` contract); requires ``4 * C <= BLOCK_C``."""
     pid_pix = tl.program_id(0)
     pix = pid_pix * BLOCK_PIX + tl.arange(0, BLOCK_PIX)
     pix_mask = pix < H * W
-    oh = (pix // W).to(tl.float32)
-    ow = (pix % W).to(tl.float32)
+    oh_i = pix // W
+    ow_i = pix % W
+    oh = oh_i.to(tl.float32)
+    ow = ow_i.to(tl.float32)
 
     c = tl.arange(0, BLOCK_C)
     c_mask = c < C
     mask2d = c_mask[:, None] & pix_mask[None, :]
 
-    v1 = tl.load(f1_ptr + c[:, None] * (H * W) + pix[None, :], mask=mask2d, other=0.0).to(tl.float32)
+    f1_off = c[:, None].to(tl.int64) * s1_c + (oh_i.to(tl.int64) * s1_h + ow_i.to(tl.int64) * s1_w)[None, :]
+    v1 = tl.load(f1_ptr + f1_off, mask=mask2d, other=0.0).to(tl.float32)
+    if SELU_F1:
+        v1 = 1.0507009873554805 * tl.where(v1 > 0, v1, 1.6732632423543772 * (tl.exp(v1) - 1.0))
 
     iy2 = oh * (H2 - 1) / (H - 1)
     ix2 = ow * (W2 - 1) / (W - 1)
@@ -260,7 +269,14 @@ _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float
 
 
 def multiscale_fuse(
-    f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, head_weight: Tensor | None = None, *, normalize: bool = True
+    f1: Tensor,
+    f2: Tensor,
+    f3: Tensor,
+    f4: Tensor,
+    head_weight: Tensor | None = None,
+    *,
+    normalize: bool = True,
+    selu_f1: bool = False,
 ) -> tuple[Tensor | None, Tensor | None]:
     """``f1`` ``[1, C, H, W]``, ``f2``/``f3``/``f4`` ``[1, C, h_i, w_i]`` (coarser, ``C <= 32``) ->
     ``(head, feature_map)``. With ``fused = cat([f1, *upsample(f2..f4)])`` (bilinear, ``align_corners=True``):
@@ -272,14 +288,13 @@ def multiscale_fuse(
     dummy = f1
     head = torch.empty(1, 8, h, w, device=f1.device, dtype=torch.float32) if head_weight is not None else None
     feature_map = torch.empty(1, 4 * c, h, w, device=f1.device, dtype=f1.dtype) if normalize else None
-    # native dtype (the kernel upcasts on load); the coarse maps go channels-last so each gathered pixel is one
-    # contiguous ``C``-wide load (NCHW made every lane of a warp hit a different cache line: L1-bound, 93%)
-    f1c = f1.contiguous()
+    # native dtype (the kernel upcasts on load); f1 is read in place (NCHW or channels-last, zero copy), while the
+    # coarse maps go channels-last so each gathered pixel is one contiguous ``C``-wide load (zero copy if NHWC already).
     f2c, f3c, f4c = (f.permute(0, 2, 3, 1).contiguous() for f in (f2, f3, f4))
     block_pix = 64
     grid = (triton.cdiv(h * w, block_pix),)
     _multiscale_fuse_kernel[grid](
-        f1c,
+        f1,
         f2c,
         f3c,
         f4c,
@@ -289,6 +304,9 @@ def multiscale_fuse(
         c,
         h,
         w,
+        f1.stride(1),
+        f1.stride(2),
+        f1.stride(3),
         f2.shape[-2],
         f2.shape[-1],
         f3.shape[-2],
@@ -301,6 +319,7 @@ def multiscale_fuse(
         OUT_DTYPE=_TL_DTYPE[f1.dtype],
         WRITE_HEAD=head_weight is not None,
         WRITE_FEATURE=normalize,
+        SELU_F1=selu_f1,
     )
     return head, feature_map
 
@@ -317,7 +336,14 @@ ops.deform_patches_int8.register(
 
 
 def _multiscale_fuse_eligible(
-    f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, head_weight: Tensor | None = None, *, normalize: bool = True
+    f1: Tensor,
+    f2: Tensor,
+    f3: Tensor,
+    f4: Tensor,
+    head_weight: Tensor | None = None,
+    *,
+    normalize: bool = True,
+    selu_f1: bool = False,
 ) -> bool:
     ok = f1.shape[0] == 1 and f1.shape[1] <= 32  # batch size 1 (the sparse extract contract); dim // 4 <= 32
     return ok and (head_weight is None or (head_weight.dtype == torch.float32 and head_weight.is_contiguous()))

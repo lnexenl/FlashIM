@@ -80,15 +80,24 @@ deform_patches_int8 = Op("deform_patches_int8", _deform_patches_int8_reference)
 
 
 def _multiscale_fuse_reference(
-    f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, head_weight: Tensor | None = None, *, normalize: bool = True
+    f1: Tensor,
+    f2: Tensor,
+    f3: Tensor,
+    f4: Tensor,
+    head_weight: Tensor | None = None,
+    *,
+    normalize: bool = True,
+    selu_f1: bool = False,
 ) -> tuple[Tensor | None, Tensor | None]:
     """ALIKED's / RaCo's multi-scale feature fusion: ``fused = cat([f1, up(f2), up(f3), up(f4)])`` (bilinear,
     ``align_corners=True``, to ``f1``'s size), then ``head = selu(conv1x1(fused.float(), head_weight))`` (the score
     head's first layer, FP32; ``head_weight`` ``[8, 4C]``) and ``feature_map = F.normalize(fused, p=2, dim=1)`` in
-    ``f1``'s dtype. Either output can be skipped. See ``backends/triton/aliked.py`` for the fused kernel."""
+    ``f1``'s dtype. With ``selu_f1=True``, ``F.selu`` is applied to ``f1`` in registers (fusing RaCo's full-resolution
+    ``gate(conv1(x1))``). Either output can be skipped. See ``backends/triton/aliked.py`` for the fused kernel."""
     size = f1.shape[-2:]
+    v1 = F.selu(f1.float()) if selu_f1 else f1.float()
     upsampled = [F.interpolate(f.float(), size=size, mode="bilinear", align_corners=True) for f in (f2, f3, f4)]
-    fused = torch.cat([f1.float(), *upsampled], dim=1)
+    fused = torch.cat([v1, *upsampled], dim=1)
     head = None if head_weight is None else F.selu(F.conv2d(fused, head_weight[:, :, None, None]))
     return head, (F.normalize(fused, p=2, dim=1).to(f1.dtype) if normalize else None)
 

@@ -54,8 +54,15 @@ def _eligible(image: Tensor, cls_token: Tensor, pos_embed: Tensor, weight: Tenso
     )
 
 
-# sm_89 and sm_90 only: the two architectures it was measured on.
+_MEASURED_CAPABILITIES = ((8, 9), (9, 0), (12, 0))
+
+
+def _accepts(weight: Tensor, bias: Tensor) -> bool:
+    return weight.is_cuda and torch.cuda.get_device_capability(weight.device) in _MEASURED_CAPABILITIES
+
+
+# sm_89, sm_90 and sm_120: the architectures it was measured on (sm_120: 0.601 -> 0.143 ms at 896x1176, 4.20x).
 ops.patch_embed_tokens.register(
-    "cublas", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)),
-    when=_eligible, prepare=_prepare,
+    "cublas", device=DeviceSpec("cuda", min_capability=(8, 9)),
+    when=_eligible, accepts=_accepts, prepare=_prepare,
 )(_patch_embed_cublas)

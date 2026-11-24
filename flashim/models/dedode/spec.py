@@ -107,7 +107,8 @@ def int8_decoder_producers(model: nn.Module, ctx: BuildContext) -> list[str] | s
         return "skipped: not int8"
     from flashim.quant.passes.separable_conv_block import fuse_int8_producers
 
-    return fuse_int8_producers(model, _DECODERS)
+    prefixes = tuple(f"{name}." for name, module in model.named_modules() if isinstance(module, blocks.ConvRefiner))
+    return fuse_int8_producers(model, prefixes) if prefixes else []
 
 
 def int8_refiner_input(model: nn.Module, ctx: BuildContext) -> list[str] | str:
@@ -256,8 +257,9 @@ VIT_EPILOGUE_PASSES = {
 
 
 # SageAttention impl per architecture (``flashim.backends.external.sageattention``): QK INT8 with per-warp scales, PV FP8.
-# sm_89 kernel on Ada, the WGMMA kernel on Hopper (the sm_89 kernel on an H20 is slower than cuDNN SDPA).
-_SAGE_IMPLS = {(8, 9): "sage-fp8-warp", (9, 0): "sage-fp8-sm90-warp"}
+# sm_89 kernel on Ada and consumer Blackwell (sm_120: 1.29 -> 0.66 ms per ViT-L/14 attention layer, 1.95x over FlashAttention),
+# the WGMMA kernel on Hopper (the sm_89 kernel on an H20 is slower than cuDNN SDPA).
+_SAGE_IMPLS = {(8, 9): "sage-fp8-warp", (9, 0): "sage-fp8-sm90-warp", (12, 0): "sage-fp8-warp"}
 VIT_SAGE_LAYERS = "2-23"
 
 
@@ -284,15 +286,15 @@ def _sage_platform(platform) -> bool:
 
 
 def _vit_sage_attention(model: nn.Module, ctx: BuildContext) -> list[str] | str:
-    """int8: SageAttention (QK INT8, PV FP8) on a subset of the DINOv2 blocks, the rest stay on torch SDPA. Option
+    """int8 / fp8: SageAttention (QK INT8, PV FP8) on a subset of the DINOv2 blocks, the rest stay on torch SDPA. Option
     ``optimize.options.vit_attention = {"layers": "2-23", "impl": "auto"}`` (``layers``: see :func:`parse_layers`, ``""``
     = none; ``impl``: an ``ops.sdpa`` impl name, ``auto`` = :data:`_SAGE_IMPLS` of the platform). Layers 0 and 1 stay
     out by default. Relative L2 error of the ViT output against the same ViT with FP32 attention in every layer (10
     MegaDepth images at 1200 px; the INT8 ViT with torch SDPA sits at 7.1e-2): sage on all 24 layers 8.2e-2 (L20) / 8.6e-2
     (H20), on layers 2-23 7.5e-2 / 7.4e-2; layers 0 and 1 alone give 8.0e-2 and 7.7e-2 on L20, any single later layer
     7.1-7.5e-2. Per-warp QK scales measured faster than per-thread at the same error class."""
-    if ctx.config.precision.quant != "int8":
-        return "skipped: not int8"
+    if ctx.config.precision.quant not in ("int8", "fp8"):
+        return "skipped: not quantized"
     dinov2 = getattr(getattr(model.descriptor, "encoder", None), "dinov2", None)
     if dinov2 is None:  # a VGG-only descriptor (LoMa-B128)
         return "skipped: no ViT"
@@ -306,11 +308,10 @@ def _vit_sage_attention(model: nn.Module, ctx: BuildContext) -> list[str] | str:
     return {"impl": impl, "layers": layers}
 
 
-# dedode-g only (dad shares the ViT but keeps its BF16 numerics).
 VIT_ATTENTION_PASSES = {
     "vit_sage_attention": Pass(
         _vit_sage_attention, requires=_sage_platform, exact=False,
-        description="int8: SageAttention (QK INT8 per warp, PV FP8) on DINOv2 blocks 2-23 (sm_89, sm_90)",
+        description="int8 / fp8: SageAttention (QK INT8 per warp, PV FP8) on DINOv2 blocks 2-23 (sm_89, sm_90, sm_120)",
     ),
 }
 

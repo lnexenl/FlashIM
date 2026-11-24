@@ -49,15 +49,20 @@ def sample_keypoints(logits: Tensor, top_k: int, cfg: SamplerConfig) -> tuple[Te
     if cfg.nms_size:
         probs = probs * (probs == F.max_pool2d(probs, cfg.nms_size, stride=1, padding=cfg.nms_size // 2))
     if cfg.remove_borders:
-        frame = torch.zeros_like(probs)
-        frame[..., 4:-4, 4:-4] = 1
-        probs = probs * frame
+        probs[..., :4, :] = 0
+        probs[..., -4:, :] = 0
+        probs[..., :, :4] = 0
+        probs[..., :, -4:] = 0
     index = torch.topk(probs.reshape(-1), k=min(top_k, h * w)).indices
-    keypoints = torch.stack((index % w, index // w), dim=-1).float()
+    xs, ys = index % w, index // w
+    keypoints = torch.stack((xs, ys), dim=-1).float()
     if cfg.subpixel:
         k = cfg.nms_size
-        patches = F.unfold(logits[:, None], kernel_size=k, padding=k // 2)[0][:, index]  # [k*k, N]
-        offsets = torch.stack(torch.meshgrid(*[torch.arange(k, device=logits.device) - k // 2] * 2, indexing="ij"), -1)
+        pad = k // 2
+        steps = torch.arange(k, device=logits.device)
+        padded = F.pad(logits[0], (pad,) * 4)
+        patches = padded[(ys[:, None] + steps)[:, :, None], (xs[:, None] + steps)[:, None, :]].reshape(-1, k * k).t()
+        offsets = torch.stack(torch.meshgrid(steps - pad, steps - pad, indexing="ij"), -1)
         offsets = offsets.reshape(k * k, 2).flip(-1).float()  # (dx, dy), row-major like the patch unfolding
         keypoints = keypoints + torch.einsum("kn,kd->nd", (patches / cfg.subpixel_temp).softmax(0), offsets)
     return keypoints, probs.reshape(-1)[index]
@@ -120,7 +125,11 @@ class DeDoDe(sparse.SparseExtractor):
 
     @torch.inference_mode()
     def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
-        corr = (a.descriptors[0].float() @ b.descriptors[0].float().t()) * self.inv_temperature
+        d0, d1 = a.descriptors[0], b.descriptors[0]
+        if self.compute_dtype != torch.float32 and d0.is_cuda:
+            corr = ops.matmul_nt_fp32(d0.to(self.compute_dtype), d1.to(self.compute_dtype), self.inv_temperature)
+        else:
+            corr = (d0.float() @ d1.float().t()) * self.inv_temperature
         # mutual maxima of softmax(corr, -2) * softmax(corr, -1) above the threshold, without the [M, N] probabilities:
         # measured 5.7 -> 0.74 ms for 4096 x 4096 keypoints (sm_120), identical match lists on 100 MegaDepth pairs
         log_conf, index, mutual = ops.dual_softmax_mutual(corr)

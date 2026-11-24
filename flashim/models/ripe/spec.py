@@ -5,7 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from flashim.config import RunConfig
-from flashim.models.dedode.spec import DECODER_UPSAMPLE_PASS
+from flashim.models.dedode.spec import (
+    DECODER_FUSION_PASSES,
+    DECODER_UPSAMPLE_PASS,
+    STEM_EXACT_PASSES,
+    STEM_TC_PASSES,
+)
 from flashim.models.ripe.model import RIPE
 from flashim.models.sparse_spec import extractor_spec
 
@@ -21,6 +26,8 @@ def _load(config: RunConfig) -> RIPE:
     return RIPE.from_pretrained(checkpoint=config.checkpoint, device=config.device, **config.arch)
 
 
+_PASSES = {**DECODER_UPSAMPLE_PASS, **DECODER_FUSION_PASSES, **STEM_EXACT_PASSES, **STEM_TC_PASSES}
+
 SPEC = extractor_spec(
     name="ripe",
     description="RIPE detector/descriptor (VGG19 + ConvRefiner heatmap, hypercolumn 256-d descriptors, mutual-NN matching)",
@@ -32,6 +39,6 @@ SPEC = extractor_spec(
     # 16 ConvRefiner hidden blocks (64 / 128 channels) as one BF16 kernel each: BF16 extract 55.5 -> 36.8 ms
     fused_bf16_blocks=("net.decoder.",),
     channels_last=True,  # BF16 extract at 1200 px, interleaved in one process (sm_120): 76 -> 56 ms
-    extra_passes=DECODER_UPSAMPLE_PASS,
-    structural_passes=tuple(DECODER_UPSAMPLE_PASS),
+    extra_passes=_PASSES,
+    structural_passes=tuple(_PASSES),
 )

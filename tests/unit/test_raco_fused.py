@@ -120,3 +120,45 @@ def test_use_fused_ranker_requires_folded_batchnorm():
     model = RaCo(RaCoConfig(num_keypoints=8)).eval().cuda()
     with pytest.raises(RuntimeError, match="BatchNorm"):
         model.use_fused_ranker()
+
+
+@pytest.mark.parametrize("shape", [(1, 8, 64, 64), (2, 8, 75, 101), (1, 8, 1, 1), (1, 8, 256, 320)])
+def test_score_head_cuda_matches_reference(shape):
+    from flashim.backends.cuda import raco as cuda_raco
+
+    if cuda_raco._score_head_library() is None:
+        pytest.skip("nvcc unavailable")
+    torch.manual_seed(0)
+    x = torch.randn(*shape, device="cuda", dtype=torch.float32)
+    w1 = torch.randn(4, 8, 3, 3, device="cuda") * 0.2
+    w2 = torch.randn(4, 4, 3, 3, device="cuda") * 0.2
+    w3 = torch.randn(1, 4, 3, 3, device="cuda") * 0.2
+    bound = ops.raco_score_head.bind(w1, w2, w3).warmup()
+    assert bound.primary == "cuda"
+    ops.reset_call_counts()
+    with torch.backends.cudnn.flags(allow_tf32=False):
+        ref = ops.raco_score_head.get("reference")(x, w1, w2, w3)
+        out = bound(x)
+    assert ops.call_counts()["raco_score_head"] == {"reference": 1, "cuda": 1}
+    assert out.shape == ref.shape == (shape[0], 1, shape[2], shape[3]) and out.dtype == torch.float32
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+
+def test_fused_detector_tracks_unfused_detector():
+    model = _folded_raco(2)
+    image = torch.rand(1, 3, 192, 224, device="cuda")
+    x = model.normalize(image)
+    with torch.inference_mode():
+        ref_fp32 = model.detector_logits(x)
+        enabled_fp32 = model.use_fused_detector()
+        assert any(s.startswith("score_head:") for s in enabled_fp32)
+        fused_fp32 = model.detector_logits(x)
+        torch.testing.assert_close(fused_fp32, ref_fp32, atol=2e-4, rtol=2e-4)  # TF32 in unfused cuDNN vs exact FP32
+
+        model._fused_score_head = None
+        model.set_compute_dtype(torch.bfloat16)
+        ref_bf16 = model.detector_logits(x)
+        enabled_bf16 = model.use_fused_detector()
+        assert any(s.startswith("block1:") for s in enabled_bf16)
+        fused_bf16 = model.detector_logits(x)
+    assert _rel_rms(fused_bf16, ref_bf16) < 0.03

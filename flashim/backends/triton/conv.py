@@ -930,12 +930,15 @@ def _conv3x3_cin3_quantize(x: Tensor, scale: Tensor, packed: Tensor, bias: Tenso
     return Int8Tensor(out, scale)
 
 
+_STEM_TC_CAPABILITIES = ((8, 9), (9, 0), (12, 0))
+
+
 def _conv3x3_cin3_accepts(weight: Tensor, bias: Tensor) -> bool:
     cout = weight.shape[0]
-    return weight.shape[1:] == (3, 3, 3) and cout & (cout - 1) == 0 and cout <= 128 and bias.shape == (cout,)
-
-
-_STEM_TC_CAPABILITIES = ((8, 9), (9, 0), (12, 0))
+    return (
+        weight.is_cuda and platform_for(weight.device).capability in _STEM_TC_CAPABILITIES
+        and weight.shape[1:] == (3, 3, 3) and cout & (cout - 1) == 0 and cout <= 128 and bias.shape == (cout,)
+    )
 
 
 def _conv3x3_cin3_eligible(x: Tensor, scale: Tensor, weight: Tensor, bias: Tensor) -> bool:

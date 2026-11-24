@@ -108,7 +108,8 @@ PRODUCER_TILE = {(8, 9): (4, 8, 2), (9, 0): (4, 8, 1), (12, 0): (4, 8, 2)}
 #: ``(COLS, TH, NG)`` of the fused BF16 block per capability and channel count (same sweeps, 5 tiles x 2 occupancy caps,
 #: all bit-identical to Triton). The L20 is DRAM-bound on the full-resolution 32 / 64-channel blocks (every tile within
 #: 3% of the best, ~10% over Triton there); one tile for every channel count is within 0.3% of the per-shape best.
-#: sm_120 (RTX 5070 Ti): 1.17-1.29x vs Triton on 32-ch (RoMaV2/DeDoDe), 1.52x on 64-ch, 1.39x on 128-ch.
+#: sm_120 (RTX 5070 Ti): 1.17-1.29x vs Triton on 32-ch (RoMaV2/DeDoDe), 1.52x on 64-ch, 1.39x on 128-ch;
+#: producer 2.3-3.7x over TileLang and 2.1-2.8x over Triton, bit-identical.
 DWPW_TILE = {
     (8, 9): {32: (4, 4, 4), 64: (4, 4, 4), 128: (4, 4, 4)},
     (9, 0): {32: (4, 8, 4), 64: (4, 8, 4), 128: (4, 8, 8)},

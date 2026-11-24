@@ -67,7 +67,7 @@ class DeformableTransformer(nn.Module):
     def forward(self, srcs: list[Tensor]) -> list[Tensor]:
         shapes = tuple((s.shape[-2], s.shape[-1]) for s in srcs)
         batch = srcs[0].shape[0]
-        src = torch.cat([s.flatten(2).transpose(1, 2) for s in srcs], dim=1)
+        src = torch.cat([s.permute(0, 2, 3, 1).flatten(1, 2) for s in srcs], dim=1)
         pos, reference = self.geometry(shapes, src.dtype, src.device)
         memory = self.encoder(src, pos.expand(batch, -1, -1), reference.expand(batch, -1, -1), shapes)
         out, start = [], 0
