@@ -21,6 +21,7 @@ from flashim.ops.conv import (
     conv2d_at_points,
     conv2d_single_output,
     conv2d_small_cin_quantize_int8,
+    conv3x3_small_cin_relu,
     depthwise5x5_relu_int8,
     depthwise5x5_relu_mxfp8,
     depthwise5x5_relu_pointwise,
@@ -29,6 +30,7 @@ from flashim.ops.conv import (
     im2col_gather,
     int8_conv2d,
     int8_conv2d_maxpool,
+    int8_conv2d_maxpool_only,
     mxfp8_conv2d,
 )
 from flashim.ops.correlation import dual_softmax_mutual, local_corr
@@ -83,6 +85,7 @@ __all__ = [
     "conv2d_at_points",
     "conv2d_single_output",
     "conv2d_small_cin_quantize_int8",
+    "conv3x3_small_cin_relu",
     "deform_patches_int8",
     "deformable_attention",
     "depthwise5x5_relu_int8",
@@ -99,6 +102,7 @@ __all__ = [
     "instance_norm_prelu",
     "int8_conv2d",
     "int8_conv2d_maxpool",
+    "int8_conv2d_maxpool_only",
     "int8_linear",
     "int8_linear_quantize",
     "jpeg_fancy_upsample",

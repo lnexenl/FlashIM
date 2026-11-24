@@ -382,3 +382,47 @@ def _conv2d_single_output_reference(x: Tensor, weight: Tensor, bias: Tensor | No
 
 
 conv2d_single_output = Op("conv2d_single_output", _conv2d_single_output_reference)
+
+
+# -- small-Cin 3x3 stem conv + bias + ReLU (+ optional INT8 / MXFP8 output) -----------------------------
+
+
+def _conv3x3_small_cin_relu_reference(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    *,
+    out_scale: Tensor | None = None,
+    out_exponent: Tensor | None = None,
+) -> Tensor | Int8Tensor | QuantizedTensor:
+    """3x3 / stride-1 / pad-1 conv + bias + ReLU for small input channel counts (``Cin in (1, 3)``).
+    Returns channels-last BF16 ``[B, Cout, H, W]``, or static ``Int8Tensor`` / ``QuantizedTensor`` NHWC
+    when ``out_scale`` / ``out_exponent`` is given."""
+    raw = F.conv2d(x, weight, None, padding=1)
+    if out_scale is not None:
+        return bias_relu_quantize_int8(raw, bias, out_scale)
+    out = F.relu(raw + bias.view(1, -1, 1, 1))
+    if out_exponent is not None:
+        return quantize_static(out.permute(0, 2, 3, 1), out_exponent)
+    return out.contiguous(memory_format=torch.channels_last)
+
+
+conv3x3_small_cin_relu = Op("conv3x3_small_cin_relu", _conv3x3_small_cin_relu_reference, composite=True, weights=2)
+
+
+# -- INT8 conv2d + ReLU + MaxPool2d(2) -> next conv's INT8 input (without writing the unpooled map) -----
+
+
+def _int8_conv2d_maxpool_only_reference(
+    x: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None,
+    kh: int, kw: int, sh: int, sw: int, ph: int, pw: int, dh: int, dw: int, *, relu: bool = False, out_scale: Tensor,
+) -> Tensor:
+    """Like :func:`int8_conv2d_maxpool`, but returns only the 2x2 / stride-2 max-pooled INT8 NHWC tensor
+    ``[B, Ho // 2, Wo // 2, Cout]`` (skipping the full-resolution BF16 write when nothing reads it, e.g. SuperPoint)."""
+    _, pooled = int8_conv2d_maxpool(
+        x, weight, a_scale, w_scale, bias, kh, kw, sh, sw, ph, pw, dh, dw, relu=relu, out_scale=out_scale
+    )
+    return pooled
+
+
+int8_conv2d_maxpool_only = Op("int8_conv2d_maxpool_only", _int8_conv2d_maxpool_only_reference, composite=True)
