@@ -15,7 +15,13 @@ from flashim.ops._registry import (
     reset_call_counts,
     set_strict,
 )
-from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
+from flashim.ops.aliked import (
+    aliked_bilinear_sample,
+    aliked_sample_patches,
+    aliked_score_head,
+    deform_patches_int8,
+    multiscale_fuse,
+)
 from flashim.ops.attention import deformable_attention, rope_qk, rope_qk_interleaved, sdpa
 from flashim.ops.conv import (
     conv2d_at_points,
@@ -79,6 +85,9 @@ __all__ = [
     "BoundOp",
     "DeviceSpec",
     "Op",
+    "aliked_bilinear_sample",
+    "aliked_sample_patches",
+    "aliked_score_head",
     "bias_relu_quantize_int8",
     "call_counts",
     "configure",

@@ -6,23 +6,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from flashim.utils import device_constant, grid_sample
+from flashim import ops
+from flashim.utils import device_constant
 
 
 def sample_patches(features: Tensor, corners: Tensor, size: int) -> Tensor:
     """``size x size`` integer-pixel patches of ``features`` ``[C, H, W]`` centered near ``corners`` ``[N, 2]``
-    ``(x, y)``, clamped to the image. Dependency-free port of LightGlue's ``get_patches`` fallback
-    (github.com/cvg/LightGlue), used instead of ALIKED's optional ``custom_ops`` CUDA extension."""
-    c, h, w = features.shape
-    corner = (corners - size / 2 + 1).long()
-    corner[:, 0] = corner[:, 0].clamp(min=0, max=w - 1 - size)
-    corner[:, 1] = corner[:, 1].clamp(min=0, max=h - 1 - size)
-    offset = torch.arange(size, device=features.device)
-    x, y = torch.meshgrid(offset, offset, indexing="ij")
-    patches = torch.stack((x, y)).permute(2, 1, 0).unsqueeze(2).to(corner) + corner[None, None]
-    pts = patches.reshape(-1, 2)
-    sampled = features.permute(1, 2, 0)[tuple(pts.T)[::-1]]
-    return sampled.reshape(size, size, -1, c).permute(2, 3, 0, 1)
+    ``(x, y)``, clamped to the image."""
+    return ops.aliked_sample_patches(features, corners, size)
 
 
 class SDDH(nn.Module):
@@ -57,14 +48,16 @@ class SDDH(nn.Module):
 
         kpts_wh = (keypoints / 2 + 0.5) * wh
         patch = sample_patches(features, kpts_wh.long(), self.kernel_size)  # [N, C, K, K]
-        offset = self.offset_conv(patch)[:, :, 0, 0].clamp(-max_offset, max_offset)
+        c0, gate, c2 = self.offset_conv[0], self.offset_conv[1], self.offset_conv[2]
+        if isinstance(c0, nn.Conv2d) and isinstance(c2, nn.Conv2d):
+            hidden = gate(F.linear(patch.reshape(num_kpts, -1), c0.weight.reshape(c0.out_channels, -1), c0.bias))
+            offset = F.linear(hidden, c2.weight.reshape(c2.out_channels, -1), c2.bias).clamp(-max_offset, max_offset)
+        else:
+            offset = self.offset_conv(patch)[:, :, 0, 0].clamp(-max_offset, max_offset)
         offset = offset.view(num_kpts, 2, self.n_pos).permute(0, 2, 1)  # [N, n_pos, 2]
 
-        pos = kpts_wh.unsqueeze(1) + offset  # [N, n_pos, 2]
-        pos = (2.0 * pos / wh[None] - 1).reshape(1, num_kpts * self.n_pos, 1, 2)
-        sampled = grid_sample(features.unsqueeze(0), pos, mode="bilinear", align_corners=True)  # [1, C, N*n_pos, 1]
-        sampled = sampled.reshape(c, num_kpts, self.n_pos, 1).permute(1, 0, 2, 3)  # [N, C, n_pos, 1]
-
-        sampled = torch.selu(self.sf_conv(sampled)).squeeze(-1)  # [N, C, n_pos]
-        descriptors = torch.einsum("ncp,pcd->nd", sampled, self.agg_weights)
+        pos = kpts_wh.unsqueeze(1) + offset  # [N, n_pos, 2] in pixel coordinates
+        sampled = ops.aliked_bilinear_sample(features, pos.reshape(-1, 2)).reshape(num_kpts, self.n_pos, c)
+        sampled = torch.selu(F.linear(sampled, self.sf_conv.weight.reshape(c, c)))  # [N, n_pos, C]
+        descriptors = torch.einsum("npc,pcd->nd", sampled, self.agg_weights)
         return F.normalize(descriptors, p=2.0, dim=1)

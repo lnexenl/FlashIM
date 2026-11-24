@@ -250,10 +250,13 @@ def _multiscale_fuse_kernel(
         sumsq = tl.sum(tl.where(c_mask[:, None], v1 * v1 + v2 * v2 + v3 * v3 + v4 * v4, 0.0), axis=0)
         inv_norm = 1.0 / tl.maximum(tl.sqrt(sumsq), EPS)  # [BLOCK_PIX]; matches F.normalize(p=2, dim=1)
 
-        tl.store(feature_ptr + (0 * C + c)[:, None] * (H * W) + pix[None, :], (v1 * inv_norm[None, :]).to(OUT_DTYPE), mask=mask2d)
-        tl.store(feature_ptr + (1 * C + c)[:, None] * (H * W) + pix[None, :], (v2 * inv_norm[None, :]).to(OUT_DTYPE), mask=mask2d)
-        tl.store(feature_ptr + (2 * C + c)[:, None] * (H * W) + pix[None, :], (v3 * inv_norm[None, :]).to(OUT_DTYPE), mask=mask2d)
-        tl.store(feature_ptr + (3 * C + c)[:, None] * (H * W) + pix[None, :], (v4 * inv_norm[None, :]).to(OUT_DTYPE), mask=mask2d)
+        # Store channels-last [H, W, 4*C] so SDDH's 128-ch patch & bilinear gathers are 100% coalesced.
+        base_f = feature_ptr + pix[:, None].to(tl.int64) * (4 * C)
+        mask_pc = pix_mask[:, None] & c_mask[None, :]
+        tl.store(base_f + (0 * C + c)[None, :], tl.trans(v1 * inv_norm[None, :]).to(OUT_DTYPE), mask=mask_pc)
+        tl.store(base_f + (1 * C + c)[None, :], tl.trans(v2 * inv_norm[None, :]).to(OUT_DTYPE), mask=mask_pc)
+        tl.store(base_f + (2 * C + c)[None, :], tl.trans(v3 * inv_norm[None, :]).to(OUT_DTYPE), mask=mask_pc)
+        tl.store(base_f + (3 * C + c)[None, :], tl.trans(v4 * inv_norm[None, :]).to(OUT_DTYPE), mask=mask_pc)
 
 
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
@@ -271,7 +274,10 @@ def multiscale_fuse(
         raise ValueError(f"multiscale_fuse needs C = dim // 4 <= 32, got {c}")
     dummy = f1
     head = torch.empty(1, 8, h, w, device=f1.device, dtype=torch.float32) if head_weight is not None else None
-    feature_map = torch.empty(1, 4 * c, h, w, device=f1.device, dtype=f1.dtype) if normalize else None
+    feature_map = (
+        torch.empty(1, 4 * c, h, w, device=f1.device, dtype=f1.dtype, memory_format=torch.channels_last)
+        if normalize else None
+    )
     # native dtype (the kernel upcasts on load); the coarse maps go channels-last so each gathered pixel is one
     # contiguous ``C``-wide load (NCHW made every lane of a warp hit a different cache line: L1-bound, 93%)
     f1c = f1.contiguous()
@@ -326,3 +332,147 @@ def _multiscale_fuse_eligible(
 ops.multiscale_fuse.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_multiscale_fuse_eligible
 )(multiscale_fuse)
+
+
+# -- SDDH sparse patch gather & coalesced bilinear sampling ----------------------------------------------
+
+
+@triton.jit
+def _aliked_sample_patches_kernel(
+    feat_ptr, corners_ptr, out_ptr,
+    N, C, H, W, sf_c, sf_h, sf_w, sc_0, sc_1,
+    SIZE: tl.constexpr, BLOCK_C: tl.constexpr,
+):
+    """One program per keypoint: gathers ``SIZE x SIZE`` integer pixels across all ``C`` channels (coalesced
+    when ``features`` is NHWC ``sf_c == 1``) into ``[N, C, SIZE, SIZE]``."""
+    n = tl.program_id(0)
+    if n >= N:
+        return
+    cx = tl.load(corners_ptr + n.to(tl.int64) * sc_0).to(tl.int32)
+    cy = tl.load(corners_ptr + n.to(tl.int64) * sc_0 + sc_1).to(tl.int32)
+    # Match `(corners - size / 2 + 1).long().clamp(0, dim - 1 - size)` (exact for all odd size and corners >= 0)
+    shift: tl.constexpr = SIZE // 2
+    x0 = tl.minimum(tl.maximum(cx - shift, 0), W - 1 - SIZE)
+    y0 = tl.minimum(tl.maximum(cy - shift, 0), H - 1 - SIZE)
+
+    c = tl.arange(0, BLOCK_C)
+    c_ok = c < C
+    out_base = out_ptr + n.to(tl.int64) * C * (SIZE * SIZE) + c.to(tl.int64) * (SIZE * SIZE)
+    for dy in tl.static_range(SIZE):
+        for dx in tl.static_range(SIZE):
+            pix_off = (y0 + dy).to(tl.int64) * sf_h + (x0 + dx).to(tl.int64) * sf_w
+            val = tl.load(feat_ptr + pix_off + c.to(tl.int64) * sf_c, mask=c_ok, other=0.0)
+            tl.store(out_base + dy * SIZE + dx, val, mask=c_ok)
+
+
+def _aliked_sample_patches_triton(features: Tensor, corners: Tensor, size: int) -> Tensor:
+    c, h, w = features.shape
+    n = corners.shape[0]
+    if n == 0:
+        return features.new_empty(0, c, size, size)
+    out = torch.empty(n, c, size, size, device=features.device, dtype=features.dtype)
+    block_c = triton.next_power_of_2(c)
+    _aliked_sample_patches_kernel[(n,)](
+        features, corners, out, n, c, h, w, *features.stride(), corners.stride(0), corners.stride(1),
+        SIZE=size, BLOCK_C=block_c, num_warps=4,
+    )
+    return out
+
+
+def _aliked_sample_patches_eligible(features: Tensor, corners: Tensor, size: int) -> bool:
+    return (
+        features.is_cuda and features.ndim == 3 and features.shape[0] <= 256
+        and size % 2 == 1 and 1 <= size <= 7
+        and features.shape[1] > size and features.shape[2] > size
+        and corners.ndim == 2 and corners.shape[1] == 2
+        and corners.dtype in (torch.int32, torch.int64)
+    )
+
+
+ops.aliked_sample_patches.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_aliked_sample_patches_eligible
+)(_aliked_sample_patches_triton)
+
+
+@triton.jit
+def _aliked_bilinear_sample_kernel(
+    feat_ptr, pos_ptr, out_ptr,
+    M, C, H, W, sf_c, sf_h, sf_w, sp_0, sp_1,
+    BLOCK_M: tl.constexpr, BLOCK_C: tl.constexpr,
+):
+    """Coalesced bilinear sampling (``align_corners=True``, zero padding) of ``[C, H, W]`` (NHWC when ``sf_c == 1``)
+    at ``M`` continuous pixel coordinates ``(x, y)`` -> contiguous ``[M, C]``."""
+    pid_m = tl.program_id(0)
+    ms = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_ok = ms < M
+    c = tl.arange(0, BLOCK_C)
+    c_ok = c < C
+
+    px = tl.load(pos_ptr + ms.to(tl.int64) * sp_0, mask=m_ok, other=-2.0).to(tl.float32)
+    py = tl.load(pos_ptr + ms.to(tl.int64) * sp_0 + sp_1, mask=m_ok, other=-2.0).to(tl.float32)
+
+    x0f = tl.floor(px)
+    y0f = tl.floor(py)
+    lx = (px - x0f)[:, None]
+    ly = (py - y0f)[:, None]
+    x0 = x0f.to(tl.int32)
+    y0 = y0f.to(tl.int32)
+    x1 = x0 + 1
+    y1 = y0 + 1
+
+    c_off = c[None, :].to(tl.int64) * sf_c
+    acc = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
+
+    ok00 = m_ok & (y0 >= 0) & (y0 < H) & (x0 >= 0) & (x0 < W)
+    v00 = tl.load(feat_ptr + y0[:, None].to(tl.int64) * sf_h + x0[:, None].to(tl.int64) * sf_w + c_off,
+                  mask=ok00[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
+    acc += v00 * ((1.0 - ly) * (1.0 - lx))
+
+    ok01 = m_ok & (y0 >= 0) & (y0 < H) & (x1 >= 0) & (x1 < W)
+    v01 = tl.load(feat_ptr + y0[:, None].to(tl.int64) * sf_h + x1[:, None].to(tl.int64) * sf_w + c_off,
+                  mask=ok01[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
+    acc += v01 * ((1.0 - ly) * lx)
+
+    ok10 = m_ok & (y1 >= 0) & (y1 < H) & (x0 >= 0) & (x0 < W)
+    v10 = tl.load(feat_ptr + y1[:, None].to(tl.int64) * sf_h + x0[:, None].to(tl.int64) * sf_w + c_off,
+                  mask=ok10[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
+    acc += v10 * (ly * (1.0 - lx))
+
+    ok11 = m_ok & (y1 >= 0) & (y1 < H) & (x1 >= 0) & (x1 < W)
+    v11 = tl.load(feat_ptr + y1[:, None].to(tl.int64) * sf_h + x1[:, None].to(tl.int64) * sf_w + c_off,
+                  mask=ok11[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
+    acc += v11 * (ly * lx)
+
+    tl.store(
+        out_ptr + ms[:, None].to(tl.int64) * C + c[None, :],
+        acc.to(out_ptr.dtype.element_ty),
+        mask=m_ok[:, None] & c_ok[None, :],
+    )
+
+
+def _aliked_bilinear_sample_triton(features: Tensor, pos: Tensor) -> Tensor:
+    c, h, w = features.shape
+    m = pos.shape[0]
+    if m == 0:
+        return features.new_empty(0, c)
+    out = torch.empty(m, c, device=features.device, dtype=features.dtype)
+    block_c = triton.next_power_of_2(c)
+    block_m = 16 if block_c >= 128 else 32
+    _aliked_bilinear_sample_kernel[(triton.cdiv(m, block_m),)](
+        features, pos, out, m, c, h, w, *features.stride(), pos.stride(0), pos.stride(1),
+        BLOCK_M=block_m, BLOCK_C=block_c, num_warps=4,
+    )
+    return out
+
+
+def _aliked_bilinear_sample_eligible(features: Tensor, pos: Tensor) -> bool:
+    return (
+        features.is_cuda and features.ndim == 3 and features.shape[0] <= 256
+        and features.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and pos.ndim == 2 and pos.shape[1] == 2
+    )
+
+
+ops.aliked_bilinear_sample.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_aliked_bilinear_sample_eligible
+)(_aliked_bilinear_sample_triton)

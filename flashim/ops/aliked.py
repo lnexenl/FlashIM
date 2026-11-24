@@ -94,3 +94,54 @@ def _multiscale_fuse_reference(
 
 
 multiscale_fuse = Op("multiscale_fuse", _multiscale_fuse_reference)
+
+
+def _aliked_score_head_reference(
+    head: Tensor, w1: Tensor, w2: Tensor, w3: Tensor, *, apply_sigmoid: bool = True
+) -> Tensor:
+    """ALIKED's ``score_head[2:]``: ``conv3x3(8->4) -> SELU -> conv3x3(4->4) -> SELU -> conv3x3(4->1)``
+    (all bias-free FP32, padding=1), optionally followed by ``sigmoid``."""
+    x = F.selu(F.conv2d(head.float(), w1.float(), padding=1))
+    x = F.selu(F.conv2d(x, w2.float(), padding=1))
+    x = F.conv2d(x, w3.float(), padding=1)
+    return torch.sigmoid(x) if apply_sigmoid else x
+
+
+aliked_score_head = Op("aliked_score_head", _aliked_score_head_reference)
+
+
+def _aliked_sample_patches_reference(features: Tensor, corners: Tensor, size: int) -> Tensor:
+    """``size x size`` integer-pixel patches of ``features`` ``[C, H, W]`` centered near ``corners`` ``[N, 2]``
+    ``(x, y)`` (clamped to ``[0, W-1-size] x [0, H-1-size]``) -> ``[N, C, size, size]``."""
+    c, h, w = features.shape
+    if corners.shape[0] == 0:
+        return features.new_empty(0, c, size, size)
+    corner = (corners - size / 2 + 1).long()
+    corner[:, 0] = corner[:, 0].clamp(min=0, max=w - 1 - size)
+    corner[:, 1] = corner[:, 1].clamp(min=0, max=h - 1 - size)
+    offset = torch.arange(size, device=features.device)
+    x, y = torch.meshgrid(offset, offset, indexing="ij")
+    patches = torch.stack((x, y)).permute(2, 1, 0).unsqueeze(2).to(corner) + corner[None, None]
+    pts = patches.reshape(-1, 2)
+    sampled = features.permute(1, 2, 0)[tuple(pts.T)[::-1]]
+    return sampled.reshape(size, size, -1, c).permute(2, 3, 0, 1)
+
+
+aliked_sample_patches = Op("aliked_sample_patches", _aliked_sample_patches_reference)
+
+
+def _aliked_bilinear_sample_reference(features: Tensor, pos: Tensor) -> Tensor:
+    """Bilinear sample (``align_corners=True``, zero padding) of ``features`` ``[C, H, W]`` at pixel coordinates
+    ``pos`` ``[M, 2]`` ``(x, y)`` in ``[0, W-1] x [0, H-1]`` -> ``[M, C]`` in ``features.dtype`` (computed in FP32)."""
+    from flashim.utils import device_constant
+
+    c, h, w = features.shape
+    if pos.shape[0] == 0:
+        return features.new_empty(0, c)
+    wh = device_constant([w - 1, h - 1], features, torch.float32)
+    grid = (2.0 * pos.float() / wh - 1.0).reshape(1, pos.shape[0], 1, 2)
+    out = F.grid_sample(features.float().unsqueeze(0), grid, mode="bilinear", align_corners=True)  # [1, C, M, 1]
+    return out[0, :, :, 0].t().contiguous().to(features.dtype)
+
+
+aliked_bilinear_sample = Op("aliked_bilinear_sample", _aliked_bilinear_sample_reference)

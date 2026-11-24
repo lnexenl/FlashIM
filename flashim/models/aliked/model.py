@@ -157,7 +157,9 @@ class ALIKED(FeatureMatcher, nn.Module):
         ``[B, 1, H, W]`` in ``(0, 1)``, both at the input's own resolution (internally padded to a multiple of
         ``config.div_by``)."""
         head, feature_map, box = self._encode(image)
-        score_map = torch.sigmoid(self.score_head[2:](head))
+        score_map = ops.aliked_score_head(
+            head, self.score_head[2].weight, self.score_head[4].weight, self.score_head[6].weight, apply_sigmoid=True
+        )
         return _unpad(feature_map, box), _unpad(score_map, box)
 
     def encode(self, image: Tensor) -> Tensor:
