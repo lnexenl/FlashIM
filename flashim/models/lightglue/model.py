@@ -377,7 +377,13 @@ class LightGlue(nn.Module):
     def best_matches(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Per point of image A: the best log assignment over image B's points, its index and whether it is mutual
         (:meth:`MatchAssignment.matches` of the last executed layer)."""
-        if not self.graphs or self.config.depth_confidence > 0 or not desc0.is_cuda or torch.is_grad_enabled():
+        if (
+            not self.graphs
+            or self.config.depth_confidence > 0
+            or not desc0.is_cuda
+            or torch.is_grad_enabled()
+            or max(desc0.shape[1], desc1.shape[1]) > 8192
+        ):
             return self._best_matches(desc0, desc1, enc0, enc1)
         unsafe = [impl for impl in sorted(_model_sdpa_impls(self)) if not sdpa_graph_safe(impl, desc0.device)]
         if unsafe:
@@ -394,13 +400,20 @@ class LightGlue(nn.Module):
             cache.move_to_end(key)
             return runner(desc0, desc1, enc0, enc1)
         runner = CudaGraphRunner(self._best_matches)
+        failed = False
         try:
             outputs = runner(desc0, desc1, enc0, enc1)
-        except RuntimeError as exc:  # e.g. a kernel launched on the legacy default stream (unpatched SageAttention)
+        except RuntimeError as exc:  # e.g. legacy-default-stream kernel or OOM during capture
             warn_once(logger, f"lightglue-graph-{id(self)}", "%s: CUDA graph capture failed, running eagerly "
                       "from now on (%s)", type(self).__name__, exc)
             self.graphs = 0
+            failed = True
+        if failed:
+            # Release the failed runner, cached private pools, and exception traceback frames before eager fallback.
+            del runner
+            cache.clear()
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             return self._best_matches(desc0, desc1, enc0, enc1)
         cache[key] = runner
         while len(cache) > self.graphs:

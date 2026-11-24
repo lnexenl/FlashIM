@@ -129,6 +129,7 @@ class SparseExtractor(FeatureMatcher, nn.Module):
         if hits < 2:
             return fn(*args)
         runner = CudaGraphRunner(fn, warmups=2)
+        failed = False
         try:
             outputs = runner(*args)
         except RuntimeError as exc:
@@ -137,7 +138,13 @@ class SparseExtractor(FeatureMatcher, nn.Module):
                 "%s: CUDA graph capture failed, running eagerly from now on (%s)", type(self).__name__, exc,
             )
             self.graphs = 0
+            failed = True
+        if failed:
+            # Release the failed runner, cached private pools, and exception traceback frames before eager fallback.
+            del runner
+            cache.clear()
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             return fn(*args)
         cache[key] = runner
         while len(cache) > self.graphs:
