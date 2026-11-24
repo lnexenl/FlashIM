@@ -391,6 +391,8 @@ class FlexGlue(ImageMatcher, nn.Module):
         self.quant_report = None
         self.calibration_metadata: dict[str, str] | None = None
         self.compute_dtype = torch.float32
+        self.descriptor_graph: bool = False
+        self._descriptor_runners: dict[tuple, object] = {}
 
     @classmethod
     def from_pretrained(
@@ -492,13 +494,30 @@ class FlexGlue(ImageMatcher, nn.Module):
 
     # -- matching ----------------------------------------------------------------------------
 
+    def _run_descriptor_graph(self, resized: Tensor) -> Tensor:
+        """Replay ``self.descriptor(resized)`` from a per-shape CUDA graph (bit-identical to eager)."""
+        from flashim.engines.cuda_graph import CudaGraphRunner
+
+        key = (tuple(resized.shape), resized.dtype, resized.device)
+        runner = self._descriptor_runners.get(key)
+        if runner is None:
+            if len(self._descriptor_runners) >= 4:
+                self._descriptor_runners.pop(next(iter(self._descriptor_runners)))
+            runner = CudaGraphRunner(self.descriptor, warmups=3)
+            self._descriptor_runners[key] = runner
+        return runner(resized)
+
     def _encode_pair(self, images: list[Tensor]) -> list[Tensor]:
         """``_encode`` of both images in one descriptor batch (all are resized to ``describe_resize``)."""
         resized = torch.cat([
             F.interpolate(image, size=self.config.describe_resize, mode="bilinear", align_corners=False)
             for image in images
-        ])
-        return list(self.descriptor(resized.to(self.compute_dtype)).split(1))
+        ]).to(self.compute_dtype)
+        if self.descriptor_graph and resized.is_cuda and not torch.is_grad_enabled():
+            out = self._run_descriptor_graph(resized)
+        else:
+            out = self.descriptor(resized)
+        return list(out.split(1))
 
     def _prepare(self, images: list[Tensor]) -> tuple[list[Tensor], list[Tensor], list[Tensor]]:
         features = self._encode_pair(images)

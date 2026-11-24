@@ -240,3 +240,25 @@ def test_convnext_block_fold_gamma_matches_unfolded():
         assert not block.fold_gamma()
         after = block(x)
     assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_cuda_graph_pass_guards():
+    from types import SimpleNamespace
+
+    import flashim
+    from flashim.models.flexglue.spec import SPEC
+    from flashim.platforms import Feature
+
+    apply = SPEC.passes["cuda_graph"].apply
+    model = FlexGlue(SMALL)
+    cfg_eager = flashim.resolve("flexglue", "bf16", {"engine": {"kind": "eager"}})
+    cfg_compile = flashim.resolve("flexglue", "bf16", {"engine": {"kind": "compile"}})
+    plat_yes = SimpleNamespace(supports=lambda f: f == Feature.CUDA_GRAPHS, describe=lambda: "cuda")
+    plat_no = SimpleNamespace(supports=lambda f: False, describe=lambda: "cpu")
+
+    assert apply(model, SimpleNamespace(config=cfg_compile, platform=plat_yes)).startswith("skipped: engine")
+    assert not model.descriptor_graph
+    assert apply(model, SimpleNamespace(config=cfg_eager, platform=plat_no)).startswith("skipped: no CUDA graphs")
+    assert not model.descriptor_graph
+    assert apply(model, SimpleNamespace(config=cfg_eager, platform=plat_yes)) == "descriptor"
+    assert model.descriptor_graph

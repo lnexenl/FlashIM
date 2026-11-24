@@ -12,6 +12,7 @@ from flashim.models.flexglue import quant
 from flashim.models.flexglue.config import FlexGlueConfig
 from flashim.models.flexglue.descriptor import ConvNeXtBlock
 from flashim.models.flexglue.model import FlexGlue
+from flashim.platforms import Feature
 from flashim.quant.methods.int8_linear import StaticInt8Linear
 from flashim.quant.methods.linear import StaticMXFP8Linear, enable_fused_bias
 
@@ -87,6 +88,18 @@ def _fuse_transformer_glue(model: FlexGlue, ctx: BuildContext) -> int | str:
     return count
 
 
+def _cuda_graph(model: FlexGlue, ctx: BuildContext) -> str:
+    """Eager engine: replay the fixed-shape DINOv3-ConvNeXt descriptor from a CUDA graph (bit-identical; removes
+    ~1.5 ms of ConvNeXt Python/Triton launch overhead on fp8/int8). Transformer layers are not graphed because
+    SageAttention launches on the legacy default stream and corrupts CUDA graph replay."""
+    if ctx.config.engine.kind != "eager":
+        return f"skipped: engine {ctx.config.engine.kind}"
+    if not ctx.platform.supports(Feature.CUDA_GRAPHS):
+        return f"skipped: no CUDA graphs on {ctx.platform.describe()}"
+    model.descriptor_graph = True
+    return "descriptor"
+
+
 def _sage_attention(model: FlexGlue, ctx: BuildContext) -> str:
     """int8 / fp8: SageAttention in every transformer layer, the impl :data:`quant.SAGE_ATTENTION` gives the
     platform (accuracy and timings there). Torch SDPA elsewhere; a pinned ``optimize.attention`` wins."""
@@ -132,7 +145,7 @@ SPEC = ModelSpec(
         "fp32": {},
         "bf16": {
             "precision": {"compute_dtype": "bf16"},
-            "optimize": {"passes": ["fold_convnext_gamma", "channels_last"]},
+            "optimize": {"passes": ["fold_convnext_gamma", "channels_last", "cuda_graph"]},
         },
         **{
             name: {
@@ -145,6 +158,7 @@ SPEC = ModelSpec(
                         "fuse_convnext_int8",
                         "fuse_transformer_glue",
                         "sage_attention",
+                        "cuda_graph",
                     ]
                 },
             }
@@ -175,6 +189,10 @@ SPEC = ModelSpec(
         "sage_attention": Pass(
             _sage_attention, exact=False,
             description="int8 / fp8: SageAttention (INT8 QK; FP16 / FP8 PV) where measured faster than torch SDPA",
+        ),
+        "cuda_graph": Pass(
+            _cuda_graph, exact=True,
+            description="eager: replay fixed-shape descriptor from a CUDA graph (bit-identical)",
         ),
     },
     engines={"eager": EngineSpec(), "compile": EngineSpec(_regions, recompile_limit=64)},
