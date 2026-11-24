@@ -877,10 +877,10 @@ def test_upsample_concat_int8(size, coarse_size, layout):
     assert (fast.values.int() - ref.values.int()).abs().max() <= 1 and _mismatch(fast.values, ref.values) < 1e-3
 
 
-# The row kernels of ``backends/triton/resample.py`` (sm_89 / sm_90 only): bit-identical to the tile kernel they replace.
+# The row kernels of ``backends/triton/resample.py`` (sm_89 / sm_90 / sm_120): bit-identical to the tile kernel they replace.
 _needs_rows = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in {(8, 9), (9, 0)},
-    reason="the upsample row kernels are registered for sm_89 / sm_90",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in {(8, 9), (9, 0), (12, 0)},
+    reason="the upsample row kernels are registered for sm_89 / sm_90 / sm_120",
 )
 
 
