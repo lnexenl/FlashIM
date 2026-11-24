@@ -16,7 +16,7 @@ from flashim.ops._registry import (
     set_strict,
 )
 from flashim.ops.aliked import deform_patches_int8, multiscale_fuse
-from flashim.ops.attention import deformable_attention, rope_qk, rope_qk_interleaved, sdpa
+from flashim.ops.attention import deformable_attention, linear_attention, rope_qk, rope_qk_interleaved, sdpa
 from flashim.ops.conv import (
     conv2d_at_points,
     conv2d_single_output,
@@ -97,6 +97,7 @@ __all__ = [
     "layernorm_quantize_int8_rows",
     "lightglue_qkv_rope",
     "lightglue_swapped_linear",
+    "linear_attention",
     "linear_fp32",
     "local_corr",
     "matmul_nt_fp32",

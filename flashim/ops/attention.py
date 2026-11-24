@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from flashim.ops._registry import Op
@@ -60,6 +61,32 @@ def _sdpa_reference(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
 
 
 sdpa = Op("sdpa", _sdpa_reference)
+
+
+# -- linear attention (ELU+1 feature map, LoFTR) --------------------------------------------------------
+
+
+def _linear_attention_reference(
+    q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6, gemm_dtype: torch.dtype | None = None
+) -> Tensor:
+    """ELU+1 kernel attention on ``[N, L, H, D]`` / ``[N, S, H, D]`` (FP32 core; values pre-divided by ``S``).
+
+    ``gemm_dtype`` (e.g. ``torch.bfloat16``) runs the two contractions (``K^T V`` and ``Q (K^T V)``) on operands of
+    that dtype; ELU+1, the normalizer ``1 / (q . sum(k) + eps)`` and the final scaling stay FP32. Returns
+    ``[N, L, H, D]`` in ``q.dtype``.
+    """
+    out_dtype = q.dtype
+    qf, kf, vf = F.elu(q.float()) + 1.0, F.elu(k.float()) + 1.0, v.float()
+    length = vf.shape[1]
+    z = 1.0 / (torch.einsum("nlhd,nhd->nlh", qf, kf.sum(dim=1)) + eps)
+    if gemm_dtype is None:
+        kv = torch.einsum("nshd,nshv->nhdv", kf, vf / length)
+        return (torch.einsum("nlhd,nhdv,nlh->nlhv", qf, kv, z) * length).to(out_dtype)
+    kv = torch.einsum("nshd,nshv->nhdv", kf.to(gemm_dtype), (vf / length).to(gemm_dtype))
+    return (torch.einsum("nlhd,nhdv->nlhv", qf.to(gemm_dtype), kv).float() * z[..., None] * length).to(out_dtype)
+
+
+linear_attention = Op("linear_attention", _linear_attention_reference)
 
 
 # -- multi-scale deformable attention (Deformable DETR core) --------------------------------------------

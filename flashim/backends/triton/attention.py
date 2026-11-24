@@ -323,6 +323,119 @@ def rope_qk_interleaved(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple
     return q_out, k_out
 
 
+# -- fused ELU+1 linear attention (LoFTR) ----------------------------------------------------------------
+
+
+@triton.jit
+def _linear_attn_kv_kernel(
+    k_ptr, v_ptr, ksum_ptr, kv_ptr,
+    ks_n, ks_s, ks_h, vs_n, vs_s, vs_h,
+    H, S, inv_s,
+    NUM_SPLITS: tl.constexpr, D: tl.constexpr, BLOCK_S: tl.constexpr, BF16_GEMM: tl.constexpr,
+):
+    """Split-S accumulation of ``k_sum = sum_s (elu(k) + 1)`` and ``kv = (elu(k) + 1)^T (v / S)`` per (batch, head).
+    Every K/V token is read once (no materialized ELU / scaled-V / BF16-cast intermediates)."""
+    split_id = tl.program_id(0)
+    nh = tl.program_id(1)
+    n = (nh // H).to(tl.int64)
+    h = (nh % H).to(tl.int64)
+    chunk = tl.cdiv(S, NUM_SPLITS)
+    s_start = split_id * chunk
+    s_end = tl.minimum(s_start + chunk, S)
+    d = tl.arange(0, D)
+    k_base = k_ptr + n * ks_n + h * ks_h
+    v_base = v_ptr + n * vs_n + h * vs_h
+    ksum = tl.zeros((D,), dtype=tl.float32)
+    kv = tl.zeros((D, D), dtype=tl.float32)
+    for s0 in range(s_start, s_end, BLOCK_S):
+        offs_s = s0 + tl.arange(0, BLOCK_S)
+        s_ok = offs_s < s_end
+        kv_mask = s_ok[:, None]
+        k = tl.load(k_base + offs_s[:, None].to(tl.int64) * ks_s + d[None, :], mask=kv_mask, other=0.0).to(tl.float32)
+        v = tl.load(v_base + offs_s[:, None].to(tl.int64) * vs_s + d[None, :], mask=kv_mask, other=0.0).to(tl.float32)
+        kf = tl.where(k > 0.0, k + 1.0, tl.exp(k))
+        kf = tl.where(kv_mask, kf, 0.0)
+        vs = tl.where(kv_mask, v * inv_s, 0.0)
+        ksum += tl.sum(kf, axis=0)
+        if BF16_GEMM:
+            kv = tl.dot(tl.trans(kf.to(tl.bfloat16)), vs.to(tl.bfloat16), kv)
+        else:
+            kv = tl.dot(tl.trans(kf), vs, kv, input_precision="ieee")
+    ksum_off = (nh.to(tl.int64) * NUM_SPLITS + split_id) * D + d
+    tl.store(ksum_ptr + ksum_off, ksum)
+    kv_off = ((nh.to(tl.int64) * NUM_SPLITS + split_id) * D + d[:, None]) * D + d[None, :]
+    tl.store(kv_ptr + kv_off, kv)
+
+
+@triton.jit
+def _linear_attn_q_kernel(
+    q_ptr, ksum_ptr, kv_ptr, out_ptr,
+    qs_n, qs_l, qs_h, os_n, os_l, os_h,
+    H, L, eps, length_f,
+    D: tl.constexpr, BLOCK_L: tl.constexpr, BF16_GEMM: tl.constexpr,
+):
+    """Fused ``(elu(q) + 1) @ kv * (length / ((elu(q) + 1) . k_sum + eps))``, written directly in ``out_ptr`` dtype."""
+    pid_l = tl.program_id(0)
+    nh = tl.program_id(1)
+    n = (nh // H).to(tl.int64)
+    h = (nh % H).to(tl.int64)
+    offs_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    l_ok = offs_l < L
+    d = tl.arange(0, D)
+    ksum = tl.load(ksum_ptr + nh.to(tl.int64) * D + d)
+    kv = tl.load(kv_ptr + (nh.to(tl.int64) * D + d[:, None]) * D + d[None, :])
+    q_off = n * qs_n + offs_l[:, None].to(tl.int64) * qs_l + h * qs_h + d[None, :]
+    q = tl.load(q_ptr + q_off, mask=l_ok[:, None], other=0.0).to(tl.float32)
+    qf = tl.where(q > 0.0, q + 1.0, tl.exp(q))
+    z = length_f / (tl.sum(qf * ksum[None, :], axis=1) + eps)
+    if BF16_GEMM:
+        acc = tl.dot(qf.to(tl.bfloat16), kv.to(tl.bfloat16))
+    else:
+        acc = tl.dot(qf, kv, input_precision="ieee")
+    out = acc * z[:, None]
+    o_off = n * os_n + offs_l[:, None].to(tl.int64) * os_l + h * os_h + d[None, :]
+    tl.store(out_ptr + o_off, out.to(out_ptr.dtype.element_ty), mask=l_ok[:, None])
+
+
+def linear_attention(
+    q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6, gemm_dtype: torch.dtype | None = None
+) -> Tensor:
+    batch, l_len, heads, dim = q.shape
+    s_len = k.shape[1]
+    nh = batch * heads
+    bf16_gemm = gemm_dtype == torch.bfloat16
+    if s_len >= 128:
+        block_s = 64 if dim >= 64 else 128
+        num_splits = min(64, triton.cdiv(s_len, block_s))
+    else:
+        block_s = max(16, triton.next_power_of_2(s_len))
+        num_splits = 1
+    stages = 2 if dim >= 64 else 3
+    ksum_part = torch.empty((nh, num_splits, dim), device=q.device, dtype=torch.float32)
+    kv_part = torch.empty((nh, num_splits, dim, dim), device=q.device, dtype=torch.float32)
+    _linear_attn_kv_kernel[(num_splits, nh)](
+        k, v, ksum_part, kv_part,
+        k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1), v.stride(2),
+        heads, s_len, 1.0 / s_len,
+        NUM_SPLITS=num_splits, D=dim, BLOCK_S=block_s, BF16_GEMM=bf16_gemm, num_warps=4, num_stages=stages,
+    )
+    if num_splits > 1:
+        ksum = ksum_part.sum(dim=1)
+        kv = kv_part.sum(dim=1)
+    else:
+        ksum = ksum_part.squeeze(1)
+        kv = kv_part.squeeze(1)
+    out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    block_l = (64 if dim >= 64 else 128) if l_len >= 128 else max(16, triton.next_power_of_2(l_len))
+    _linear_attn_q_kernel[(triton.cdiv(l_len, block_l), nh)](
+        q, ksum, kv, out,
+        q.stride(0), q.stride(1), q.stride(2), out.stride(0), out.stride(1), out.stride(2),
+        heads, l_len, float(eps), float(s_len),
+        D=dim, BLOCK_L=block_l, BF16_GEMM=bf16_gemm, num_warps=4, num_stages=stages,
+    )
+    return out
+
+
 # -- registrations ---------------------------------------------------------------------------------------
 
 _FLOATS = (torch.float16, torch.bfloat16, torch.float32)
@@ -367,6 +480,26 @@ def _rope_interleaved_eligible(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -
 ops.rope_qk_interleaved.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_rope_interleaved_eligible
 )(rope_qk_interleaved)
+
+
+def _linear_attention_eligible(q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6, gemm_dtype=None) -> bool:
+    return (
+        not torch.is_grad_enabled()
+        and q.ndim == 4 and k.ndim == 4 and v.ndim == 4
+        and k.shape == v.shape
+        and q.shape[0] == k.shape[0] and q.shape[2] == k.shape[2] and q.shape[3] == k.shape[3]
+        and q.shape[3] in (16, 32, 64)
+        and q.shape[1] > 0 and k.shape[1] > 0
+        and q.dtype == k.dtype == v.dtype
+        and q.dtype in _FLOATS
+        and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
+        and gemm_dtype in (None, torch.bfloat16)
+    )
+
+
+ops.linear_attention.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_linear_attention_eligible
+)(linear_attention)
 
 
 def _deformable_eligible(value, offsets, weights, reference, spatial_shapes, softmax=False) -> bool:
