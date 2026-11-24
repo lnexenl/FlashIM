@@ -105,6 +105,8 @@ class Preset:
     fused_refiner_io: bool = False
     # Refine both match directions as one batch with one projection per feature map (bit-exact).
     batched_directions: bool = False
+    # Share logits_ba = logits_ab^T and batch AB+BA through a channels-last DPTHead.
+    batched_matcher: bool = False
     # Fuse each MXFP8 refiner block (depthwise + quantize + pointwise GEMM) into one kernel where supported.
     fused_mx_blocks: bool = False
     description: str = ""
@@ -127,6 +129,7 @@ PRESETS: dict[str, Preset] = {
         fused_bf16_refiners=(1,),
         fused_refiner_io=True,
         batched_directions=True,
+        batched_matcher=True,
         calibration=INT8_CALIBRATION,
         description="static INT8 transformer linears + DPT projections + stride-4/2 refiner blocks, FlashIM refiner "
         "kernels (fused BF16 stride-1 blocks, fused refiner input/heads, batched directions); not RoMaV2-exact",
@@ -143,6 +146,7 @@ PRESETS: dict[str, Preset] = {
         fused_bf16_refiners=(1,),
         fused_refiner_io=True,
         batched_directions=True,
+        batched_matcher=True,
         fused_mx_blocks=True,
         description="static MXFP8 transformer linears + fused MXFP8 stride-4/2 refiner blocks, FlashIM refiner "
         "kernels (fused BF16 stride-1 blocks, fused refiner input); not RoMaV2-exact",

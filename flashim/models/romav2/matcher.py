@@ -63,6 +63,8 @@ class Matcher(nn.Module):
         self.register_buffer("temp", torch.tensor(0.1))
         self.mv_vit = MatchTransformer(in_dim=feat_dim * num_feature_layers, out_dim=dim)
         self.head = DPTHead(dim_in=dim, out_dim=3, down_ratio=4)
+        # Share logits_ba = logits_ab^T and batch AB+BA in one DPTHead call (set by batched_matcher pass).
+        self.batched_directions = False
 
     def _match_embedding(self, f_a: Tensor, f_b: Tensor, pos_emb: Tensor) -> tuple[Tensor, Tensor]:
         batch, h, w, _ = f_a.shape
@@ -91,6 +93,27 @@ class Matcher(nn.Module):
         with torch.autocast(f_a.device.type, torch.bfloat16):
             f_mv = self.mv_vit(torch.stack((f_a, f_b), dim=1)).reshape(batch, 2, h, w, self.dim)
         f_mv_a, f_mv_b = f_mv[:, 0].float(), f_mv[:, 1].float()
+
+        if bidirectional and self.batched_directions:
+            hw = h * w
+            logits_ab_flat = (1 / self.temp * _cosine_similarity(f_mv_a, f_mv_b)).reshape(batch, hw, hw)
+            logits_ba_flat = logits_ab_flat.transpose(1, 2)
+            pos_flat = pos_emb.reshape(batch, hw, -1)
+            emb_ab = torch.bmm(torch.softmax(logits_ab_flat, dim=2), pos_flat).reshape(batch, h, w, -1)
+            emb_ba = torch.bmm(torch.softmax(logits_ba_flat, dim=2), pos_flat).reshape(batch, h, w, -1)
+            head_in = [
+                *(torch.cat((a, b)) for a, b in zip(f_list_a[:-1], f_list_b[:-1])),
+                torch.cat((f_list_a[-1] + f_mv_a + emb_ab, f_list_b[-1] + f_mv_b + emb_ba)),
+            ]
+            head_out = self.head(head_in)
+            return {
+                "attn_AB_logits": logits_ab_flat.reshape(batch, h, w, h, w),
+                "warp_AB": head_out[:batch, ..., :2],
+                "confidence_AB": head_out[:batch, ..., 2:],
+                "attn_BA_logits": logits_ba_flat.reshape(batch, h, w, h, w),
+                "warp_BA": head_out[batch:, ..., :2],
+                "confidence_BA": head_out[batch:, ..., 2:],
+            }
 
         logits_ab, emb_ab = self._match_embedding(f_mv_a, f_mv_b, pos_emb)
         warp_ab, conf_ab = self._head(f_list_a, f_mv_a, emb_ab)

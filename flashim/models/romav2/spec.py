@@ -114,6 +114,19 @@ def _batched_directions(model: RoMaV2, ctx: BuildContext) -> None:
     model.batched_directions = True
 
 
+def _batched_matcher(model: RoMaV2, ctx: BuildContext) -> int:
+    """Share ``logits_ba = logits_ab.T`` and batch AB+BA through a channels-last DPTHead (eliminates one 2500^2x1024
+    FP32 similarity GEMM and NCHW<->NHWC copies inside DPTHead)."""
+    model.matcher.batched_directions = True
+    model.matcher.head.channels_last = True
+    converted = 0
+    for child in model.matcher.head.modules():
+        if isinstance(child, (nn.Conv2d, nn.ConvTranspose2d)):
+            child.weight.data = child.weight.data.to(memory_format=torch.channels_last)
+            converted += 1
+    return converted
+
+
 SAGE_IMPLS = {(8, 9): "sage-fp8", (9, 0): "sage-fp8-sm90", (12, 0): "sage-fp8"}
 
 
@@ -170,6 +183,7 @@ def _overlay(preset: quant.Preset) -> dict:
         ("fused_refiner_io", preset.fused_refiner_io),
         ("fused_mx_blocks", preset.fused_mx_blocks),
         ("batched_directions", preset.batched_directions),
+        ("batched_matcher", preset.batched_matcher),
         ("fused_rope", preset.fused_rope),
         ("fused_block_epilogues", preset.fused_block_epilogues),
         ("sage_attention", preset.sage_attention),
@@ -208,6 +222,10 @@ SPEC = ModelSpec(
         "fused_refiner_io": Pass(_fused_refiner_io, exact=False, description="fused refiner input + output heads"),
         "fused_mx_blocks": Pass(_fused_mx_blocks, exact=False, description="dw + quantize + pw MXFP8 in one kernel"),
         "batched_directions": Pass(_batched_directions, description="both match directions as one batch"),
+        "batched_matcher": Pass(
+            _batched_matcher, exact=False,
+            description="share logits_ba = logits_ab^T and batch AB+BA through channels-last DPTHead",
+        ),
         "fused_rope": Pass(_fused_rope, exact=False, description="DINOv3 + MV-ViT RoPE as one fused kernel"),
         "fused_block_epilogues": Pass(
             _fused_block_epilogues, stage="post_quant", exact=False,
