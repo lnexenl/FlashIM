@@ -34,7 +34,7 @@ BACKENDS: tuple[Backend, ...] = (
         packages=("triton",),
     ),
     Backend("tilelang", ("tilelang.conv", "tilelang.gemm"), packages=("tilelang",)),
-    Backend("cuda", ("cuda.raco", "cuda.conv", "cuda.aliked")),  # JIT CUDA C++: needs nvcc (Feature.NVCC), built on first eligible call
+    Backend("cuda", ("cuda.raco", "cuda.conv", "cuda.aliked", "cuda.nms")),  # JIT CUDA C++: needs nvcc (Feature.NVCC), built on first eligible call
     Backend("sageattention", ("external.sageattention",), packages=("sageattention",)),
 )
 

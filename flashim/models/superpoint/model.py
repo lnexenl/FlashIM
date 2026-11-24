@@ -95,7 +95,7 @@ class SuperPoint(sparse.SparseExtractor):
     def dense_descriptors(self, x: Tensor) -> Tensor:
         return F.normalize(self.convDb(conv_relu(self.convDa, x, feeds=self.convDb)).float(), dim=1)
 
-    def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
+    def _detect_trunk(self, image: Tensor) -> tuple[Tensor, Tensor]:
         x = self.encode(image)
         scores = sparse.simple_nms(self.score_map(x), self.nms_radius)
         if self.remove_borders:
@@ -104,11 +104,15 @@ class SuperPoint(sparse.SparseExtractor):
             scores[:, :, :pad] = -1
             scores[:, -pad:] = -1
             scores[:, :, -pad:] = -1
+        return scores, self.dense_descriptors(x)
+
+    def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
+        scores, dense_desc = self._run_graphed("detect_trunk", self._detect_trunk, image)
         _, ys, xs = torch.where(scores > self.detection_threshold)
         keypoints = torch.stack((xs, ys), -1)
         keypoints, kp_scores, _ = sparse.select_top_k(keypoints, scores[0, ys, xs], top_k)
         keypoints = keypoints.float()
-        return keypoints, kp_scores, sparse.sample_descriptors(keypoints, self.dense_descriptors(x), 8)
+        return keypoints, kp_scores, sparse.sample_descriptors(keypoints, dense_desc, 8)
 
     def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
         return sparse.sample_descriptors(keypoints.float(), self.dense_descriptors(self.encode(image)), 8)

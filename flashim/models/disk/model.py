@@ -184,16 +184,20 @@ class DISK(sparse.SparseExtractor):
             descriptors = self.dense(image)[1][0][:, index[:, 1], index[:, 0]].t()
         return F.normalize(descriptors, dim=-1)
 
+    def _detect_trunk_split(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        head = self.unet.path_up[-1].conv[3]
+        features = self.unet(image.to(self.compute_dtype), head_input=True)
+        heatmap = ops.conv2d_single_output(features, head.heat.weight, head.heat.bias)
+        selected = ops.strict_nms_mask(heatmap, self.nms_window, self.score_threshold)[0, 0]
+        return features, heatmap, selected
+
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
         head = self.unet.path_up[-1].conv[3]
         if isinstance(head, SplitHeadConv):  # the descriptor half of the head only at the selected keypoints
-            features = self.unet(image.to(self.compute_dtype), head_input=True)
-            # FP32 heatmap straight from the compute-dtype features (no FP32 copy of them): full FP32 accumulation in
-            # the Triton impl, more exact than the cuDNN TF32 the dense head used (max rel 2e-6 vs 2e-4 of float64)
-            heatmap = ops.conv2d_single_output(features, head.heat.weight, head.heat.bias)
+            features, heatmap, selected = self._run_graphed("detect_trunk", self._detect_trunk_split, image)
         else:
             heatmap, descriptor_map = self.dense(image)
-        selected = ops.strict_nms_mask(heatmap, self.nms_window, self.score_threshold)[0, 0]
+            selected = ops.strict_nms_mask(heatmap, self.nms_window, self.score_threshold)[0, 0]
         ys, xs = selected.nonzero(as_tuple=True)
         keypoints, scores, _ = sparse.select_top_k(torch.stack((xs, ys), -1), heatmap[0, 0, ys, xs], top_k)
         if isinstance(head, SplitHeadConv):

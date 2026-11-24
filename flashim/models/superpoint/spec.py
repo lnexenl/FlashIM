@@ -52,6 +52,7 @@ SPEC = extractor_spec(
     compile_regions=("conv1a", "conv1b", "conv2a", "conv2b", "conv3a", "conv3b", "conv4a", "conv4b"),
     has_batchnorm=False,
     channels_last=True,  # BF16 extract at 1200 px, interleaved in one process (sm_120): 7.8 -> 6.7 ms
+    cuda_graph=True,
     extra_passes={
         "fused_stem_conv": Pass(
             _fused_stem_conv, exact=False,

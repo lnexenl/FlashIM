@@ -129,12 +129,16 @@ class XFeat(sparse.SparseExtractor):
         feats = F.normalize(self.dense(image)[0], dim=1)
         return F.normalize(_sample(feats, keypoints, h, w, "bicubic"), dim=-1)
 
-    def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
-        h, w = image.shape[-2:]
+    def _detect_trunk(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         feats, logits, reliability = self.dense(image)
         feats = F.normalize(feats, dim=1)
         heatmap = self.keypoint_heatmap(logits)
         pos = (heatmap == F.max_pool2d(heatmap, 5, 1, 2)) & (heatmap > self.detection_threshold)
+        return feats, heatmap, reliability, pos
+
+    def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
+        h, w = image.shape[-2:]
+        feats, heatmap, reliability, pos = self._run_graphed("detect_trunk", self._detect_trunk, image)
         ys, xs = pos[0, 0].nonzero(as_tuple=True)
         keypoints = torch.stack((xs, ys), -1)
         if h % 2 == 0 and w % 2 == 0:

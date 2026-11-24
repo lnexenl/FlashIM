@@ -144,6 +144,17 @@ class ALIKE(sparse.SparseExtractor):
         descriptors = F.linear(at_keypoints, weight[:-1, :, 0, 0].float(), None if bias is None else bias[:-1].float())
         return F.normalize(descriptors, dim=-1)
 
+    def _detect_trunk_single(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        weight, bias = self.convhead2.weight, self.convhead2.bias
+        score_b = None if bias is None else bias[-1:]
+        f1, f2, f3, f4 = self._multiscale_levels(image)
+        scores_map = torch.sigmoid(ops.multiscale_score(f1, f2, f3, f4, weight[-1, :, 0, 0], score_b))
+        _, _, h, w = scores_map.shape
+        nms = sparse.simple_nms(scores_map, 2)
+        r = self.config.radius
+        nms[:, :, : r + 1], nms[:, :, :, : r + 1], nms[:, :, h - r :], nms[:, :, :, w - r :] = 0, 0, 0, 0
+        return f1, f2, f3, f4, scores_map, nms
+
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
         cfg = self.config
         weight, bias = self.convhead2.weight, self.convhead2.bias
@@ -151,17 +162,18 @@ class ALIKE(sparse.SparseExtractor):
         if cfg.single_head:
             # Skip materializing the dense [1, dim, H, W] concat: compute the 1-ch score map directly from the
             # 4 scales (ops.multiscale_score), then sample f1..f4 only at the selected keypoints.
-            levels = self._multiscale_levels(image)
-            scores_map = torch.sigmoid(ops.multiscale_score(*levels, weight[-1, :, 0, 0], score_b))
+            f1, f2, f3, f4, scores_map, nms = self._run_graphed("detect_trunk", self._detect_trunk_single, image)
+            levels = (f1, f2, f3, f4)
             fused = None
         else:
             levels = None
             fused = self.head_input(image)
             scores_map = torch.sigmoid(ops.conv2d_single_output(fused, weight[-1:], score_b))
+            _, _, h, w = scores_map.shape
+            nms = sparse.simple_nms(scores_map, 2)
+            r = cfg.radius
+            nms[:, :, : r + 1], nms[:, :, :, : r + 1], nms[:, :, h - r :], nms[:, :, :, w - r :] = 0, 0, 0, 0
         _, _, h, w = scores_map.shape
-        nms = sparse.simple_nms(scores_map, 2)
-        r = cfg.radius
-        nms[:, :, : r + 1], nms[:, :, :, : r + 1], nms[:, :, h - r :], nms[:, :, :, w - r :] = 0, 0, 0, 0
         flat = nms.reshape(-1)
         if top_k is not None and top_k > 0:
             index = torch.topk(flat, min(top_k, flat.numel())).indices

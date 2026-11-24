@@ -4,26 +4,15 @@ and mutual-nearest-neighbour descriptor matching."""
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
+from flashim import ops
 from flashim.utils import device_constant, grid_sample
 
 
 def simple_nms(scores: Tensor, radius: int) -> Tensor:
     """Two-round soft non-maximum suppression with a ``(2 * radius + 1)`` window."""
-
-    def max_pool(x: Tensor) -> Tensor:
-        return F.max_pool2d(x, kernel_size=radius * 2 + 1, stride=1, padding=radius)
-
-    zeros = torch.zeros_like(scores)
-    max_mask = scores == max_pool(scores)
-    for _ in range(2):
-        suppressed = max_pool(max_mask.float()) > 0
-        supp_scores = torch.where(suppressed, zeros, scores)
-        new_max = supp_scores == max_pool(supp_scores)
-        max_mask = max_mask | (new_max & ~suppressed)
-    return torch.where(max_mask, scores, zeros)
+    return ops.simple_nms(scores, radius)
 
 
 def _select_indices(nms_scores: Tensor, scores_map: Tensor, top_k: int, scores_th: float, n_limit: int) -> list[Tensor]:

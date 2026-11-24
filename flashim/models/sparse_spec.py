@@ -23,6 +23,7 @@ from torch import nn
 
 from flashim.build import BuildContext, EngineSpec, ModelSpec, Pass, dtype
 from flashim.config import RunConfig
+from flashim.platforms import Feature
 from flashim.quant.scheme import (
     INT8_ACTIVATIONS,
     INT8_TOKEN_ACTIVATIONS,
@@ -69,6 +70,19 @@ def _fused_bf16_blocks(prefixes: Sequence[str]):
     return apply
 
 
+def _cuda_graph(model: nn.Module, ctx: BuildContext) -> int | str:
+    """Eager engine (bf16 / int8 / fp8): replay the static-shape dense trunk from a per-shape CUDA graph
+    (:attr:`SparseExtractor.graphs`); bit-identical to eager, eliminates Python / Triton dispatch overhead."""
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    if ctx.config.engine.kind != "eager":
+        return f"skipped: engine {ctx.config.engine.kind}"
+    if not ctx.platform.supports(Feature.CUDA_GRAPHS):
+        return f"skipped: no CUDA graphs on {ctx.platform.describe()}"
+    model.graphs = int(ctx.option("cuda_graphs", 4))
+    return model.graphs
+
+
 def extractor_spec(
     *,
     name: str,
@@ -88,6 +102,7 @@ def extractor_spec(
     structural_passes: Sequence[str] = (),
     channels_last: bool = False,
     fused_bf16_blocks: Sequence[str] = (),
+    cuda_graph: bool = False,
 ) -> ModelSpec:
     def fold(model: nn.Module, ctx: BuildContext) -> list[str]:
         model.fused_batchnorm = model.fold_batchnorm()
@@ -104,6 +119,11 @@ def extractor_spec(
             description="fused BF16 separable conv blocks (bf16 / int8 / fp8)",
         )
         structural_passes = (*structural_passes, "fused_bf16_blocks")
+    if cuda_graph:
+        passes["cuda_graph"] = Pass(
+            _cuda_graph, description="eager: static-shape trunk replayed from one CUDA graph per input shape",
+        )
+        structural_passes = (*structural_passes, "cuda_graph")
     always = ([*(["fold_batchnorm"] if has_batchnorm else []), *structural_passes])
     fp32 = {"optimize": {"passes": always}} if always else {}
     quant_configs = {
