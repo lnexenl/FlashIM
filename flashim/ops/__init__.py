@@ -44,6 +44,7 @@ from flashim.ops.gemm import (
 )
 from flashim.ops.image import jpeg_fancy_upsample
 from flashim.ops.lightglue import lightglue_qkv_rope, lightglue_swapped_linear
+from flashim.ops.matching import hamming_distances, hamming_ratio_mutual_match, ratio_mutual_match
 from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
     bias_relu_quantize_int8,
@@ -84,6 +85,8 @@ __all__ = [
     "dual_softmax_mutual",
     "gelu_quantize",
     "gelu_quantize_int8",
+    "hamming_distances",
+    "hamming_ratio_mutual_match",
     "im2col_gather",
     "int8_conv2d",
     "int8_conv2d_maxpool",
@@ -114,6 +117,7 @@ __all__ = [
     "quantize_mxfp8",
     "raco_head5x5",
     "raco_resblock",
+    "ratio_mutual_match",
     "reset_call_counts",
     "romav2_refiner_heads",
     "romav2_refiner_input",
