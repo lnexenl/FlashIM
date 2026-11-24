@@ -25,9 +25,13 @@ def test_only_dedode_g_has_the_pass():
 
 
 def test_platform_gate():
+    import importlib.util
     from types import SimpleNamespace
 
     gate = spec.SPEC_G.passes["vit_sage_attention"].requires
+    has_sage = importlib.util.find_spec("sageattention") is not None
     assert gate(SimpleNamespace(capability=(8, 6))) is False
-    assert gate(SimpleNamespace(capability=(12, 0))) is False
+    assert gate(SimpleNamespace(capability=(8, 9))) is has_sage
+    assert gate(SimpleNamespace(capability=(9, 0))) is has_sage
+    assert gate(SimpleNamespace(capability=(12, 0))) is has_sage
     assert gate(SimpleNamespace(capability=None)) is False
