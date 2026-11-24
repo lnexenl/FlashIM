@@ -35,8 +35,9 @@ def _select_indices(nms_scores: Tensor, scores_map: Tensor, top_k: int, scores_t
         return list(torch.topk(flat_nms, top_k).indices)
     if scores_th > 0:
         masks = flat_nms > scores_th
-        if masks.sum() == 0:  # matches upstream: falls back to the per-image mean threshold for every image
-            masks = flat_nms > flat_scores.mean(dim=1, keepdim=True)
+        # Branchless fallback (matches upstream: falls back to per-image mean when no pixel passes scores_th)
+        # without a blocking host sync on `masks.sum() == 0`.
+        masks = torch.where(masks.any(), masks, flat_nms > flat_scores.mean(dim=1, keepdim=True))
     else:
         masks = flat_nms > flat_scores.mean(dim=1, keepdim=True)
     indices = []
@@ -68,15 +69,23 @@ def detect_keypoints(
     indices = _select_indices(nms_scores, score_map.detach(), top_k, scores_th, n_limit)
 
     wh = device_constant([w - 1, h - 1], score_map)
-    kernel = 2 * radius + 1
-    offsets = torch.linspace(-radius, radius, kernel, device=score_map.device)
-    grid = torch.stack(torch.meshgrid(offsets, offsets, indexing="ij")).view(2, -1).t()[:, [1, 0]]  # (kernel**2, 2) (x, y)
-    patches = F.unfold(score_map, kernel_size=kernel, padding=radius)  # [B, kernel**2, H*W], keeps score_map's grad
+    offs = list(range(-radius, radius + 1))
+    # Precomputed patch offsets in row-major (dy, dx) order — avoids both the `[:, [1, 0]]` host sync and
+    # materializing a 109 MB dense `F.unfold(score_map, 5, padding=2)` buffer for <= 4096 keypoints.
+    grid = device_constant([(dx, dy) for dy in offs for dx in offs], score_map, torch.float32)  # [K^2, 2] (x, y)
+    oy = device_constant([dy for dy in offs for _ in offs], score_map, torch.long)
+    ox = device_constant([dx for _ in offs for dx in offs], score_map, torch.long)
 
     keypoints, kptscores, dispersities = [], [], []
     for b_idx, idx in enumerate(indices):
-        patch = patches[b_idx].t()[idx]  # [N, kernel**2]
-        nms_xy = torch.stack((idx % w, idx // w), dim=1).float()  # (x, y)
+        ix = idx % w
+        iy = idx // w
+        ys = iy[:, None] + oy[None, :]
+        xs = ix[:, None] + ox[None, :]
+        inside = (ys >= 0) & (ys < h) & (xs >= 0) & (xs < w)
+        patch = score_map[b_idx, 0, ys.clamp(0, h - 1), xs.clamp(0, w - 1)]
+        patch = torch.where(inside, patch, torch.zeros_like(patch))  # [N, kernel**2], keeps score_map's grad
+        nms_xy = torch.stack((ix, iy), dim=1).float()  # (x, y)
 
         weight = ((patch - patch.max(dim=1, keepdim=True).values.detach()) / temperature).exp()
         residual = (weight @ grid) / weight.sum(dim=1, keepdim=True)  # soft-argmax, [N, 2]
@@ -96,12 +105,12 @@ def mutual_nn_match(desc0: Tensor, desc1: Tensor, threshold: float = 0.75) -> tu
     """Mutual-nearest-neighbour cosine matches above ``threshold`` (``desc0``/``desc1``: ``[N, C]``,
     L2-normalized). Equivalent to ALIKED's ``demo_pair.py`` ``mnn_mather``, without its zero-then-argmax
     quirk (a similarity below ``threshold`` never changes which index is the nearest neighbour here)."""
+    if desc0.shape[0] == 0 or desc1.shape[0] == 0:
+        empty = torch.zeros(0, dtype=torch.long, device=desc0.device)
+        return empty, empty, desc0.new_zeros(0)
     sim = desc0 @ desc1.t()
-    nn01 = sim.argmax(dim=1)
-    nn10 = sim.argmax(dim=0)
+    nn01, nn10 = sim.argmax(dim=1), sim.argmax(dim=0)
+    best = sim.gather(1, nn01[:, None])[:, 0]
     ids0 = torch.arange(sim.shape[0], device=sim.device)
-    idx1 = nn01[ids0]
-    mutual = ids0 == nn10[idx1]
-    valid = mutual & (sim[ids0, idx1] >= threshold)
-    idx0 = ids0[valid]
-    return idx0, idx1[valid], sim[idx0, idx1[valid]]
+    idx0 = ((ids0 == nn10[nn01]) & (best >= threshold)).nonzero()[:, 0]  # single host sync (match count)
+    return idx0, nn01[idx0], best[idx0]

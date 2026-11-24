@@ -97,7 +97,10 @@ class ALIKE(sparse.SparseExtractor):
         x3 = self.block3(F.max_pool2d(x2, 4))
         x4 = self.block4(F.max_pool2d(x3, 4))
         size = image.shape[-2:]
-        levels = [self.gate(conv(x)) for conv, x in zip((self.conv1, self.conv2, self.conv3, self.conv4), (x1, x2, x3, x4))]
+        levels = [
+            conv_relu(conv, x) if isinstance(self.gate, nn.ReLU) else self.gate(conv(x))
+            for conv, x in zip((self.conv1, self.conv2, self.conv3, self.conv4), (x1, x2, x3, x4))
+        ]
         fused = torch.cat(
             [levels[0]] + [F.interpolate(x, size=size, mode="bilinear", align_corners=True) for x in levels[1:]], dim=1
         )
@@ -129,8 +132,7 @@ class ALIKE(sparse.SparseExtractor):
             index = torch.topk(flat, min(top_k, flat.numel())).indices
         else:
             mask = flat > cfg.scores_th
-            if not mask.any():
-                mask = flat > scores_map.mean()
+            mask = torch.where(mask.any(), mask, flat > scores_map.mean())
             index = mask.nonzero()[:, 0]
             if len(index) > cfg.n_limit:
                 index = index[flat[index].sort(descending=True)[1][: cfg.n_limit]]

@@ -27,11 +27,15 @@ def _pad_to(image: Tensor, div_by: int) -> tuple[Tensor, tuple[int, int, int, in
     ``(left, right, top, bottom)`` used to crop the corresponding output back."""
     h, w = image.shape[-2:]
     pad_h, pad_w = (-h) % div_by, (-w) % div_by
+    if pad_h == 0 and pad_w == 0:
+        return image, (0, 0, 0, 0)
     box = (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2)
     return F.pad(image, box, mode="replicate"), box
 
 
 def _unpad(x: Tensor, box: tuple[int, int, int, int]) -> Tensor:
+    if box == (0, 0, 0, 0):
+        return x
     left, right, top, bottom = box
     h, w = x.shape[-2:]
     return x[..., top : h - bottom, left : w - right]
