@@ -14,10 +14,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from flashim.models.romav2.geometry import normalized_grid
 from flashim.ops._registry import Op
 from flashim.ops.correlation import local_corr
-from flashim.utils import grid_sample
+from flashim.utils import grid_sample, normalized_grid
 
 
 def _refiner_input_reference(
