@@ -253,7 +253,7 @@ def _kde_balance_weights(dense_p2d0_n1, dense_p2d1_n0, scores, num_samples, std=
     # upstream weights the density by ``valid``: park the gated-out points far outside [-1, 1]^4 so they add
     # nothing to the valid ones (their own density is masked below)
     points = torch.where(valid[..., None] > 0, torch.cat(points, 1), 10.0)
-    density = ops.kde_density.get("reference")(points, std=std) * scale[:, None]
+    density = ops.kde_density(points, std=std).float() * scale[:, None]
     balance = torch.where(density < min_support, 1e-7, 1 / (density + 1))
     return balance * valid  # valid cells only, no extra confidence weighting
 
