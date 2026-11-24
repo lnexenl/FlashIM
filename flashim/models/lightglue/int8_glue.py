@@ -53,9 +53,23 @@ def unsupported(model: nn.Module) -> str | None:
     return None
 
 
+def supports_layernorm_gelu(model: nn.Module) -> bool:
+    """Whether ``ops.layernorm_gelu_quantize_int8`` has a bit-exact kernel on ``model``'s device for its FFN width
+    (may compile the libdevice probe: call before CUDA graph capture)."""
+    device = model.device
+    sa = model.transformers[0].self_attn
+    c = sa.out_proj.in_features
+    hidden = torch.zeros(128, 2 * c, device=device, dtype=torch.bfloat16)
+    _, norm, _, last = sa.ffn
+    return ops.layernorm_gelu_quantize_int8.supports(
+        hidden, norm.weight, norm.bias, norm.eps, last.input_scale, channel_scale=last.channel_scale
+    )
+
+
 def probe(model: nn.Module) -> list[str]:
-    """The ops of the fused path that have no kernel on ``model``'s device for its shapes (``Op.supports`` on probe
-    tensors of 64 tokens per image; the GELU's libdevice probe compiles a kernel: call before CUDA graph capture)."""
+    """The required ops of the fused path that have no kernel on ``model``'s device for its shapes (``Op.supports`` on
+    probe tensors of 64 tokens per image; also probes ``layernorm_gelu_quantize_int8`` and caches whether it fuses or
+    falls back bit-identically to ``last.quantize(act(norm(hidden)))`` — call before CUDA graph capture)."""
     device = model.device
     layer = model.transformers[0]
     sa, ca = layer.self_attn, layer.cross_attn
@@ -67,8 +81,7 @@ def probe(model: nn.Module) -> list[str]:
     wide = torch.zeros(rows, 2 * c, device=device, dtype=torch.int8)
     table = torch.zeros(2, 1, half, c // heads, device=device, dtype=torch.bfloat16)
     o = torch.zeros(2, heads, half, c // heads, device=device, dtype=torch.bfloat16)
-    hidden = torch.zeros(rows, 2 * c, device=device, dtype=torch.bfloat16)
-    first, norm, _, last = sa.ffn
+    first, _, _, last = sa.ffn
     checks = {
         "quantize_int8_multi": ops.quantize_int8_multi.supports(
             x, [ca.to_qk.input_scale, ca.to_v.input_scale, ca.ffn[0].input_scale], [q, q, wide[:, :c]]),
@@ -80,20 +93,22 @@ def probe(model: nn.Module) -> list[str]:
         "int8_linear_quantize": ops.int8_linear_quantize.supports(
             q, sa.out_proj.weight_int8, sa.out_proj.input_scale, sa.out_proj.weight_scale, sa.out_proj.bias,
             first.input_scale, wide[:, c:]),
-        "layernorm_gelu_quantize_int8": ops.layernorm_gelu_quantize_int8.supports(
-            hidden, norm.weight, norm.bias, norm.eps, last.input_scale, channel_scale=last.channel_scale),
         "int8_linear(residual)": ops.int8_linear.supports(
             wide, last.weight_int8, last.input_scale, last.weight_scale, last.bias, residual=x),
     }
+    model._int8_glue_ln_gelu = supports_layernorm_gelu(model)
     return [name for name, ok in checks.items() if not ok]
 
 
-def _ffn(ffn: nn.Sequential, f0in: Tensor, x: Tensor) -> Tensor:
-    first, norm, _, last = ffn
+def _ffn(ffn: nn.Sequential, f0in: Tensor, x: Tensor, *, fused_ln_gelu: bool = True) -> Tensor:
+    first, norm, act, last = ffn
     hidden = ops.int8_linear(f0in, first.weight_int8, first.input_scale, first.weight_scale, first.bias)
-    q = ops.layernorm_gelu_quantize_int8(
-        hidden, norm.weight, norm.bias, norm.eps, last.input_scale, channel_scale=last.channel_scale
-    )
+    if fused_ln_gelu:
+        q = ops.layernorm_gelu_quantize_int8(
+            hidden, norm.weight, norm.bias, norm.eps, last.input_scale, channel_scale=last.channel_scale
+        )
+    else:
+        q = last.quantize(act(norm(hidden)))
     return ops.int8_linear(q.values, last.weight_int8, last.input_scale, last.weight_scale, last.bias, residual=x)
 
 
@@ -104,7 +119,7 @@ def _message(proj: StaticInt8Linear, message: Tensor, first: StaticInt8Linear, f
                              first.input_scale, f0in[:, c:])
 
 
-def self_block(block, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+def self_block(block, x: Tensor, cos: Tensor, sin: Tensor, *, fused_ln_gelu: bool = True) -> Tensor:
     rows, c = x.shape
     first = block.ffn[0]
     qx = torch.empty(rows, c, device=x.device, dtype=torch.int8)
@@ -114,10 +129,10 @@ def self_block(block, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     q, k, v = ops.lightglue_qkv_rope(qx, lin.weight_int8, lin.input_scale, lin.weight_scale, lin.bias, cos, sin,
                                      block.num_heads)
     _message(block.out_proj, ops.sdpa.get(block.sdpa_impl)(q, k, v), first, f0in, c)
-    return _ffn(block.ffn, f0in, x)
+    return _ffn(block.ffn, f0in, x, fused_ln_gelu=fused_ln_gelu)
 
 
-def cross_block(block, x: Tensor) -> Tensor:
+def cross_block(block, x: Tensor, *, fused_ln_gelu: bool = True) -> Tensor:
     rows, c = x.shape
     first = block.ffn[0]
     q_qk, q_v = (torch.empty(rows, c, device=x.device, dtype=torch.int8) for _ in range(2))
@@ -134,18 +149,21 @@ def cross_block(block, x: Tensor) -> Tensor:
 
     _message(block.to_out, ops.sdpa.get(block.sdpa_impl)(heads(qk), heads(qk_swapped), heads(v_swapped)), first,
              f0in, c)
-    return _ffn(block.ffn, f0in, x)
+    return _ffn(block.ffn, f0in, x, fused_ln_gelu=fused_ln_gelu)
 
 
 def features(model: nn.Module, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> tuple[Tensor, Tensor, int]:
     """:meth:`LightGlue.features` for one pair with ``desc0.shape == desc1.shape`` (batch 1), every layer run."""
+    fused_ln_gelu = getattr(model, "_int8_glue_ln_gelu", None)
+    if fused_ln_gelu is None:
+        fused_ln_gelu = model._int8_glue_ln_gelu = supports_layernorm_gelu(model)
     x0, x1 = (model.input_proj(d.to(model.compute_dtype, memory_format=torch.contiguous_format)) for d in (desc0, desc1))
     tokens, c = x0.shape[1], x0.shape[2]
     x = torch.cat((x0, x1)).view(2 * tokens, c)
     cos, sin = torch.cat((enc0.to(model.compute_dtype), enc1.to(model.compute_dtype)), dim=1)
     for layer in model.transformers:
-        x = self_block(layer.self_attn, x, cos, sin)
-        x = cross_block(layer.cross_attn, x)
+        x = self_block(layer.self_attn, x, cos, sin, fused_ln_gelu=fused_ln_gelu)
+        x = cross_block(layer.cross_attn, x, fused_ln_gelu=fused_ln_gelu)
     model.executed_layers = len(model.transformers)
     x0, x1 = x.view(2, tokens, c).chunk(2)
     return x0, x1, len(model.transformers) - 1

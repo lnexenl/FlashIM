@@ -995,8 +995,8 @@ def test_int8_linear_per_row_scale(impl):
 
 # -- ViT glue: LayerNorm + per-row INT8, and the GELU / residual epilogues of the INT8 GEMM -------------------------------
 _EXACT_LN_ARCH = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((8, 9), (9, 0)),
-    reason="the torch-exact LayerNorm kernel is registered for sm_89 / sm_90 (the archs it was checked on)",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((8, 9), (9, 0), (12, 0)),
+    reason="the torch-exact LayerNorm kernel is registered for sm_89 / sm_90 / sm_120 (the archs it was checked on)",
 )
 
 

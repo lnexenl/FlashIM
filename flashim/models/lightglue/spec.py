@@ -97,6 +97,21 @@ def _fused_bias(model: LightGlue, ctx) -> list[str] | str:
     return enable_fused_bias(model)
 
 
+def _fused_int8_glue(model: LightGlue, ctx) -> int | str:
+    """int8: fuse the transformer layers' glue (:mod:`flashim.models.lightglue.int8_glue`, bit-identical) where the
+    required ops have kernels for the platform."""
+    if ctx.config.precision.quant != "int8":
+        return "skipped: not int8"
+    from flashim.models.lightglue import int8_glue
+
+    if (reason := int8_glue.unsupported(model)) is not None:
+        return f"skipped: {reason}"
+    if missing := int8_glue.probe(model):
+        return f"skipped: no kernel on {ctx.platform.describe()} for {', '.join(missing)}"
+    model.int8_glue = True
+    return len(model.transformers)
+
+
 PASSES = {
     "low_precision_similarity": Pass(
         _low_precision_similarity, exact=False,
@@ -109,6 +124,14 @@ PASSES = {
     "fused_bias": Pass(
         _fused_bias, exact=False,
         description="fp8: StaticMXFP8Linear biases fused into cuBLAS GEMM epilogue",
+    ),
+    "rotate_residual_stream": Pass(
+        lambda model, ctx: quant.rotate_residual_stream(model), stage="pre_quant", exact=False,
+        description="Hadamard rotations folded into the weights (int8: evens out the quantized inputs' channels)",
+    ),
+    "fused_int8_glue": Pass(
+        _fused_int8_glue,
+        description="int8: one residual stream for both images, quantize / RoPE / swap / residual fused into GEMMs",
     ),
 }
 
@@ -134,6 +157,7 @@ SPEC = ModelSpec(
         "int8": {
             "extends": "bf16",
             "precision": {"quant": "int8"},
+            "optimize": {"passes+": ["rotate_residual_stream", "fused_int8_glue"]},
         },
     },
     default_preset="fp8",
