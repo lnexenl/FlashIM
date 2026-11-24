@@ -171,7 +171,7 @@ Unknown keys, passes and engines are errors; a pass the platform cannot run is s
 | sm_80 / sm_86 | A100, RTX 30xx | not tuned; no FP8, so INT8 fallbacks apply |
 
 A GPU without FP8 builds the nearest other preset instead (`int8`, or `bf16` for a model without INT8), and says so in a warning and in
-`model.build_report.fallbacks`. Details in
+`model.build_report.fallbacks`. Details, and which model was tested on which GPU (✅ / ❌ / 🔍), in
 [docs/platforms.md](https://github.com/lnexenl/FlashIM/blob/main/docs/platforms.md).
 
 ## Checkpoints
