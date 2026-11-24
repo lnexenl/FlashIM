@@ -17,7 +17,7 @@ planned) and **quantization** (MXFP8, INT8). Models are native PyTorch ports ver
   shadows the stdlib `types`. Worktrees without a `.venv`, Jetson, caches, shell quirks: `docs/dev-environment.md`.
 - Tests: `.venv/bin/python -m pytest -q -p no:cacheprovider tests` (several minutes with a GPU; without one add
   `-m "not cuda"`). Markers: `cuda`, `sm120`, `weights`, `oracle`, `slow`. Known failures (2026-11): all of
-  `tests/ops/test_depthwise_cuda.py` on `main`; `tests/parity/test_lightglue_parity.py::test_reduced_precision_tracks_fp32[fp8]`
+  `tests/ops/test_depthwise_cuda.py` on `dev`; `tests/parity/test_lightglue_parity.py::test_reduced_precision_tracks_fp32[fp8]`
   is an xfail.
 - Lint: `.venv/bin/ruff check <files you changed>` (line length 110). **Only `--fix` files you changed**: a directory `--fix`
   once rewrote the user's uncommitted files.
@@ -82,7 +82,7 @@ architectures are compile-checked and reported as such. Long GPU jobs (one comma
 
 ## Working with other agents
 
-- One task, one branch cut from `main` (`model/<name>`, `fix/<name>`), one `git worktree`. Do not `git stash` (shared with
+- One task, one branch cut from `dev` (`model/<name>`, `fix/<name>`), one `git worktree`. Do not `git stash` (shared with
   other worktrees): commit a WIP instead. Do not touch files you did not change; other worktrees can have uncommitted work.
 - One GPU: wrap CUDA commands in `flock ~/.cache/flashim/gpu.lock` and keep each under about 10 minutes.
 - Shared code (`flashim/ops`, `quant/`, `layers/`, backends) is used by every model: a change there needs the bit-identity
@@ -90,6 +90,8 @@ architectures are compile-checked and reported as such. Long GPU jobs (one comma
 
 ## Git
 
+- **`main` only receives merges from `dev`.** Work branches are cut from `dev` and their PRs target `dev`; never open a PR from a
+  work branch straight to `main`, and never push to `main` or `dev` directly.
 - Commit and push only when asked. Commit messages say what changed and why, plus how it was verified (bit-identical
   configs, test counts, timings).
 - Pull requests: fill `.github/pull_request_template.md`, keep the sections the change needs, and say what was not verified.
