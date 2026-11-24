@@ -62,6 +62,15 @@ def _fold_similarity_temperature(model: nn.Module, ctx: BuildContext) -> str:
     return "coarse matching"
 
 
+def _low_precision_similarity(model: nn.Module, ctx: BuildContext) -> str:
+    """Coarse similarity via ``ops.matmul_nt_fp32`` (BF16 tensor cores, FP32 accumulation & output, temperature folded
+    into cuBLAS alpha) instead of an FP32 SIMT SGEMM. Skipped for ``fp32`` (the reference numerics)."""
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    model.low_precision_similarity = True
+    return "coarse matching"
+
+
 SPEC = extractor_spec(
     name="loftr",
     description="LoFTR detector-free matcher (variant outdoor | indoor); match(a, b) only",
@@ -69,7 +78,7 @@ SPEC = extractor_spec(
     calibration_dir=Path(__file__).parent / "calibration",
     quantized=QUANTIZED,
     protected=PROTECTED,
-    compile_regions=("backbone",),
+    compile_regions=("backbone", "loftr_coarse"),
     role="dense",
     extra_passes={
         "channels_last": Pass(_channels_last, description="NHWC backbone convolutions (bf16 / fp32)", exact=False),
@@ -79,6 +88,11 @@ SPEC = extractor_spec(
         "fold_similarity_temperature": Pass(
             _fold_similarity_temperature, description="coarse-similarity temperature folded into an operand", exact=False
         ),
+        "low_precision_similarity": Pass(
+            _low_precision_similarity,
+            description="coarse similarity as ops.matmul_nt_fp32 (BF16 tensor cores, FP32 output; not fp32)",
+            exact=False,
+        ),
     },
-    structural_passes=("channels_last", "bf16_linear_attention", "fold_similarity_temperature"),
+    structural_passes=("channels_last", "bf16_linear_attention", "fold_similarity_temperature", "low_precision_similarity"),
 )

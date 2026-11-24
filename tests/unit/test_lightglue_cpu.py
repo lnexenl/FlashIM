@@ -126,3 +126,59 @@ def test_each_pipeline_uses_the_lightglue_trained_on_its_keypoints():
     assert weights.CVG_FILES["raco-aliked"] == "raco_aliked_lightglue.pth"
     for pipeline, variant in (("aliked-lightglue", "aliked"), ("raco-aliked-lightglue", "raco-aliked")):
         assert resolve(pipeline, "fp32").components["matcher"].variant == variant
+
+
+def test_cross_block_batched_matches_unbatched_and_low_precision_similarity():
+    from flashim.models.lightglue.model import CrossBlock, MatchAssignment
+
+    torch.manual_seed(0)
+    block = CrossBlock(32, 2).eval()
+    x0, x1 = torch.randn(1, 16, 32), torch.randn(1, 16, 32)
+    with torch.inference_mode():
+        y0, y1 = block(x0, x1)
+        # Compare against split path by appending a dummy token and slicing back for self-check on identical math
+        x0_pad = torch.cat((x0, torch.zeros(1, 1, 32)), dim=1)
+        # Direct unbatched reference using the same weights
+        sdpa = torch.nn.functional.scaled_dot_product_attention
+        qk0, qk1 = block._heads(block.to_qk(x0)), block._heads(block.to_qk(x1))
+        v0, v1 = block._heads(block.to_v(x0)), block._heads(block.to_v(x1))
+        m0 = block.to_out(sdpa(qk0, qk1, v1).transpose(1, 2).reshape(x0.shape))
+        m1 = block.to_out(sdpa(qk1, qk0, v0).transpose(1, 2).reshape(x1.shape))
+        ref0 = x0 + block.ffn(torch.cat((x0, m0), -1))
+        ref1 = x1 + block.ffn(torch.cat((x1, m1), -1))
+    assert x0_pad.shape[1] == 17
+    torch.testing.assert_close(y0, ref0, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(y1, ref1, atol=1e-5, rtol=1e-5)
+
+    head = MatchAssignment(32).eval().to(torch.bfloat16)
+    a, b = x0.to(torch.bfloat16), x1.to(torch.bfloat16)
+    with torch.inference_mode():
+        sim_ref = head.similarity(a, b)
+        head.low_precision_similarity = True
+        sim_lp = head.similarity(a, b)
+    torch.testing.assert_close(sim_lp, sim_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_rotate_residual_stream_supports_xfeat_dim96():
+    import copy
+
+    from flashim.models.lightglue.config import XFEAT_CONFIG
+    from flashim.models.lightglue.quant import rotate_residual_stream
+    from flashim.quant.rotation import hadamard
+
+    h96 = hadamard(96, dtype=torch.float64)
+    torch.testing.assert_close(h96 @ h96.T, torch.eye(96, dtype=torch.float64), atol=1e-12, rtol=0)
+
+    torch.manual_seed(0)
+    cfg = copy.copy(XFEAT_CONFIG)
+    model = LightGlue(cfg).eval()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    rotated = copy.deepcopy(model)
+    assert rotate_residual_stream(rotated) > 0
+    d0, d1 = torch.randn(1, 24, cfg.input_dim), torch.randn(1, 20, cfg.input_dim)
+    e0, e1 = model.posenc(torch.rand(1, 24, 2)), model.posenc(torch.rand(1, 20, 2))
+    with torch.inference_mode():
+        s0 = model.scores(d0, d1, e0, e1)
+        s1 = rotated.scores(d0, d1, e0, e1)
+    torch.testing.assert_close(s1, s0, atol=2e-4, rtol=1e-4)

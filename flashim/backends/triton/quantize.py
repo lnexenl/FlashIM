@@ -20,7 +20,7 @@ from flashim.backends.triton._layernorm_stats import THREADS as LN_THREADS
 from flashim.backends.triton._layernorm_stats import torch_layernorm_apply, torch_layernorm_stats
 from flashim.backends.triton._libdevice import gelu_erf, gelu_launch_kwargs, torch_gelu_libdevice
 from flashim.ops._registry import DeviceSpec
-from flashim.platforms import Feature
+from flashim.platforms import Feature, platform_for
 from flashim.quant.formats.mx import padded_channels
 from flashim.quant.tensor import Int8Tensor, QuantizedTensor
 
@@ -695,20 +695,24 @@ ops.layernorm_quantize_int8.register(
 ops.gelu_quantize_int8.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=lambda value, *a, **k: _row_major(value)
 )(gelu_quantize_int8)
+# Capabilities where ATen's BF16 LayerNorm reduction tree was verified bit-exact against torch_layernorm_stats:
+# sm_89 (L20), sm_90 (H20), sm_120 (RTX 5070 Ti; 1.04-1.19x vs unfused on 512/1024-ch shapes).
+_EXACT_LN_CAPABILITIES = ((8, 9), (9, 0), (12, 0))
+
+
 def _layernorm_rows_eligible(value, weight, bias, eps) -> bool:
     """The statistics replicate ATen's BF16 row kernel (:mod:`._layernorm_stats`): BF16 rows of ``N`` a multiple of 512,
-    with BF16 affine parameters, as DINOv2 / DeDoDe's ``nn.LayerNorm`` modules are."""
+    with BF16 affine parameters, as DINOv2 / DeDoDe / LightGlue's ``nn.LayerNorm`` modules are."""
     n = value.shape[-1]
     return (
-        value.dtype == weight.dtype == torch.bfloat16 and bias is not None and bias.dtype == torch.bfloat16
+        platform_for(value.device).capability in _EXACT_LN_CAPABILITIES
+        and value.dtype == weight.dtype == torch.bfloat16 and bias is not None and bias.dtype == torch.bfloat16
         and _row_major(value) and n % LN_EXACT_MULTIPLE == 0 and n <= 4096
     )
 
 
-# Bit-exact against ``nn.LayerNorm`` + ``quantize_int8_rows`` as measured on an L20 (sm_89) and an H20 (sm_90) only:
-# other architectures run the torch reference until someone has checked them.
 ops.layernorm_quantize_int8_rows.register(
-    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)), requires=[Feature.TRITON],
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(12, 0)), requires=[Feature.TRITON],
     when=_layernorm_rows_eligible,
 )(layernorm_quantize_int8_rows)
 ops.quantize_int8_rows.register(
@@ -745,8 +749,8 @@ ops.quantize_int8_multi.register(
 ops.quantize_int8_heads.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_quantize_heads_eligible
 )(quantize_int8_heads)
-# Exact LayerNorm statistics measured on sm_89 / sm_90 only (as layernorm_quantize_int8_rows).
+# Exact LayerNorm statistics measured on sm_89 / sm_90 / sm_120 (as layernorm_quantize_int8_rows).
 ops.layernorm_gelu_quantize_int8.register(
-    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)), requires=[Feature.TRITON],
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(12, 0)), requires=[Feature.TRITON],
     when=_layernorm_gelu_eligible,
 )(layernorm_gelu_quantize_int8)

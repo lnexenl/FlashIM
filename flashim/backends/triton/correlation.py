@@ -317,16 +317,19 @@ def dual_softmax_mutual_three_pass(
     return log_conf, index, mutual
 
 
-# Elements from which the two-pass variant wins on an L20: 1.07-1.34x from 256 MiB up (16800 x 16500: 4.76 -> 3.81 ms,
-# 8192^2: 1.15 -> 0.86 ms), 0.81x at 187 MiB and 0.41x at 95 MiB, where the matrix stays in L2 and the three-pass row
-# tiles keep more CTAs busy. The crossover depends on the L2 size, so other architectures keep three passes until measured.
+# Elements from which the two-pass variant wins on L20 (sm_89) and RTX 5070 Ti (sm_120):
+# - L20: 1.07-1.34x from 256 MiB up (16800 x 16500: 4.76 -> 3.81 ms, 8192^2: 1.15 -> 0.86 ms), 0.81x at 187 MiB.
+# - sm_120: 16800 x 16500: 4.025 -> 3.725 ms (1.08x), 12000^2: 2.109 -> 1.524 ms (1.38x),
+#   8192^2: 1.039 -> 0.738 ms (1.41x); 4096^2 (64 MiB): 0.272 vs 0.289 ms (three-pass wins in L2).
+# The crossover depends on L2 size, so other architectures keep three passes until measured.
 TWO_PASS_MIN_ELEMENTS = 1 << 26
+TWO_PASS_CAPABILITIES = ((8, 9), (12, 0))
 
 
 def dual_softmax_mutual(
     sim: Tensor, row_bias: Tensor | None = None, col_bias: Tensor | None = None
 ) -> tuple[Tensor, Tensor, Tensor]:
-    if sim.numel() >= TWO_PASS_MIN_ELEMENTS and platform_for(sim.device).capability == (8, 9):
+    if sim.numel() >= TWO_PASS_MIN_ELEMENTS and platform_for(sim.device).capability in TWO_PASS_CAPABILITIES:
         return dual_softmax_mutual_two_pass(sim, row_bias, col_bias)
     return dual_softmax_mutual_three_pass(sim, row_bias, col_bias)
 

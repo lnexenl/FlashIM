@@ -171,8 +171,11 @@ def test_hadamard_is_orthogonal_and_symmetric():
     h = hadamard(64, dtype=torch.float64)
     torch.testing.assert_close(h @ h.T, torch.eye(64, dtype=torch.float64))
     assert torch.equal(h, h.T) and h.abs().unique().numel() == 1
+    h96 = hadamard(96, dtype=torch.float64)
+    torch.testing.assert_close(h96 @ h96.T, torch.eye(96, dtype=torch.float64))
+    assert h96.abs().unique().numel() == 1
     with pytest.raises(ValueError):
-        hadamard(96)
+        hadamard(100)
 
 
 def _outlier_input(rows=512, channels=128):

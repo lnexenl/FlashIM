@@ -65,11 +65,11 @@ def main() -> None:
         overrides = [f"components.extractor.preset={args.rdd_preset}"]
         if args.checkpoint:
             overrides.append(f"components.matcher.checkpoint={args.checkpoint}")
-        spec = get_spec(flashim.resolve(args.pipeline, "bf16").components["matcher"].model)
-        passes = spec.presets.get(args.format, {}).get("optimize", {}).get("passes", ())
-        rotated = "rotate_residual_stream" in passes
+        resolved_fmt = flashim.resolve(args.pipeline, args.format).components["matcher"]
+        spec = get_spec(resolved_fmt.model)
+        rotated = "rotate_residual_stream" in resolved_fmt.optimize.passes
         if rotated:  # observe the inputs the quantized layers will see
-            overrides.append(f"components.matcher.optimize.passes={json.dumps(list(passes))}")
+            overrides.append('components.matcher.optimize.passes=["rotate_residual_stream"]')
         pipeline = flashim.load(args.pipeline, "bf16", overrides=overrides)
         rdd, model = pipeline.extractor, pipeline.matcher
         matcher = pipeline.run_config.components["matcher"]
@@ -79,9 +79,16 @@ def main() -> None:
     else:
         if not args.out:
             parser.error("--out is required without --pipeline")
+        resolved_fmt = flashim.resolve("lightglue", args.format, config={"variant": args.extractor})
+        rotated = "rotate_residual_stream" in resolved_fmt.optimize.passes
         rdd = flashim.load(args.extractor, preset=args.rdd_preset or ("fp8" if args.extractor == "rdd" else "fp32"))
         model = flashim.load(
-            "lightglue", "bf16", config={"variant": args.extractor, "checkpoint": args.checkpoint}
+            "lightglue", "bf16",
+            config={
+                "variant": args.extractor,
+                "checkpoint": args.checkpoint,
+                **({"optimize": {"passes": ["rotate_residual_stream"]}} if rotated else {}),
+            },
         )
         config = PRESETS[args.format].config
     targets = [

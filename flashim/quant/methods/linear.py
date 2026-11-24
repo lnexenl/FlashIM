@@ -82,6 +82,9 @@ class StaticMXFP8Linear(nn.Module):
             (self.out_features, self.in_features),
         )
 
+    # Add bias in the GEMM epilogue (FP32 accumulator + bias, one rounding) instead of a separate BF16 elementwise pass.
+    fused_bias = False
+
     def _finish(self, out: Tensor, leading: tuple[int, ...], dtype: torch.dtype) -> Tensor:
         if self.bias_bf16 is not None:
             out = out + self.bias_bf16
@@ -89,6 +92,8 @@ class StaticMXFP8Linear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         quantized = ops.quantize_mxfp8(x, self.input_exponent)  # dispatched: one Triton kernel on CUDA
+        if self.fused_bias and self.bias is not None:
+            return self.matmul(quantized, bias=True).to(x.dtype)
         return self._finish(self.gemm(quantized, None), tuple(x.shape[:-1]), x.dtype)
 
     def quantize_layernorm(
@@ -114,7 +119,9 @@ class StaticMXFP8Linear(nn.Module):
 
         ``bias=False`` leaves the bias out (for consumers that fold it into their own kernel); ``bias=True`` adds
         it in the GEMM epilogue (FP32 accumulator + bias, one rounding)."""
-        out = self.gemm(quantized, self.bias if bias else None)
+        # cuBLAS block-scaled scaled_mm takes BF16 bias directly; passing bias_bf16 avoids a per-call FP32->BF16 copy.
+        gemm_bias = (self.bias_bf16 if self.kernel_name == "cublas" else self.bias) if bias else None
+        out = self.gemm(quantized, gemm_bias)
         return out[:, : self.out_features].reshape(*quantized.logical_shape[:-1], self.out_features)
 
     def forward_prequantized(self, quantized: QuantizedTensor) -> Tensor:
@@ -123,8 +130,20 @@ class StaticMXFP8Linear(nn.Module):
             quantized.scale_exponent, self.input_exponent
         ):
             raise ValueError("Prequantized activation uses a different static scale")
+        if self.fused_bias and self.bias is not None:
+            return self.matmul(quantized, bias=True)
         out = self.gemm(quantized, None)
         return self._finish(out, quantized.logical_shape[:-1], torch.bfloat16)
 
     def extra_repr(self) -> str:
         return f"in={self.in_features}, out={self.out_features}, kernel={self.kernel_name}"
+
+
+def enable_fused_bias(model: nn.Module) -> list[str]:
+    """Switch every :class:`StaticMXFP8Linear` with a bias to the GEMM's fused bias epilogue (returns module names)."""
+    enabled = []
+    for name, module in model.named_modules():
+        if type(module) is StaticMXFP8Linear and module.bias is not None:
+            module.fused_bias = True
+            enabled.append(name)
+    return enabled
