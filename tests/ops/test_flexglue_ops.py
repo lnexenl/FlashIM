@@ -120,3 +120,41 @@ def test_qk_norm_swap_heads(dtype, b, n, h, d):
     assert torch.allclose(tq.float(), rq.float(), atol=tol, rtol=tol)
     assert torch.allclose(tk.float(), rk.float(), atol=tol, rtol=tol)
     assert torch.equal(tk[: b // 2], tq[b // 2 :]) and torch.equal(tk[b // 2 :], tq[: b // 2])
+
+
+@pytest.mark.parametrize("b,h,n,d", [(2, 8, 4096, 64), (1, 4, 77, 32)])
+@torch.inference_mode()
+def test_quantize_mxfp8_heads(b, h, n, d):
+    torch.manual_seed(0)
+    x = torch.randn(b, h, n, d, device="cuda", dtype=torch.bfloat16)
+    exp = torch.randint(-4, 4, (h * d // 32,), device="cuda", dtype=torch.int8)
+    assert ops.quantize_mxfp8_heads.explain(x, exp)["triton"] == "selected"
+    ref = ops.quantize_mxfp8_heads.get("reference")(x, exp)
+    tri = ops.quantize_mxfp8_heads.get("triton")(x, exp)
+    assert torch.equal(tri.values.view(torch.uint8), ref.values.view(torch.uint8))
+
+
+@pytest.mark.parametrize("rows,c", [(8192, 512), (77, 128)])
+@torch.inference_mode()
+def test_layernorm_cat_quantize_mxfp8_and_int8(rows, c):
+    torch.manual_seed(0)
+    x = torch.randn(2, rows // 2, c, device="cuda", dtype=torch.bfloat16)
+    msg = torch.randn_like(x)
+    w, b = torch.randn(c, device="cuda", dtype=torch.bfloat16), torch.randn(c, device="cuda", dtype=torch.bfloat16)
+    msg_bias = torch.randn(c, device="cuda", dtype=torch.float32) * 0.1
+    exp = torch.randint(-3, 3, (2 * c // 32,), device="cuda", dtype=torch.int8)
+
+    assert ops.layernorm_cat_quantize_mxfp8.explain(x, msg, w, b, 1e-5, exp, msg_bias=msg_bias)["triton"] == "selected"
+    ref_fp8 = ops.layernorm_cat_quantize_mxfp8.get("reference")(x, msg, w, b, 1e-5, exp, msg_bias=msg_bias)
+    tri_fp8 = ops.layernorm_cat_quantize_mxfp8.get("triton")(x, msg, w, b, 1e-5, exp, msg_bias=msg_bias)
+    # Left half (x) is bit-exact; right half (LayerNorm) allows tiny 1-ulp rounding diff.
+    assert torch.equal(tri_fp8.values[..., :c].view(torch.uint8), ref_fp8.values[..., :c].view(torch.uint8))
+    diff_fp8 = (tri_fp8.values[..., c:].view(torch.uint8) != ref_fp8.values[..., c:].view(torch.uint8)).float().mean().item()
+    assert diff_fp8 < 0.005
+
+    scale = torch.tensor(0.05, device="cuda", dtype=torch.float32)
+    assert ops.layernorm_cat_quantize_int8.explain(x, msg, w, b, 1e-5, scale)["triton"] == "selected"
+    ref_i8 = ops.layernorm_cat_quantize_int8.get("reference")(x, msg, w, b, 1e-5, scale)
+    tri_i8 = ops.layernorm_cat_quantize_int8.get("triton")(x, msg, w, b, 1e-5, scale)
+    assert torch.equal(tri_i8.values[..., :c], ref_i8.values[..., :c])
+    assert (tri_i8.values[..., c:].int() - ref_i8.values[..., c:].int()).abs().max().item() <= 1

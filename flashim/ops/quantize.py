@@ -3,6 +3,7 @@ linear writes its E4M3 input directly."""
 
 from __future__ import annotations
 
+import torch
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -207,3 +208,64 @@ def _layernorm_gelu_quantize_int8_reference(
 
 
 layernorm_gelu_quantize_int8 = Op("layernorm_gelu_quantize_int8", _layernorm_gelu_quantize_int8_reference)
+
+
+# -- MXFP8 / INT8 attention-output and message-norm+cat producers ------------------------------------
+
+
+def _quantize_mxfp8_heads_reference(value: Tensor, scale_exponent: Tensor) -> QuantizedTensor:
+    """``quantize_mxfp8(value.transpose(1, 2).reshape(B * N, H * D), scale_exponent)`` of an attention output
+    ``[B, H, N, D]``: the token-major E4M3 input of the output projection, without the transposed BF16 copy."""
+    batch, heads, tokens, dim = value.shape
+    return quantize_static(value.transpose(1, 2).reshape(batch * tokens, heads * dim), scale_exponent)
+
+
+quantize_mxfp8_heads = Op("quantize_mxfp8_heads", _quantize_mxfp8_heads_reference)
+
+
+def _layernorm_cat_quantize_mxfp8_reference(
+    x: Tensor,
+    msg: Tensor,
+    weight: Tensor | None,
+    bias: Tensor | None,
+    eps: float,
+    scale_exponent: Tensor,
+    *,
+    msg_bias: Tensor | None = None,
+) -> QuantizedTensor:
+    """``quantize_mxfp8(cat([x, LayerNorm(msg [+ msg_bias])], dim=-1), scale_exponent)`` with FP32 statistics,
+    rounded to ``msg.dtype`` before quantization (fuses output-proj bias, message_norm, cat and ffn.0 quantize)."""
+    dense = msg.float() if msg_bias is None else msg.float() + msg_bias.float()
+    normed = F.layer_norm(
+        dense,
+        (msg.shape[-1],),
+        weight.float() if weight is not None else None,
+        bias.float() if bias is not None else None,
+        eps,
+    ).to(msg.dtype)
+    return quantize_static(torch.cat((x, normed), dim=-1), scale_exponent)
+
+
+layernorm_cat_quantize_mxfp8 = Op("layernorm_cat_quantize_mxfp8", _layernorm_cat_quantize_mxfp8_reference)
+
+
+def _layernorm_cat_quantize_int8_reference(
+    x: Tensor,
+    msg: Tensor,
+    weight: Tensor | None,
+    bias: Tensor | None,
+    eps: float,
+    scale: Tensor,
+) -> Int8Tensor:
+    """``quantize_int8(cat([x, LayerNorm(msg)], dim=-1), scale)`` with FP32 statistics, rounded to ``msg.dtype``."""
+    normed = F.layer_norm(
+        msg.float(),
+        (msg.shape[-1],),
+        weight.float() if weight is not None else None,
+        bias.float() if bias is not None else None,
+        eps,
+    ).to(msg.dtype)
+    return quantize_int8_static(torch.cat((x, normed), dim=-1), scale)
+
+
+layernorm_cat_quantize_int8 = Op("layernorm_cat_quantize_int8", _layernorm_cat_quantize_int8_reference)

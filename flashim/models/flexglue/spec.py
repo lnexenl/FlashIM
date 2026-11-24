@@ -13,6 +13,7 @@ from flashim.models.flexglue.config import FlexGlueConfig
 from flashim.models.flexglue.descriptor import ConvNeXtBlock
 from flashim.models.flexglue.model import FlexGlue
 from flashim.quant.methods.int8_linear import StaticInt8Linear
+from flashim.quant.methods.linear import StaticMXFP8Linear, enable_fused_bias
 
 
 def _load(config: RunConfig) -> FlexGlue:
@@ -63,6 +64,27 @@ def _fuse_convnext_int8(model: FlexGlue, ctx: BuildContext) -> int | str:
             m.fused_int8 = True
             count += 1
     return count if count else "skipped: no static INT8 ConvNeXt blocks"
+
+
+def _fuse_transformer_glue(model: FlexGlue, ctx: BuildContext) -> int | str:
+    """fp8 / int8: fuse quantized transformer glue (MXFP8 cuBLAS bias epilogue, attention-output head quantize,
+    message_norm+cat+ffn.0 quantize, ffn LN+GELU+quantize, INT8 residual epilogue, shared to_qk/to_v quantize)."""
+    qkind = ctx.config.precision.quant
+    if qkind not in ("fp8", "int8"):
+        return f"skipped: quant={qkind!r}"
+    if qkind == "fp8":
+        enable_fused_bias(model)
+    count = 0
+    for layer in model.transformers:
+        sa, ca = layer.self_attn, layer.cross_attn
+        sa.fused_glue = True
+        ca.fused_glue = True
+        if isinstance(ca.to_qk, StaticMXFP8Linear) and isinstance(ca.to_v, StaticMXFP8Linear):
+            ca.shared_qkv_scale = bool(torch.equal(ca.to_qk.input_exponent, ca.to_v.input_exponent))
+        elif isinstance(ca.to_qk, StaticInt8Linear) and isinstance(ca.to_v, StaticInt8Linear):
+            ca.shared_qkv_scale = bool(torch.equal(ca.to_qk.input_scale, ca.to_v.input_scale))
+        count += 1
+    return count
 
 
 def _sage_attention(model: FlexGlue, ctx: BuildContext) -> str:
@@ -117,7 +139,13 @@ SPEC = ModelSpec(
                 "extends": "bf16",
                 "precision": {"quant": name},
                 "optimize": {
-                    "passes": ["fold_convnext_gamma", "channels_last", "fuse_convnext_int8", "sage_attention"]
+                    "passes": [
+                        "fold_convnext_gamma",
+                        "channels_last",
+                        "fuse_convnext_int8",
+                        "fuse_transformer_glue",
+                        "sage_attention",
+                    ]
                 },
             }
             for name in _QUANTIZED
@@ -139,6 +167,10 @@ SPEC = ModelSpec(
         "fuse_convnext_int8": Pass(
             _fuse_convnext_int8, exact=False,
             description="fuse ConvNeXtBlock LN+quantize_int8, GELU+quantize_int8 and pwconv2 residual add",
+        ),
+        "fuse_transformer_glue": Pass(
+            _fuse_transformer_glue, exact=False,
+            description="fuse MXFP8/INT8 transformer bias, head quantize, message_norm+cat, FFN LN+GELU and residual",
         ),
         "sage_attention": Pass(
             _sage_attention, exact=False,

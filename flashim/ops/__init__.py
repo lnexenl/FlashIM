@@ -57,6 +57,8 @@ from flashim.ops.quantize import (
     bias_relu_quantize_int8,
     gelu_quantize,
     gelu_quantize_int8,
+    layernorm_cat_quantize_int8,
+    layernorm_cat_quantize_mxfp8,
     layernorm_gelu_quantize_int8,
     layernorm_quantize,
     layernorm_quantize_int8,
@@ -66,6 +68,7 @@ from flashim.ops.quantize import (
     quantize_int8_multi,
     quantize_int8_rows,
     quantize_mxfp8,
+    quantize_mxfp8_heads,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
 from flashim.ops.resample import pil_bicubic_resize, upsample_add, upsample_concat, upsample_concat_int8
@@ -100,6 +103,8 @@ __all__ = [
     "int8_linear_quantize",
     "jpeg_fancy_upsample",
     "kde_density",
+    "layernorm_cat_quantize_int8",
+    "layernorm_cat_quantize_mxfp8",
     "layernorm_gelu_quantize_int8",
     "layernorm_quantize",
     "layernorm_quantize_int8",
@@ -123,6 +128,7 @@ __all__ = [
     "quantize_int8_multi",
     "quantize_int8_rows",
     "quantize_mxfp8",
+    "quantize_mxfp8_heads",
     "raco_head5x5",
     "raco_resblock",
     "reset_call_counts",

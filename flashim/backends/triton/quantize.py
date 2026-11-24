@@ -629,6 +629,164 @@ def layernorm_gelu_quantize_int8(
     return Int8Tensor(out, scale)
 
 
+# -- MXFP8 / INT8 attention-output and message-norm+cat producers ------------------------------------
+
+
+@triton.jit
+def _quantize_mxfp8_heads_kernel(
+    x_ptr, exp_ptr, o_ptr, TOKENS, HEADS: tl.constexpr, D: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    """``quantize_mxfp8(x.transpose(1, 2).reshape(B * N, H * D), exp)`` of a contiguous ``x [B, H, N, D]``."""
+    n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    bh = tl.program_id(1)
+    h = bh % HEADS
+    d = tl.arange(0, D)
+    mask = (n < TOKENS)[:, None]
+    x = tl.load(x_ptr + (bh.to(tl.int64) * TOKENS + n[:, None]) * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
+    cols = h * D + d
+    exponent = tl.load(exp_ptr + cols // 32).to(tl.float32)
+    scaled = x * tl.exp2(-exponent)[None, :]
+    quantized = to_e4m3(tl.maximum(tl.minimum(scaled, 448.0), -448.0))
+    dst = ((bh // HEADS).to(tl.int64) * TOKENS + n[:, None]) * (HEADS * D) + cols[None, :]
+    tl.store(o_ptr + dst, quantized, mask=mask)
+
+
+def quantize_mxfp8_heads(value: Tensor, scale_exponent: Tensor) -> QuantizedTensor:
+    batch, heads, tokens, dim = value.shape
+    channels = heads * dim
+    out = torch.empty((batch * tokens, channels), device=value.device, dtype=torch.float8_e4m3fn)
+    exp = scale_exponent.to(value.device, torch.int8)
+    _quantize_mxfp8_heads_kernel[(triton.cdiv(tokens, 64), batch * heads)](
+        value, exp, out, tokens, HEADS=heads, D=dim, BLOCK_N=64, num_warps=4
+    )
+    return QuantizedTensor(out, exp, (batch * tokens, channels))
+
+
+@triton.jit
+def _layernorm_cat_quantize_kernel(
+    x_ptr,
+    msg_ptr,
+    w_ptr,
+    b_ptr,
+    msg_bias_ptr,
+    scale_ptr,
+    out_ptr,
+    channels,
+    eps,
+    BLOCK_C: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_MSG_BIAS: tl.constexpr,
+    ROUND: tl.constexpr,
+    INT8: tl.constexpr,
+):
+    """One program per row: quantize ``x[row, :C]`` into ``out[row, :C]`` and ``LayerNorm(msg[row, :C] [+ msg_bias])``
+    into ``out[row, C:2*C]`` (``channels`` is a multiple of 32 for MXFP8, so no channel padding)."""
+    row = tl.program_id(0).to(tl.int64)
+    in_base = row * channels
+    out_base = row * (2 * channels)
+    cols = tl.arange(0, BLOCK_C)
+    valid = cols < channels
+
+    x = tl.load(x_ptr + in_base + cols, mask=valid, other=0.0).to(tl.float32)
+    msg = tl.load(msg_ptr + in_base + cols, mask=valid, other=0.0).to(tl.float32)
+    if HAS_MSG_BIAS:
+        msg = msg + tl.load(msg_bias_ptr + cols, mask=valid, other=0.0).to(tl.float32)
+
+    mean = tl.sum(tl.where(valid, msg, 0.0), axis=0) / channels
+    centered = tl.where(valid, msg - mean, 0.0)
+    var = tl.sum(centered * centered, axis=0) / channels
+    normed = centered * tl.rsqrt(var + tl.cast(eps, tl.float32))
+    if HAS_WEIGHT:
+        normed = normed * tl.load(w_ptr + cols, mask=valid, other=0.0).to(tl.float32)
+    if HAS_BIAS:
+        normed = normed + tl.load(b_ptr + cols, mask=valid, other=0.0).to(tl.float32)
+    normed = _round_to_dense(tl.where(valid, normed, 0.0), ROUND)
+
+    if INT8:
+        inv_s = 1.0 / tl.load(scale_ptr)
+        qx = tl.maximum(tl.minimum(libdevice.rint(x * inv_s), 127.0), -127.0).to(tl.int8)
+        qn = tl.maximum(tl.minimum(libdevice.rint(normed * inv_s), 127.0), -127.0).to(tl.int8)
+        tl.store(out_ptr + out_base + cols, qx, mask=valid)
+        tl.store(out_ptr + out_base + channels + cols, qn, mask=valid)
+    else:
+        exp_x = tl.load(scale_ptr + cols // 32, mask=valid, other=0).to(tl.float32)
+        exp_n = tl.load(scale_ptr + (channels + cols) // 32, mask=valid, other=0).to(tl.float32)
+        qx = to_e4m3(tl.maximum(tl.minimum(x * tl.exp2(-exp_x), 448.0), -448.0))
+        qn = to_e4m3(tl.maximum(tl.minimum(normed * tl.exp2(-exp_n), 448.0), -448.0))
+        tl.store(out_ptr + out_base + cols, qx, mask=valid)
+        tl.store(out_ptr + out_base + channels + cols, qn, mask=valid)
+
+
+def layernorm_cat_quantize_mxfp8(
+    x: Tensor,
+    msg: Tensor,
+    weight: Tensor | None,
+    bias: Tensor | None,
+    eps: float,
+    scale_exponent: Tensor,
+    *,
+    msg_bias: Tensor | None = None,
+) -> QuantizedTensor:
+    channels = x.shape[-1]
+    rows = x.numel() // channels
+    out = torch.empty((*x.shape[:-1], 2 * channels), device=x.device, dtype=torch.float8_e4m3fn)
+    exp = scale_exponent.to(x.device, torch.int8)
+    block_c = triton.next_power_of_2(channels)
+    _layernorm_cat_quantize_kernel[(rows,)](
+        x,
+        msg,
+        weight.contiguous().reshape(-1) if weight is not None else msg,
+        bias.contiguous().reshape(-1) if bias is not None else msg,
+        msg_bias.contiguous().reshape(-1) if msg_bias is not None else msg,
+        exp,
+        out,
+        channels,
+        float(eps),
+        BLOCK_C=block_c,
+        HAS_WEIGHT=weight is not None,
+        HAS_BIAS=bias is not None,
+        HAS_MSG_BIAS=msg_bias is not None,
+        ROUND=_ROUND_CODE[msg.dtype],
+        INT8=False,
+        num_warps=4 if block_c >= 128 else 2,
+    )
+    return QuantizedTensor(out, exp, (*x.shape[:-1], 2 * channels))
+
+
+def layernorm_cat_quantize_int8(
+    x: Tensor,
+    msg: Tensor,
+    weight: Tensor | None,
+    bias: Tensor | None,
+    eps: float,
+    scale: Tensor,
+) -> Int8Tensor:
+    channels = x.shape[-1]
+    rows = x.numel() // channels
+    out = torch.empty((*x.shape[:-1], 2 * channels), device=x.device, dtype=torch.int8)
+    block_c = triton.next_power_of_2(channels)
+    _layernorm_cat_quantize_kernel[(rows,)](
+        x,
+        msg,
+        weight.contiguous().reshape(-1) if weight is not None else msg,
+        bias.contiguous().reshape(-1) if bias is not None else msg,
+        msg,
+        scale,
+        out,
+        channels,
+        float(eps),
+        BLOCK_C=block_c,
+        HAS_WEIGHT=weight is not None,
+        HAS_BIAS=bias is not None,
+        HAS_MSG_BIAS=False,
+        ROUND=_ROUND_CODE[msg.dtype],
+        INT8=True,
+        num_warps=4 if block_c >= 128 else 2,
+    )
+    return Int8Tensor(out, scale)
+
+
 # -- registrations ---------------------------------------------------------------------------------------
 
 def _row_major(value: Tensor) -> bool:
@@ -750,3 +908,43 @@ ops.layernorm_gelu_quantize_int8.register(
     "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)), requires=[Feature.TRITON],
     when=_layernorm_gelu_eligible,
 )(layernorm_gelu_quantize_int8)
+
+
+def _quantize_mxfp8_heads_eligible(value: Tensor, scale_exponent: Tensor) -> bool:
+    if value.ndim != 4 or not _row_major(value):
+        return False
+    dim = value.shape[-1]
+    return dim >= 32 and dim == triton.next_power_of_2(dim) and dim % 32 == 0
+
+
+ops.quantize_mxfp8_heads.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3],
+    when=_quantize_mxfp8_heads_eligible,
+)(quantize_mxfp8_heads)
+
+
+def _layernorm_cat_mxfp8_eligible(x, msg, weight, bias, eps, scale_exponent, *, msg_bias=None) -> bool:
+    c = x.shape[-1] if x.ndim >= 2 else 0
+    return (
+        x.shape == msg.shape
+        and _row_major(x)
+        and _row_major(msg)
+        and 32 <= c <= 2048
+        and c % 32 == 0
+    )
+
+
+ops.layernorm_cat_quantize_mxfp8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON, Feature.FP8_E4M3],
+    when=_layernorm_cat_mxfp8_eligible,
+)(layernorm_cat_quantize_mxfp8)
+
+
+def _layernorm_cat_int8_eligible(x, msg, weight, bias, eps, scale) -> bool:
+    c = x.shape[-1] if x.ndim >= 2 else 0
+    return x.shape == msg.shape and _row_major(x) and _row_major(msg) and 1 <= c <= 2048
+
+
+ops.layernorm_cat_quantize_int8.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_layernorm_cat_int8_eligible
+)(layernorm_cat_quantize_int8)

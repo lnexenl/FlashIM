@@ -23,6 +23,8 @@ from flashim.models.flexglue.config import FlexGlueConfig
 from flashim.models.flexglue.descriptor import DINOv3Descriptor
 from flashim.models.romav2.model import ImageLike, load_image
 from flashim.platforms import default_device
+from flashim.quant.methods.int8_linear import StaticInt8Linear
+from flashim.quant.methods.linear import StaticMXFP8Linear
 from flashim.types import Matches
 from flashim.utils import device_constant
 
@@ -85,7 +87,58 @@ def _attention(q: Tensor, k: Tensor, v: Tensor, impl: str = "reference") -> Tens
     return out.transpose(1, 2).flatten(-2)
 
 
+def _post_attention_ffn(
+    x: Tensor, out_hnd: Tensor, proj: nn.Module, message_norm: nn.LayerNorm, ffn: nn.Sequential, fused: bool
+) -> Tensor:
+    """``x + ffn(cat([x, message_norm(proj(out_hnd.transpose(1, 2).flatten(-2)))], -1))`` with quantized glue fused."""
+    if fused and x.dtype == torch.bfloat16:
+        first, norm, act, last = ffn
+        if (
+            isinstance(proj, StaticMXFP8Linear)
+            and isinstance(first, StaticMXFP8Linear)
+            and isinstance(last, StaticMXFP8Linear)
+            and isinstance(norm, nn.LayerNorm)
+            and isinstance(act, nn.GELU)
+        ):
+            q_out = ops.quantize_mxfp8_heads(out_hnd, proj.input_exponent)
+            msg = proj.matmul(q_out, bias=False).reshape_as(x)
+            msg_bias = None if proj.bias is None else proj.bias[: proj.out_features]
+            f0_in = ops.layernorm_cat_quantize_mxfp8(
+                x, msg, message_norm.weight, message_norm.bias, message_norm.eps, first.input_exponent,
+                msg_bias=msg_bias,
+            )
+            hidden = first.matmul(f0_in, bias=False)
+            f0_bias = None if first.bias is None else first.bias[: first.out_features]
+            f3_in = last.quantize_layernorm(hidden, None, norm, input_bias=f0_bias, activation=act.approximate)
+            return x + last.matmul(f3_in, bias=last.bias is not None).to(x.dtype)
+        if (
+            isinstance(proj, StaticInt8Linear)
+            and isinstance(first, StaticInt8Linear)
+            and isinstance(last, StaticInt8Linear)
+            and proj.channel_scale is None
+            and first.channel_scale is None
+            and last.channel_scale is None
+            and isinstance(norm, nn.LayerNorm)
+            and isinstance(act, nn.GELU)
+        ):
+            q_out = ops.quantize_int8_heads(out_hnd, proj.input_scale)
+            msg = proj.forward_prequantized(q_out).reshape_as(x)
+            f0_in = ops.layernorm_cat_quantize_int8(
+                x, msg, message_norm.weight, message_norm.bias, message_norm.eps, first.input_scale
+            )
+            hidden = first.forward_prequantized(f0_in)
+            f3_in = last.quantize_layernorm(hidden, None, norm, activation=act.approximate)
+            return ops.int8_linear(
+                f3_in.matrix(), last.weight_int8, last.input_scale, last.weight_scale, last.bias,
+                residual=x.reshape(-1, last.out_features),
+            ).reshape_as(x)
+    message = proj(out_hnd.transpose(1, 2).flatten(-2))
+    return x + ffn(torch.cat([x, message_norm(message)], -1))
+
+
 class SelfBlock(nn.Module):
+    fused_glue: bool = False
+
     def __init__(self, dim: int, num_heads: int) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -111,11 +164,13 @@ class SelfBlock(nn.Module):
             self.num_heads,
         )
         out = ops.sdpa.get(self.sdpa_impl)(q, k, v)
-        message = self.out_proj(out.transpose(1, 2).flatten(-2))
-        return x + self.ffn(torch.cat([x, self.message_norm(message)], -1))
+        return _post_attention_ffn(x, out, self.out_proj, self.message_norm, self.ffn, self.fused_glue)
 
 
 class CrossBlock(nn.Module):
+    fused_glue: bool = False
+    shared_qkv_scale: bool = False
+
     def __init__(self, dim: int, num_heads: int) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -142,12 +197,49 @@ class CrossBlock(nn.Module):
     def forward_stacked(self, x: Tensor) -> Tensor:
         """``forward`` on both images stacked on the batch, ``x = cat([x0, x1])`` of equal token counts: one call
         per linear and one attention over the 2B pairs (image 0 attends to image 1 and vice versa)."""
+        if self.fused_glue and x.dtype == torch.bfloat16:
+            if (
+                self.shared_qkv_scale
+                and isinstance(self.to_qk, StaticMXFP8Linear)
+                and isinstance(self.to_v, StaticMXFP8Linear)
+            ):
+                qx = self.to_qk.quantize(x)
+                qk_raw = self.to_qk.matmul(qx, bias=self.to_qk.bias is not None).to(x.dtype)
+                v_raw = self.to_v.matmul(qx, bias=self.to_v.bias is not None).to(x.dtype)
+            elif (
+                isinstance(self.to_qk, StaticInt8Linear)
+                and isinstance(self.to_v, StaticInt8Linear)
+                and self.to_qk.channel_scale is None
+                and self.to_v.channel_scale is None
+            ):
+                if self.shared_qkv_scale:
+                    qx = self.to_qk.quantize(x)
+                    qk_raw = self.to_qk.forward_prequantized(qx).to(x.dtype)
+                    v_raw = ops.int8_linear(
+                        qx.matrix(), self.to_v.weight_int8, self.to_v.input_scale, self.to_v.weight_scale,
+                        self.to_v.bias,
+                    ).reshape_as(x)
+                else:
+                    x2d = x.reshape(-1, x.shape[-1])
+                    q_qk = torch.empty(x2d.shape, device=x.device, dtype=torch.int8)
+                    q_v = torch.empty_like(q_qk)
+                    ops.quantize_int8_multi(x2d, [self.to_qk.input_scale, self.to_v.input_scale], [q_qk, q_v])
+                    qk_raw = ops.int8_linear(
+                        q_qk, self.to_qk.weight_int8, self.to_qk.input_scale, self.to_qk.weight_scale,
+                        self.to_qk.bias,
+                    ).reshape_as(x)
+                    v_raw = ops.int8_linear(
+                        q_v, self.to_v.weight_int8, self.to_v.input_scale, self.to_v.weight_scale, self.to_v.bias
+                    ).reshape_as(x)
+            else:
+                qk_raw, v_raw = self.to_qk(x), self.to_v(x)
+        else:
+            qk_raw, v_raw = self.to_qk(x), self.to_v(x)
         q, k_swap, v_swap = ops.qk_norm_swap_heads(
-            self.to_qk(x), self.to_v(x), self.qk_norm.weight, self.qk_norm.bias, self.qk_norm.eps, self.num_heads
+            qk_raw, v_raw, self.qk_norm.weight, self.qk_norm.bias, self.qk_norm.eps, self.num_heads
         )
         out = ops.sdpa.get(self.sdpa_impl)(q, k_swap, v_swap)
-        message = self.to_out(out.transpose(1, 2).flatten(-2))
-        return x + self.ffn(torch.cat([x, self.message_norm(message)], -1))
+        return _post_attention_ffn(x, out, self.to_out, self.message_norm, self.ffn, self.fused_glue)
 
 
 class TransformerLayer(nn.Module):
