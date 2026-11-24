@@ -322,7 +322,13 @@ class LightGlue(nn.Module):
     def best_matches(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Per point of image A: the best log assignment over image B's points, its index and whether it is mutual
         (:meth:`MatchAssignment.matches` of the last executed layer)."""
-        if not self.graphs or self.config.depth_confidence > 0 or not desc0.is_cuda or torch.is_grad_enabled():
+        if (
+            not self.graphs
+            or self.config.depth_confidence > 0
+            or not desc0.is_cuda
+            or torch.is_grad_enabled()
+            or max(desc0.shape[1], desc1.shape[1]) > 8192
+        ):
             return self._best_matches(desc0, desc1, enc0, enc1)
         from flashim.engines.cuda_graph import CudaGraphRunner
 
@@ -332,14 +338,30 @@ class LightGlue(nn.Module):
         if runner is not None:
             cache.move_to_end(key)
             return runner(desc0, desc1, enc0, enc1)
+        # Only capture a shape once it repeats: variable-keypoint extractors (SuperPoint, DISK on ScanNet) emit a
+        # unique (N0, N1) almost every pair, where capturing a throwaway graph per pair ran 2-4x slower than eager.
+        seen = self.__dict__.setdefault("_graph_seen", OrderedDict())
+        hits = seen.get(key, 0) + 1
+        seen[key] = hits
+        seen.move_to_end(key)
+        while len(seen) > 256:
+            seen.popitem(last=False)
+        if hits < 2:
+            return self._best_matches(desc0, desc1, enc0, enc1)
         runner = CudaGraphRunner(self._best_matches)
+        failed = False
         try:
             outputs = runner(desc0, desc1, enc0, enc1)
-        except RuntimeError as exc:  # e.g. a kernel launched on the legacy default stream (unpatched SageAttention)
+        except RuntimeError as exc:  # e.g. legacy-default-stream kernel or OOM during capture
             warn_once(logger, f"lightglue-graph-{id(self)}", "%s: CUDA graph capture failed, running eagerly "
                       "from now on (%s)", type(self).__name__, exc)
             self.graphs = 0
+            failed = True
+        if failed:
+            del runner
+            cache.clear()
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             return self._best_matches(desc0, desc1, enc0, enc1)
         cache[key] = runner
         while len(cache) > self.graphs:

@@ -4,6 +4,7 @@ tokens, dual-softmax coarse matching, and a 5x5-window fine refinement."""
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from pathlib import Path
 
 import torch
@@ -211,8 +212,8 @@ class LoFTR(ImageMatcher, nn.Module):
         self.fine_preprocess.down_proj = nn.Linear(256, 128, bias=True)
         self.fine_preprocess.merge_feat = nn.Linear(256, 128, bias=True)
         self.loftr_fine = LocalFeatureTransformer(128, 8, ["self", "cross"])
-        self._pe: dict[tuple[int, int], Tensor] = {}
-        self._inner_cache: dict[tuple[int, int, int, torch.device], Tensor] = {}
+        self._pe: OrderedDict[tuple[int, int], Tensor] = OrderedDict()
+        self._inner_cache: OrderedDict[tuple[int, int, int, torch.device], Tensor] = OrderedDict()
 
     @classmethod
     def from_pretrained(cls, *, variant: str = "outdoor", checkpoint: str | Path | None = None,
@@ -244,9 +245,16 @@ class LoFTR(ImageMatcher, nn.Module):
     fold_batchnorm = sparse.SparseExtractor.fold_batchnorm
 
     def positions(self, h: int, w: int) -> Tensor:
-        if (h, w) not in self._pe:
-            self._pe[(h, w)] = position_encoding(256, h, w, self.temp_bug_fix, self.device)
-        return self._pe[(h, w)]
+        key = (h, w)
+        pe = self._pe.get(key)
+        if pe is None:
+            pe = position_encoding(256, h, w, self.temp_bug_fix, self.device)
+            self._pe[key] = pe
+            while len(self._pe) > 16:
+                self._pe.popitem(last=False)
+        else:
+            self._pe.move_to_end(key)
+        return pe
 
     def coarse_features(self, gray: Tensor) -> tuple[Tensor, Tensor]:
         feat_c, feat_f = self.backbone(gray.to(self.compute_dtype))
@@ -256,7 +264,12 @@ class LoFTR(ImageMatcher, nn.Module):
         key = (h, w, border, device)
         mask = self._inner_cache.get(key)
         if mask is None:
-            mask = self._inner_cache[key] = _inner_cells(h, w, border, device)
+            mask = _inner_cells(h, w, border, device)
+            self._inner_cache[key] = mask
+            while len(self._inner_cache) > 32:
+                self._inner_cache.popitem(last=False)
+        else:
+            self._inner_cache.move_to_end(key)
         return mask
 
     @torch.inference_mode()
