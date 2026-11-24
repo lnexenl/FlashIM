@@ -532,8 +532,12 @@ def test_int8_conv2d_maxpool_odd_size_takes_the_reference():
 
 
 _needs_stem_tc = pytest.mark.skipif(
+    not torch.cuda.is_available() or platform_for(DEV).capability not in ((8, 9), (9, 0), (12, 0)),
+    reason="the tensor-core stem is registered for sm_89 / sm_90 / sm_120 only",
+)
+_needs_patch_embed_tc = pytest.mark.skipif(
     not torch.cuda.is_available() or platform_for(DEV).capability not in ((8, 9), (9, 0)),
-    reason="the tensor-core stem and the cuBLAS patch embedding are registered for sm_89 / sm_90 only",
+    reason="the cuBLAS patch embedding is registered for sm_89 / sm_90 only",
 )
 
 
@@ -556,7 +560,7 @@ def test_conv2d_small_cin_quantize_int8(batch, height, width, cout):
     assert bound.primary == "triton" and torch.equal(bound(x, scale).values, fast.values)
 
 
-@_needs_stem_tc
+@_needs_patch_embed_tc
 @pytest.mark.parametrize("hw", [(28, 42), (56, 28), (14, 14)])
 def test_patch_embed_tokens(hw):
     """Patch embedding as a GEMM into the token buffer: the reference's tokens up to the summation order (1 BF16 ulp)."""
@@ -578,7 +582,7 @@ def test_patch_embed_tokens(hw):
     assert batch2.shape == (2, 1 + h * w, 1024)  # batch > 1 takes the reference
 
 
-@_needs_stem_tc
+@_needs_patch_embed_tc
 def test_patch_embed_tokens_compiles():
     torch.manual_seed(0)
     image = torch.randn(1, 3, 56, 84, device=DEV).bfloat16()
@@ -634,6 +638,11 @@ def test_mxfp8_conv2d_scaled(cin, cout, kh, kw, sh, sw, ph, pw, dh, dw, has_bias
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-3
     fused = ops.mxfp8_conv2d.get("triton_scaled")(*args, relu=True)
     assert torch.equal(fused, F.relu(fast))
+    if cout % 32 == 0:
+        out_exp = torch.randint(-6, 3, (cout // 32,), dtype=torch.int8, device=DEV)
+        chained = ops.mxfp8_conv2d.get("triton_scaled")(*args, relu=True, out_exponent=out_exp)
+        expected = ops.quantize_mxfp8.get("triton")(fused, out_exp).values
+        assert chained.dtype == torch.float8_e4m3fn and torch.equal(chained.view(torch.uint8), expected.view(torch.uint8))
 
 
 @pytest.mark.parametrize("impl", ["triton", "cublas"])

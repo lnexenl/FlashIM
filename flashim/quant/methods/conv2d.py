@@ -32,9 +32,11 @@ from flashim.quant.methods.linear import StaticMXFP8Linear
 from flashim.quant.tensor import Int8Tensor, QuantizedTensor, QuantizedWeight
 
 # Where a conv writes the next conv's quantized input from its epilogue (``chain_output``), bit-identical to the separate
-# quantize pass. Measured on an L20 (see ``StaticMXFP8Conv2d``) and on an H20: a conv + ReLU pair 0.324 -> 0.304 ms (FP8,
-# 64 -> 64 3x3 at 448x600), 0.802 -> 0.770 (FP8, 256 -> 256 at 224x300), 0.210 -> 0.198 (INT8, 64 -> 64 at 448x600).
-CHAINED_CAPABILITIES = ((8, 9), (9, 0))
+# quantize pass. Measured on L20 (sm_89), H20 (sm_90), and RTX 5070 Ti (sm_120):
+# - H20: 64->64 3x3 at 448x600 0.324 -> 0.304 ms (FP8), 0.210 -> 0.198 (INT8); 256->256 at 224x300 0.802 -> 0.770 (FP8).
+# - sm_120: 2x64 3x3 at 800x800 1.498 -> 1.179 ms (1.27x FP8), 1.425 -> 1.120 ms (1.27x INT8);
+#   1x128 3x3 at 448x600 0.946 -> 0.825 ms (1.15x FP8), 0.859 -> 0.743 ms (1.16x INT8).
+CHAINED_CAPABILITIES = ((8, 9), (9, 0), (12, 0))
 # INT8 also on sm_87 (no FP8 there). Measured on a Jetson AGX Orin, bit-identical: RoMaV2's eight INT8 VGG convs,
 # batch 2, 32.8 -> 30.5 ms at 800x800 and 51.9 -> 48.0 ms at 1024x1024.
 INT8_CHAINED_CAPABILITIES = (*CHAINED_CAPABILITIES, (8, 7))
