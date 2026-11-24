@@ -146,7 +146,9 @@ def test_int8_preset_rotates_the_residual_stream():
         assert config.optimize.passes == (
             "low_precision_similarity", "rotate_residual_stream", "sage_attention", "fused_int8_glue", "cuda_graph"
         )
-    assert flashim.resolve("loma-matcher", "fp8").optimize.passes == ("low_precision_similarity",)
+    assert flashim.resolve("loma-matcher", "fp8").optimize.passes == (
+        "low_precision_similarity", "fused_bias", "sage_attention", "cuda_graph"
+    )
 
 
 def test_int8_pipelines_extractor_passes():
@@ -164,16 +166,17 @@ def test_int8_pipelines_extractor_passes():
         assert flashim.resolve(f"loma-{variant}", "bf16").components["extractor"].optimize.passes == PASSES
 
 
-def test_cuda_graph_and_glue_passes_skip_outside_int8_eager():
+def test_cuda_graph_and_glue_passes_skip_when_ineligible():
     from types import SimpleNamespace
 
     from flashim.models.loma.matcher_spec import PASSES
 
     model = LoMaMatcher(SMALL).eval()
+    fp32 = SimpleNamespace(config=flashim.resolve("loma-matcher", "fp32"))
     bf16 = SimpleNamespace(config=flashim.resolve("loma-matcher", "bf16"))
     compiled = SimpleNamespace(config=flashim.resolve("loma-matcher", "int8", overrides=["engine.kind=compile"]),
                                option=lambda name, default=None: default)
-    assert PASSES["cuda_graph"].apply(model, bf16) == "skipped: not int8"
+    assert PASSES["cuda_graph"].apply(model, fp32) == "skipped: fp32"
     assert PASSES["cuda_graph"].apply(model, compiled) == "skipped: engine compile"
     assert PASSES["fused_int8_glue"].apply(model, bf16) == "skipped: not int8"
     assert model.graphs == 0 and not model.int8_glue
@@ -181,7 +184,11 @@ def test_cuda_graph_and_glue_passes_skip_outside_int8_eager():
 
 def test_low_precision_similarity_only_in_the_reduced_precision_presets():
     passes = {preset: flashim.resolve("loma-matcher", preset).optimize.passes for preset in ("fp32", "bf16", "fp8")}
-    assert passes == {"fp32": (), "bf16": ("low_precision_similarity",), "fp8": ("low_precision_similarity",)}
+    assert passes == {
+        "fp32": (),
+        "bf16": ("low_precision_similarity", "cuda_graph"),
+        "fp8": ("low_precision_similarity", "fused_bias", "sage_attention", "cuda_graph"),
+    }
     for preset, expected in passes.items():  # the pipelines' matcher component resolves the same way
         assert flashim.resolve("loma-l", preset).components["matcher"].optimize.passes == expected
 
@@ -211,3 +218,34 @@ def test_low_precision_similarity_is_the_product_of_the_bf16_projections():
     torch.testing.assert_close(log_conf, scores.max(1).values)
     assert torch.equal(index, scores.argmax(1))
     assert torch.equal(mutual, scores.argmax(0)[index] == torch.arange(6))
+
+
+@pytest.mark.cuda
+def test_sdpa_graph_safe_guards_cuda_graph_capture():
+    """``sdpa_graph_safe`` must return True for reference SDPA and detect non-graph-safe SageAttention builds before
+    ``best_matches`` captures a silently corrupt graph."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from flashim.models.lightglue.model import sdpa_graph_safe
+
+    device = torch.device("cuda")
+    assert sdpa_graph_safe(None, device) is True
+    assert sdpa_graph_safe("reference", device) is True
+    if "sage-fp8" not in {i.name for i in flashim.ops.sdpa.impls}:
+        pytest.skip("needs sageattention")
+    safe = sdpa_graph_safe("sage-fp8", device)
+    assert isinstance(safe, bool)
+    if not safe:
+        model = LoMaMatcher(dataclasses.replace(SMALL, dim=64, num_heads=1)).to(device).eval()
+        model.set_compute_dtype(torch.bfloat16)
+        for layer in model.transformers:
+            layer.self_attn.sdpa_impl = layer.cross_attn.sdpa_impl = "sage-fp8"
+        model.graphs = 4
+        d0 = torch.randn(1, 64, 16, device=device, dtype=torch.bfloat16)
+        d1 = torch.randn(1, 64, 16, device=device, dtype=torch.bfloat16)
+        e0, e1 = model.posenc(torch.rand(1, 64, 2, device=device)), model.posenc(torch.rand(1, 64, 2, device=device))
+        with torch.inference_mode():
+            got = model.best_matches(d0, d1, e0, e1)
+            assert model.graphs == 0
+            want = model._best_matches(d0, d1, e0, e1)
+        assert torch.equal(got[1], want[1]) and torch.equal(got[2], want[2])

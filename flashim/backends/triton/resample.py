@@ -157,17 +157,18 @@ def _to_int8(value, inv):
 
 
 @triton.jit
-def _concat_int8_pair_kernel(
+def _concat_pair_kernel(
     coarse_ptr, other_ptr, out_ptr, scale_ptr,
     H, W, h, w, scale_h, scale_w,
     cs_b, cs_c, cs_h, cs_w, os_b, os_c, os_h, os_w,
     C_OTHER: tl.constexpr, C_COARSE: tl.constexpr, BLOCK_X: tl.constexpr, PO: tl.constexpr, PC: tl.constexpr,
+    INT8: tl.constexpr, COARSE_FIRST: tl.constexpr,
 ):
     """Exact 2x, BF16 inputs. Program ``(x block, i)`` writes the output rows ``2i + 1`` and ``2i + 2`` (``i = -1 .. h -
     1``; rows outside ``[0, H)`` masked). Their vertical taps are both coarse rows ``max(i, 0)`` and ``min(i + 1, h -
     1)``, so the taps and the horizontal lerps are shared and each output needs ``ly0 * top + ly1 * bottom`` (the tile
     kernel's expression and operand order). Row 0 takes taps (0, 0) with weights (1, 0) instead of (0, 1): equal for
-    finite values."""
+    finite values. ``INT8=True`` quantizes statically to INT8; ``INT8=False`` stores BF16 channels-last directly."""
     pid = tl.program_id(1)
     b = (pid // (h + 1)).to(tl.int64)
     i = pid % (h + 1) - 1
@@ -178,7 +179,6 @@ def _concat_int8_pair_kernel(
     x_ok = x < W
     x = tl.where(x_ok, x, 0)
     C_OUT: tl.constexpr = C_OTHER + C_COARSE
-    inv = 1.0 / tl.load(scale_ptr)
     xo = (x.to(tl.int64) * os_w)[:, None]
     o = tl.arange(0, PO)
     mo = x_ok[:, None] & (o < C_OTHER)[None, :]
@@ -203,10 +203,19 @@ def _concat_int8_pair_kernel(
     bottom = lx0 * vbl + lx1 * vbr
     pa = out_ptr + ((b * H + ya_c) * W + x.to(tl.int64))[:, None] * C_OUT
     pb = out_ptr + ((b * H + yb_c) * W + x.to(tl.int64))[:, None] * C_OUT
-    tl.store(pa + o[None, :], _to_int8(fa.to(tl.float32), inv), mask=mo & a_ok)
-    tl.store(pb + o[None, :], _to_int8(fb.to(tl.float32), inv), mask=mo & b_ok)
-    tl.store(pa + C_OTHER + c[None, :], _to_int8(_bf16_round(ly0a * top + ly1a * bottom), inv), mask=m & a_ok)
-    tl.store(pb + C_OTHER + c[None, :], _to_int8(_bf16_round(ly0b * top + ly1b * bottom), inv), mask=m & b_ok)
+    o_off: tl.constexpr = C_COARSE if COARSE_FIRST else 0
+    c_off: tl.constexpr = 0 if COARSE_FIRST else C_OTHER
+    if INT8:
+        inv = 1.0 / tl.load(scale_ptr)
+        tl.store(pa + o_off + o[None, :], _to_int8(fa.to(tl.float32), inv), mask=mo & a_ok)
+        tl.store(pb + o_off + o[None, :], _to_int8(fb.to(tl.float32), inv), mask=mo & b_ok)
+        tl.store(pa + c_off + c[None, :], _to_int8(_bf16_round(ly0a * top + ly1a * bottom), inv), mask=m & a_ok)
+        tl.store(pb + c_off + c[None, :], _to_int8(_bf16_round(ly0b * top + ly1b * bottom), inv), mask=m & b_ok)
+    else:
+        tl.store(pa + o_off + o[None, :], fa.to(tl.bfloat16), mask=mo & a_ok)
+        tl.store(pb + o_off + o[None, :], fb.to(tl.bfloat16), mask=mo & b_ok)
+        tl.store(pa + c_off + c[None, :], (ly0a * top + ly1a * bottom).to(tl.bfloat16), mask=m & a_ok)
+        tl.store(pb + c_off + c[None, :], (ly0b * top + ly1b * bottom).to(tl.bfloat16), mask=m & b_ok)
 
 
 @triton.jit
@@ -261,19 +270,36 @@ def _is_2x(features: Tensor, coarse: Tensor) -> bool:
     return features.shape[-2] == 2 * coarse.shape[-2] and features.shape[-1] == 2 * coarse.shape[-1]
 
 
-def upsample_concat_int8_pair(features: Tensor, coarse: Tensor, scale: Tensor) -> Int8Tensor:
+def _launch_pair(
+    features: Tensor, coarse: Tensor, out: Tensor, scale: Tensor | None, *, coarse_first: bool = False
+) -> Tensor:
     batch, c_features, height, width = features.shape
     c_coarse, h, w = coarse.shape[1:]
-    out = torch.empty(batch, height, width, c_features + c_coarse, device=features.device, dtype=torch.int8)
     block_x, num_warps = _PAIR_TILES.get(torch.cuda.get_device_capability(features.device), {}).get(
         c_features + c_coarse, _PAIR_DEFAULT
     )
-    _concat_int8_pair_kernel[(triton.cdiv(width, block_x), batch * (h + 1))](
-        coarse, features, out, scale, height, width, h, w, h / height, w / width, *coarse.stride(), *features.stride(),
+    _concat_pair_kernel[(triton.cdiv(width, block_x), batch * (h + 1))](
+        coarse, features, out, out if scale is None else scale, height, width, h, w, h / height, w / width,
+        *coarse.stride(), *features.stride(),
         C_OTHER=c_features, C_COARSE=c_coarse, BLOCK_X=block_x, PO=triton.next_power_of_2(c_features),
-        PC=triton.next_power_of_2(c_coarse), num_warps=num_warps,
+        PC=triton.next_power_of_2(c_coarse), INT8=scale is not None, COARSE_FIRST=coarse_first, num_warps=num_warps,
     )
-    return Int8Tensor(out, scale)
+    return out
+
+
+def upsample_concat_pair(features: Tensor, coarse: Tensor, *, coarse_first: bool = False) -> Tensor:
+    batch, c_features, height, width = features.shape
+    out = torch.empty(
+        batch, c_features + coarse.shape[1], height, width, device=features.device, dtype=torch.bfloat16,
+        memory_format=torch.channels_last,
+    )
+    return _launch_pair(features, coarse, out, None, coarse_first=coarse_first)
+
+
+def upsample_concat_int8_pair(features: Tensor, coarse: Tensor, scale: Tensor) -> Int8Tensor:
+    batch, c_features, height, width = features.shape
+    out = torch.empty(batch, height, width, c_features + coarse.shape[1], device=features.device, dtype=torch.int8)
+    return Int8Tensor(_launch_pair(features, coarse, out, scale), scale)
 
 
 def upsample_add_rows(coarse: Tensor, delta: Tensor) -> Tensor:
@@ -306,11 +332,16 @@ ops.upsample_concat_int8.register(
 ops.upsample_add.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible_add)(upsample_add)
 
 
-def _rows_eligible_concat(features: Tensor, coarse: Tensor, scale: Tensor) -> bool:
+def _rows_eligible_concat_bf16(features: Tensor, coarse: Tensor, *, coarse_first: bool = False) -> bool:
     return (
-        _eligible_concat(features, coarse) and features.dtype == torch.bfloat16 and coarse.dtype == torch.bfloat16
+        _eligible_concat(features, coarse, coarse_first=coarse_first)
+        and features.dtype == torch.bfloat16 and coarse.dtype == torch.bfloat16
         and _is_2x(features, coarse) and torch.cuda.get_device_capability(features.device) in _ROWS_CAPABILITIES
     )
+
+
+def _rows_eligible_concat(features: Tensor, coarse: Tensor, scale: Tensor) -> bool:
+    return _rows_eligible_concat_bf16(features, coarse)
 
 
 def _rows_eligible_add(coarse: Tensor, delta: Tensor) -> bool:
@@ -326,6 +357,9 @@ def _rows_eligible_add(coarse: Tensor, delta: Tensor) -> bool:
 
 # sm_89 / sm_90 / sm_120: the capabilities these kernels were run and timed on (other architectures keep the tile kernel).
 _ROWS_DEVICE = DeviceSpec("cuda", min_capability=(8, 9))
+ops.upsample_concat.register(
+    "triton_rows", device=_ROWS_DEVICE, requires=[Feature.TRITON], when=_rows_eligible_concat_bf16
+)(upsample_concat_pair)
 ops.upsample_concat_int8.register(
     "triton_rows", device=_ROWS_DEVICE, requires=[Feature.TRITON], when=_rows_eligible_concat
 )(upsample_concat_int8_pair)

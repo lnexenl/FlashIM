@@ -500,6 +500,84 @@ def quantize_int8_rows(value: Tensor) -> tuple[Tensor, Tensor]:
 
 
 @triton.jit
+def _quantize_int8_rows_heads_kernel(
+    value_ptr, out_ptr, scale_ptr, rows, TOKENS, HEADS: tl.constexpr, D: tl.constexpr,
+    K: tl.constexpr, BLOCK_K: tl.constexpr, ROWS: tl.constexpr,
+):
+    """Per-token dynamic INT8 directly from ``[B, H, N, D]`` contiguous -> ``[B * N, H * D]`` INT8 + ``[B * N, 1]``
+    FP32 scales, bit-identical to ``value.transpose(1, 2).reshape(B * N, H * D)`` followed by ``quantize_int8_rows``."""
+    row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    row_ok = row < rows
+    cols = tl.arange(0, BLOCK_K)
+    col_ok = cols < K
+    mask = row_ok[:, None] & col_ok[None, :]
+    b = row // TOKENS
+    n = row % TOKENS
+    h = cols // D
+    d = cols % D
+    src = ((b[:, None] * HEADS + h[None, :]).to(tl.int64) * TOKENS + n[:, None]) * D + d[None, :]
+    value = tl.load(value_ptr + src, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.max(tl.abs(value), 1) * (1.0 / 127.0)
+    scale = tl.where(scale > 1.1920928955078125e-07, scale, 1.1920928955078125e-07)
+    scaled = libdevice.rint(tl.math.div_rn(value, scale[:, None]))
+    dst = row[:, None].to(tl.int64) * K + cols[None, :]
+    tl.store(out_ptr + dst, tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8), mask=mask)
+    tl.store(scale_ptr + row, scale, mask=row_ok)
+
+
+def quantize_int8_rows_heads(value: Tensor) -> tuple[Tensor, Tensor]:
+    batch, heads, tokens, dim = value.shape
+    transposed = value.transpose(1, 2)
+    if transposed.is_contiguous():
+        # FlashAttention SDPA returns [B, H, N, D] backed by [B, N, H, D] memory: zero-copy contiguous after transpose.
+        return quantize_int8_rows(transposed.reshape(batch * tokens, heads * dim))
+    rows, k = batch * tokens, heads * dim
+    out = torch.empty((rows, k), device=value.device, dtype=torch.int8)
+    scale = torch.empty((rows, 1), device=value.device, dtype=torch.float32)
+    block_k = triton.next_power_of_2(k)
+    per_program = max(1, 4096 // block_k)
+    _quantize_int8_rows_heads_kernel[(triton.cdiv(rows, per_program),)](
+        value, out, scale, rows, tokens, HEADS=heads, D=dim, K=k, BLOCK_K=block_k, ROWS=per_program,
+        num_warps=4 if block_k <= 2048 else 8,
+    )
+    return out, scale
+
+
+@triton.jit
+def _gelu_quantize_int8_rows_kernel(
+    value_ptr, out_ptr, scale_ptr, rows, K: tl.constexpr, BLOCK_K: tl.constexpr, ROWS: tl.constexpr,
+):
+    """Exact GELU (rounded to BF16 first, matching ``nn.GELU()``) + per-row dynamic INT8 quantization in one pass."""
+    row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    cols = tl.arange(0, BLOCK_K)
+    mask = (row < rows)[:, None] & (cols < K)[None, :]
+    offsets = row[:, None].to(tl.int64) * K + cols[None, :]
+    value = tl.load(value_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    value = gelu_erf(value).to(tl.bfloat16).to(tl.float32)
+    value = tl.where(mask, value, 0.0)
+    scale = tl.max(tl.abs(value), 1) * (1.0 / 127.0)
+    scale = tl.where(scale > 1.1920928955078125e-07, scale, 1.1920928955078125e-07)
+    scaled = libdevice.rint(tl.math.div_rn(value, scale[:, None]))
+    tl.store(out_ptr + offsets, tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8), mask=mask)
+    tl.store(scale_ptr + row, scale, mask=row < rows)
+
+
+def gelu_quantize_int8_rows(value: Tensor) -> tuple[Tensor, Tensor]:
+    k = value.shape[-1]
+    rows = value.numel() // k
+    out = torch.empty(value.shape, device=value.device, dtype=torch.int8)
+    scale = torch.empty((*value.shape[:-1], 1), device=value.device, dtype=torch.float32)
+    block_k = triton.next_power_of_2(k)
+    per_program = max(1, 4096 // block_k)
+    extra = gelu_launch_kwargs(value.device) if torch_gelu_libdevice(value.device) is not None else {}
+    _gelu_quantize_int8_rows_kernel[(triton.cdiv(rows, per_program),)](
+        value, out, scale, rows, K=k, BLOCK_K=block_k, ROWS=per_program, num_warps=4 if block_k <= 2048 else 8,
+        **extra,
+    )
+    return out, scale
+
+
+@triton.jit
 def _layernorm_quantize_int8_rows_kernel(
     x_ptr, w_ptr, b_ptr, out_ptr, scale_ptr, eps, N: tl.constexpr, BLOCK: tl.constexpr, T: tl.constexpr,
     ITERS: tl.constexpr,
@@ -586,6 +664,10 @@ def _quantize_int8_heads_kernel(x_ptr, s_ptr, o_ptr, TOKENS, HEADS: tl.constexpr
 
 def quantize_int8_heads(value: Tensor, scale: Tensor) -> Int8Tensor:
     batch, heads, tokens, dim = value.shape
+    transposed = value.transpose(1, 2)
+    if transposed.is_contiguous():
+        # FlashAttention SDPA returns [B, H, N, D] backed by [B, N, H, D] memory: zero-copy contiguous after transpose.
+        return quantize_int8(transposed.reshape(batch * tokens, heads * dim), scale)
     out = torch.empty(batch * tokens, heads * dim, device=value.device, dtype=torch.int8)
     _quantize_int8_heads_kernel[(triton.cdiv(tokens, 64), batch * heads)](
         value, scale, out, tokens, HEADS=heads, D=dim, BLOCK_N=64, num_warps=4
@@ -719,6 +801,18 @@ ops.quantize_int8_rows.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON],
     when=lambda value: _row_major(value) and value.shape[-1] <= 8192,
 )(quantize_int8_rows)
+ops.quantize_int8_rows_heads.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON],
+    when=lambda value: (
+        value.ndim == 4 and value.dtype in (torch.float16, torch.bfloat16, torch.float32) and value.numel() > 0
+        and value.shape[1] * value.shape[3] <= 8192
+        and (value.is_contiguous() or value.transpose(1, 2).is_contiguous())
+    ),
+)(quantize_int8_rows_heads)
+ops.gelu_quantize_int8_rows.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON],
+    when=lambda value: _row_major(value) and value.dtype == torch.bfloat16 and value.shape[-1] <= 8192,
+)(gelu_quantize_int8_rows)
 
 
 def _quantize_multi_eligible(value: Tensor, scales: list[Tensor], outs: list[Tensor]) -> bool:
@@ -731,7 +825,11 @@ def _quantize_multi_eligible(value: Tensor, scales: list[Tensor], outs: list[Ten
 
 def _quantize_heads_eligible(value: Tensor, scale: Tensor) -> bool:
     dim = value.shape[-1] if value.ndim == 4 else 0
-    return value.ndim == 4 and _row_major(value) and dim >= 16 and dim == triton.next_power_of_2(dim)
+    return (
+        value.ndim == 4 and value.dtype in (torch.float16, torch.bfloat16, torch.float32) and value.numel() > 0
+        and dim >= 16 and dim == triton.next_power_of_2(dim)
+        and (value.is_contiguous() or value.transpose(1, 2).is_contiguous())
+    )
 
 
 def _layernorm_gelu_eligible(value, weight, bias, eps, scale, *, channel_scale=None) -> bool:

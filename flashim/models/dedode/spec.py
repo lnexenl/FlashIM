@@ -210,11 +210,11 @@ def tensor_core_first_conv(model: nn.Module, ctx: BuildContext) -> list[str] | s
 
 
 def patch_embed_gemm(model: nn.Module, ctx: BuildContext) -> list[str] | str:
-    """int8: DINOv2's patch convolution + class token + positional embedding as one GEMM into the token buffer
+    """int8 / fp8: DINOv2's patch convolution + class token + positional embedding as one GEMM into the token buffer
     (``ops.patch_embed_tokens``; FP32 summation order differs from cuDNN's convolution). Only where the op has a kernel
-    (sm_89 / sm_90)."""
-    if ctx.config.precision.quant != "int8":
-        return "skipped: not int8"
+    (sm_89 / sm_90 / sm_120)."""
+    if ctx.config.precision.quant not in ("int8", "fp8"):
+        return "skipped: not quantized"
     found = []
     for name, module in model.named_modules():
         if isinstance(module, blocks.DinoV2) and module.patch_embed.proj.weight.dtype == torch.bfloat16:
