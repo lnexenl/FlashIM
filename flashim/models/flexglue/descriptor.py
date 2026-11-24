@@ -11,6 +11,9 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim import ops
+from flashim.quant.methods.int8_linear import StaticInt8Linear
+
 
 def _to_hwc(x: Tensor) -> Tensor:
     """``(b, c, h, w)`` -> ``(b, h, w, c)``."""
@@ -30,6 +33,8 @@ class LayerNorm2d(nn.LayerNorm):
 
 
 class ConvNeXtBlock(nn.Module):
+    fused_int8: bool = False
+
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
@@ -39,9 +44,51 @@ class ConvNeXtBlock(nn.Module):
         self.pwconv2 = nn.Linear(4 * dim, dim)
         self.gamma = nn.Parameter(torch.ones(dim))
 
+    def fold_gamma(self) -> bool:
+        """Fold LayerScale ``gamma`` into ``pwconv2`` before quantization (exact in real arithmetic)."""
+        if self.gamma is None:
+            return False
+        with torch.no_grad():
+            g = self.gamma.to(self.pwconv2.weight.dtype)
+            self.pwconv2.weight.mul_(g[:, None])
+            if self.pwconv2.bias is not None:
+                self.pwconv2.bias.mul_(g.to(self.pwconv2.bias.dtype))
+        self.register_parameter("gamma", None)
+        return True
+
     def forward(self, x: Tensor) -> Tensor:
-        y = self.norm(self.dwconv(x).permute(0, 2, 3, 1))
-        y = self.gamma * self.pwconv2(self.act(self.pwconv1(y)))
+        y = self.dwconv(x).permute(0, 2, 3, 1)
+        if (
+            self.fused_int8
+            and self.gamma is None
+            and isinstance(self.pwconv1, StaticInt8Linear)
+            and isinstance(self.pwconv2, StaticInt8Linear)
+            and self.pwconv1.channel_scale is None
+            and self.pwconv2.channel_scale is None
+            and isinstance(self.act, nn.GELU)
+            and x.dtype == torch.bfloat16
+        ):
+            if not y.is_contiguous():
+                y = y.contiguous()
+            x_hwc = x.permute(0, 2, 3, 1)
+            if not x_hwc.is_contiguous():
+                x_hwc = x_hwc.contiguous()
+            q1 = self.pwconv1.quantize_layernorm(y, None, self.norm)
+            h = self.pwconv1.forward_prequantized(q1)
+            q2 = self.pwconv2.quantize_gelu(h, self.act.approximate)
+            out = ops.int8_linear(
+                q2.values.reshape(-1, self.pwconv2.in_features),
+                self.pwconv2.weight_int8,
+                self.pwconv2.input_scale,
+                self.pwconv2.weight_scale,
+                self.pwconv2.bias,
+                residual=x_hwc.reshape(-1, self.pwconv2.out_features),
+            )
+            return out.reshape(x_hwc.shape).permute(0, 3, 1, 2)
+        y = self.norm(y)
+        y = self.pwconv2(self.act(self.pwconv1(y)))
+        if self.gamma is not None:
+            y = self.gamma * y
         return x + y.permute(0, 3, 1, 2)
 
 
@@ -108,6 +155,8 @@ class LinearConvHead(nn.Module):
 class DINOv3Descriptor(nn.Module):
     """Describes images densely (search map) and keypoints sparsely (descriptors)."""
 
+    channels_last: bool = False
+
     def __init__(self) -> None:
         super().__init__()
         self.backbone = ConvNeXt()
@@ -119,4 +168,7 @@ class DINOv3Descriptor(nn.Module):
 
     def forward(self, image: Tensor) -> Tensor:
         """Dense ``input_dim``-wide stride-8 features ``[B, C, h/8, w/8]`` of ``[B, 3, H, W]`` in ``[0, 1]``."""
-        return self.head(self.backbone((image - self.mean) / self.std))
+        x = (image - self.mean) / self.std
+        if self.channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
+        return self.head(self.backbone(x))

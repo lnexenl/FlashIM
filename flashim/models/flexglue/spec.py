@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import dataclasses
 
+import torch
+
 from flashim.build import BuildContext, EngineSpec, ModelSpec, Pass, dtype
 from flashim.config import RunConfig
 from flashim.models.flexglue import quant
 from flashim.models.flexglue.config import FlexGlueConfig
+from flashim.models.flexglue.descriptor import ConvNeXtBlock
 from flashim.models.flexglue.model import FlexGlue
+from flashim.quant.methods.int8_linear import StaticInt8Linear
 
 
 def _load(config: RunConfig) -> FlexGlue:
@@ -25,6 +29,40 @@ def _set_precision(model: FlexGlue, config: RunConfig) -> None:
 def _set_attention(model: FlexGlue, impl: str) -> None:
     for layer in model.transformers:
         layer.self_attn.sdpa_impl = layer.cross_attn.sdpa_impl = impl
+
+
+def _fold_convnext_gamma(model: FlexGlue, ctx: BuildContext) -> int | str:
+    """Fold ConvNeXt ``gamma`` into ``pwconv2`` before quantization (skipped in fp32 for exact reference parity)."""
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    return sum(m.fold_gamma() for m in model.descriptor.backbone.modules() if isinstance(m, ConvNeXtBlock))
+
+
+def _channels_last(model: FlexGlue, ctx: BuildContext) -> str:
+    """NHWC ConvNeXt backbone + LinearConvHead in bf16 / int8 / fp8: eliminates 72 NCHW<->NHWC copies per pair and
+    runs 7x7 depthwise convs via cuDNN NHWC."""
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    model.descriptor.backbone.to(memory_format=torch.channels_last)
+    model.descriptor.head.to(memory_format=torch.channels_last)
+    model.descriptor.channels_last = True
+    return "descriptor"
+
+
+def _fuse_convnext_int8(model: FlexGlue, ctx: BuildContext) -> int | str:
+    """Fuse ConvNeXtBlock LN + quantize, GELU + quantize, and pwconv2 residual add when pwconv1/pwconv2 are static
+    INT8 (int8 and fp8 presets)."""
+    count = 0
+    for m in model.descriptor.backbone.modules():
+        if (
+            isinstance(m, ConvNeXtBlock)
+            and m.gamma is None
+            and isinstance(m.pwconv1, StaticInt8Linear)
+            and isinstance(m.pwconv2, StaticInt8Linear)
+        ):
+            m.fused_int8 = True
+            count += 1
+    return count if count else "skipped: no static INT8 ConvNeXt blocks"
 
 
 def _sage_attention(model: FlexGlue, ctx: BuildContext) -> str:
@@ -70,9 +108,18 @@ SPEC = ModelSpec(
     load=_load,
     presets={
         "fp32": {},
-        "bf16": {"precision": {"compute_dtype": "bf16"}},
+        "bf16": {
+            "precision": {"compute_dtype": "bf16"},
+            "optimize": {"passes": ["fold_convnext_gamma", "channels_last"]},
+        },
         **{
-            name: {"extends": "bf16", "precision": {"quant": name}, "optimize": {"passes": ["sage_attention"]}}
+            name: {
+                "extends": "bf16",
+                "precision": {"quant": name},
+                "optimize": {
+                    "passes": ["fold_convnext_gamma", "channels_last", "fuse_convnext_int8", "sage_attention"]
+                },
+            }
             for name in _QUANTIZED
         },
     },
@@ -81,6 +128,18 @@ SPEC = ModelSpec(
     calibrations={name: p.calibration for name, p in _QUANTIZED.items()},
     protected=quant.PROTECTED,
     passes={
+        "fold_convnext_gamma": Pass(
+            _fold_convnext_gamma, stage="pre_quant", exact=False,
+            description="fold ConvNeXtBlock.gamma into pwconv2 before quantization",
+        ),
+        "channels_last": Pass(
+            _channels_last, exact=False,
+            description="NHWC ConvNeXt backbone + LinearConvHead (bf16 / int8 / fp8)",
+        ),
+        "fuse_convnext_int8": Pass(
+            _fuse_convnext_int8, exact=False,
+            description="fuse ConvNeXtBlock LN+quantize_int8, GELU+quantize_int8 and pwconv2 residual add",
+        ),
         "sage_attention": Pass(
             _sage_attention, exact=False,
             description="int8 / fp8: SageAttention (INT8 QK; FP16 / FP8 PV) where measured faster than torch SDPA",

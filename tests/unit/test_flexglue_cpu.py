@@ -205,7 +205,8 @@ def test_sage_attention_pass_picks_the_measured_impl_per_architecture():
 
     apply = SPEC.passes["sage_attention"].apply
     registered = {impl.name for impl in ops.sdpa.impls}
-    assert flashim.resolve("flexglue", "bf16").optimize.passes == ()
+    assert "sage_attention" not in flashim.resolve("flexglue", "bf16").optimize.passes
+    assert flashim.resolve("flexglue", "fp32").optimize.passes == ()
 
     def run(preset: str, capability, attention: str = "sdpa"):
         model = FlexGlue(SMALL)
@@ -224,3 +225,18 @@ def test_sage_attention_pass_picks_the_measured_impl_per_architecture():
         assert result.startswith("skipped: torch SDPA") and pinned == "reference"
     result, pinned = run("fp8", (12, 0), attention="sage")  # a pinned optimize.attention wins (set after the passes)
     assert result.startswith("skipped: optimize.attention") and pinned == "reference"
+
+
+def test_convnext_block_fold_gamma_matches_unfolded():
+    from flashim.models.flexglue.descriptor import ConvNeXtBlock
+
+    torch.manual_seed(0)
+    block = ConvNeXtBlock(32).eval()
+    block.gamma.data.uniform_(0.1, 2.0)
+    x = torch.randn(2, 32, 8, 8)
+    with torch.no_grad():
+        before = block(x)
+        assert block.fold_gamma()
+        assert not block.fold_gamma()
+        after = block(x)
+    assert torch.allclose(before, after, atol=1e-5)

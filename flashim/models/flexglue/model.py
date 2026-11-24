@@ -363,13 +363,13 @@ class FlexGlue(ImageMatcher, nn.Module):
         layer, score = cfg.num_layers, None
         if f0.shape == f1.shape and cfg.early_stop_decay is None:
             # Keep both images stacked as [2B, N, C] across all layers (no per-layer cat/chunk, one posenc/input_proj).
-            x = self.input_proj(torch.cat((f0, f1), dim=0).flatten(2).mT.to(self.compute_dtype))
+            x = self.input_proj(torch.cat((f0, f1), dim=0).permute(0, 2, 3, 1).flatten(1, 2).to(self.compute_dtype))
             enc0 = self._posenc(f0)
             for block in self.transformers[: cfg.num_layers]:
                 x = block.cross_attn.forward_stacked(block.self_attn(x, enc0))
             x0, x1 = x.chunk(2)
         else:
-            x0, x1 = (self.input_proj(f.flatten(2).mT.to(self.compute_dtype)) for f in (f0, f1))
+            x0, x1 = (self.input_proj(f.permute(0, 2, 3, 1).flatten(1, 2).to(self.compute_dtype)) for f in (f0, f1))
             enc0 = self._posenc(f0)
             enc1 = enc0 if f0.shape[-2:] == f1.shape[-2:] else self._posenc(f1)
             for k, block in enumerate(self.transformers[: cfg.num_layers], 1):
@@ -404,7 +404,7 @@ class FlexGlue(ImageMatcher, nn.Module):
             F.interpolate(image, size=self.config.describe_resize, mode="bilinear", align_corners=False)
             for image in images
         ])
-        return list(self.descriptor(resized.to(self.compute_dtype)).float().split(1))
+        return list(self.descriptor(resized.to(self.compute_dtype)).split(1))
 
     def _prepare(self, images: list[Tensor]) -> tuple[list[Tensor], list[Tensor], list[Tensor]]:
         features = self._encode_pair(images)
