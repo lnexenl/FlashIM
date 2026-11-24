@@ -107,7 +107,8 @@ def int8_decoder_producers(model: nn.Module, ctx: BuildContext) -> list[str] | s
         return "skipped: not int8"
     from flashim.quant.passes.separable_conv_block import fuse_int8_producers
 
-    return fuse_int8_producers(model, _DECODERS)
+    prefixes = tuple(f"{name}." for name, module in model.named_modules() if isinstance(module, blocks.ConvRefiner))
+    return fuse_int8_producers(model, prefixes) if prefixes else []
 
 
 def int8_refiner_input(model: nn.Module, ctx: BuildContext) -> list[str] | str:
