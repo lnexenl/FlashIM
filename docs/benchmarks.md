@@ -156,11 +156,11 @@ uv run python benchmarks/speed/extractor.py --model disk-lightglue --preset fp8 
     --overrides components.extractor.preset=fp8
 ```
 
-The accuracy matrix of the 2026-11 additions (about 6.7 hours; resumable, one `flock` on `~/.cache/flashim/gpu.lock`
-per run) and its report with the paired-bootstrap gate:
+The accuracy matrix of the 2026-11 additions (about 6.7 hours; resumable, each run takes a GPU lock so it can share
+the GPU) and its report with the paired-bootstrap gate:
 
 ```bash
-setsid nohup benchmarks/accuracy/b_models_matrix.sh > results/accuracy/b_models/matrix.log 2>&1 &
+benchmarks/accuracy/b_models_matrix.sh > results/accuracy/b_models/matrix.log 2>&1
 uv run python benchmarks/accuracy/b_models_report.py --dir results/accuracy/b_models
 ```
 

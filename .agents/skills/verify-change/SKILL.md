@@ -25,7 +25,6 @@ python benchmarks/profile/output_hashes.py --compare results/hashes/base results
 - The set covers the older models, LoMa and the 2026-11 additions (`--list` prints the names, `--configs <fnmatch>` picks some);
   the file records `fallbacks` and `--compare` prints them next to the call counts. A model that is not in the list: add it.
 - In a worktree, check the tree under test is the one imported: `PYTHONPATH=<tree> python -c "import flashim; print(flashim.__file__)"`.
-  Keep the base worktree and `results/hashes/` outside `/tmp` (a 16 GB tmpfs).
 
 ## Accuracy changes: task-level AUC, not tensor allclose
 
@@ -37,7 +36,7 @@ python benchmarks/profile/output_hashes.py --compare results/hashes/base results
   returns `Matches`; `--dataset scannet1500`), `run.py` is RoMaV2's.
 - Compare numerics in eager in one process: `compile-full` is not reproducible across processes (max-autotune) and two
   compiled instances in one process share Dynamo graphs.
-- Long runs: `setsid nohup <script> &`, only with the user's OK; see `docs/dev-environment.md`.
+- Long runs (one command over about 10 minutes, or a whole dataset) need the user's OK; the matrix scripts are resumable.
 
 ## Speed
 

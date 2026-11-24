@@ -1,8 +1,7 @@
 # AGENTS.md
 
 Rules for coding agents on FlashIM. This file is short on purpose: workflows live in skills (`.agents/skills/`, linked from
-`.claude/skills/`), machine setup in `docs/dev-environment.md`, structure in `docs/architecture.md`, usage and results in
-`README.md` and `docs/`. A rule that a test can check is a test (`tests/unit/test_architecture.py`), not a sentence here.
+`.claude/skills/`), structure in `docs/architecture.md`, usage and results in `README.md` and `docs/`. A rule that a test can check is a test (`tests/unit/test_architecture.py`), not a sentence here.
 
 ## What FlashIM is
 
@@ -14,7 +13,7 @@ planned) and **quantization** (MXFP8, INT8). Models are native PyTorch ports ver
 ## Commands
 
 - Python is `.venv/bin/python` (torch 2.11, triton 3.6). **Never run Python from inside `flashim/`**: `flashim/types.py`
-  shadows the stdlib `types`. Worktrees without a `.venv`, Jetson, caches, shell quirks: `docs/dev-environment.md`.
+  shadows the stdlib `types`. A worktree without a `.venv` runs the main checkout's interpreter with `PYTHONPATH=<worktree>`.
 - Tests: `.venv/bin/python -m pytest -q -p no:cacheprovider tests` (several minutes with a GPU; without one add
   `-m "not cuda"`). Markers: `cuda`, `sm120`, `weights`, `oracle`, `slow`. Known failures (2026-11): all of
   `tests/ops/test_depthwise_cuda.py` on `dev`; `tests/parity/test_lightglue_parity.py::test_reduced_precision_tracks_fp32[fp8]`
@@ -68,7 +67,8 @@ architectures are compile-checked and reported as such. Long GPU jobs (one comma
 ## Gotchas
 
 - `uv sync` removes everything outside the lockfile (sageattention, tilelang): use `uv sync --extra eval --extra tilelang --group dev`.
-- `data/` and `results/` are gitignored; test images are in `assets/`; nothing reads from an upstream checkout.
+- `data/` (or `$FLASHIM_DATA`, `flashim/paths.py`) and `results/` are gitignored; test images are in `assets/`; nothing reads from
+  an upstream checkout.
 - `compile-full` is not reproducible across processes; compare numerics in eager in one process. Compiled RoMaV2 speed
   varies 15-25% between processes.
 - The autotuned Triton conv kernels cache their tile picks: `FLASHIM_AUTOTUNE_CACHE=0` when comparing tiles or trees.
@@ -84,7 +84,7 @@ architectures are compile-checked and reported as such. Long GPU jobs (one comma
 
 - One task, one branch cut from `dev` (`model/<name>`, `fix/<name>`), one `git worktree`. Do not `git stash` (shared with
   other worktrees): commit a WIP instead. Do not touch files you did not change; other worktrees can have uncommitted work.
-- One GPU: wrap CUDA commands in `flock ~/.cache/flashim/gpu.lock` and keep each under about 10 minutes.
+- One GPU shared by several agents: serialize CUDA commands with a lock file (`flock`) and keep each locked command short.
 - Shared code (`flashim/ops`, `quant/`, `layers/`, backends) is used by every model: a change there needs the bit-identity
   check of the models it affects, not only of yours.
 

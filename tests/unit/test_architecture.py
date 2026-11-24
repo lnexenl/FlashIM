@@ -157,7 +157,7 @@ def test_tilelang_files_do_not_use_future_annotations():
 
 # -- documentation ---------------------------------------------------------------------------------------------
 
-DOCS = ["AGENTS.md", "docs/dev-environment.md", *sorted(str(p.relative_to(ROOT)) for p in ROOT.glob(".agents/skills/*/SKILL.md")
+DOCS = ["AGENTS.md", *sorted(str(p.relative_to(ROOT)) for p in ROOT.glob(".agents/skills/*/SKILL.md")
                                                          if p.parent.name not in {"kernelwiki", "ncu-report-skill"})]
 UNTRACKED = {"data", "results", ".venv", "~", "kernelwiki"}  # gitignored or machine-local (third-party skill)
 FILE_SUFFIXES = (".py", ".md", ".sh", ".toml", ".json", ".txt", ".yaml", ".yml", ".cu")
