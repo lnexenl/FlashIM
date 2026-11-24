@@ -92,12 +92,14 @@ class DynamicInt8TransformerBlock(nn.Module):
         q, s = self._norm_quantize(self.norm1, flat, ln)
         qkv = self._linear(attn.qkv, q, s).reshape(batch, tokens, 3, attn.num_heads, channels // attn.num_heads)
         qh, kh, vh = (t.transpose(1, 2) for t in qkv.unbind(2))
-        out = ops.sdpa.get(attn.sdpa_impl)(qh, kh, vh).transpose(1, 2).reshape(-1, channels)
-        q, s = ops.quantize_int8_rows(out if out.is_contiguous() else out.contiguous())
+        out = ops.sdpa.get(attn.sdpa_impl)(qh, kh, vh)
+        q, s = ops.quantize_int8_rows_heads(out)
         x1 = self._linear(attn.proj, q, s, residual=flat) if residual else flat + self._linear(attn.proj, q, s)
         q, s = self._norm_quantize(self.norm2, x1, ln)
         if gelu:
             q, s = ops.quantize_int8_rows(self._linear(self.mlp.fc1, q, s, gelu=True))
+        elif self._exact_gelu:
+            q, s = ops.gelu_quantize_int8_rows(self._linear(self.mlp.fc1, q, s))
         else:
             q, s = ops.quantize_int8_rows(self.mlp.act(self._linear(self.mlp.fc1, q, s)))
         x2 = self._linear(self.mlp.fc2, q, s, residual=x1) if residual else x1 + self._linear(self.mlp.fc2, q, s)

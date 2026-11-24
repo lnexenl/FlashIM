@@ -157,6 +157,25 @@ def _quantize_int8_rows_reference(value: Tensor) -> tuple[Tensor, Tensor]:
 quantize_int8_rows = Op("quantize_int8_rows", _quantize_int8_rows_reference)
 
 
+def _quantize_int8_rows_heads_reference(value: Tensor) -> tuple[Tensor, Tensor]:
+    """Per-token dynamic INT8 of an attention output ``[B, H, N, D]``:
+    ``quantize_int8_rows(value.transpose(1, 2).reshape(B * N, H * D))``, without the transposed BF16 copy."""
+    batch, heads, tokens, dim = value.shape
+    return _quantize_int8_rows_reference(value.transpose(1, 2).reshape(batch * tokens, heads * dim))
+
+
+quantize_int8_rows_heads = Op("quantize_int8_rows_heads", _quantize_int8_rows_heads_reference)
+
+
+def _gelu_quantize_int8_rows_reference(value: Tensor) -> tuple[Tensor, Tensor]:
+    """Per-row dynamic INT8 of exact ``nn.GELU()(value)`` (rounded to ``value.dtype`` first, as
+    ``quantize_int8_rows(F.gelu(value))``)."""
+    return _quantize_int8_rows_reference(F.gelu(value))
+
+
+gelu_quantize_int8_rows = Op("gelu_quantize_int8_rows", _gelu_quantize_int8_rows_reference)
+
+
 def _layernorm_quantize_int8_rows_reference(
     value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
 ) -> tuple[Tensor, Tensor]:

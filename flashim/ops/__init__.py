@@ -49,6 +49,7 @@ from flashim.ops.quantize import (
     bias_relu_quantize_int8,
     gelu_quantize,
     gelu_quantize_int8,
+    gelu_quantize_int8_rows,
     layernorm_gelu_quantize_int8,
     layernorm_quantize,
     layernorm_quantize_int8,
@@ -57,6 +58,7 @@ from flashim.ops.quantize import (
     quantize_int8_heads,
     quantize_int8_multi,
     quantize_int8_rows,
+    quantize_int8_rows_heads,
     quantize_mxfp8,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
@@ -84,6 +86,7 @@ __all__ = [
     "dual_softmax_mutual",
     "gelu_quantize",
     "gelu_quantize_int8",
+    "gelu_quantize_int8_rows",
     "im2col_gather",
     "int8_conv2d",
     "int8_conv2d_maxpool",
@@ -111,6 +114,7 @@ __all__ = [
     "quantize_int8_heads",
     "quantize_int8_multi",
     "quantize_int8_rows",
+    "quantize_int8_rows_heads",
     "quantize_mxfp8",
     "raco_head5x5",
     "raco_resblock",
