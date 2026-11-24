@@ -21,7 +21,7 @@ def _needs_nvcc():
 
 
 def _selected_on_measured_archs() -> bool:
-    return platform_for(DEV).capability in ((8, 9), (9, 0))
+    return platform_for(DEV).capability in ((8, 9), (9, 0), (12, 0))
 
 
 def _producer_inputs(batch, channels, height, width, seed=0):
