@@ -34,9 +34,12 @@ def test_registry_and_resolve():
     assert cfg_int8.components["matcher"].preset == "int8"
     fb: dict[str, str] = {}
     cfg_fp8 = flashim.resolve("omniglue", "fp8", fallbacks=fb)
-    assert cfg_fp8.components["extractor"].preset == "fp8"
+    assert cfg_fp8.preset == "int8"
+    assert cfg_fp8.components["extractor"].preset == "int8"
     assert cfg_fp8.components["matcher"].preset == "int8"
-    assert "matcher" in fb
+    assert "omniglue" in fb
+    # Component extractor still exposes its calibrated fp8 preset when requested directly.
+    assert flashim.resolve("omniglue-extractor", "fp8").preset == "fp8"
     assert flashim.resolve("superpoint", "fp32", overrides={"variant": "sp_v6"}).variant == "sp_v6"
     with pytest.raises(ValueError, match="unknown variant"):
         flashim.resolve("superpoint", "fp32", overrides={"variant": "nope"})

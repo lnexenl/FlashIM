@@ -44,7 +44,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | [`loma-extractor`](models/loma.md), [`loma-matcher`](models/loma.md) | LoMa's components (variant `b128` \| `b` \| `l` \| `g` \| `r`) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `superglue` | SuperGlue attentional GNN + Sinkhorn OT sparse matcher (variants `outdoor`, `indoor`; Magic Leap non-commercial) | `fp32`, **`bf16`**, `int8` |
 | `superpoint-superglue` | SuperPoint (`nms=4`, `threshold=0.005`) + SuperGlue (Magic Leap non-commercial; variant `outdoor` \| `indoor`) | `fp32`, **`bf16`**, `int8` |
-| `omniglue` | OmniGlue: SuperPoint (`sp_v6`, MIT) + DINOv2 ViT-B/14 + 18-layer DINO-masked GNN + Sinkhorn matcher (Apache-2.0) | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `omniglue` | OmniGlue: SuperPoint (`sp_v6`, MIT) + DINOv2 ViT-B/14 + 18-layer DINO-masked GNN + Sinkhorn matcher (Apache-2.0) | `fp32`, **`bf16`**, `int8` |
 | `omniglue-extractor`, `omniglue-matcher` | OmniGlue's components (`omniglue-matcher` omits `fp8` and degrades `fp8` -> `int8`) | `fp32`, **`bf16`**, `int8` *(extractor adds `fp8`)* |
 
 Every learned model is a native PyTorch port that is checked against its upstream implementation (`tests/parity`).

@@ -8,8 +8,8 @@ GPU tensors):
 - ``bf16``: ``52.35 -> 24.58 ms`` (**2.13x**; extract ``16.47 -> 9.80 ms``, match ``12.11 -> 4.24 ms``)
 - ``int8`` (dynamic per-token INT8 ViT + GNN): ``20.66 ms`` (**2.53x** vs BF16 baseline, **4.40x** vs FP32;
   extract ``8.29 ms`` [``sp_v6`` ``4.73``, DINOv2 ``3.59``], match ``3.28 ms``)
-- ``fp8`` (calibrated MXFP8 ViT + BF16 ``sp_v6``; matcher degrades to ``int8``): ``23.56 ms``
-  (extract ``9.88 ms``, match ``3.32 ms``).
+- ``fp8`` degrades to ``int8`` via ``build.NEAREST`` (MXFP8 on DINOv2 ViT-B/14 is slower and drops ScanNet-1500
+  AUC@5 by ``-0.0062 [-0.0124, -0.0001]`` vs ``int8``; see :mod:`flashim.models.omniglue.quant`).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import dataclasses
 import torch
 from torch import nn
 
-from flashim.build import PRECISIONS, BuildContext, EngineSpec, ModelSpec, Pass, dtype
+from flashim.build import BuildContext, EngineSpec, ModelSpec, Pass, dtype
 from flashim.config import RunConfig
 from flashim.models.dedode.spec import PATCH_EMBED_PASS
 from flashim.models.lightglue.spec import _compose
@@ -221,6 +221,11 @@ EXTRACTOR_SPEC = dataclasses.replace(
 
 # -- Pipeline spec -----------------------------------------------------------------------------------------
 
+# Ship fp32 / bf16 / int8 on the pipeline (omitting fp8 so fp8 -> int8 via build.NEAREST): omniglue-matcher has no fp8
+# and omniglue-extractor's MXFP8 DINOv2 ViT-B/14 is strictly dominated by dynamic per-token INT8 on both accuracy
+# (ScanNet-1500 fp8 vs int8: -0.0062 [-0.0124, -0.0001], MegaDepth-1500: -0.0051; see quant.py) and speed.
+_PIPELINE_PRESETS = ("fp32", "bf16", "int8")
+
 SPEC = ModelSpec(
     name="omniglue",
     role="pipeline",
@@ -233,7 +238,7 @@ SPEC = ModelSpec(
                 "matcher": {"model": "omniglue-matcher", "preset": preset},
             }
         }
-        for preset in PRECISIONS
+        for preset in _PIPELINE_PRESETS
     },
     default_preset="bf16",
     compose=_compose,

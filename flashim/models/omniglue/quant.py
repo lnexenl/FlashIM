@@ -28,6 +28,21 @@ eager mode, compared against FP32 matches):
 - ``int8``: ``kp_overlap=0.9750``, ``desc_cos=0.9998``, ``match_agree=0.8838``, ``match_ratio=1.0112``
 - ``fp8`` (matcher degrades to ``int8``): ``kp_overlap=0.9750``, ``desc_cos=0.9998``, ``match_agree=0.8860``,
   ``match_ratio=1.0123``.
+
+**Full 1500-pair pose-AUC gate & targeted 300-pair / DINOv2 ViT-B/14 diagnosis (sm_120, eager, poselib 1.0 px,
+seeds 17 / 29 / 42)**:
+- On the full 1500-pair gate, ``omniglue int8`` vs ``bf16`` is ``+0.0024 [-0.0049, +0.0095]`` (PASS, 42.7 s vs 44.5 s)
+  on MegaDepth-1500 and ``+0.0012 [-0.0051, +0.0073]`` on ScanNet-1500, whereas ``omniglue fp8`` (``omniglue-extractor
+  fp8`` + ``omniglue-matcher int8``) drops to ``-0.0028 [-0.0101, +0.0043]`` (46.3 s) on MegaDepth-1500 and
+  ``-0.0050 [-0.0114, +0.0013]`` on ScanNet-1500. Paired ``fp8`` vs ``int8`` (differing only in DINOv2 ViT-B/14, since
+  both keep ``sp_v6`` in BF16 and the matcher in dynamic INT8) is ``-0.0051 [-0.0122, +0.0019]`` on MegaDepth-1500 and
+  a statistically significant ``-0.0062 [-0.0124, -0.0001]`` on ScanNet-1500.
+- DINOv2 ViT-B/14 feature diagnostics on ScanNet (8 images, 640x480) show static MXFP8 has 35% higher relative L2 error
+  than dynamic per-token INT8 (``rel_l2=0.1344, cos=0.9909, 4.89 ms`` vs ``0.0997, cos=0.9949, 4.34 ms``). Neither
+  dynamic per-block-32 MXFP8 (``rel_l2=0.1351, 8.28 ms``) nor skipping blocks 10-11 (``0.1190``), all ``mlp.fc2``
+  (``0.1189``), or blocks 0, 10, 11 (``0.1107, 5.73 ms``) recovers INT8's accuracy: E4M3's 3-bit mantissa accumulates
+  error across all 12 ViT blocks. Because ``int8`` strictly dominates ``fp8`` on both accuracy and speed across both
+  datasets, the ``omniglue`` pipeline omits ``fp8`` so ``fp8`` cleanly degrades to ``int8`` via ``build.NEAREST``.
 """
 
 from __future__ import annotations
