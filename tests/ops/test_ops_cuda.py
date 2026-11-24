@@ -532,8 +532,8 @@ def test_int8_conv2d_maxpool_odd_size_takes_the_reference():
 
 
 _needs_stem_tc = pytest.mark.skipif(
-    not torch.cuda.is_available() or platform_for(DEV).capability not in ((8, 9), (9, 0)),
-    reason="the tensor-core stem and the cuBLAS patch embedding are registered for sm_89 / sm_90 only",
+    not torch.cuda.is_available() or platform_for(DEV).capability not in ((8, 9), (9, 0), (12, 0)),
+    reason="the tensor-core stem and the cuBLAS patch embedding are registered for sm_89 / sm_90 / sm_120 only",
 )
 
 
@@ -586,7 +586,7 @@ def test_patch_embed_tokens_compiles():
     cls, pos = torch.randn(1, 1, 1024, device=DEV).bfloat16(), torch.randn(1, 1 + 4 * 6, 1024, device=DEV).bfloat16()
     bound = ops.patch_embed_tokens.bind(weight, bias).warmup()
     compiled = torch.compile(lambda x: bound(x, cls, pos), fullgraph=True)
-    torch.testing.assert_close(compiled(image), bound(image, cls, pos), atol=0.04, rtol=0)  # Inductor fuses the BF16 adds
+    torch.testing.assert_close(compiled(image), bound(image, cls, pos), atol=0.04, rtol=2**-7)  # Inductor fuses the BF16 adds (<= 1 BF16 ulp)
 
 
 @pytest.mark.parametrize("batch,height,width", [(1, 8, 40), (2, 13, 37), (1, 120, 160)])

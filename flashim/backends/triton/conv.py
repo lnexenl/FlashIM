@@ -930,9 +930,15 @@ def _conv3x3_cin3_quantize(x: Tensor, scale: Tensor, packed: Tensor, bias: Tenso
     return Int8Tensor(out, scale)
 
 
+_SMALL_CIN_CAPABILITIES = ((8, 9), (9, 0), (12, 0))
+
+
 def _conv3x3_cin3_accepts(weight: Tensor, bias: Tensor) -> bool:
     cout = weight.shape[0]
-    return weight.shape[1:] == (3, 3, 3) and cout & (cout - 1) == 0 and cout <= 128 and bias.shape == (cout,)
+    return (
+        weight.is_cuda and torch.cuda.get_device_capability(weight.device) in _SMALL_CIN_CAPABILITIES
+        and weight.shape[1:] == (3, 3, 3) and cout & (cout - 1) == 0 and cout <= 128 and bias.shape == (cout,)
+    )
 
 
 def _conv3x3_cin3_eligible(x: Tensor, scale: Tensor, weight: Tensor, bias: Tensor) -> bool:
@@ -942,9 +948,10 @@ def _conv3x3_cin3_eligible(x: Tensor, scale: Tensor, weight: Tensor, bias: Tenso
     )
 
 
-# sm_89 and sm_90 only: the two architectures it was measured on (the reference chain is the fallback elsewhere).
+# sm_89, sm_90 and sm_120: the architectures it was measured on (sm_120: 1.273 -> 0.123 ms at 896x1200, 10.4x; the
+# reference chain is the fallback elsewhere).
 ops.conv2d_small_cin_quantize_int8.register(
-    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)), requires=[Feature.TRITON],
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 9)), requires=[Feature.TRITON],
     when=_conv3x3_cin3_eligible, accepts=_conv3x3_cin3_accepts, prepare=_conv3x3_cin3_prepare,
 )(_conv3x3_cin3_quantize)
 
