@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import logging
 import math
+from collections import OrderedDict
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from flashim import ops
+from flashim.log import warn_once
 from flashim.models.lightglue import weights
 from flashim.models.lightglue.config import LightGlueConfig
 from flashim.platforms import default_device
 from flashim.quant.methods.linear import StaticMXFP8Linear
 from flashim.types import Matches, SparseFeatures
 from flashim.utils import device_constant
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_keypoints(keypoints: Tensor, image_size: Tensor) -> Tensor:
@@ -120,14 +125,14 @@ class CrossBlock(nn.Module):
         if x0.shape == x1.shape:
             x = torch.cat((x0, x1))
             qk, v = self._heads(self.to_qk(x)), self._heads(self.to_v(x))
-            m = sdpa(qk, qk.flip(0), v.flip(0))
-            m0, m1 = m.transpose(1, 2).reshape(x.shape).chunk(2)
-        else:
-            qk0, qk1 = (self._heads(self.to_qk(x)) for x in (x0, x1))
-            v0, v1 = (self._heads(self.to_v(x)) for x in (x0, x1))
-            m0 = sdpa(qk0, qk1, v1).transpose(1, 2).reshape(x0.shape)
-            m1 = sdpa(qk1, qk0, v0).transpose(1, 2).reshape(x1.shape)
-        m0, m1 = apply_batched(self.to_out, [m0, m1])
+            m = self.to_out(sdpa(qk, qk.flip(0), v.flip(0)).transpose(1, 2).reshape(x.shape))
+            x = x + ffn_forward(self.ffn, torch.cat((x, m), -1))
+            x0, x1 = x.chunk(2)
+            return x0, x1
+        qk0, qk1 = (self._heads(self.to_qk(x)) for x in (x0, x1))
+        v0, v1 = (self._heads(self.to_v(x)) for x in (x0, x1))
+        m0 = self.to_out(sdpa(qk0, qk1, v1).transpose(1, 2).reshape(x0.shape))
+        m1 = self.to_out(sdpa(qk1, qk0, v0).transpose(1, 2).reshape(x1.shape))
         x0 = x0 + ffn_forward(self.ffn, torch.cat((x0, m0), -1))
         x1 = x1 + ffn_forward(self.ffn, torch.cat((x1, m1), -1))
         return x0, x1
@@ -156,18 +161,32 @@ class TokenConfidence(nn.Module):
 
 
 class MatchAssignment(nn.Module):
-    """Assignment head of one layer: similarity of the projected descriptors + per-point matchability."""
+    """Assignment head of one layer: similarity of the projected descriptors + per-point matchability.
+
+    ``low_precision_similarity`` (enabled by the ``low_precision_similarity`` pass on reduced-precision presets):
+    computes ``sim`` via ``ops.matmul_nt_fp32`` from ``final_proj``'s low-precision outputs (tensor cores, FP32
+    accumulation and output) instead of an FP32 SGEMM."""
+
+    low_precision_similarity = False
 
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.matchability = nn.Linear(dim, 1)
         self.final_proj = nn.Linear(dim, dim)
 
+    def similarity(self, x0: Tensor, x1: Tensor) -> Tensor:
+        """``[B, M, N]`` FP32 similarity ``final_proj(x0) final_proj(x1)^T / sqrt(dim)``."""
+        dim = x0.shape[-1]
+        if self.low_precision_similarity:
+            m0, m1 = self.final_proj(x0), self.final_proj(x1)
+            sims = [ops.matmul_nt_fp32(a, b, dim**-0.5) for a, b in zip(m0, m1)]
+            return sims[0][None] if len(sims) == 1 else torch.stack(sims)
+        m0, m1 = (self.final_proj(x).float() / dim**0.25 for x in (x0, x1))
+        return m0 @ m1.transpose(-1, -2)
+
     def forward(self, x0: Tensor, x1: Tensor) -> Tensor:
         """Log assignment scores ``[B, M, N]`` (the dustbin row/column never yields a match and is omitted)."""
-        dim = x0.shape[-1]
-        m0, m1 = (self.final_proj(x).float() / dim**0.25 for x in (x0, x1))
-        sim = m0 @ m1.transpose(-1, -2)
+        sim = self.similarity(x0, x1)
         z0, z1 = (self.matchability(x).float() for x in (x0, x1))
         certainty = F.logsigmoid(z0) + F.logsigmoid(z1).transpose(-1, -2)
         return F.log_softmax(sim, -1) + F.log_softmax(sim, -2) + certainty
@@ -176,9 +195,7 @@ class MatchAssignment(nn.Module):
         """Per point of image A (batch 1): the maximum of :meth:`forward`'s log assignment over image B's points,
         its index, and whether the pair is mutual -- without the ``[M, N]`` score matrix
         (``ops.dual_softmax_mutual``; the log matchabilities are its row / column biases)."""
-        dim = x0.shape[-1]
-        m0, m1 = (self.final_proj(x).float() / dim**0.25 for x in (x0, x1))
-        sim = (m0 @ m1.transpose(-1, -2))[0]
+        sim = self.similarity(x0, x1)[0]
         z0, z1 = (F.logsigmoid(self.matchability(x).float())[0, :, 0] for x in (x0, x1))
         return ops.dual_softmax_mutual(sim, z0, z1)
 
@@ -291,13 +308,43 @@ class LightGlue(nn.Module):
         x0, x1, i = self.features(desc0, desc1, enc0, enc1)
         return self.log_assignment[i](x0, x1)
 
-    def best_matches(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Per point of image A: the best log assignment over image B's points, its index and whether it is mutual
-        (:meth:`MatchAssignment.matches` of the last executed layer)."""
+    # ``cuda_graph`` pass: :meth:`best_matches` (all layers + the last assignment head; requires depth_confidence <= 0
+    # so there is no host sync) replayed from one CUDA graph per input shape, the ``graphs`` most recent shapes kept;
+    # mutual-match filtering stays eager. 0 = eager.
+    graphs = 0
+
+    def _best_matches(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         x0, x1, i = self.features(desc0, desc1, enc0, enc1)
         # same matches as ``filter_matches(self.scores(...))`` (identical lists on 200 MegaDepth pairs); the fused op
         # measured 4.2 to 4.8 ms less per 4096 x 4096 pair on sm_120 (SuperPoint 18.8 -> 14.6 ms, XFeat 8.8 -> 4.0 ms)
         return self.log_assignment[i].matches(x0, x1)
+
+    def best_matches(self, desc0: Tensor, desc1: Tensor, enc0: Tensor, enc1: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Per point of image A: the best log assignment over image B's points, its index and whether it is mutual
+        (:meth:`MatchAssignment.matches` of the last executed layer)."""
+        if not self.graphs or self.config.depth_confidence > 0 or not desc0.is_cuda or torch.is_grad_enabled():
+            return self._best_matches(desc0, desc1, enc0, enc1)
+        from flashim.engines.cuda_graph import CudaGraphRunner
+
+        cache = self.__dict__.setdefault("_graph_runners", OrderedDict())
+        key = tuple((t.shape, t.dtype, t.device) for t in (desc0, desc1, enc0, enc1))
+        runner = cache.get(key)
+        if runner is not None:
+            cache.move_to_end(key)
+            return runner(desc0, desc1, enc0, enc1)
+        runner = CudaGraphRunner(self._best_matches)
+        try:
+            outputs = runner(desc0, desc1, enc0, enc1)
+        except RuntimeError as exc:  # e.g. a kernel launched on the legacy default stream (unpatched SageAttention)
+            warn_once(logger, f"lightglue-graph-{id(self)}", "%s: CUDA graph capture failed, running eagerly "
+                      "from now on (%s)", type(self).__name__, exc)
+            self.graphs = 0
+            torch.cuda.synchronize()
+            return self._best_matches(desc0, desc1, enc0, enc1)
+        cache[key] = runner
+        while len(cache) > self.graphs:
+            cache.popitem(last=False)
+        return outputs
 
     @torch.inference_mode()
     def match_features(
