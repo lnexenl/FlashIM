@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim import ops
 from flashim.models import sparse
 from flashim.models.dedode import blocks
 from flashim.models.ripe import weights
@@ -66,9 +67,8 @@ class RIPE(sparse.SparseExtractor):
         return self._describe(self.heatmap(image)[1], keypoints, h, w)
 
     def _describe(self, features: list[Tensor], keypoints: Tensor, h: int, w: int) -> Tensor:
-        grid = (2.0 * keypoints.float() / device_constant([w - 1, h - 1], keypoints, torch.float32) - 1.0).view(1, 1, -1, 2)
-        hyper = torch.cat(
-            [F.grid_sample(f.float(), grid, mode="bilinear", align_corners=True)[0, :, 0] for f in features], dim=0
-        )  # [960, K]
-        desc = self.conv_dim_reduction_coarse_desc(hyper[None].to(self.conv_dim_reduction_coarse_desc.weight.dtype))[0].t()
+        grid = 2.0 * keypoints.float() / device_constant([w - 1, h - 1], keypoints, torch.float32) - 1.0
+        weight = self.conv_dim_reduction_coarse_desc.weight
+        hyper = ops.bilinear_sample_points(features, grid, align_corners=True, out_dtype=weight.dtype)  # [K, 960]
+        desc = F.linear(hyper, weight[:, :, 0], self.conv_dim_reduction_coarse_desc.bias)
         return F.normalize(desc.float(), dim=-1)
