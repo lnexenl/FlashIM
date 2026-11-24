@@ -229,13 +229,19 @@ def _add_rows_kernel(
     tl.store(out_ptr + ((row.to(tl.int64) * W + x) * C)[:, None] + c[None, :], value, mask=m)
 
 
-# (BLOCK_X, num_warps) per (compute capability, output channels): rot-timed sweeps on L20 / H20 (every 2x concat tile
-# is within 2-3 % on L20, at the DRAM roofline; H20 is issue-bound and wants fewer pixels per program on the wide maps:
-# the 512-channel kernel uses 255 registers). The add tiles must stay <= 32 pixels (see above).
-_PAIR_TILES = {(8, 9): {96: (8, 8)}, (9, 0): {512: (8, 2), 256: (16, 2), 128: (16, 2), 96: (32, 1)}}
+# (BLOCK_X, num_warps) per (compute capability, output channels): rot-timed sweeps on L20 / H20 / RTX 5070 Ti (every 2x
+# concat tile is within 2-3 % on L20, at the DRAM roofline; H20 is issue-bound and wants fewer pixels per program on the
+# wide maps: the 512-channel kernel uses 255 registers; sm_120: 1.65-3.12x over the tile kernel, bit-identical). The add
+# tiles must stay <= 32 pixels (see above; sm_120: 1.09-1.23x over the tile kernel, bit-identical).
+_PAIR_TILES = {
+    (8, 9): {96: (8, 8)},
+    (9, 0): {512: (8, 2), 256: (16, 2), 128: (16, 2), 96: (32, 1)},
+    (12, 0): {512: (8, 8), 256: (16, 2), 128: (8, 8), 96: (8, 8)},
+}
 _PAIR_DEFAULT = (16, 4)
-_ADD_TILES = {(8, 9): (8, 2), (9, 0): (4, 2)}
+_ADD_TILES = {(8, 9): (8, 2), (9, 0): (4, 2), (12, 0): (8, 2)}
 _ADD_DEFAULT = (8, 2)
+_ROWS_CAPABILITIES = ((8, 9), (9, 0), (12, 0))
 
 
 def _is_2x(features: Tensor, coarse: Tensor) -> bool:
@@ -290,7 +296,7 @@ ops.upsample_add.register("triton", device=DeviceSpec("cuda"), requires=[Feature
 def _rows_eligible_concat(features: Tensor, coarse: Tensor, scale: Tensor) -> bool:
     return (
         _eligible_concat(features, coarse) and features.dtype == torch.bfloat16 and coarse.dtype == torch.bfloat16
-        and _is_2x(features, coarse)
+        and _is_2x(features, coarse) and torch.cuda.get_device_capability(features.device) in _ROWS_CAPABILITIES
     )
 
 
@@ -301,12 +307,12 @@ def _rows_eligible_add(coarse: Tensor, delta: Tensor) -> bool:
     channels = delta.shape[1]
     return (
         _eligible_add(coarse, delta) and coarse.stride(1) == 1 and delta.stride(1) == 1 and channels >= 96
-        and channels % 32 == 0
+        and channels % 32 == 0 and torch.cuda.get_device_capability(delta.device) in _ROWS_CAPABILITIES
     )
 
 
-# sm_89 / sm_90 only: the capabilities these kernels were run and timed on (other architectures keep the tile kernel).
-_ROWS_DEVICE = DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0))
+# sm_89 / sm_90 / sm_120: the capabilities these kernels were run and timed on (other architectures keep the tile kernel).
+_ROWS_DEVICE = DeviceSpec("cuda", min_capability=(8, 9))
 ops.upsample_concat_int8.register(
     "triton_rows", device=_ROWS_DEVICE, requires=[Feature.TRITON], when=_rows_eligible_concat
 )(upsample_concat_int8_pair)
