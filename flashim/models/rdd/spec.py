@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import torch
 from torch import nn
 
 from flashim.build import BuildContext, EngineSpec, ModelSpec, Pass, dtype
@@ -51,6 +52,24 @@ def _fold_batchnorm(model: RDD, ctx: BuildContext) -> list[str]:
     return folded
 
 
+def _fold_convnext_gamma(model: RDD, ctx: BuildContext) -> int:
+    """Fold ConvNeXt ``Block.gamma`` into ``pwconv2`` before BF16 cast."""
+    from flashim.models.rdd.backbone import Block
+
+    return sum(m.fold_gamma() for m in model.backbone.modules() if isinstance(m, Block))
+
+
+def _channels_last(model: RDD, ctx: BuildContext) -> str:
+    """NHWC ConvNeXt + input_proj in bf16/fp8: eliminates 36 NCHW<->NHWC copies per extract and switches 7x7 depthwise
+    convs from PyTorch's generic NCHW kernel to cuDNN NHWC. Skipped in fp32 (reference numerics)."""
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    model.backbone.to(memory_format=torch.channels_last)
+    model.backbone.channels_last = True
+    model.input_proj.to(memory_format=torch.channels_last)
+    return "backbone+input_proj"
+
+
 def _fuse_query_projections(model: nn.Module, ctx: BuildContext) -> int:
     from flashim.layers import MSDeformAttn
 
@@ -58,7 +77,7 @@ def _fuse_query_projections(model: nn.Module, ctx: BuildContext) -> int:
     return model.fused_query_projections
 
 
-_BASE = {"optimize": {"passes": ["fold_batchnorm", "fuse_query_projections"]}}
+_BASE = {"optimize": {"passes": ["fold_batchnorm", "fold_convnext_gamma", "channels_last", "fuse_query_projections"]}}
 _BF16 = {"extends": "fp32", "precision": {"compute_dtype": "bf16"}}
 PRESETS = {
     "fp32": _BASE,
@@ -79,6 +98,13 @@ SPEC = ModelSpec(
     passes={
         "fold_batchnorm": Pass(
             _fold_batchnorm, stage="pre_quant", description="exact conv+BN fold (detector + matchibility_head)"
+        ),
+        "fold_convnext_gamma": Pass(
+            _fold_convnext_gamma, stage="pre_quant", exact=False,
+            description="fold ConvNeXt Block.gamma into pwconv2",
+        ),
+        "channels_last": Pass(
+            _channels_last, exact=False, description="NHWC ConvNeXt + input_proj (bf16 / fp8)"
         ),
         "fuse_query_projections": Pass(
             _fuse_query_projections, description="one GEMM for sampling offsets + attention weights (non-quantized)"
