@@ -65,3 +65,21 @@ def _dual_softmax_mutual_reference(
 
 
 dual_softmax_mutual = Op("dual_softmax_mutual", _dual_softmax_mutual_reference)
+
+
+def _mutual_nn_sqdist_reference(x: Tensor, y: Tensor) -> tuple[Tensor, Tensor]:
+    """Mutual nearest neighbors under squared Euclidean distance between ``x [M, D]`` and ``y [N, D]`` (FP32).
+
+    Returns ``(m0 [M], m1 [N])`` int64 indices, ``-1`` where not mutual.
+    """
+    m, n = x.shape[0], y.shape[0]
+    if m == 0 or n == 0:
+        return x.new_full((m,), -1, dtype=torch.long), y.new_full((n,), -1, dtype=torch.long)
+    dist = torch.cdist(x.float(), y.float(), compute_mode="donot_use_mm_for_euclid_dist")
+    nn0, nn1 = dist.argmin(1), dist.argmin(0)
+    mutual0 = torch.arange(m, device=x.device) == nn1[nn0]
+    mutual1 = torch.arange(n, device=y.device) == nn0[nn1]
+    return torch.where(mutual0, nn0, -1), torch.where(mutual1, nn1, -1)
+
+
+mutual_nn_sqdist = Op("mutual_nn_sqdist", _mutual_nn_sqdist_reference)

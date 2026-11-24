@@ -504,3 +504,115 @@ def _eligible_pil_resize(image: Tensor, sizes: Sequence[tuple[int, int]]) -> boo
 ops.pil_bicubic_resize.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible_pil_resize
 )(pil_bicubic_resize)
+
+
+# -- border-padded bilinear point sampling (ops.bilinear_sample_border) -----------------------------------
+
+
+@triton.jit
+def _bilinear_sample_border_kernel(
+    feat_ptr,
+    pts_ptr,
+    out_ptr,
+    N,
+    C,
+    H,
+    W,
+    fs_b,
+    fs_c,
+    fs_h,
+    fs_w,
+    ps_b,
+    ps_n,
+    ps_xy,
+    BLOCK_N: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    b = tl.program_id(2).to(tl.int64)
+    n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    n_ok = n < N
+    c_ok = c < C
+    mask = n_ok[:, None] & c_ok[None, :]
+
+    p_base = pts_ptr + b * ps_b + n.to(tl.int64) * ps_n
+    gx = tl.load(p_base, mask=n_ok, other=0.0).to(tl.float32)
+    gy = tl.load(p_base + ps_xy, mask=n_ok, other=0.0).to(tl.float32)
+
+    # align_corners=False + padding_mode="border": clamp pixel coords to [0, W-1] / [0, H-1] before floor.
+    ix = tl.minimum(tl.maximum(((gx + 1.0) * W - 1.0) * 0.5, 0.0), (W - 1.0))
+    iy = tl.minimum(tl.maximum(((gy + 1.0) * H - 1.0) * 0.5, 0.0), (H - 1.0))
+    x0 = tl.floor(ix).to(tl.int32)
+    y0 = tl.floor(iy).to(tl.int32)
+    x1 = tl.minimum(x0 + 1, W - 1)
+    y1 = tl.minimum(y0 + 1, H - 1)
+    wx = ix - x0.to(tl.float32)
+    wy = iy - y0.to(tl.float32)
+
+    f_base = feat_ptr + b * fs_b + c[None, :].to(tl.int64) * fs_c
+    y0o = y0[:, None].to(tl.int64) * fs_h
+    y1o = y1[:, None].to(tl.int64) * fs_h
+    x0o = x0[:, None].to(tl.int64) * fs_w
+    x1o = x1[:, None].to(tl.int64) * fs_w
+
+    v00 = tl.load(f_base + y0o + x0o, mask=mask, other=0.0).to(tl.float32)
+    v01 = tl.load(f_base + y0o + x1o, mask=mask, other=0.0).to(tl.float32)
+    v10 = tl.load(f_base + y1o + x0o, mask=mask, other=0.0).to(tl.float32)
+    v11 = tl.load(f_base + y1o + x1o, mask=mask, other=0.0).to(tl.float32)
+
+    top = v00 + wx[:, None] * (v01 - v00)
+    bot = v10 + wx[:, None] * (v11 - v10)
+    val = top + wy[:, None] * (bot - top)
+    out_off = (b * N + n[:, None].to(tl.int64)) * C + c[None, :]
+    tl.store(out_ptr + out_off, val.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def bilinear_sample_border(features: Tensor, points_n: Tensor) -> Tensor:
+    b, c, h, w = features.shape
+    n = points_n.shape[1]
+    out = torch.empty((b, n, c), device=features.device, dtype=features.dtype)
+    if b * n * c == 0:
+        return out
+    block_c = min(64, max(16, triton.next_power_of_2(c)))
+    block_n = 32 if block_c >= 64 else 64
+    _bilinear_sample_border_kernel[(triton.cdiv(n, block_n), triton.cdiv(c, block_c), b)](
+        features,
+        points_n,
+        out,
+        n,
+        c,
+        h,
+        w,
+        features.stride(0),
+        features.stride(1),
+        features.stride(2),
+        features.stride(3),
+        points_n.stride(0),
+        points_n.stride(1),
+        points_n.stride(2),
+        BLOCK_N=block_n,
+        BLOCK_C=block_c,
+        num_warps=4,
+    )
+    return out
+
+
+def _eligible_bilinear_sample_border(features: Tensor, points_n: Tensor) -> bool:
+    return (
+        not torch.is_grad_enabled()
+        and features.is_cuda
+        and points_n.is_cuda
+        and features.ndim == 4
+        and points_n.ndim == 3
+        and points_n.shape[0] == features.shape[0]
+        and points_n.shape[2] == 2
+        and features.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and points_n.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and features.shape[2] > 0
+        and features.shape[3] > 0
+    )
+
+
+ops.bilinear_sample_border.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible_bilinear_sample_border
+)(bilinear_sample_border)

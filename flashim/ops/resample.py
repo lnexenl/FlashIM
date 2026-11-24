@@ -70,3 +70,15 @@ def _pil_bicubic_resize_reference(image: Tensor, sizes: Sequence[tuple[int, int]
 
 
 pil_bicubic_resize = Op("pil_bicubic_resize", _pil_bicubic_resize_reference)
+
+
+def _bilinear_sample_border_reference(features: Tensor, points_n: Tensor) -> Tensor:
+    """Bilinearly sample ``features [B, C, H, W]`` at normalized ``(x, y)`` ``points_n [B, N, 2]`` in ``[-1, 1]``
+    with ``padding_mode='border'`` and ``align_corners=False`` -> ``[B, N, C]`` in ``features.dtype``."""
+    out = F.grid_sample(
+        features, points_n[:, None].to(features.dtype), mode="bilinear", padding_mode="border", align_corners=False
+    )
+    return out[:, :, 0].transpose(1, 2)
+
+
+bilinear_sample_border = Op("bilinear_sample_border", _bilinear_sample_border_reference)

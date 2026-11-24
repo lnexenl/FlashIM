@@ -38,7 +38,7 @@ from flashim.ops.conv import (
     int8_conv2d_maxpool,
     mxfp8_conv2d,
 )
-from flashim.ops.correlation import dual_softmax_mutual, local_corr
+from flashim.ops.correlation import dual_softmax_mutual, local_corr, mutual_nn_sqdist
 from flashim.ops.density import kde_density
 from flashim.ops.flexglue import flexglue_entmax_readout
 from flashim.ops.gemm import (
@@ -71,7 +71,13 @@ from flashim.ops.quantize import (
     quantize_mxfp8_heads,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
-from flashim.ops.resample import pil_bicubic_resize, upsample_add, upsample_concat, upsample_concat_int8
+from flashim.ops.resample import (
+    bilinear_sample_border,
+    pil_bicubic_resize,
+    upsample_add,
+    upsample_concat,
+    upsample_concat_int8,
+)
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 
 __all__ = [
@@ -80,6 +86,7 @@ __all__ = [
     "DeviceSpec",
     "Op",
     "bias_relu_quantize_int8",
+    "bilinear_sample_border",
     "call_counts",
     "configure",
     "conv2d_at_points",
@@ -115,6 +122,7 @@ __all__ = [
     "local_corr",
     "matmul_nt_fp32",
     "multiscale_fuse",
+    "mutual_nn_sqdist",
     "mxfp8_conv2d",
     "mxfp8_gelu_mlp",
     "mxfp8_linear",

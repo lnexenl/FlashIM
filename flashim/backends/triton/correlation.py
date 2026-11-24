@@ -399,3 +399,72 @@ def _dual_softmax_mutual_impl(
     sim: Tensor, row_bias: Tensor | None = None, col_bias: Tensor | None = None
 ) -> tuple[Tensor, Tensor, Tensor]:
     return dual_softmax_mutual(sim, row_bias, col_bias)
+
+
+# -- tiled squared-distance mutual nearest neighbors (ops.mutual_nn_sqdist) -------------------------------
+
+
+@triton.jit
+def _argmin_sqdist_kernel(
+    x_ptr, y_ptr, out_ptr, M, N, D: tl.constexpr, DP: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    dims = tl.arange(0, DP)
+    row_ok = rows < M
+    xi = tl.load(x_ptr + rows[:, None].to(tl.int64) * D + dims[None, :], mask=row_ok[:, None] & (dims[None, :] < D),
+                 other=0.0).to(tl.float32)
+    best_d = tl.full((BLOCK_M,), float("inf"), dtype=tl.float32)
+    best_j = tl.zeros((BLOCK_M,), dtype=tl.int32)
+    for start in range(0, N, BLOCK_N):
+        cols = start + tl.arange(0, BLOCK_N)
+        col_ok = cols < N
+        d2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for c in tl.static_range(D):
+            xc = tl.sum(tl.where(dims[None, :] == c, xi, 0.0), axis=1)
+            yc = tl.load(y_ptr + cols.to(tl.int64) * D + c, mask=col_ok, other=0.0).to(tl.float32)
+            diff = xc[:, None] - yc[None, :]
+            d2 += diff * diff
+        d2 = tl.where(col_ok[None, :], d2, float("inf"))
+        tile_min = tl.min(d2, axis=1)
+        tile_j = tl.min(tl.where(d2 == tile_min[:, None], cols[None, :], N), axis=1)
+        better = tile_min < best_d
+        best_d = tl.where(better, tile_min, best_d)
+        best_j = tl.where(better, tile_j, best_j)
+    tl.store(out_ptr + rows, best_j.to(tl.int64), mask=row_ok)
+
+
+def mutual_nn_sqdist(x: Tensor, y: Tensor) -> tuple[Tensor, Tensor]:
+    m, d = x.shape
+    n = y.shape[0]
+    if m == 0 or n == 0:
+        return x.new_full((m,), -1, dtype=torch.long), y.new_full((n,), -1, dtype=torch.long)
+    xf, yf = x.float().contiguous(), y.float().contiguous()
+    nn0 = torch.empty(m, device=x.device, dtype=torch.long)
+    nn1 = torch.empty(n, device=y.device, dtype=torch.long)
+    dp = triton.next_power_of_2(d)
+    block_m, block_n = 64, 128
+    _argmin_sqdist_kernel[(triton.cdiv(m, block_m),)](
+        xf, yf, nn0, m, n, D=d, DP=dp, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=4
+    )
+    _argmin_sqdist_kernel[(triton.cdiv(n, block_m),)](
+        yf, xf, nn1, n, m, D=d, DP=dp, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=4
+    )
+    mutual0 = torch.arange(m, device=x.device) == nn1[nn0]
+    mutual1 = torch.arange(n, device=y.device) == nn0[nn1]
+    return torch.where(mutual0, nn0, -1), torch.where(mutual1, nn1, -1)
+
+
+def _mutual_nn_sqdist_eligible(x: Tensor, y: Tensor) -> bool:
+    return (
+        x.is_cuda
+        and y.is_cuda
+        and x.ndim == 2
+        and y.ndim == 2
+        and x.shape[1] == y.shape[1]
+        and 1 <= x.shape[1] <= 8
+    )
+
+
+ops.mutual_nn_sqdist.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_mutual_nn_sqdist_eligible
+)(mutual_nn_sqdist)

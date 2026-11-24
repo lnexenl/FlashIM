@@ -50,9 +50,7 @@ def cell_centers(h: int, w: int, scale: tuple, device: torch.device) -> Tensor:
 
 def sample_features(features: Tensor, points_n: Tensor) -> Tensor:
     """Bilinearly sample ``(B, C, H, W)`` features at points ``(B, N, 2)`` in ``[-1, 1]`` -> ``(B, N, C)``."""
-    points_n = points_n.to(features.dtype)
-    out = F.grid_sample(features, points_n[:, None], "bilinear", padding_mode="border", align_corners=False)
-    return out[:, :, 0].transpose(1, 2)
+    return ops.bilinear_sample_border(features, points_n)
 
 
 def rotate_half(x: Tensor) -> Tensor:
@@ -266,11 +264,12 @@ class OffsetHead(nn.Module):
         self.query_encoder = _mlp([dim, hidden, hidden])
         self.match_encoder = _mlp([dim, hidden, hidden])
         self.head = _mlp([2 * hidden, 2 * hidden, 2 * (bins + 2)])  # last bin unused
+        self.register_buffer("bin_coords", torch.arange(bins + 1, dtype=torch.float32), persistent=False)
 
     def forward(self, f_query: Tensor, f_match: Tensor, hw: tuple[int, int]) -> Tensor:
         x = torch.cat([self.query_encoder(f_query), self.match_encoder(f_match)], -1)
         logits = self.head(x).unflatten(-1, (2, self.bins + 2))[..., : self.bins + 1]
-        bins = torch.arange(self.bins + 1, device=x.device, dtype=x.dtype)
+        bins = self.bin_coords.to(device=x.device, dtype=x.dtype)
         delta = ((logits.softmax(-1) * bins).sum(-1) / self.bins - 0.5) * 2
         return torch.stack([delta[..., 0] * 2 / hw[1], delta[..., 1] * 2 / hw[0]], -1)
 
@@ -290,7 +289,7 @@ class MatchHead(nn.Module):
 
     def forward(self, points_ni: Tensor, cf_i: Tensor, cf_j: Tensor) -> tuple[Tensor, Tensor]:
         """Normalized points ``(B, N, 2)`` of i -> predicted points in j and confidence."""
-        search = F.normalize(self.to_search(cf_j.flatten(2).mT), dim=-1)
+        search = F.normalize(self.to_search(cf_j.permute(0, 2, 3, 1).flatten(1, 2)), dim=-1)
         if self.query_chunk_size is None:
             return self.match_points(points_ni, cf_i, cf_j, search)
         chunks = [self.match_points(points, cf_i, cf_j, search) for points in points_ni.split(self.query_chunk_size, dim=1)]
@@ -299,13 +298,7 @@ class MatchHead(nn.Module):
         p2di_nj, confidence = zip(*chunks)
         return torch.cat(p2di_nj, 1), torch.cat(confidence, 1)
 
-    def match_points(self, points_ni, cf_i, cf_j, search) -> tuple[Tensor, Tensor]:
-        """forward on one chunk of points, with the normalized search features of j."""
-        hw = cf_j.shape[-2:]
-        f_query = sample_features(cf_i, points_ni)
-        query = F.normalize(self.to_search(f_query), dim=-1)
-        logits = query @ search.mT * self.temperature
-        grid = cell_centers(*hw, scale=(hw[1], hw[0]), device=logits.device)
+    def _finish_readout(self, f_query: Tensor, cf_j: Tensor, logits: Tensor, grid: Tensor, hw: tuple[int, int]):
         p2di_nj, window_mass = ops.flexglue_entmax_readout(logits, grid, hw)
         f_match = sample_features(cf_j, p2di_nj)
         p2di_nj = p2di_nj + self.offset_head(f_query, f_match, hw)
@@ -314,21 +307,29 @@ class MatchHead(nn.Module):
         matchability = torch.sigmoid(self.matchability(f_query).squeeze(-1))
         return p2di_nj, matchability * window_mass
 
+    def match_points(self, points_ni, cf_i, cf_j, search) -> tuple[Tensor, Tensor]:
+        """forward on one chunk of points, with the normalized search features of j."""
+        hw = cf_j.shape[-2:]
+        f_query = sample_features(cf_i, points_ni)
+        query = F.normalize(self.to_search(f_query), dim=-1)
+        logits = query @ search.mT * self.temperature
+        grid = cell_centers(*hw, scale=(hw[1], hw[0]), device=logits.device)
+        return self._finish_readout(f_query, cf_j, logits, grid, hw)
 
-def _mutual_nn(dist: Tensor) -> tuple[Tensor, Tensor]:
-    """Mutual nearest neighbors of a ``(B, M, N)`` distance matrix, -1 if not mutual."""
-    m0, m1 = dist.argmin(2), dist.argmin(1)
-    mutual0 = torch.arange(m0.shape[1], device=m0.device) == m1.gather(1, m0)
-    mutual1 = torch.arange(m1.shape[1], device=m1.device) == m0.gather(1, m1)
-    return torch.where(mutual0, m0, -1), torch.where(mutual1, m1, -1)
-
-
-def _sq_dist_gemm(x: Tensor, y: Tensor) -> Tensor:
-    """Squared distance ``(B, M, N)`` of ``x (B, M, D)`` and ``y (B, N, D)`` in one GEMM, no sqrt."""
-    ones_x, ones_y = x.new_ones(*x.shape[:-1], 1), y.new_ones(*y.shape[:-1], 1)
-    xa = torch.cat([-2 * x, x.square().sum(-1, keepdim=True), ones_x], -1)
-    ya = torch.cat([y, ones_y, y.square().sum(-1, keepdim=True)], -1)
-    return xa @ ya.mT
+    def match_dense_pair(self, cf0: Tensor, cf1: Tensor) -> tuple[list[Tensor], list[Tensor]]:
+        """Both directions on the cell centers of equal-sized dense maps ``cf0, cf1``: sampling at exact cell centers
+        is bit-identical to reading ``cf`` directly, ``to_search`` runs once per image, and ``logits_10 = logits_01.mT``."""
+        hw = cf0.shape[-2:]
+        f0 = cf0.permute(0, 2, 3, 1).flatten(1, 2)
+        f1 = cf1.permute(0, 2, 3, 1).flatten(1, 2)
+        s0 = F.normalize(self.to_search(f0), dim=-1)
+        s1 = F.normalize(self.to_search(f1), dim=-1)
+        logits01 = s0 @ s1.mT * self.temperature
+        logits10 = logits01.mT.contiguous()
+        grid = cell_centers(*hw, scale=(hw[1], hw[0]), device=logits01.device)
+        p0, c0 = self._finish_readout(f0, cf1, logits01, grid, hw)
+        p1, c1 = self._finish_readout(f1, cf0, logits10, grid, hw)
+        return [p0, p1], [c0, c1]
 
 
 def _grid_sources(h: int, w: int, device: torch.device) -> Tensor:
@@ -478,8 +479,9 @@ class FlexGlue(ImageMatcher, nn.Module):
         # matches will use (upstream's ``pair_context``), so ``is_covisible`` is never stale
         if layer == cfg.num_layers or score is None:
             score = self.covisibility_score(x0, x1, layer)
-        cf0 = x0.mT.unflatten(-1, f0.shape[-2:]).float()
-        cf1 = x1.mT.unflatten(-1, f1.shape[-2:]).float()
+        # Keep channels-last layout (x0 is already [B, H*W, C]) so bilinear_sample_border and to_search read coalesced.
+        cf0 = x0.float().unflatten(1, f0.shape[-2:]).permute(0, 3, 1, 2)
+        cf1 = x1.float().unflatten(1, f1.shape[-2:]).permute(0, 3, 1, 2)
         return layer, score, cf0, cf1
 
     def run_head(self, layer: int, points_ni: Tensor, cf_i: Tensor, cf_j: Tensor) -> tuple[Tensor, Tensor]:
@@ -550,29 +552,21 @@ class FlexGlue(ImageMatcher, nn.Module):
         c0, c1 = resized_wh[0][0] / 2, resized_wh[1][0] / 2
         x = torch.cat([p2d_r[0] - c1, kpts_r[0] - c0], -1)
         y = torch.cat([kpts_r[1] - c1, p2d_r[1] - c0], -1)
-        m0, m1 = _mutual_nn(_sq_dist_gemm(x[None].float(), y[None].float()))
+        m0, _ = ops.mutual_nn_sqdist(x.float(), y.float())
 
         def take(t, m):
             return t.gather(0, m.clamp(0)[:, None].expand(-1, 2))
 
+        m0c = m0.clamp(0)
         dist0 = 0.5 * (
-            (p2d_r[0] - take(kpts_r[1], m0[0])).norm(dim=-1) + (kpts_r[0] - take(p2d_r[1], m0[0])).norm(dim=-1)
+            (p2d_r[0] - take(kpts_r[1], m0c)).norm(dim=-1) + (kpts_r[0] - take(p2d_r[1], m0c)).norm(dim=-1)
         )
-        dist1 = 0.5 * (
-            (take(p2d_r[0], m1[0]) - kpts_r[1]).norm(dim=-1) + (take(kpts_r[0], m1[0]) - p2d_r[1]).norm(dim=-1)
-        )
-        scores0 = (conf[0] * conf[1].gather(0, m0[0].clamp(0))).sqrt()
-        scores1 = (conf[1] * conf[0].gather(0, m1[0].clamp(0))).sqrt()
-        valid0 = (m0[0] > -1) & (scores0 >= threshold) & valids[0] & valids[1].gather(0, m0[0].clamp(0))
-        valid1 = (m1[0] > -1) & (scores1 >= threshold) & valids[1] & valids[0].gather(0, m1[0].clamp(0))
+        scores0 = (conf[0] * conf[1].gather(0, m0c)).sqrt()
+        valid0 = (m0 > -1) & (scores0 >= threshold) & valids[0] & valids[1].gather(0, m0c)
         if cfg.max_distance_px > 0:  # dist in resized pixels of the (shared) descriptor frame
             valid0 &= dist0 < cfg.max_distance_px
-            valid1 &= dist1 < cfg.max_distance_px
         ia = torch.nonzero(valid0)[:, 0]
-        ib = m0[0][ia]
-        if ia.numel() == 0:
-            empty = kpts[0].new_zeros(0, 2)
-            return Matches(empty, empty, kpts[0].new_zeros(0), ia, ib)
+        ib = m0[ia]
         return Matches(kpts[0][ia], kpts[1][ib], scores0[ia], ia, ib)
 
     def _match(self, img_a: ImageLike, img_b: ImageLike, *, resize: int | None, max_matches: int | None,
@@ -594,12 +588,18 @@ class FlexGlue(ImageMatcher, nn.Module):
         cf = [cf0, cf1]
         hw = [tuple(f.shape[-2:]) for f in features]
         centers = [_grid_sources(h, w, a.device).view(1, h * w, 2) for h, w in hw]
-        p2d_n, conf = [], []
-        for i in (0, 1):
-            j = 1 - i
-            p2di_nj, confidence = self.run_head(layer, centers[i], cf[i], cf[j])
-            p2d_n.append(p2di_nj.view(1, hw[i][0], hw[i][1], 2))
-            conf.append(confidence.view(1, hw[i][0], hw[i][1]))
+        head = self.heads[layer]
+        if hw[0] == hw[1] and (head.query_chunk_size is None or hw[0][0] * hw[0][1] <= head.query_chunk_size):
+            p_list, c_list = head.match_dense_pair(cf0.to(self.heads_dtype), cf1.to(self.heads_dtype))
+            p2d_n = [p.float().view(1, hw[i][0], hw[i][1], 2) for i, p in enumerate(p_list)]
+            conf = [c.float().view(1, hw[i][0], hw[i][1]) for i, c in enumerate(c_list)]
+        else:
+            p2d_n, conf = [], []
+            for i in (0, 1):
+                j = 1 - i
+                p2di_nj, confidence = self.run_head(layer, centers[i], cf[i], cf[j])
+                p2d_n.append(p2di_nj.view(1, hw[i][0], hw[i][1], 2))
+                conf.append(confidence.view(1, hw[i][0], hw[i][1]))
         # gate_dense (upstream): covisibility, confidence filter, border and cycle checks in the resized frame
         is_covisible = (score >= cfg.min_covisibility).view(1, 1, 1)
         src_n = [centers[i].view(1, *hw[i], 2) for i in (0, 1)]
