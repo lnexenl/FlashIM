@@ -27,7 +27,8 @@ from pathlib import Path
 from flashim.build import EngineSpec, ModelSpec, Pass
 from flashim.config import RunConfig
 from flashim.models.lightglue import quant as lightglue_quant
-from flashim.models.lightglue.spec import _regions, _set_attention, _set_precision
+from flashim.models.lightglue.model import sdpa_graph_safe
+from flashim.models.lightglue.spec import _fused_bias, _regions, _set_attention, _set_precision
 from flashim.models.loma.matcher import VARIANTS, DualSoftmaxAssignment, LoMaMatcher
 from flashim.platforms import Feature
 
@@ -53,8 +54,9 @@ def _low_precision_similarity(model: LoMaMatcher, ctx) -> int:
 
 
 # SageAttention impl per architecture (``flashim.backends.external.sageattention``; per-thread QK INT8, PV FP8): the sm_89
-# kernel on Ada, the WGMMA kernel on Hopper (the sm_89 kernel on an H20 is slower than cuDNN SDPA).
-SAGE_IMPLS = {(8, 9): "sage-fp8", (9, 0): "sage-fp8-sm90"}
+# kernel on Ada and consumer Blackwell (sm_120), the WGMMA kernel on Hopper (the sm_89 kernel on an H20 is slower than
+# cuDNN SDPA).
+SAGE_IMPLS = {(8, 9): "sage-fp8", (9, 0): "sage-fp8-sm90", (12, 0): "sage-fp8"}
 
 
 def _sage_platform(platform) -> bool:
@@ -64,28 +66,49 @@ def _sage_platform(platform) -> bool:
 
 
 def _sage_attention(model: LoMaMatcher, ctx) -> dict | str:
-    """int8: every self / cross attention on SageAttention (``SAGE_IMPLS``); ``optimize.attention`` overrides it."""
-    if ctx.config.precision.quant != "int8":
-        return "skipped: not int8"
+    """int8 / fp8: every self / cross attention on SageAttention (``SAGE_IMPLS``); ``optimize.attention`` overrides it.
+
+    On sm_120 with an unpatched SageAttention (not CUDA-graph safe), eager ``sage-fp8`` beats graphed FlashAttention on
+    the wider variants (``dim >= 512``: loma-l 20.3 -> 13.1 ms int8 / 25.0 -> 18.6 ms fp8 at 4096 kp; loma-g 43.6 ->
+    29.3 ms int8 / 56.9 -> 39.3 ms fp8 at 4096 kp and wins at 2048 kp too), whereas at ``dim == 256`` (loma-b / b128 / r)
+    eager SageAttention loses 2-2.8x to graphed SDPA at the default 2048 kp (3.5 vs 7.0-10.1 ms), so ``dim < 512`` keeps
+    graphed SDPA unless SageAttention is graph-safe."""
+    if ctx.config.precision.quant not in ("int8", "fp8"):
+        return "skipped: not quantized"
     from flashim import ops
 
     impl = SAGE_IMPLS[ctx.platform.capability]
     if impl not in {i.name for i in ops.sdpa.impls}:
         return f"skipped: {impl} not registered (sageattention without its sm_90 kernels)"
+    if (
+        ctx.platform.capability == (12, 0)
+        and model.config.dim < 512
+        and ctx.config.engine.kind == "eager"
+        and not sdpa_graph_safe(impl, model.device)
+    ):
+        return f"skipped: unpatched {impl} is not CUDA-graph safe (graphed SDPA is faster at dim={model.config.dim})"
     _set_attention(model, impl)
     return {"impl": impl}
 
 
 def _cuda_graph(model: LoMaMatcher, ctx) -> int | str:
-    """int8, eager engine: the transformer and the assignment head as one CUDA graph per keypoint-count pair
-    (:attr:`LoMaMatcher.graphs`); bit-identical to eager. Needs every kernel on the current stream: SageAttention
-    as released launches on the legacy default stream, the capture then fails and the matcher runs eagerly (warned)."""
-    if ctx.config.precision.quant != "int8":
-        return "skipped: not int8"
+    """Eager engine (bf16 / fp8 / int8): the transformer and the assignment head as one CUDA graph per keypoint-count
+    pair (:attr:`LightGlue.graphs`); bit-identical to eager. Skipped when the active attention impl is not CUDA-graph
+    safe (e.g. unpatched SageAttention launching on the legacy default stream)."""
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
     if ctx.config.engine.kind != "eager":
         return f"skipped: engine {ctx.config.engine.kind}"
     if not ctx.platform.supports(Feature.CUDA_GRAPHS):
         return f"skipped: no CUDA graphs on {ctx.platform.describe()}"
+    impls = {
+        impl for layer in model.transformers
+        for impl in (layer.self_attn.sdpa_impl, layer.cross_attn.sdpa_impl)
+        if impl is not None
+    }
+    unsafe = [impl for impl in sorted(impls) if not sdpa_graph_safe(impl, model.device)]
+    if unsafe:
+        return f"skipped: {', '.join(unsafe)} not CUDA-graph safe"
     model.graphs = int(ctx.option("cuda_graphs", 4))
     return model.graphs
 
@@ -111,16 +134,21 @@ PASSES = {
         description="the assignment similarity as ops.matmul_nt_fp32 of final_proj's BF16 outputs (tensor cores, "
         "FP32 accumulation and output) instead of an FP32 SGEMM",
     ),
+    "fused_bias": Pass(
+        _fused_bias, exact=False,
+        description="fp8: StaticMXFP8Linear biases fused into cuBLAS GEMM epilogue",
+    ),
     "sage_attention": Pass(
         _sage_attention, requires=_sage_platform, exact=False,
-        description="int8: attention on SageAttention (QK INT8, PV FP8; sm_89 kernel / sm_90 WGMMA kernel)",
+        description="int8 / fp8: attention on SageAttention (QK INT8, PV FP8; sm_89 / sm_90 / sm_120)",
     ),
     "fused_int8_glue": Pass(
         _fused_int8_glue, description="int8: one residual stream for both images, quantize / RoPE / swap / LayerNorm "
         "+ GELU fused into the GEMMs and their producers",
     ),
     "cuda_graph": Pass(
-        _cuda_graph, description="int8: transformer + assignment head replayed from one CUDA graph per keypoint-count pair",
+        _cuda_graph,
+        description="bf16 / fp8 / int8: transformer + assignment head replayed from one CUDA graph per keypoint-count pair",
     ),
     "rotate_residual_stream": Pass(
         lambda model, ctx: lightglue_quant.rotate_residual_stream(model), stage="pre_quant", exact=False,
@@ -136,9 +164,25 @@ SPEC = ModelSpec(
     load=_load,
     presets={
         "fp32": {},
-        "bf16": {"precision": {"compute_dtype": "bf16"}, "optimize": {"passes": ["low_precision_similarity"]}},
-        "fp8": {"extends": "bf16", "precision": {"quant": "fp8"}},
-        "int8": {"extends": "bf16", "precision": {"quant": "int8"}, "optimize": {"passes+": ["rotate_residual_stream", "sage_attention", "fused_int8_glue", "cuda_graph"]}},
+        "bf16": {
+            "precision": {"compute_dtype": "bf16"},
+            "optimize": {"passes": ["low_precision_similarity", "cuda_graph"]},
+        },
+        "fp8": {
+            "extends": "bf16",
+            "precision": {"quant": "fp8"},
+            "optimize": {"passes": ["low_precision_similarity", "fused_bias", "sage_attention", "cuda_graph"]},
+        },
+        "int8": {
+            "extends": "bf16",
+            "precision": {"quant": "int8"},
+            "optimize": {
+                "passes": [
+                    "low_precision_similarity", "rotate_residual_stream", "sage_attention", "fused_int8_glue",
+                    "cuda_graph",
+                ]
+            },
+        },
     },
     default_preset="bf16",
     quant_configs=QUANT_CONFIGS,

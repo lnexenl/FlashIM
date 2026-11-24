@@ -200,6 +200,61 @@ class MatchAssignment(nn.Module):
         return ops.dual_softmax_mutual(sim, z0, z1)
 
 
+_GRAPH_SAFE_SDPA: dict[tuple[str, int], bool] = {}
+
+
+def sdpa_graph_safe(impl: str | None, device: torch.device) -> bool:
+    """Whether ``ops.sdpa.get(impl)`` captures and replays faithfully inside a CUDA graph on ``device``.
+
+    Unpatched SageAttention releases launch their C++ kernels on the legacy default stream: on CUDA 13 / PyTorch 2.11
+    that can succeed without raising ``RuntimeError`` while silently replaying stale/corrupt outputs. Probe once per
+    ``(impl, device)`` on a tiny tensor with mutated inputs so graph capture never silently corrupts matches."""
+    if impl is None or not impl.startswith("sage") or device.type != "cuda":
+        return True
+    idx = torch.cuda.current_device() if device.index is None else device.index
+    key = (impl, idx)
+    if key in _GRAPH_SAFE_SDPA:
+        return _GRAPH_SAFE_SDPA[key]
+    sdpa = ops.sdpa.get(impl)
+    ok = False
+    try:
+        with torch.inference_mode():
+            q = torch.randn(1, 2, 64, 64, device=device, dtype=torch.bfloat16)
+            k = torch.randn_like(q)
+            v = torch.randn_like(q)
+            s = torch.cuda.Stream(device=device)
+            s.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(s):
+                for _ in range(2):
+                    sdpa(q, k, v)
+            torch.cuda.current_stream(device).wait_stream(s)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=s):
+                o = sdpa(q, k, v)
+            q2, k2, v2 = torch.randn_like(q), torch.randn_like(k), torch.randn_like(v)
+            ref = sdpa(q2, k2, v2)
+            q.copy_(q2)
+            k.copy_(k2)
+            v.copy_(v2)
+            o.zero_()
+            g.replay()
+            torch.cuda.synchronize(device)
+            ok = bool(torch.isfinite(o).all() and torch.allclose(o, ref, atol=1e-2, rtol=1e-2))
+    except RuntimeError:
+        torch.cuda.synchronize(device)
+        ok = False
+    _GRAPH_SAFE_SDPA[key] = ok
+    return ok
+
+
+def _model_sdpa_impls(model: LightGlue) -> set[str]:
+    return {
+        impl for layer in model.transformers
+        for impl in (layer.self_attn.sdpa_impl, layer.cross_attn.sdpa_impl)
+        if impl is not None
+    }
+
+
 def filter_matches(scores: Tensor, threshold: float) -> tuple[Tensor, Tensor, Tensor]:
     """Mutual best matches of a log assignment matrix ``[1, M, N]`` whose probability exceeds ``threshold``:
     indices into image A, indices into image B, and the match probabilities."""
@@ -323,6 +378,12 @@ class LightGlue(nn.Module):
         """Per point of image A: the best log assignment over image B's points, its index and whether it is mutual
         (:meth:`MatchAssignment.matches` of the last executed layer)."""
         if not self.graphs or self.config.depth_confidence > 0 or not desc0.is_cuda or torch.is_grad_enabled():
+            return self._best_matches(desc0, desc1, enc0, enc1)
+        unsafe = [impl for impl in sorted(_model_sdpa_impls(self)) if not sdpa_graph_safe(impl, desc0.device)]
+        if unsafe:
+            warn_once(logger, f"lightglue-graph-{id(self)}", "%s: %s is not CUDA-graph safe, running eagerly "
+                      "from now on", type(self).__name__, ", ".join(unsafe))
+            self.graphs = 0
             return self._best_matches(desc0, desc1, enc0, enc1)
         from flashim.engines.cuda_graph import CudaGraphRunner
 
