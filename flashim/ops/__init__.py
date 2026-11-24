@@ -63,7 +63,13 @@ from flashim.ops.quantize import (
     quantize_mxfp8,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock
-from flashim.ops.resample import pil_bicubic_resize, upsample_add, upsample_concat, upsample_concat_int8
+from flashim.ops.resample import (
+    multiscale_score,
+    pil_bicubic_resize,
+    upsample_add,
+    upsample_concat,
+    upsample_concat_int8,
+)
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
 
 __all__ = [
@@ -107,6 +113,7 @@ __all__ = [
     "local_corr",
     "matmul_nt_fp32",
     "multiscale_fuse",
+    "multiscale_score",
     "mxfp8_conv2d",
     "mxfp8_gelu_mlp",
     "mxfp8_linear",

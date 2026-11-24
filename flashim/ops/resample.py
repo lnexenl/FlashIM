@@ -71,3 +71,20 @@ def _pil_bicubic_resize_reference(image: Tensor, sizes: Sequence[tuple[int, int]
 
 
 pil_bicubic_resize = Op("pil_bicubic_resize", _pil_bicubic_resize_reference)
+
+
+def _multiscale_score_reference(
+    f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, weight: Tensor, bias: Tensor | None = None
+) -> Tensor:
+    """4-scale bilinear fusion (``align_corners=True`` to ``f1``'s size) + 1-channel FP32 1x1 projection:
+    ``conv1x1(cat([f1, up(f2), up(f3), up(f4)], 1).float(), weight, bias)`` -> ``[B, 1, H, W]`` FP32.
+    ``weight`` is ``[4 * C]`` FP32, ``bias`` is ``[1]`` (or scalar) FP32 or ``None``."""
+    size = f1.shape[-2:]
+    upsampled = [F.interpolate(f.float(), size=size, mode="bilinear", align_corners=True) for f in (f2, f3, f4)]
+    fused = torch.cat([f1.float(), *upsampled], dim=1)
+    w = weight.float().reshape(1, -1, 1, 1)
+    b = None if bias is None else bias.float().reshape(1)
+    return F.conv2d(fused, w, b)
+
+
+multiscale_score = Op("multiscale_score", _multiscale_score_reference)

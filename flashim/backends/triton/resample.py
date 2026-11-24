@@ -517,3 +517,110 @@ def _eligible_pil_resize(image: Tensor, sizes: Sequence[tuple[int, int]]) -> boo
 ops.pil_bicubic_resize.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible_pil_resize
 )(pil_bicubic_resize)
+
+
+# -- 4-scale align_corners=True bilinear fusion -> 1-channel FP32 score map (ALIKE single_head) ----------------------
+
+
+@triton.jit
+def _bilinear_ac_nhwc(ptr, oh, ow, scale_h, scale_w, h, w, C, c, mask2d):
+    """Bilinear ``align_corners=True`` sample of NHWC ``[h, w, C]`` at ``(oh, ow)`` using host-computed scales -> ``[BLOCK_PIX, BLOCK_C]``."""
+    iy = oh * scale_h
+    ix = ow * scale_w
+    y0 = tl.minimum(tl.maximum(iy.to(tl.int32), 0), h - 1)
+    x0 = tl.minimum(tl.maximum(ix.to(tl.int32), 0), w - 1)
+    y1 = tl.minimum(y0 + 1, h - 1)
+    x1 = tl.minimum(x0 + 1, w - 1)
+    ly = (iy - y0.to(tl.float32))[:, None]
+    lx = (ix - x0.to(tl.float32))[:, None]
+    v00 = tl.load(ptr + (y0 * w + x0)[:, None].to(tl.int64) * C + c[None, :], mask=mask2d, other=0.0).to(tl.float32)
+    v01 = tl.load(ptr + (y0 * w + x1)[:, None].to(tl.int64) * C + c[None, :], mask=mask2d, other=0.0).to(tl.float32)
+    v10 = tl.load(ptr + (y1 * w + x0)[:, None].to(tl.int64) * C + c[None, :], mask=mask2d, other=0.0).to(tl.float32)
+    v11 = tl.load(ptr + (y1 * w + x1)[:, None].to(tl.int64) * C + c[None, :], mask=mask2d, other=0.0).to(tl.float32)
+    return (1.0 - ly) * ((1.0 - lx) * v00 + lx * v01) + ly * ((1.0 - lx) * v10 + lx * v11)
+
+
+@triton.jit
+def _multiscale_score_kernel(
+    f1_ptr, f2_ptr, f3_ptr, f4_ptr, w_ptr, b_ptr, out_ptr,
+    C, H, W, H2, W2, H3, W3, H4, W4, sh2, sw2, sh3, sw3, sh4, sw4, s1_c, s1_h, s1_w,
+    HAS_BIAS: tl.constexpr, F1_NHWC: tl.constexpr, BLOCK_PIX: tl.constexpr, BLOCK_C: tl.constexpr,
+):
+    """Fused 4-scale ``align_corners=True`` bilinear upsample + 1-ch FP32 dot product. Never materializes the
+    ``[1, 4*C, H, W]`` concat; reads ``f1`` in place (NCHW or NHWC) and coarse ``f2..f4`` in coalesced NHWC."""
+    pid = tl.program_id(0)
+    pix = pid * BLOCK_PIX + tl.arange(0, BLOCK_PIX)
+    p_ok = pix < H * W
+    oy = pix // W
+    ox = pix % W
+    oh = oy.to(tl.float32)
+    ow = ox.to(tl.float32)
+
+    c = tl.arange(0, BLOCK_C)
+    c_ok = c < C
+    mask_pc = p_ok[:, None] & c_ok[None, :]
+
+    w1 = tl.load(w_ptr + 0 * C + c, mask=c_ok, other=0.0)
+    w2 = tl.load(w_ptr + 1 * C + c, mask=c_ok, other=0.0)
+    w3 = tl.load(w_ptr + 2 * C + c, mask=c_ok, other=0.0)
+    w4 = tl.load(w_ptr + 3 * C + c, mask=c_ok, other=0.0)
+
+    if F1_NHWC:
+        v1 = tl.load(f1_ptr + pix[:, None].to(tl.int64) * C + c[None, :], mask=mask_pc, other=0.0).to(tl.float32)
+    else:
+        v1 = tl.load(
+            f1_ptr + c[None, :].to(tl.int64) * s1_c + oy[:, None].to(tl.int64) * s1_h + ox[:, None].to(tl.int64) * s1_w,
+            mask=mask_pc, other=0.0,
+        ).to(tl.float32)
+
+    v2 = _bilinear_ac_nhwc(f2_ptr, oh, ow, sh2, sw2, H2, W2, C, c, mask_pc)
+    v3 = _bilinear_ac_nhwc(f3_ptr, oh, ow, sh3, sw3, H3, W3, C, c, mask_pc)
+    v4 = _bilinear_ac_nhwc(f4_ptr, oh, ow, sh4, sw4, H4, W4, C, c, mask_pc)
+
+    acc = tl.sum(v1 * w1[None, :] + v2 * w2[None, :] + v3 * w3[None, :] + v4 * w4[None, :], axis=1)
+    if HAS_BIAS:
+        acc += tl.load(b_ptr)
+    tl.store(out_ptr + pix, acc, mask=p_ok)
+
+
+def _multiscale_score_triton(
+    f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, weight: Tensor, bias: Tensor | None = None
+) -> Tensor:
+    _, c, h, w = f1.shape
+    h2, w2 = f2.shape[-2:]
+    h3, w3 = f3.shape[-2:]
+    h4, w4 = f4.shape[-2:]
+    sh2, sw2 = ((h2 - 1) / (h - 1) if h > 1 else 0.0), ((w2 - 1) / (w - 1) if w > 1 else 0.0)
+    sh3, sw3 = ((h3 - 1) / (h - 1) if h > 1 else 0.0), ((w3 - 1) / (w - 1) if w > 1 else 0.0)
+    sh4, sw4 = ((h4 - 1) / (h - 1) if h > 1 else 0.0), ((w4 - 1) / (w - 1) if w > 1 else 0.0)
+    f1_nhwc = f1.is_contiguous(memory_format=torch.channels_last) and not f1.is_contiguous()
+    f2c, f3c, f4c = (f.permute(0, 2, 3, 1).contiguous() for f in (f2, f3, f4))
+    w_fp32 = weight.float().reshape(-1).contiguous()
+    b_fp32 = bias.float().reshape(1).contiguous() if bias is not None else w_fp32
+    out = torch.empty(1, 1, h, w, device=f1.device, dtype=torch.float32)
+
+    block_pix = 64
+    block_c = triton.next_power_of_2(c)
+    grid = (triton.cdiv(h * w, block_pix),)
+    _multiscale_score_kernel[grid](
+        f1, f2c, f3c, f4c, w_fp32, b_fp32, out,
+        c, h, w, h2, w2, h3, w3, h4, w4, sh2, sw2, sh3, sw3, sh4, sw4,
+        f1.stride(1), f1.stride(2), f1.stride(3),
+        HAS_BIAS=bias is not None, F1_NHWC=f1_nhwc, BLOCK_PIX=block_pix, BLOCK_C=block_c, num_warps=4,
+    )
+    return out
+
+
+def _multiscale_score_eligible(
+    f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, weight: Tensor, bias: Tensor | None = None
+) -> bool:
+    return (
+        f1.is_cuda and f1.ndim == 4 and f1.shape[0] == 1 and 1 <= f1.shape[1] <= 32
+        and f2.shape[:2] == f1.shape[:2] and f3.shape[:2] == f1.shape[:2] and f4.shape[:2] == f1.shape[:2]
+        and f1.dtype in (torch.float32, torch.bfloat16, torch.float16)
+    )
+
+
+ops.multiscale_score.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_multiscale_score_eligible
+)(_multiscale_score_triton)

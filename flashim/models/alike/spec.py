@@ -36,4 +36,6 @@ SPEC = extractor_spec(
     quantized=QUANTIZED,
     protected=PROTECTED,
     compile_regions=("block1", "block2", "block3", "block4"),
+    # BF16 extract at 1200 px (sm_120, once ops.multiscale_score replaces NHWC interpolate+cat): 2.43 -> 2.09 ms
+    channels_last=True,
 )
