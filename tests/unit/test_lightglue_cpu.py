@@ -157,3 +157,28 @@ def test_cross_block_batched_matches_unbatched_and_low_precision_similarity():
         head.low_precision_similarity = True
         sim_lp = head.similarity(a, b)
     torch.testing.assert_close(sim_lp, sim_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_rotate_residual_stream_supports_xfeat_dim96():
+    import copy
+
+    from flashim.models.lightglue.config import XFEAT_CONFIG
+    from flashim.models.lightglue.quant import rotate_residual_stream
+    from flashim.quant.rotation import hadamard
+
+    h96 = hadamard(96, dtype=torch.float64)
+    torch.testing.assert_close(h96 @ h96.T, torch.eye(96, dtype=torch.float64), atol=1e-12, rtol=0)
+
+    torch.manual_seed(0)
+    cfg = copy.copy(XFEAT_CONFIG)
+    model = LightGlue(cfg).eval()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    rotated = copy.deepcopy(model)
+    assert rotate_residual_stream(rotated) > 0
+    d0, d1 = torch.randn(1, 24, cfg.input_dim), torch.randn(1, 20, cfg.input_dim)
+    e0, e1 = model.posenc(torch.rand(1, 24, 2)), model.posenc(torch.rand(1, 20, 2))
+    with torch.inference_mode():
+        s0 = model.scores(d0, d1, e0, e1)
+        s1 = rotated.scores(d0, d1, e0, e1)
+    torch.testing.assert_close(s1, s0, atol=2e-4, rtol=1e-4)
