@@ -49,6 +49,13 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 
 Every learned model is a native PyTorch port that is checked against its upstream implementation (`tests/parity`).
 
+**Preset notes.** `fp8` is not a preset of `superpoint-superglue` and `omniglue`: it builds `int8`, because MXFP8
+loses accuracy in their extractors (SuperPoint, DINOv2 ViT-B/14) and `int8` is faster and more accurate
+([accuracy](benchmarks.md#accuracy-of-the-2026-11-additions)). Licenses that restrict use: `superglue` / `superpoint-superglue`
+(Magic Leap, non-commercial), `mast3r` / `dust3r` / `ufm` weights (CC BY-NC-SA 4.0), and `eloftr`, whose upstream
+changed its license to ZJU3DV's PRL v1.0 on 2026-09-15 (the vendored oracle and the weights are Apache-2.0 from before
+that); see `THIRD_PARTY_NOTICES.md`.
+
 **Presets** name a precision:
 
 | preset | meaning |
