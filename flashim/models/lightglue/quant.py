@@ -7,7 +7,35 @@ Presets:
   softmaxes and the similarity matrix stay FP32.
 - ``fp8``  : ``bf16`` + every transformer linear (QKV / output / FFN, self- and cross-attention) as static MXFP8
   (E4M3 values, E8M0 block-32 scales); attention itself stays BF16.
-- ``int8`` : ``bf16`` + the same linears as static symmetric INT8 (per-channel weights, per-tensor activation scale).
+- ``int8`` : ``bf16`` + the same linears as static symmetric INT8 (per-channel weights, per-tensor activation scale),
+  with :func:`rotate_residual_stream` (float64 Hadamard) and SmoothQuant on ``ffn.3`` (``ROTATED_INT8_SMOOTHING``).
+
+Per-pairing MXFP8 evidence (MegaDepth-1500 / ScanNet-1500, 3 seeds 17/29/42, poselib 1.0 px, gate -0.005 AUC@5 vs
+``dev bf16``):
+
+- ``rdd-lightglue``, ``disk-lightglue``, ``raco-aliked-lightglue`` keep ``fp8`` (lower ``to_qk`` output scale:
+  std 4.3-5.8, block-32 channel ratio 2.5-3.5; ``disk`` +0.0015 mega / -0.0022 scannet, ``rdd`` -0.0045 / +0.0014).
+- ``aliked-lightglue`` (``ffn.0`` block-32 ratio 8.4, ``to_qk`` std 5.80), ``superpoint-lightglue`` (``to_qk`` std
+  7.98) and ``xfeat-lightglue`` (``dim=96``, 1 head, ``to_qk`` std 9.75 / ratio 6.7, ``Wqkv`` std 10.08 / ratio 6.5)
+  all fail full static MXFP8 (-0.0264 / -0.0281 / -0.1376 on MegaDepth-1500) due to E4M3's 3-bit mantissa noise:
+  even per-token dynamic MXFP8 activations with BF16 weights collapse match Jaccard on ``sacre_coeur`` (0.479 / 0.536
+  / 0.000), and MegaDepth-300 ablations with ``bf16`` extractors fail for ``rotate_residual_stream`` + recalibrated
+  MXFP8 (-0.0150 / -0.0345 / -0.0960), FFN-only MXFP8 (-0.0045 with -0.0103 AUC@10 / -0.0134 / -0.0603), mid-layer
+  FFN-only (-0.0042 with -0.0150 AUC@10 / -0.0231 / -0.0554), protecting ``to_qk+ffn`` (-0.0033 with -0.0091 AUC@10 /
+  -0.0186 / -0.0165), and protecting first/last layers (-0.0182 / -0.0193 / -0.0786).
+- On ``superpoint-lightglue``, quantizing SuperPoint's small VGG conv net also shifts descriptors off LightGlue's
+  manifold (MegaDepth-300: ``fp8_ext+bf16_mat`` -0.0410, ``int8_ext+int8_mat`` -0.0139 vs ``bf16_ext+int8_mat``
+  -0.0047) while running slower than BF16.
+- Accordingly, ``spec.py`` omits ``fp8`` from those three pipelines so ``build.NEAREST`` resolves ``fp8`` to their
+  nearest passing config (verified on full MegaDepth-1500 / ScanNet-1500, 3 seeds, paired vs ``dev bf16``):
+
+  - ``aliked-lightglue`` ``fp8 -> int8`` (ALIKED ``bf16`` + rotated INT8 LightGlue): MegaDepth-1500 AUC@5 0.6112
+    (-0.0000 [-0.0048, +0.0047], 37.4s vs 41.9s), ScanNet-1500 0.2011 (-0.0003 [-0.0063, +0.0057], 28.7s vs 30.7s).
+  - ``superpoint-lightglue`` ``fp8 -> int8`` (SuperPoint ``bf16`` + rotated INT8 LightGlue): MegaDepth-1500 0.5959
+    (-0.0012 [-0.0068, +0.0045]), ScanNet-1500 0.1832 (+0.0033 [-0.0029, +0.0094]).
+  - ``xfeat-lightglue`` ``fp8 / int8 -> bf16`` (rotated INT8 still drops -0.0066 at p=0.9999 / -0.0049 at p=1.0 on
+    MegaDepth-1500 and is slower than BF16 on ScanNet-1500, 19.5 vs 16.3s): MegaDepth-1500 0.5580 (+0.0000),
+    ScanNet-1500 0.1580 (+0.0000).
 """
 
 from __future__ import annotations

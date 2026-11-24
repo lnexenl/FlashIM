@@ -7,6 +7,7 @@ A pipeline's preset is every component's: each builds the nearest preset it has 
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 
 from torch import nn
 
@@ -185,7 +186,17 @@ def _compose(config: RunConfig, build) -> nn.Module:
     return SparsePipeline(build(config.components["extractor"]), build(config.components["matcher"]))
 
 
-def _pipeline(name: str, extractor: str, variant: str, default: str, description: str) -> ModelSpec:
+def _pipeline(
+    name: str,
+    extractor: str,
+    variant: str,
+    default: str,
+    description: str,
+    *,
+    presets: tuple[str, ...] = PRECISIONS,
+    extractor_presets: Mapping[str, str] | None = None,
+) -> ModelSpec:
+    ext_presets = extractor_presets or {}
     return ModelSpec(
         name=name,
         role="pipeline",
@@ -194,11 +205,11 @@ def _pipeline(name: str, extractor: str, variant: str, default: str, description
         presets={
             preset: {
                 "components": {
-                    "extractor": {"model": extractor, "preset": preset},
+                    "extractor": {"model": extractor, "preset": ext_presets.get(preset, preset)},
                     "matcher": {"model": "lightglue", "preset": preset, "variant": variant},
                 }
             }
-            for preset in PRECISIONS
+            for preset in presets
         },
         default_preset=default,
         compose=_compose,
@@ -206,14 +217,30 @@ def _pipeline(name: str, extractor: str, variant: str, default: str, description
 
 
 RDD_LIGHTGLUE = _pipeline("rdd-lightglue", "rdd", "rdd", "fp8", "RDD detector/descriptor + LightGlue")
-ALIKED_LIGHTGLUE = _pipeline("aliked-lightglue", "aliked", "aliked", "fp32", "ALIKED + LightGlue (cvg's ALIKED-trained weights)")
+# MXFP8 fails the -0.005 AUC@5 gate on ALIKED, SuperPoint and XFeat LightGlue (see quant.py for measured evidence):
+# omitting unsupported presets lets build.NEAREST resolve ``fp8`` to each pairing's nearest passing config.
+ALIKED_LIGHTGLUE = _pipeline(
+    "aliked-lightglue", "aliked", "aliked", "fp32", "ALIKED + LightGlue (cvg's ALIKED-trained weights)",
+    presets=("fp32", "bf16", "int8"),
+)
 RACO_ALIKED_LIGHTGLUE = _pipeline(
     "raco-aliked-lightglue", "raco-aliked", "raco-aliked", "fp32",
     "RaCo keypoints + ALIKED descriptors + LightGlue (cvg's RaCo + ALIKED weights)",
 )
-SUPERPOINT_LIGHTGLUE = _pipeline("superpoint-lightglue", "superpoint", "superpoint", "fp32", "SuperPoint + LightGlue (cvg weights)")
+# Quantized SuperPoint convs are slower than BF16 and shift descriptors off LightGlue's manifold (-0.041 fp8 / -0.009
+# int8 on MegaDepth-300); keeping the extractor in BF16 lets the rotated INT8 matcher pass both MegaDepth and ScanNet.
+SUPERPOINT_LIGHTGLUE = _pipeline(
+    "superpoint-lightglue", "superpoint", "superpoint", "fp32", "SuperPoint + LightGlue (cvg weights)",
+    presets=("fp32", "bf16", "int8"),
+    extractor_presets={"int8": "bf16"},
+)
 DISK_LIGHTGLUE = _pipeline("disk-lightglue", "disk", "disk", "fp32", "DISK + LightGlue (cvg weights)")
-XFEAT_LIGHTGLUE = _pipeline("xfeat-lightglue", "xfeat", "xfeat", "fp32", "XFeat + LighterGlue (verlab weights)")
+# XFeat's dim=96 1-head LighterGlue fails MXFP8 (-0.138 mega / -0.070 scannet) and exceeds -0.005 under rotated INT8
+# (-0.0066 at p=0.9999, -0.0049 at p=1.0), while BF16 is faster on ScanNet (16.3 vs 19.5s) and exact (+0.0000).
+XFEAT_LIGHTGLUE = _pipeline(
+    "xfeat-lightglue", "xfeat", "xfeat", "fp32", "XFeat + LighterGlue (verlab weights)",
+    presets=("fp32", "bf16"),
+)
 
 
 def _raco_pipeline(descriptor: str, default: str) -> ModelSpec:
