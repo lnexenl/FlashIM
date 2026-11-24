@@ -28,7 +28,8 @@ flashim/
                DeformableEncoder, ...)
   quant/       scheme.py (compressed-tensors vocabulary), formats/, tensor.py, calibration.py,
                methods/ (StaticMXFP8Linear = ops.mxfp8_linear bound to its weight, StaticInt8Linear),
-               passes/ (structural fusions matched by layer type), apply.py (quantize_model)
+               passes/ (structural fusions matched by layer type), apply.py (quantize_model),
+               rotation.py (LayerNorm-commuting rotations / Hadamard folded into weights), DynamicInt8Linear (per-token)
   config.py    RunConfig: arch / precision / optimize / engine / inference / components; layered and hashable
   build.py     ModelSpec + the generic builder every model goes through; flashim.load (the one loader), PRECISIONS
   models/base.py
@@ -41,6 +42,9 @@ flashim/
                dtype), `extractor_spec()` (the fp32 / bf16 / int8 / fp8 presets from a list of quantizable globs),
                checkpoint lookup (`checkpoint` config key / env var / torch hub folder, else download of the release
                pinned by URL + SHA-256 in each model's `weights.py`)
+  models/{roma,tiny_roma,mast3r,dust3r,ufm}/, {eloftr,xoftr}/, superglue/, omniglue/
+               dense / semi-dense / sparse ports (dust3r reuses mast3r's CroCo backbone; minima-loftr / minima-roma are
+               MINIMA weights of loftr / roma specs; superpoint-superglue and omniglue are pipelines like *-lightglue)
   models/loma/ LoMa: matcher.py (LightGlue's modules, DaD-normalized positions, last-layer dual softmax),
                extractor.py (DaD + the variant's LoMa DeDoDe descriptor on upstream's PIL-bicubic resizes),
                matcher_spec.py / extractor_spec.py (`loma-matcher`, `loma-extractor`), spec.py (pipelines
@@ -106,6 +110,12 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   `flashim/registry.py`, calibrate (`scripts/calibrate_extractor.py --model m --format fp8 --format int8`; LightGlue pairings:
   `scripts/calibrate_lightglue.py --extractor m`), add `tests/parity/<m>/test_parity.py`. Convolutions are quantized as
   im2col + GEMM (`quant/methods/conv2d.py`; groups == 1 only): measured *slower* than BF16 on the small nets here.
+- **Quantization loses accuracy -> change the scheme before giving up the preset**: find the layers (one region at a
+  time), classify the outliers (per-token: DINOv2 / CroCo ViTs -> `DynamicInt8Linear` per-token INT8; per-channel:
+  matchers without LayerNorm -> Hadamard / LayerNorm-commuting rotation + SmoothQuant, `quant/rotation.py`;
+  E4M3 mantissa noise -> mixed MXFP8 + INT8 per layer), judge by match agreement / fidelity first, and keep only the
+  layers that stay bad in BF16. A pipeline whose component's fp8 is strictly worse than its int8 omits `fp8` from its
+  presets (`_PIPELINE_PRESETS`, `superpoint-superglue`, `omniglue`) so `build.NEAREST` builds int8.
 - **Add a model**: `models/<m>/` with `model.py`, `weights.py`, `quant.py`, `spec.py` (register it in
   `flashim/registry.py` `SPECS`), the model class an `ImageMatcher` / `FeatureMatcher`, CPU unit tests and a
   parity test against the oracle. `weights.py` pins each release as `Checkpoint(filename, url, sha256)` and loads it
@@ -118,6 +128,9 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   (MXFP8 noise at its 0.9 threshold). The vendored LightGlue oracles turn off flash SDPA and set
   `cudnn.deterministic` for the whole process; `tests/conftest.py` restores both after every test, so results do not
   depend on test order. Markers: `cuda`, `sm120`, `weights`, `oracle`, `slow`.
+- **Accuracy gate of a new model**: `benchmarks/accuracy/b_models_matrix.sh` (all presets, MegaDepth-1500 + ScanNet-1500,
+  resumable) and `b_models_report.py` (paired bootstrap vs BF16); add the model to `b_models_protocol.py`. Several agents
+  sharing one GPU: wrap each CUDA command in `flock ~/.cache/flashim/gpu.lock`.
 - Lint: `.venv/bin/ruff check flashim tests` (line length 110). **Only `--fix` files you changed**
   (`ruff check --fix` on a directory rewrote the user's uncommitted files once); preview with `--diff`.
 - **Refactors must be bit-identical**: run the same inference in a `git worktree` of the previous commit and in the
@@ -174,6 +187,15 @@ Dependencies point one way: `platforms < quant.formats < ops < backends`; `layer
   when comparing tiles). Editing that file shifts line numbers, which recompiles every kernel in it.
 - TileLang 0.1.14: no `from __future__ import annotations` in TileLang files; width <= 16 miscompiles;
   `T.no_set_max_nreg()`; an explicit `fence.proxy.async` is needed before TMA refills a stage read by plain loads.
+- GPU JPEG decode (`flashim/image_io.py`) runs on a private stream: torchvision's `decode_jpeg(device="cuda")` allocates
+  its output on the caller's stream and decodes on nvJPEG's, which corrupted pixels (and made `rdd-lightglue` int8 match
+  counts vary between calls) next to GPU work; `FLASHIM_IMAGE_DECODER=pil` is the reference if a result looks odd.
+- `mast3r` / `dust3r` compute in FP16 under `bf16` / `int8` / `fp8`: the CroCo encoder's residual stream peaks at
+  ~350-650 where BF16's ULP is 4. Their 2 px match agreement vs FP32 is meaningless (< 1 working pixel); judge them by
+  pose AUC / epipolar error.
+- torch 2.11: `engine="compile"` fails on a graph that calls a `@triton.autotune(prune_configs_by=...)` kernel twice
+  (Dynamo `ListVariable` assertion in `wrap_user_defined_obj`), which is why quantized models with autotuned INT8 convs
+  run eager.
 - `torchvision.ops.deform_conv2d` ignores the current CUDA stream: keep ALIKED on the caller's stream.
 
 ## Git

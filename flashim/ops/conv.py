@@ -61,6 +61,25 @@ def _depthwise5x5_relu_int8_reference(value: Tensor, weight: Tensor, bias: Tenso
 depthwise5x5_relu_int8 = Op("depthwise5x5_relu_int8", _depthwise5x5_relu_int8_reference)
 
 
+# -- BF16 depthwise 5x5 + bias + ReLU (channels-last output) --------------------------------------
+
+
+def _depthwise5x5_relu_reference(value: Tensor, weight: Tensor, bias: Tensor) -> Tensor:
+    """Depthwise 5x5 (pad 2) on BF16-rounded inputs, + FP32 bias, ReLU -> BF16 ``[B, H, W, C]`` (contiguous).
+
+    ``value`` is ``[B, C, H, W]``; ``weight`` is packed ``[25, C]`` (ky, kx major); ``bias`` is FP32 ``[C]``.
+    Paired with ``F.linear`` (cuBLAS BF16 GEMM with fused bias) for large-channel separable conv blocks
+    (``C > 128``) where the fully fused ``depthwise5x5_relu_pointwise`` kernel cannot fit ``[BW, C]`` in registers.
+    """
+    channels = value.shape[1]
+    kernel = weight.float().t().reshape(channels, 1, 5, 5)
+    out = F.relu(F.conv2d(value.to(torch.bfloat16).float(), kernel, bias.float(), padding=2, groups=channels))
+    return out.to(torch.bfloat16).permute(0, 2, 3, 1).contiguous()
+
+
+depthwise5x5_relu = Op("depthwise5x5_relu", _depthwise5x5_relu_reference)
+
+
 # -- BF16 depthwise 5x5 + bias + ReLU + pointwise + bias (fused refiner block) -----------------
 
 
@@ -174,7 +193,7 @@ im2col_gather = Op("im2col_gather", _im2col_gather_reference)
 def _int8_conv2d_reference(
     x: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None,
     kh: int, kw: int, sh: int, sw: int, ph: int, pw: int, dh: int, dw: int, *, relu: bool = False,
-    residual: Tensor | None = None, out_scale: Tensor | None = None,
+    residual: Tensor | None = None, residual_scale: Tensor | None = None, out_scale: Tensor | None = None,
 ) -> Tensor:
     """``x`` int8 ``[B, H, W, Cin]``, ``weight`` int8 ``[Cout, kh*kw*Cin]`` in ``(ky, kx, c)`` order (as
     ``StaticInt8Conv2d.from_conv`` lays it out) -> BF16 ``[B, Ho, Wo, Cout]``; with ``out_scale`` (the activation scale
@@ -184,22 +203,24 @@ def _int8_conv2d_reference(
     before backends fused the gather into the GEMM's K-loop: one tap per full-``Cin`` ``tl.dot``, gathered
     straight from ``x`` with no materialized im2col buffer — see ``backends/triton/conv.py``. ``relu`` applies ReLU
     in the epilogue (exact: it commutes with the BF16 rounding). ``residual`` ``[B, Ho, Wo, Cout]`` (any strides) is
-    added before ReLU: in the fused impls in FP32 before the one BF16 rounding, here after it (one ulp apart).
+    added before ReLU (optionally scaled per channel by ``residual_scale [Cout]``, e.g. a RepVGG identity BN): in the
+    fused impls in FP32 before the one BF16 rounding, here after it (one ulp apart).
     """
     b, h, w, _ = x.shape
     ho = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
     wo = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
     cols = im2col_gather(x, kh, kw, sh, sw, ph, pw, dh, dw)
     out = int8_linear(cols, weight, a_scale, w_scale, bias, relu=relu and residual is None).reshape(b, ho, wo, -1)
-    out = out if residual is None else _add_residual(out, residual, relu)
+    out = out if residual is None else _add_residual(out, residual, relu, residual_scale)
     return out if out_scale is None else quantize_int8_static(out, out_scale).values
 
 
-def _add_residual(out: Tensor, residual: Tensor, relu: bool) -> Tensor:
-    """``relu(out + residual)`` in FP32, BF16 out; ``residual`` may have fewer (unpadded) channels than ``out``."""
+def _add_residual(out: Tensor, residual: Tensor, relu: bool, residual_scale: Tensor | None = None) -> Tensor:
+    """``relu(out + residual [* residual_scale])`` in FP32, BF16 out; ``residual`` may have fewer channels than ``out``."""
     channels = residual.shape[-1]
     summed = out.float()
-    summed[..., :channels] += residual.float()
+    term = residual.float() if residual_scale is None else residual.float() * residual_scale.float()
+    summed[..., :channels] += term
     return (summed.relu() if relu else summed).to(torch.bfloat16)
 
 
@@ -309,7 +330,7 @@ def block_scaled_conv_available(platform: Platform) -> bool:
 def _mxfp8_conv2d_reference(
     x: Tensor, channel_exponent: Tensor, weight: Tensor, weight_exponent: Tensor, bias: Tensor | None,
     kh: int, kw: int, sh: int, sw: int, ph: int, pw: int, dh: int, dw: int, *, relu: bool = False,
-    residual: Tensor | None = None, out_exponent: Tensor | None = None,
+    residual: Tensor | None = None, residual_scale: Tensor | None = None, out_exponent: Tensor | None = None,
 ) -> Tensor:
     """``x`` E4M3 ``[B, H, W, Cin]`` (``Cin`` already padded to a multiple of 32), ``channel_exponent`` int8
     ``[Cin / 32]`` (one static exponent per input-channel block, the *same* for every tap: a tap only changes which
@@ -333,7 +354,7 @@ def _mxfp8_conv2d_reference(
     packed_weight = QuantizedWeight(weight, weight_exponent, tuple(weight.shape))
     out = mxfp8_linear(activation, bias, packed_weight).reshape(b, ho, wo, -1)
     if residual is not None:  # see int8_conv2d
-        out = _add_residual(out, residual, relu)
+        out = _add_residual(out, residual, relu, residual_scale)
     elif relu:
         out = F.relu(out)  # ReLU commutes with the BF16 rounding: same bits as the fused epilogue
     return out if out_exponent is None else quantize_static(out, out_exponent).values

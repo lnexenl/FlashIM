@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- Ten new image-matching model families (all verified against upstream parity oracles with `fp32` / `bf16` / `int8` / `fp8` presets and custom Triton / CUDA C++ kernels):
+  - Dense matchers: `roma`, `roma-indoor`, `tiny-roma`, `ufm`, `mast3r`, `dust3r` (`mast3r` and `dust3r` use FP16 compute under `bf16`/`int8`/`fp8` to avoid BF16 ULP loss on CroCo's ~344–649 residual peaks).
+  - Detector-free / cross-modal matchers: `eloftr`, `xoftr`, `minima-loftr`, `minima-roma`.
+  - Sparse matchers & pipelines: `superglue`, `superpoint-superglue`, `omniglue`, `omniglue-extractor`, `omniglue-matcher` (adding SuperPoint `sp_v6` variant).
+- Shared ops & quantization infrastructure:
+  - Unified register-resident + L2-streaming CUDA Sinkhorn library (`csrc/sinkhorn.cu`, `ops.log_optimal_transport` and `ops.sinkhorn_mutual`); CUDA BVH 3D reciprocal NN (`csrc/reciprocal_nn.cu`, `ops.reciprocal_nn`); Triton ops for 2D/interleaved RoPE, ELU linear attention, bilinear upsampling (+ INT8 quantize), 2D box NMS, ReLU-affine, window gather, and fused LayerNorm/GELU/rotation per-row dynamic INT8 quantization (`layernorm_orthogonal`, `signed_hadamard`, FP16 `DynamicInt8Linear` / `DynamicInt8TransformerBlock`).
+  - Dynamic-only quantization configs skip calibration table loading unless explicitly supplied or registered (`calibration_metadata = None`).
+
+### Fixed
+
+- `decode_jpeg_cuda`: fixed stream/allocator race in nvJPEG GPU decoding causing intermittent pixel corruption (`fix/jpeg-decode`).
+
 ### Performance
 
 - LoMa `int8` (`loma-*` pipelines, sm_89 / sm_90), from the LoMa tuning prototypes:

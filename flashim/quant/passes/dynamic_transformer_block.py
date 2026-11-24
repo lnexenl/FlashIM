@@ -21,11 +21,22 @@ from torch import Tensor, nn
 from flashim import ops
 from flashim.layers import TransformerBlock
 from flashim.quant.methods.int8_linear import DynamicInt8Linear
+from flashim.quant.methods.linear import StaticMXFP8Linear
 from flashim.utils import set_submodule
 
 
 def _dynamic_linears(block: TransformerBlock) -> bool:
-    return all(isinstance(m, DynamicInt8Linear) for m in (block.attn.qkv, block.attn.proj, block.mlp.fc1, block.mlp.fc2))
+    linears = (block.attn.qkv, block.attn.proj, block.mlp.fc1, block.mlp.fc2)
+    return (
+        all(isinstance(m, DynamicInt8Linear) for m in linears[:2])
+        and isinstance(linears[2], (DynamicInt8Linear, StaticMXFP8Linear))
+        and isinstance(linears[3], (DynamicInt8Linear, StaticMXFP8Linear))
+        and not (isinstance(linears[2], StaticMXFP8Linear) and isinstance(linears[3], StaticMXFP8Linear))
+        and all(
+            getattr(m, "channel_scale", None) is None and getattr(m, "block_rotate", None) is None
+            for m in linears[:3]
+        )
+    )
 
 
 def is_fusable(block: nn.Module) -> bool:
@@ -41,8 +52,9 @@ def is_fusable(block: nn.Module) -> bool:
 
 
 class DynamicInt8TransformerBlock(nn.Module):
-    """:class:`~flashim.layers.TransformerBlock` (same submodule names) with the fusions of this module's docstring.
-    ``rope`` is not supported (DINOv2 has none): such a call runs the original block."""
+    """:class:`~flashim.layers.TransformerBlock` (same submodule names) with the fusions of this module's docstring."""
+
+    fuse_gelu_quantize: bool = False
 
     def __init__(self, block: TransformerBlock, device: torch.device | None = None) -> None:
         super().__init__()
@@ -51,27 +63,32 @@ class DynamicInt8TransformerBlock(nn.Module):
         self.norm1, self.attn, self.norm2, self.mlp = block.norm1, block.attn, block.norm2, block.mlp
         self.ls1, self.ls2 = block.ls1, block.ls2
         self._exact_gelu = isinstance(self.mlp.act, nn.GELU) and self.mlp.act.approximate == "none"
-        self._plan: dict[torch.device, tuple[bool, bool, bool]] = {}
+        self._plan: dict[tuple[torch.device, torch.dtype], tuple[bool, bool, bool]] = {}
         if device is not None:
-            self.plan(device)
+            self.plan(device, self.norm1.weight.dtype)
 
-    def plan(self, device: torch.device) -> tuple[bool, bool, bool]:
-        """``(layernorm+quantize, GELU epilogue, residual epilogue)`` fused for BF16 tokens on ``device``, decided once
-        per device with probe tensors (the op's ``when`` / libdevice probe may compile a kernel: do it before CUDA graph
-        capture, the pass calls this at build time)."""
-        if device not in self._plan:
+    def plan(self, device: torch.device, token_dtype: torch.dtype = torch.bfloat16) -> tuple[bool, bool, bool]:
+        """``(layernorm+quantize, GELU epilogue, residual epilogue)`` fused for BF16/FP16 tokens on ``device``,
+        decided once per ``(device, dtype)`` with probe tensors (the op's ``when`` / libdevice probe may compile a
+        kernel: do it before CUDA graph capture, the pass calls this at build time)."""
+        key = (device, token_dtype)
+        if key not in self._plan:
             channels = self.norm1.weight.shape[0]
             qkv, fc1 = self.attn.qkv, self.mlp.fc1
-            rows = torch.zeros(64, channels, device=device, dtype=torch.bfloat16)
+            rows = torch.zeros(64, channels, device=device, dtype=token_dtype)
             q = torch.zeros(64, channels, device=device, dtype=torch.int8)
             s = torch.ones(64, 1, device=device)
             ln = ops.layernorm_quantize_int8_rows.supports(rows, self.norm1.weight, self.norm1.bias, self.norm1.eps)
-            gelu = self._exact_gelu and ops.int8_linear.supports(
-                q, fc1.weight_int8, s, fc1.weight_scale, fc1.bias, gelu=True)
+            extra = {"out_dtype": token_dtype} if token_dtype == torch.float16 else {}
+            gelu = (
+                self._exact_gelu
+                and isinstance(fc1, DynamicInt8Linear)
+                and ops.int8_linear.supports(q, fc1.weight_int8, s, fc1.weight_scale, fc1.bias, gelu=True, **extra)
+            )
             residual = ops.int8_linear.supports(
-                q, qkv.weight_int8[:channels], s, qkv.weight_scale[:channels], None, residual=rows)
-            self._plan[device] = (ln, gelu, residual)
-        return self._plan[device]
+                q, qkv.weight_int8[:channels], s, qkv.weight_scale[:channels], None, residual=rows, **extra)
+            self._plan[key] = (ln, gelu, residual)
+        return self._plan[key]
 
     @staticmethod
     def _linear(lin: DynamicInt8Linear, q: Tensor, s: Tensor, **epilogue) -> Tensor:
@@ -82,25 +99,66 @@ class DynamicInt8TransformerBlock(nn.Module):
             return ops.layernorm_quantize_int8_rows(x, norm.weight, norm.bias, norm.eps)
         return ops.quantize_int8_rows(norm(x))
 
+    def _quantize_fc2_input(self, h: Tensor, *, apply_act: bool) -> tuple[Tensor, Tensor]:
+        fc2_cs, fc2_rot = self.mlp.fc2.channel_scale, self.mlp.fc2.block_rotate
+        if apply_act and fc2_rot is None and fc2_cs is None and self.fuse_gelu_quantize and isinstance(self.mlp.act, nn.GELU):
+            return ops.gelu_quantize_int8_rows(h, self.mlp.act.approximate)
+        if apply_act:
+            h = self.mlp.act(h)
+        if fc2_rot is not None:
+            return ops.rotate_quantize_int8_rows(h, fc2_rot, channel_scale=fc2_cs)
+        if fc2_cs is not None:
+            return ops.quantize_int8_rows(h, channel_scale=fc2_cs)
+        return ops.quantize_int8_rows(h)
+
     def forward(self, x: Tensor, rope: tuple[Tensor, Tensor] | None = None) -> Tensor:
-        if rope is not None or x.dtype != torch.bfloat16 or not x.is_contiguous():
+        if x.dtype not in (torch.bfloat16, torch.float16) or not x.is_contiguous():
             return self._unfused(x, rope)
-        ln, gelu, residual = self.plan(x.device)
+        ln, gelu, residual = self.plan(x.device, x.dtype)
+        out_kw = {"out_dtype": x.dtype} if x.dtype == torch.float16 else {}
         batch, tokens, channels = x.shape
         flat = x.reshape(-1, channels)
         attn = self.attn
         q, s = self._norm_quantize(self.norm1, flat, ln)
-        qkv = self._linear(attn.qkv, q, s).reshape(batch, tokens, 3, attn.num_heads, channels // attn.num_heads)
+        qkv = self._linear(attn.qkv, q, s, **out_kw).reshape(batch, tokens, 3, attn.num_heads, channels // attn.num_heads)
         qh, kh, vh = (t.transpose(1, 2) for t in qkv.unbind(2))
-        out = ops.sdpa.get(attn.sdpa_impl)(qh, kh, vh).transpose(1, 2).reshape(-1, channels)
-        q, s = ops.quantize_int8_rows(out if out.is_contiguous() else out.contiguous())
-        x1 = self._linear(attn.proj, q, s, residual=flat) if residual else flat + self._linear(attn.proj, q, s)
+        if rope is not None:
+            rope_op = ops.rope_qk_2d if getattr(attn, "rope_2d", False) else ops.rope_qk
+            qh, kh = rope_op.get(attn.rope_impl)(qh, kh, *rope)
+        out = ops.sdpa.get(attn.sdpa_impl)(qh, kh, vh)
+        q, s = ops.quantize_int8_rows_heads(out)
+        x1 = (
+            self._linear(attn.proj, q, s, residual=flat, **out_kw)
+            if residual
+            else flat + self._linear(attn.proj, q, s, **out_kw)
+        )
+        if isinstance(self.mlp.fc1, StaticMXFP8Linear):
+            h = self.mlp.fc1.matmul(self.mlp.fc1.quantize_layernorm(x1, None, self.norm2), bias=True).to(x1.dtype)
+            q, s = self._quantize_fc2_input(h, apply_act=True)
+            x2 = (
+                self._linear(self.mlp.fc2, q, s, residual=x1, **out_kw)
+                if residual
+                else x1 + self._linear(self.mlp.fc2, q, s, **out_kw)
+            )
+            return x2.view(batch, tokens, channels)
         q, s = self._norm_quantize(self.norm2, x1, ln)
+        if isinstance(self.mlp.fc2, StaticMXFP8Linear):
+            h = self._linear(self.mlp.fc1, q, s, **out_kw)
+            if isinstance(self.mlp.act, nn.GELU):
+                packed = self.mlp.fc2.quantize_gelu(h, self.mlp.act.approximate)
+                x2 = x1 + self.mlp.fc2.matmul(packed, bias=True).to(x1.dtype)
+            else:
+                x2 = x1 + self.mlp.fc2(self.mlp.act(h)).to(x1.dtype)
+            return x2.view(batch, tokens, channels)
         if gelu:
-            q, s = ops.quantize_int8_rows(self._linear(self.mlp.fc1, q, s, gelu=True))
+            q, s = self._quantize_fc2_input(self._linear(self.mlp.fc1, q, s, gelu=True, **out_kw), apply_act=False)
         else:
-            q, s = ops.quantize_int8_rows(self.mlp.act(self._linear(self.mlp.fc1, q, s)))
-        x2 = self._linear(self.mlp.fc2, q, s, residual=x1) if residual else x1 + self._linear(self.mlp.fc2, q, s)
+            q, s = self._quantize_fc2_input(self._linear(self.mlp.fc1, q, s, **out_kw), apply_act=True)
+        x2 = (
+            self._linear(self.mlp.fc2, q, s, residual=x1, **out_kw)
+            if residual
+            else x1 + self._linear(self.mlp.fc2, q, s, **out_kw)
+        )
         return x2.view(batch, tokens, channels)
 
     def _unfused(self, x: Tensor, rope: tuple[Tensor, Tensor] | None) -> Tensor:

@@ -10,6 +10,11 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | model | what it is | presets |
 |---|---|---|
 | [`romav2`](models/romav2.md) | RoMa v2 dense matcher (DINOv3 ViT-L/16, MV-ViT, DPT head, conv refiners) | `bf16`, `int8`, **`fp8`** |
+| `roma`, `roma-indoor`, `minima-roma` | RoMa (v1) dense matcher (VGG19-BN, DINOv2 ViT-L/14, GP + Transformer decoder, conv refiners; `roma` = outdoor, `minima-roma` = MINIMA modality-invariant weights) | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `tiny-roma` | Tiny-RoMa dense matcher (`tiny_roma_v1_outdoor`: XFeat backbone + coarse/fine conv refiners) | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `mast3r` | MASt3R 3D-grounded dense matcher (CroCo ViT-L encoder, ViT-B cross-attention decoder, CatMLP+DPT heads; **FP16 compute** under `bf16`/`int8`/`fp8`; CC BY-NC-SA 4.0) | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `dust3r` | DUSt3R stereo 3D pointmap matcher (CroCo ViT-L encoder, ViT-B cross-attention decoder, DPT heads; **FP16 compute** under `bf16`/`int8`/`fp8`; CC BY-NC-SA 4.0) | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `ufm` | UFM-Base dense flow & covisibility matcher (DINOv2 ViT-L/14 + 12-layer global ViT + dual DPT heads; BSD-3-Clause code, CC BY-NC-SA 4.0 weights) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | [`rdd`](models/rdd.md) | RDD sparse detector + descriptor (ConvNeXt-tiny, multi-scale deformable transformer) | `fp32`, `bf16`, **`fp8`** |
 | [`aliked`](models/aliked.md) | ALIKED sparse detector + descriptor (deformable-conv encoder, SDDH) | **`fp32`**, `bf16` |
 | [`raco`](models/raco-aliked-lightglue.md) | RaCo keypoint detector + ranker | **`fp32`**, `bf16` |
@@ -23,7 +28,9 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | `dedode-g` | DeDoDe v2 detector L + descriptor G (VGG19 + DINOv2 ViT-L/14) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `dad` | DaD detector (VGG11) + DeDoDe-G descriptors | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `ripe` | RIPE (VGG19 + ConvRefiner heatmap, hypercolumn 256-d descriptors) | `fp32`, **`bf16`**, `int8`, `fp8` |
-| `loftr` | LoFTR detector-free, semi-dense matcher (variants `outdoor`, `indoor`); `match(a, b)` only | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `loftr`, `minima-loftr` | LoFTR detector-free, semi-dense matcher (variants `outdoor`, `indoor`, `minima`); `match(a, b)` only | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `eloftr` | EfficientLoFTR detector-free, semi-dense matcher (RepVGG + aggregated RoPE attention; variants `full`, `opt`); `match(a, b)` only | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `xoftr` | XoFTR cross-modal (visible-thermal) detector-free matcher (default 640 px); `match(a, b)` only | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `sift`, `orb` | OpenCV baselines (CPU detection, GPU matching) | `fp32` |
 | [`lightglue`](models/lightglue.md) | LightGlue sparse matcher (variants `rdd`, `aliked`, `raco-aliked`, `superpoint`, `disk`, `xfeat`) | `fp32`, `bf16`, `int8`, **`fp8`** |
 | [`rdd-lightglue`](models/lightglue.md) | RDD + LightGlue | `fp32`, `bf16`, `int8`, **`fp8`** |
@@ -35,15 +42,26 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | [`raco-<model>-lightglue`](models/raco-aliked-lightglue.md#raco-with-other-models) | RaCo keypoints + `superpoint`, `disk`, `xfeat` or `rdd` descriptors + LightGlue with that model's weights | as `<model>-lightglue` |
 | [`loma-<variant>`](models/loma.md) | LoMa: DaD keypoints + LoMa-trained DeDoDe descriptors + LoMa's LightGlue-style matcher (`loma-b128`, `loma-b`, `loma-l`, `loma-g`, `loma-r`; `loma` = `loma-b`) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | [`loma-extractor`](models/loma.md), [`loma-matcher`](models/loma.md) | LoMa's components (variant `b128` \| `b` \| `l` \| `g` \| `r`) | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `superglue` | SuperGlue attentional GNN + Sinkhorn OT sparse matcher (variants `outdoor`, `indoor`; Magic Leap non-commercial) | `fp32`, **`bf16`**, `int8` |
+| `superpoint-superglue` | SuperPoint (`nms=4`, `threshold=0.005`) + SuperGlue (Magic Leap non-commercial; variant `outdoor` \| `indoor`) | `fp32`, **`bf16`**, `int8` |
+| `omniglue` | OmniGlue: SuperPoint (`sp_v6`, MIT) + DINOv2 ViT-B/14 + 18-layer DINO-masked GNN + Sinkhorn matcher (Apache-2.0) | `fp32`, **`bf16`**, `int8` |
+| `omniglue-extractor`, `omniglue-matcher` | OmniGlue's components (`omniglue-matcher` omits `fp8` and degrades `fp8` -> `int8`) | `fp32`, **`bf16`**, `int8` *(extractor adds `fp8`)* |
 
 Every learned model is a native PyTorch port that is checked against its upstream implementation (`tests/parity`).
+
+**Preset notes.** `fp8` is not a preset of `superpoint-superglue` and `omniglue`: it builds `int8`, because MXFP8
+loses accuracy in their extractors (SuperPoint, DINOv2 ViT-B/14) and `int8` is faster and more accurate
+([accuracy](benchmarks.md#accuracy-of-the-2026-11-additions)). Licenses that restrict use: `superglue` / `superpoint-superglue`
+(Magic Leap, non-commercial), `mast3r` / `dust3r` / `ufm` weights (CC BY-NC-SA 4.0), and `eloftr`, whose upstream
+changed its license to ZJU3DV's PRL v1.0 on 2026-09-15 (the vendored oracle and the weights are Apache-2.0 from before
+that); see `THIRD_PARTY_NOTICES.md`.
 
 **Presets** name a precision:
 
 | preset | meaning |
 |---|---|
 | `fp32` | the checkpoint's own precision |
-| `bf16` | BF16 compute; keypoint selection, softmaxes and sampling / position math stay FP32 |
+| `bf16` | BF16 compute (`mast3r` and `dust3r` use FP16 compute because CroCo residual peaks reach ~344–649 where BF16 ULP degrades 3D precision); keypoint selection, softmaxes and sampling / position math stay FP32 |
 | `int8` | INT8 with symmetric per-output-channel weights and one calibrated scale per activation tensor (DeDoDe-G's DINOv2 ViT: one scale per token, computed at run time) |
 | `fp8` | MXFP8: FP8 (E4M3) values with one power-of-two (E8M0) scale per 32 elements |
 
