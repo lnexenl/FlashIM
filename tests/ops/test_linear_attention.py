@@ -13,6 +13,7 @@ DEV = "cuda"
     (1, 16800, 16500, 8, 32),  # LoFTR coarse at 1200 px
     (2, 4800, 4800, 8, 32),    # LoFTR coarse batched self-attention
     (500, 25, 25, 8, 16),      # LoFTR fine 5x5 windows
+    (10000, 25, 25, 8, 16),    # LoFTR fine with N*H > 65535 (gridDim.y limit)
     (1, 13, 19, 4, 32),        # tiny ragged
     (1, 300, 500, 2, 64),      # dim=64
 ])

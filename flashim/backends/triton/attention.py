@@ -335,8 +335,8 @@ def _linear_attn_kv_kernel(
 ):
     """Split-S accumulation of ``k_sum = sum_s (elu(k) + 1)`` and ``kv = (elu(k) + 1)^T (v / S)`` per (batch, head).
     Every K/V token is read once (no materialized ELU / scaled-V / BF16-cast intermediates)."""
-    split_id = tl.program_id(0)
-    nh = tl.program_id(1)
+    nh = tl.program_id(0)
+    split_id = tl.program_id(1)
     n = (nh // H).to(tl.int64)
     h = (nh % H).to(tl.int64)
     chunk = tl.cdiv(S, NUM_SPLITS)
@@ -375,8 +375,8 @@ def _linear_attn_q_kernel(
     D: tl.constexpr, BLOCK_L: tl.constexpr, BF16_GEMM: tl.constexpr,
 ):
     """Fused ``(elu(q) + 1) @ kv * (length / ((elu(q) + 1) . k_sum + eps))``, written directly in ``out_ptr`` dtype."""
-    pid_l = tl.program_id(0)
-    nh = tl.program_id(1)
+    nh = tl.program_id(0)
+    pid_l = tl.program_id(1)
     n = (nh // H).to(tl.int64)
     h = (nh % H).to(tl.int64)
     offs_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
@@ -413,7 +413,7 @@ def linear_attention(
     stages = 2 if dim >= 64 else 3
     ksum_part = torch.empty((nh, num_splits, dim), device=q.device, dtype=torch.float32)
     kv_part = torch.empty((nh, num_splits, dim, dim), device=q.device, dtype=torch.float32)
-    _linear_attn_kv_kernel[(num_splits, nh)](
+    _linear_attn_kv_kernel[(nh, num_splits)](
         k, v, ksum_part, kv_part,
         k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1), v.stride(2),
         heads, s_len, 1.0 / s_len,
@@ -427,7 +427,7 @@ def linear_attention(
         kv = kv_part.squeeze(1)
     out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
     block_l = (64 if dim >= 64 else 128) if l_len >= 128 else max(16, triton.next_power_of_2(l_len))
-    _linear_attn_q_kernel[(triton.cdiv(l_len, block_l), nh)](
+    _linear_attn_q_kernel[(nh, triton.cdiv(l_len, block_l))](
         q, ksum, kv, out,
         q.stride(0), q.stride(1), q.stride(2), out.stride(0), out.stride(1), out.stride(2),
         heads, l_len, float(eps), float(s_len),
