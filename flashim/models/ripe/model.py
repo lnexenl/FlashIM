@@ -14,6 +14,7 @@ from flashim.models import sparse
 from flashim.models.dedode import blocks
 from flashim.models.ripe import weights
 from flashim.platforms import default_device
+from flashim.types import Matches, SparseFeatures
 from flashim.utils import device_constant
 
 
@@ -72,3 +73,12 @@ class RIPE(sparse.SparseExtractor):
         hyper = ops.bilinear_sample_points(features, grid, align_corners=True, out_dtype=weight.dtype)  # [K, 960]
         desc = F.linear(hyper, weight[:, :, 0], self.conv_dim_reduction_coarse_desc.bias)
         return F.normalize(desc.float(), dim=-1)
+
+    @torch.inference_mode()
+    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
+        limit = self.match_threshold if threshold is None else threshold
+        desc0, desc1 = a.descriptors[0], b.descriptors[0]
+        if self.compute_dtype != torch.float32 and desc0.is_cuda:
+            desc0, desc1 = desc0.to(self.compute_dtype), desc1.to(self.compute_dtype)
+        ia, ib, score = ops.mutual_nn_match(desc0, desc1, limit)
+        return Matches(a.keypoints[0][ia], b.keypoints[0][ib], score, ia, ib)

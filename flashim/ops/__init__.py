@@ -31,7 +31,7 @@ from flashim.ops.conv import (
     int8_conv2d_maxpool,
     mxfp8_conv2d,
 )
-from flashim.ops.correlation import dual_softmax_mutual, local_corr
+from flashim.ops.correlation import dual_softmax_mutual, local_corr, mutual_nn_match
 from flashim.ops.density import kde_density
 from flashim.ops.gemm import (
     int8_linear,
@@ -108,6 +108,7 @@ __all__ = [
     "local_corr",
     "matmul_nt_fp32",
     "multiscale_fuse",
+    "mutual_nn_match",
     "mxfp8_conv2d",
     "mxfp8_gelu_mlp",
     "mxfp8_linear",

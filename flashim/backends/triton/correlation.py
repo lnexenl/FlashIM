@@ -399,3 +399,114 @@ def _dual_softmax_mutual_impl(
     sim: Tensor, row_bias: Tensor | None = None, col_bias: Tensor | None = None
 ) -> tuple[Tensor, Tensor, Tensor]:
     return dual_softmax_mutual(sim, row_bias, col_bias)
+
+
+# -- fused tiled mutual-nearest-neighbour matching (ops.mutual_nn_match) ----------------------------------
+# Avoids materializing the full [M, N] FP32 similarity matrix (4.2 GB at M=N=32k for RIPE): each row block
+# computes [BLOCK_M, BLOCK_N] inner-product tiles in registers, tracks row max/argmax online and writes only
+# [m_blocks, N] column partials (65 MB at 32k), reduced in a tiny second pass.
+
+
+@triton.jit
+def _mnn_tiled_kernel(
+    a_ptr, b_ptr, row_val_ptr, row_idx_ptr, col_val_ptr, col_idx_ptr,
+    M, N, D, sa_m, sa_k, sb_n, sb_k,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, USE_TF32: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_ok = rows < M
+    row_best = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    row_best_idx = tl.zeros((BLOCK_M,), dtype=tl.int32)
+    a_row_base = a_ptr + rows[:, None].to(tl.int64) * sa_m
+
+    for n_start in range(0, N, BLOCK_N):
+        cols = n_start + tl.arange(0, BLOCK_N)
+        col_ok = cols < N
+        b_col_base = b_ptr + cols[None, :].to(tl.int64) * sb_n
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_start in range(0, D, BLOCK_K):
+            ks = k_start + tl.arange(0, BLOCK_K)
+            k_ok = ks < D
+            a = tl.load(a_row_base + ks[None, :].to(tl.int64) * sa_k, mask=row_ok[:, None] & k_ok[None, :], other=0.0)
+            b = tl.load(b_col_base + ks[:, None].to(tl.int64) * sb_k, mask=k_ok[:, None] & col_ok[None, :], other=0.0)
+            if USE_TF32:
+                acc = tl.dot(a, b, acc, input_precision="tf32")
+            else:
+                acc = tl.dot(a, b, acc)
+        tile = tl.where(row_ok[:, None] & col_ok[None, :], acc, -float("inf"))
+        r_val, r_idx = tl.max(tile, axis=1, return_indices=True)
+        better = r_val > row_best
+        row_best = tl.where(better, r_val, row_best)
+        row_best_idx = tl.where(better, n_start + r_idx, row_best_idx)
+        c_val, c_idx = tl.max(tile, axis=0, return_indices=True)
+        partial = pid_m.to(tl.int64) * N + cols
+        tl.store(col_val_ptr + partial, c_val, mask=col_ok)
+        tl.store(col_idx_ptr + partial, pid_m * BLOCK_M + c_idx, mask=col_ok)
+
+    tl.store(row_val_ptr + rows, row_best, mask=row_ok)
+    tl.store(row_idx_ptr + rows, row_best_idx, mask=row_ok)
+
+
+@triton.jit
+def _mnn_col_reduce_kernel(col_val_ptr, col_idx_ptr, nn10_ptr, N, M_BLOCKS, BLOCK_N: tl.constexpr):
+    cols = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_ok = cols < N
+    best = tl.full((BLOCK_N,), -float("inf"), dtype=tl.float32)
+    best_idx = tl.zeros((BLOCK_N,), dtype=tl.int32)
+    for mb in range(M_BLOCKS):
+        off = mb.to(tl.int64) * N + cols
+        val = tl.load(col_val_ptr + off, mask=col_ok, other=-float("inf"))
+        idx = tl.load(col_idx_ptr + off, mask=col_ok, other=0)
+        better = val > best
+        best = tl.where(better, val, best)
+        best_idx = tl.where(better, idx, best_idx)
+    tl.store(nn10_ptr + cols, best_idx, mask=col_ok)
+
+
+def mutual_nn_match(desc0: Tensor, desc1: Tensor, threshold: float = 0.0) -> tuple[Tensor, Tensor, Tensor]:
+    m, d = desc0.shape
+    n = desc1.shape[0]
+    device = desc0.device
+    if m == 0 or n == 0:
+        empty = torch.zeros(0, dtype=torch.long, device=device)
+        return empty, empty, desc0.new_zeros(0, dtype=torch.float32)
+    use_tf32 = desc0.dtype == torch.float32
+    block_m = 64 if (m < 2048 or use_tf32) else 128
+    block_n = 64 if n < 1024 else 128
+    block_k = 32 if use_tf32 else 64
+    # Measured on sm_120 (32320 x 23731 x 256 BF16): (128, 128, 64, nw=4, ns=2) = 5.38 ms vs 6.57 ms at nw=8
+    # (and 22.54 ms / 3.23 GB peak VRAM for the materialized FP32 reference).
+    num_warps = 4
+    m_blocks = triton.cdiv(m, block_m)
+    row_val = torch.empty(m, device=device, dtype=torch.float32)
+    row_idx = torch.empty(m, device=device, dtype=torch.int32)
+    col_val = torch.empty((m_blocks, n), device=device, dtype=torch.float32)
+    col_idx = torch.empty((m_blocks, n), device=device, dtype=torch.int32)
+    _mnn_tiled_kernel[(m_blocks,)](
+        desc0, desc1, row_val, row_idx, col_val, col_idx,
+        m, n, d, desc0.stride(0), desc0.stride(1), desc1.stride(0), desc1.stride(1),
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, USE_TF32=use_tf32,
+        num_warps=num_warps, num_stages=2,
+    )
+    nn10 = torch.empty(n, device=device, dtype=torch.int32)
+    _mnn_col_reduce_kernel[(triton.cdiv(n, 256),)](col_val, col_idx, nn10, n, m_blocks, BLOCK_N=256, num_warps=4)
+    nn01 = row_idx.long()
+    ids0 = torch.arange(m, device=device)
+    idx0 = torch.nonzero((nn10[nn01].long() == ids0) & (row_val >= threshold))[:, 0]
+    return idx0, nn01[idx0], row_val[idx0]
+
+
+def _mnn_eligible(desc0: Tensor, desc1: Tensor, threshold: float = 0.0) -> bool:
+    return (
+        desc0.ndim == desc1.ndim == 2
+        and desc0.shape[1] == desc1.shape[1]
+        and desc0.dtype == desc1.dtype
+        and desc0.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and desc0.is_cuda and desc1.is_cuda
+    )
+
+
+ops.mutual_nn_match.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 0)), requires=[Feature.TRITON], when=_mnn_eligible
+)(mutual_nn_match)
