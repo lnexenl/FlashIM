@@ -921,6 +921,27 @@ def test_upsample_concat_int8_rows_is_bit_identical_to_the_tile_kernel(coarse_si
 
 
 @_needs_rows
+@pytest.mark.parametrize("coarse_size", [(1, 1), (3, 5), (19, 23), (112, 150), (7, 70)])
+@pytest.mark.parametrize("channels", [(256, 256), (128, 128), (64, 32), (24, 40), (512, 512)])
+@pytest.mark.parametrize("layout", ["nchw", "nhwc"])
+def test_upsample_concat_bf16_rows_is_bit_identical_to_the_tile_kernel(coarse_size, channels, layout):
+    """Exact 2x, BF16 taps: every product of the bilinear weights (1/4, 3/4) is exact, so the row-pair kernel gives the
+    tile kernel's BF16 values bit for bit (and declines non-2x / FP32 taps)."""
+    torch.manual_seed(0)
+    fmt = _channels(layout)
+    (c_features, c_coarse), (h, w) = channels, coarse_size
+    features = (torch.randn(2, c_features, 2 * h, 2 * w, device=DEV) * 2).bfloat16().contiguous(memory_format=fmt)
+    coarse = (torch.randn(2, c_coarse, h, w, device=DEV) * 2).bfloat16().contiguous(memory_format=fmt)
+    assert ops.upsample_concat.explain(features, coarse)["triton_rows"] == "selected"
+    ops.reset_call_counts()
+    got = ops.upsample_concat(features, coarse)
+    assert ops.call_counts()["upsample_concat"] == {"triton_rows": 1}
+    want = ops.upsample_concat.get("triton")(features, coarse)
+    assert got.shape == (2, c_features + c_coarse, 2 * h, 2 * w) and got.dtype == torch.bfloat16
+    assert got.is_contiguous(memory_format=torch.channels_last) and torch.equal(got, want)
+
+
+@_needs_rows
 def test_upsample_concat_int8_rows_declines_what_it_does_not_reproduce():
     """Other ratios (the descriptor's 56 -> 98 map) and FP32 taps stay on the tile kernel."""
     features = torch.randn(1, 32, 98, 98, device=DEV).bfloat16().contiguous(memory_format=torch.channels_last)
