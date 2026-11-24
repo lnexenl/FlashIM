@@ -54,3 +54,30 @@ def test_extract_and_match_on_cpu():
     assert (a.keypoints[..., 0] < 130).all() and (a.keypoints[..., 1] < 100).all()
     assert b.image_size == (100, 130)
     assert len(m.confidence) == 64  # every keypoint is its own mutual nearest neighbour
+
+
+def test_fold_batchnorm_preserves_outputs():
+    from flashim.models.rdd.spec import _fold_batchnorm
+
+    torch.manual_seed(0)
+    model = RDD(SMALL).eval()
+    for module in model.modules():
+        if isinstance(module, torch.nn.BatchNorm2d):
+            module.running_mean.normal_(0, 0.2)
+            module.running_var.uniform_(0.5, 2.0)
+            if module.affine:
+                module.weight.data.uniform_(0.5, 1.5)
+                module.bias.data.normal_(0, 0.1)
+    image = torch.rand(1, 3, 64, 64)
+    feat = torch.randn(1, SMALL.d_model, 16, 16)
+    with torch.inference_mode():
+        det_before = model.detector(image)
+        mat_before = model.matchability(feat)
+    folded = _fold_batchnorm(model, None)
+    assert len(folded) == 8 + 2  # 4 detector blocks x 2 + 2 matchibility_head BasicLayers
+    assert not any(isinstance(m, torch.nn.BatchNorm2d) for m in model.modules())
+    with torch.inference_mode():
+        det_after = model.detector(image)
+        mat_after = model.matchability(feat)
+    torch.testing.assert_close(det_after, det_before, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(mat_after, mat_before, atol=1e-5, rtol=1e-5)

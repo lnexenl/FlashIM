@@ -29,6 +29,28 @@ def _set_precision(model: RDD, config: RunConfig) -> None:
         model.detector.set_dtype(dtype(detector))
 
 
+def _fold_batchnorm(model: RDD, ctx: BuildContext) -> list[str]:
+    """Fold eval BatchNorm into its preceding Conv2d across ``detector`` and ``matchibility_head`` (exact)."""
+    from flashim.models.rdd.detector import ConvBlock, ResBlock
+    from flashim.models.rdd.model import BasicLayer
+
+    if model.training:
+        raise RuntimeError("fold_batchnorm requires model.eval()")
+    folded = []
+    for name, module in model.named_modules():
+        if isinstance(module, (ConvBlock, ResBlock)) and isinstance(module.bn1, nn.BatchNorm2d):
+            module.conv1 = nn.utils.fusion.fuse_conv_bn_eval(module.conv1, module.bn1)
+            module.bn1 = nn.Identity()
+            module.conv2 = nn.utils.fusion.fuse_conv_bn_eval(module.conv2, module.bn2)
+            module.bn2 = nn.Identity()
+            folded += [f"{name}.conv1", f"{name}.conv2"]
+        elif isinstance(module, BasicLayer) and isinstance(module.layer[1], nn.BatchNorm2d):
+            module.layer[0] = nn.utils.fusion.fuse_conv_bn_eval(module.layer[0], module.layer[1])
+            module.layer[1] = nn.Identity()
+            folded.append(f"{name}.layer.0")
+    return folded
+
+
 def _fuse_query_projections(model: nn.Module, ctx: BuildContext) -> int:
     from flashim.layers import MSDeformAttn
 
@@ -36,7 +58,7 @@ def _fuse_query_projections(model: nn.Module, ctx: BuildContext) -> int:
     return model.fused_query_projections
 
 
-_BASE = {"optimize": {"passes": ["fuse_query_projections"]}}
+_BASE = {"optimize": {"passes": ["fold_batchnorm", "fuse_query_projections"]}}
 _BF16 = {"extends": "fp32", "precision": {"compute_dtype": "bf16"}}
 PRESETS = {
     "fp32": _BASE,
@@ -55,6 +77,9 @@ SPEC = ModelSpec(
     calibrations={name: preset.calibration for name, preset in quant.PRESETS.items() if preset.config is not None},
     protected=quant.PROTECTED,
     passes={
+        "fold_batchnorm": Pass(
+            _fold_batchnorm, stage="pre_quant", description="exact conv+BN fold (detector + matchibility_head)"
+        ),
         "fuse_query_projections": Pass(
             _fuse_query_projections, description="one GEMM for sampling offsets + attention weights (non-quantized)"
         ),
