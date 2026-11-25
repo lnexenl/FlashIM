@@ -33,8 +33,11 @@ to BF16 or protecting a layer; protecting layers is the last resort and needs th
 - Record every scheme tried with its accuracy and ms in the model's `quant.py`, rejected ones included, and the reason a preset
   was dropped there and in the preset notes of `docs/models.md`.
 - Target: within about 0.02 fidelity of BF16 and faster than BF16. If a preset ends up strictly worse than the next one
-  down (`fp8` vs `int8`), drop it from the spec so `build.NEAREST` builds the better one; for a pipeline omit it from
-  `_PIPELINE_PRESETS` (`superpoint-superglue`: SuperPoint `conv1b` has 41x channel outliers; `omniglue`: DINOv2 ViT-B under
-  MXFP8).
+  down (`fp8` vs `int8`), drop it from the spec so `build.NEAREST` builds the better one (e.g. `dedode`,
+  `aliked-lightglue`, `superpoint-lightglue`, `disk-lightglue` omit `fp8` -> `int8`; `xfeat-lightglue` omits `int8` and
+  `fp8` -> `bf16`); for a pipeline omit it from `_PIPELINE_PRESETS` (`superpoint-superglue`: SuperPoint `conv1b` has
+  41x channel outliers; `omniglue`: DINOv2 ViT-B under MXFP8). When a single variant or conv still needs BF16 exclusion
+  after alternative schemes are tried, use `ModelSpec.quant_configs` per-variant `<variant>/<quant>` lookup (e.g.
+  `loma-b128` `fp8`) or `extractor_spec(..., fp8_ignore=...)` (e.g. `superpoint` `conv1b`).
 - Small conv nets (channels < 128) lose to BF16 on speed too: keep them BF16 (`tiny-roma`, `superpoint`, `xfeat`).
 - The acceptance test is task-level: `verify-change` (AUC@5 drop < 0.005 vs BF16 with a paired bootstrap CI).

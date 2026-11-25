@@ -93,12 +93,15 @@ class StaticInt8Linear(nn.Module):
         self._unsmoothed("gelu_quantize_int8")
         return ops.gelu_quantize_int8(value, self.input_scale, approximate)
 
-    def forward_prequantized(self, quantized: Int8Tensor, relu: bool = False) -> Tensor:
-        """Consume an activation packed with this layer's input scale; BF16 out (``relu``: ReLU in the epilogue)."""
+    def forward_prequantized(
+        self, quantized: Int8Tensor, relu: bool = False, residual: Tensor | None = None
+    ) -> Tensor:
+        """Consume an activation packed with this layer's input scale; BF16 out (``relu`` / ``residual`` in the epilogue)."""
         if quantized.scale is not self.input_scale and not torch.equal(quantized.scale, self.input_scale):
             raise ValueError("Prequantized activation uses a different static scale")
         out = ops.int8_linear(
-            quantized.matrix(), self.weight_int8, self.input_scale, self.weight_scale, self.bias, relu=relu
+            quantized.matrix(), self.weight_int8, self.input_scale, self.weight_scale, self.bias,
+            relu=relu, residual=residual,
         )
         return out.reshape(*quantized.logical_shape[:-1], self.out_features)
 

@@ -253,6 +253,16 @@ def _fp8_mixed_int8(model: nn.Module, ctx: BuildContext) -> dict[str, int] | str
     return {"convs": len(sub.convs), "linears": len(sub.linears) - len(sub.convs)}
 
 
+def _batch_self_attention(model: nn.Module, ctx: BuildContext) -> str:
+    """Batch equal-shape self-attention pairs across both images in ``loftr_coarse`` / ``loftr_fine``."""
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    for tr in (model.loftr_coarse, model.loftr_fine):
+        if isinstance(tr, LocalFeatureTransformer):
+            tr.batch_self = True
+    return "loftr_coarse, loftr_fine"
+
+
 def _spec(
     name: str,
     default_variant: str,
@@ -285,6 +295,9 @@ def _spec(
         "bf16_coarse_similarity": Pass(
             _bf16_coarse_similarity, description="coarse similarity via cuBLAS BF16->FP32 matmul_nt_fp32 (not fp32)", exact=False
         ),
+        "batch_self_attention": Pass(
+            _batch_self_attention, description="batch equal-shape self-attention pairs across both images (not fp32)", exact=False
+        ),
         "fused_qkv": Pass(
             _fused_qkv, description="fused QKV (self) / KV (cross) projections + batched self-attention (not fp32)", exact=False
         ),
@@ -302,7 +315,10 @@ def _spec(
         ("rotate_v_merge", "fp8_mixed_int8", "channels_last_unquantized", "fused_fpn_upsample", "batch_backbone",
          "fused_linear_attention", "fused_qkv", "fused_encoder_epilogues", "bf16_coarse_similarity")
         if optimized
-        else ("channels_last", "bf16_linear_attention", "fold_similarity_temperature")
+        else (
+            "channels_last", "bf16_linear_attention", "fused_linear_attention",
+            "batch_self_attention", "fold_similarity_temperature", "bf16_coarse_similarity",
+        )
     )
     spec = extractor_spec(
         name=name,
@@ -311,7 +327,7 @@ def _spec(
         calibration_dir=CALIBRATION_DIR,
         quantized=QUANTIZED,
         protected=PROTECTED,
-        compile_regions=("backbone",),
+        compile_regions=("backbone",) if optimized else ("backbone", "loftr_coarse"),
         role="dense",
         extra_passes=extra_passes,
         structural_passes=structural,

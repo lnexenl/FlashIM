@@ -33,6 +33,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 
 import torch
 
+import flashim.log as _log
 from flashim.log import profiler_range, warn_once
 from flashim.platforms import Feature, Platform, platform_for
 
@@ -120,11 +121,13 @@ class _Config:
 
 
 _CONFIG = _Config()
+_HAS_OVERRIDES = False
 OPS: dict[str, Op] = {}
 
 
 def configure(spec: str | None) -> None:
     """Apply a ``FLASHIM_OPS``-style override string (replaces previous overrides)."""
+    global _HAS_OVERRIDES
     _CONFIG.disabled.clear()
     _CONFIG.forced.clear()
     for token in (spec or "").split(","):
@@ -138,6 +141,7 @@ def configure(spec: str | None) -> None:
             _CONFIG.forced[op] = impl
         else:
             raise ValueError(f"Invalid FLASHIM_OPS token {token!r}")
+    _HAS_OVERRIDES = bool(_CONFIG.disabled or _CONFIG.forced)
 
 
 def set_strict(strict: bool) -> None:
@@ -179,6 +183,8 @@ class Op:
         self.weights = weights
         self.impls: list[Impl] = []
         self.calls: Counter[str] = Counter()
+        self._candidates_cache: dict[Platform, tuple[Impl, ...]] = {}
+        self._auto_cache: dict[Platform, tuple[Impl, ...]] = {}
         self.__doc__ = reference.__doc__
         OPS[name] = self
 
@@ -205,13 +211,23 @@ class Op:
                     accepts,
                 )
             )
+            self._candidates_cache.clear()
+            self._auto_cache.clear()
             return fn
 
         return decorator
 
+    def _candidates_tuple(self, platform: Platform) -> tuple[Impl, ...]:
+        cached = self._candidates_cache.get(platform)
+        if cached is None:
+            available = [impl for impl in self.impls if impl.available(platform)]
+            cached = tuple(sorted(available, key=lambda i: (-i.priority, i.device.span, i.order)))
+            self._candidates_cache[platform] = cached
+            self._auto_cache[platform] = tuple(impl for impl in cached if not impl.opt_in)
+        return cached
+
     def candidates(self, platform: Platform) -> list[Impl]:
-        available = [impl for impl in self.impls if impl.available(platform)]
-        return sorted(available, key=lambda i: (-i.priority, i.device.span, i.order))
+        return list(self._candidates_tuple(platform))
 
     def _unknown_impl(self, name: str) -> str:
         from flashim.backends import BACKENDS, LOADED
@@ -221,6 +237,8 @@ class Op:
         return f"Op {self.name!r} has no impl {name!r} (registered: {[i.name for i in self.impls]}){hint}"
 
     def _platform(self, args: tuple, kwargs: dict) -> Platform:
+        if args and type(args[0]) is torch.Tensor:
+            return platform_for(args[0].device)
         return platform_for(_first_device(args) or _first_device(kwargs.values()) or torch.device("cpu"))
 
     def explain(self, *args, **kwargs) -> dict[str, str]:
@@ -251,17 +269,24 @@ class Op:
     ) -> Impl | None:
         """The impl to run (``None`` = the reference). Global overrides first; a pinned impl that does not apply
         falls back to the reference, not to other impls. ``strict=False``: no strict-mode error on a fallback."""
-        forced = _CONFIG.forced.get(self.name)
-        if forced == REFERENCE or self.name in _CONFIG.disabled:
-            return None
-        if forced is not None:
-            return self._find(forced)
+        if _HAS_OVERRIDES:
+            forced = _CONFIG.forced.get(self.name)
+            if forced == REFERENCE or self.name in _CONFIG.disabled:
+                return None
+            if forced is not None:
+                return self._find(forced)
         if pin == REFERENCE:
             return None
         platform = self._platform(args, kwargs)
-        for impl in [self._find(pin)] if pin is not None else self.candidates(platform):
-            if not impl.available(platform) or (pin is None and impl.opt_in):
-                continue
+        if pin is None:
+            impls = self._auto_cache.get(platform)
+            if impls is None:
+                self._candidates_tuple(platform)
+                impls = self._auto_cache[platform]
+        else:
+            cand = self._find(pin)
+            impls = (cand,) if cand.available(platform) else ()
+        for impl in impls:
             if impl.accepts is not None:
                 ok = None if accepted is None else accepted.get(impl.name)
                 if ok is None:
@@ -309,6 +334,8 @@ class Op:
         if name not in self.calls:
             self._log_first_use(name, args, kwargs, pinned)
         self.calls[name] += 1
+        if not _log.NVTX and not torch.autograd._profiler_enabled():
+            return fn(*call_args, **kwargs)
         with profiler_range(f"flashim::{self.name}[{name}]"):
             return fn(*call_args, **kwargs)
 
@@ -376,17 +403,24 @@ class BoundOp:
         self.pin = pin
         self._prepared: dict[str, tuple] = {}
         self._accepted: dict[str, bool] = {}
+        self._usable_cache: tuple[int, tuple[Impl, ...]] | None = None
 
     @property
     def platform(self) -> Platform:
         return platform_for(_first_device(self.weights) or torch.device("cpu"))
 
     def _usable(self) -> list[Impl]:
+        n = len(self.op.impls)
+        if self._usable_cache is not None and self._usable_cache[0] == n:
+            return list(self._usable_cache[1])
         impls = [
-            impl for impl in self.op.candidates(self.platform)
-            if impl.accepts is None or impl.accepts(*self.weights)
+            impl for impl in self.op._candidates_tuple(self.platform)
+            if (self.pin is not None or not impl.opt_in) and (impl.accepts is None or impl.accepts(*self.weights))
         ]
-        return impls if self.pin is None else [i for i in impls if i.name == self.pin]
+        if self.pin is not None:
+            impls = [i for i in impls if i.name == self.pin]
+        self._usable_cache = (n, tuple(impls))
+        return impls
 
     @property
     def available(self) -> list[str]:
@@ -407,7 +441,19 @@ class BoundOp:
 
     def __call__(self, *args, **kwargs):
         full = args + self.weights
-        impl = self.op._choose(full, kwargs, pin=self.pin, accepted=self._accepted)
+        if not _HAS_OVERRIDES and self.pin != REFERENCE:
+            n = len(self.op.impls)
+            if self._usable_cache is None or self._usable_cache[0] != n:
+                self._usable()
+            impl = None
+            for cand in self._usable_cache[1]:
+                if cand.when is None or cand.when(*full, **kwargs):
+                    impl = cand
+                    break
+            if impl is None and self.pin is None and _CONFIG.strict and self.platform.device_type != "cpu":
+                raise RuntimeError(f"Op {self.op.name!r} fell back to the reference on {self.platform.describe()}")
+        else:
+            impl = self.op._choose(full, kwargs, pin=self.pin, accepted=self._accepted)
         prepared = None
         if impl is not None and impl.prepare is not None:
             prepared = self._prepared.get(impl.name)

@@ -67,6 +67,25 @@ def _dual_softmax_mutual_reference(
 dual_softmax_mutual = Op("dual_softmax_mutual", _dual_softmax_mutual_reference)
 
 
+def _mutual_nn_match_reference(desc0: Tensor, desc1: Tensor, threshold: float = 0.0) -> tuple[Tensor, Tensor, Tensor]:
+    """Mutual-nearest-neighbour inner-product matches with similarity >= ``threshold``.
+
+    ``desc0 [M, D]``, ``desc1 [N, D]`` -> ``(idx0 [K] int64, idx1 [K] int64, score [K] fp32)``.
+    """
+    if desc0.shape[0] == 0 or desc1.shape[0] == 0:
+        empty = torch.zeros(0, dtype=torch.long, device=desc0.device)
+        return empty, empty, desc0.new_zeros(0, dtype=torch.float32)
+    sim = desc0.float() @ desc1.float().t()
+    nn01, nn10 = sim.argmax(dim=1), sim.argmax(dim=0)
+    best = sim.gather(1, nn01[:, None])[:, 0]
+    ids0 = torch.arange(sim.shape[0], device=sim.device)
+    idx0 = ((ids0 == nn10[nn01]) & (best >= threshold)).nonzero()[:, 0]
+    return idx0, nn01[idx0], best[idx0]
+
+
+mutual_nn_match = Op("mutual_nn_match", _mutual_nn_match_reference)
+
+
 def _union_softmax_match_reference(sim: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Row-wise and column-wise one-way softmax maxima and argmax indices over ``sim [L, S]`` (FP32).
 

@@ -24,7 +24,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | `disk` | DISK (U-Net of 5x5 convs, 128-d descriptors) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `alike` | ALIKE (variants `alike-t`, `alike-s`, `alike-n`, `alike-l`) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `xfeat` | XFeat (0.7M-parameter conv net, 64-d descriptors) | `fp32`, **`bf16`**, `int8`, `fp8` |
-| `dedode` | DeDoDe v2 detector L + descriptor B (VGG19) | `fp32`, **`bf16`**, `int8`, `fp8` |
+| `dedode` | DeDoDe v2 detector L + descriptor B (VGG19) | `fp32`, **`bf16`**, `int8` |
 | `dedode-g` | DeDoDe v2 detector L + descriptor G (VGG19 + DINOv2 ViT-L/14) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `dad` | DaD detector (VGG11) + DeDoDe-G descriptors | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `ripe` | RIPE (VGG19 + ConvRefiner heatmap, hypercolumn 256-d descriptors) | `fp32`, **`bf16`**, `int8`, `fp8` |
@@ -34,12 +34,12 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | `sift`, `orb` | OpenCV baselines (CPU detection, GPU matching) | `fp32` |
 | [`lightglue`](models/lightglue.md) | LightGlue sparse matcher (variants `rdd`, `aliked`, `raco-aliked`, `superpoint`, `disk`, `xfeat`) | `fp32`, `bf16`, `int8`, **`fp8`** |
 | [`rdd-lightglue`](models/lightglue.md) | RDD + LightGlue | `fp32`, `bf16`, `int8`, **`fp8`** |
-| [`aliked-lightglue`](models/lightglue.md) | ALIKED + LightGlue (cvg's ALIKED-trained weights) | **`fp32`**, `bf16`, `int8`, `fp8` |
+| [`aliked-lightglue`](models/lightglue.md) | ALIKED + LightGlue (cvg's ALIKED-trained weights) | **`fp32`**, `bf16`, `int8` |
 | [`raco-aliked-lightglue`](models/raco-aliked-lightglue.md) | RaCo keypoints + ALIKED descriptors + LightGlue (cvg's RaCo + ALIKED weights) | **`fp32`**, `bf16`, `int8`, `fp8` |
-| [`superpoint-lightglue`](models/lightglue.md) | SuperPoint + LightGlue (cvg weights) | **`fp32`**, `bf16`, `int8`, `fp8` |
-| [`disk-lightglue`](models/lightglue.md) | DISK + LightGlue (cvg weights) | **`fp32`**, `bf16`, `int8`, `fp8` |
-| [`xfeat-lightglue`](models/lightglue.md) | XFeat + LighterGlue (verlab weights) | **`fp32`**, `bf16`, `int8`, `fp8` |
-| [`raco-<model>-lightglue`](models/raco-aliked-lightglue.md#raco-with-other-models) | RaCo keypoints + `superpoint`, `disk`, `xfeat` or `rdd` descriptors + LightGlue with that model's weights | as `<model>-lightglue` |
+| [`superpoint-lightglue`](models/lightglue.md) | SuperPoint + LightGlue (cvg weights) | **`fp32`**, `bf16`, `int8` |
+| [`disk-lightglue`](models/lightglue.md) | DISK + LightGlue (cvg weights) | **`fp32`**, `bf16`, `int8` |
+| [`xfeat-lightglue`](models/lightglue.md) | XFeat + LighterGlue (verlab weights) | **`fp32`**, `bf16` |
+| [`raco-<model>-lightglue`](models/raco-aliked-lightglue.md#raco-with-other-models) | RaCo keypoints + `superpoint`, `disk`, `xfeat` or `rdd` descriptors + LightGlue with that model's weights | **`fp32`**, `bf16`, `int8`, `fp8` *(`raco-rdd-lightglue` defaults to `fp8`)* |
 | [`loma-<variant>`](models/loma.md) | LoMa: DaD keypoints + LoMa-trained DeDoDe descriptors + LoMa's LightGlue-style matcher (`loma-b128`, `loma-b`, `loma-l`, `loma-g`, `loma-r`; `loma` = `loma-b`) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | [`loma-extractor`](models/loma.md), [`loma-matcher`](models/loma.md) | LoMa's components (variant `b128` \| `b` \| `l` \| `g` \| `r`) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | `superglue` | SuperGlue attentional GNN + Sinkhorn OT sparse matcher (variants `outdoor`, `indoor`; Magic Leap non-commercial) | `fp32`, **`bf16`**, `int8` |
@@ -49,12 +49,12 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 
 Every learned model is a native PyTorch port that is checked against its upstream implementation (`tests/parity`).
 
-**Preset notes.** `fp8` is not a preset of `superpoint-superglue` and `omniglue`: it builds `int8`, because MXFP8
-loses accuracy in their extractors (SuperPoint, DINOv2 ViT-B/14) and `int8` is faster and more accurate
-([accuracy](benchmarks.md#accuracy-of-the-2026-11-additions)). Licenses that restrict use: `superglue` / `superpoint-superglue`
-(Magic Leap, non-commercial), `mast3r` / `dust3r` / `ufm` weights (CC BY-NC-SA 4.0), and `eloftr`, whose upstream
-changed its license to ZJU3DV's PRL v1.0 on 2026-09-15 (the vendored oracle and the weights are Apache-2.0 from before
-that); see `THIRD_PARTY_NOTICES.md`.
+**Preset notes.**
+- Presets omitted because MXFP8 (or INT8) loses pose AUC and is slower or dominated by the fallback (resolved via `build.NEAREST`):
+  - `fp8` -> `int8`: `dedode` (pure VGG19; `dedode-g` keeps `fp8`), `aliked-lightglue`, `superpoint-lightglue` (runs SuperPoint in `bf16` and LightGlue in rotated `int8`), `disk-lightglue`, `superpoint-superglue`, and `omniglue`.
+  - `fp8` / `int8` -> `bf16`: `xfeat-lightglue` (96-dim LighterGlue drops AUC under both MXFP8 and rotated INT8 and is slower than BF16 on ScanNet-1500).
+- Targeted BF16 layer exclusions for quantization fidelity: `xfeat` protects `keypoint_head.*` and `block2.*` in `int8` / `fp8`; `superpoint` keeps `conv1b` in BF16 for `fp8` (`extractor_spec(..., fp8_ignore=...)`); `dedode` excludes `descriptor.encoder.layers.{3,7,10}` in `int8`; `ripe` excludes `net.encoder.layers.{3,7,10}` in `fp8`; `loma-b128` keeps `*.decoder.*` and matcher `transformers.{4,5}.*` in BF16 for `fp8` via `ModelSpec.quant_configs` per-variant `<variant>/<quant>` lookup (other LoMa variants keep full MXFP8).
+- Licenses that restrict use: `superglue` / `superpoint-superglue` (Magic Leap, non-commercial), `mast3r` / `dust3r` / `ufm` weights (CC BY-NC-SA 4.0), and `eloftr`, whose upstream changed its license to ZJU3DV's PRL v1.0 on 2026-09-15 (the vendored oracle and the weights are Apache-2.0 from before that); see `THIRD_PARTY_NOTICES.md`.
 
 **Presets** name a precision:
 
@@ -62,7 +62,7 @@ that); see `THIRD_PARTY_NOTICES.md`.
 |---|---|
 | `fp32` | the checkpoint's own precision |
 | `bf16` | BF16 compute (`mast3r` and `dust3r` use FP16 compute because CroCo residual peaks reach ~344–649 where BF16 ULP degrades 3D precision); keypoint selection, softmaxes and sampling / position math stay FP32 |
-| `int8` | INT8 with symmetric per-output-channel weights and one calibrated scale per activation tensor (DeDoDe-G's DINOv2 ViT: one scale per token, computed at run time) |
+| `int8` | INT8 with symmetric per-output-channel weights and static per-tensor calibrated activation scales, per-token dynamic INT8 (`DynamicInt8Linear`) for DINOv2 / CroCo ViTs (`dedode-g`, `dad`, `loma-*`, `roma`, `mast3r`, `dust3r`, `ufm`, `omniglue`), and folded Hadamard rotation + SmoothQuant (`rotate_residual_stream`) for residual-stream matchers (`lightglue`, `loma-matcher`, `superglue`, `mast3r`, `dust3r`, `ufm`) |
 | `fp8` | MXFP8: FP8 (E4M3) values with one power-of-two (E8M0) scale per 32 elements |
 
 **Engines** (`eager`, `compile`; RoMaV2 also `compile-full`) are separate from presets: any preset runs with any of

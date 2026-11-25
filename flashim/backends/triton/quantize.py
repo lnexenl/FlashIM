@@ -793,6 +793,10 @@ def _quantize_int8_heads_kernel(x_ptr, s_ptr, o_ptr, TOKENS, HEADS: tl.constexpr
 
 def quantize_int8_heads(value: Tensor, scale: Tensor) -> Int8Tensor:
     batch, heads, tokens, dim = value.shape
+    transposed = value.transpose(1, 2)
+    if transposed.is_contiguous():
+        # FlashAttention SDPA returns [B, H, N, D] backed by [B, N, H, D] memory: zero-copy contiguous after transpose.
+        return quantize_int8(transposed.reshape(batch * tokens, heads * dim), scale)
     out = torch.empty(batch * tokens, heads * dim, device=value.device, dtype=torch.int8)
     _quantize_int8_heads_kernel[(triton.cdiv(tokens, 64), batch * heads)](
         value, scale, out, tokens, HEADS=heads, D=dim, BLOCK_N=64, num_warps=4
@@ -902,11 +906,16 @@ ops.layernorm_quantize_int8.register(
 ops.gelu_quantize_int8.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=lambda value, *a, **k: _row_major(value)
 )(gelu_quantize_int8)
+# Capabilities where ATen's BF16 LayerNorm reduction tree was verified bit-exact against torch_layernorm_stats:
+# sm_89 (L20), sm_90 (H20), sm_120 (RTX 5070 Ti; 1.04-1.19x vs unfused on 512/1024-ch shapes).
+_EXACT_LN_CAPABILITIES = ((8, 9), (9, 0), (12, 0))
+
+
 def _layernorm_rows_eligible(value, weight, bias, eps) -> bool:
-    """The statistics replicate ATen's BF16 row kernel (:mod:`._layernorm_stats`): BF16 rows of ``N`` a multiple of 512
-    (256 on sm_120, verified 0 diffs across N=512..2048 including N=768), with BF16 affine parameters."""
+    """The statistics replicate ATen's BF16/FP16 row kernel (:mod:`._layernorm_stats`): rows of ``N`` a multiple of 512
+    (256 on sm_120, verified 0 diffs across N=512..2048 including N=768), with matching affine parameters."""
     cap = platform_for(value.device).capability
-    if cap not in ((8, 9), (9, 0), (12, 0)):
+    if cap not in _EXACT_LN_CAPABILITIES:
         return False
     n = value.shape[-1]
     mult = 256 if cap == (12, 0) else LN_EXACT_MULTIPLE
@@ -994,7 +1003,11 @@ def _quantize_multi_eligible(value: Tensor, scales: list[Tensor], outs: list[Ten
 
 def _quantize_heads_eligible(value: Tensor, scale: Tensor) -> bool:
     dim = value.shape[-1] if value.ndim == 4 else 0
-    return value.ndim == 4 and _row_major(value) and dim >= 16 and dim == triton.next_power_of_2(dim)
+    return (
+        value.ndim == 4 and value.dtype in (torch.float16, torch.bfloat16, torch.float32) and value.numel() > 0
+        and dim >= 16 and dim == triton.next_power_of_2(dim)
+        and (value.is_contiguous() or value.transpose(1, 2).is_contiguous())
+    )
 
 
 def _layernorm_gelu_eligible(value, weight, bias, eps, scale, *, channel_scale=None) -> bool:
@@ -1014,9 +1027,9 @@ ops.quantize_int8_multi.register(
 ops.quantize_int8_heads.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_quantize_heads_eligible
 )(quantize_int8_heads)
-# Exact LayerNorm statistics measured on sm_89 / sm_90 only (as layernorm_quantize_int8_rows).
+# Exact LayerNorm statistics measured on sm_89 / sm_90 / sm_120 (as layernorm_quantize_int8_rows).
 ops.layernorm_gelu_quantize_int8.register(
-    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)), requires=[Feature.TRITON],
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(12, 0)), requires=[Feature.TRITON],
     when=_layernorm_gelu_eligible,
 )(layernorm_gelu_quantize_int8)
 

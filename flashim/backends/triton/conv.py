@@ -936,21 +936,28 @@ def _conv3x3_cin3_quantize(x: Tensor, scale: Tensor, packed: Tensor, bias: Tenso
     return Int8Tensor(out, scale)
 
 
+_STEM_TC_CAPABILITIES = ((8, 9), (9, 0), (12, 0))
+
+
 def _conv3x3_cin3_accepts(weight: Tensor, bias: Tensor) -> bool:
     cout = weight.shape[0]
-    return weight.shape[1:] == (3, 3, 3) and cout & (cout - 1) == 0 and cout <= 128 and bias.shape == (cout,)
+    return (
+        weight.is_cuda and platform_for(weight.device).capability in _STEM_TC_CAPABILITIES
+        and weight.shape[1:] == (3, 3, 3) and cout & (cout - 1) == 0 and cout <= 128 and bias.shape == (cout,)
+    )
 
 
 def _conv3x3_cin3_eligible(x: Tensor, scale: Tensor, weight: Tensor, bias: Tensor) -> bool:
     return (
-        x.ndim == 4 and x.shape[1] == 3 and x.dtype == torch.bfloat16 and x.is_contiguous()
+        platform_for(x.device).capability in _STEM_TC_CAPABILITIES
+        and x.ndim == 4 and x.shape[1] == 3 and x.dtype == torch.bfloat16 and x.is_contiguous()
         and weight.dtype == torch.bfloat16 and bias.dtype == torch.bfloat16
     )
 
 
-# sm_89 and sm_90 only: the two architectures it was measured on (the reference chain is the fallback elsewhere).
+# sm_89, sm_90, sm_120 (the measured archs; sm_120 3x896x1200: 1.276 -> 0.122 ms, 10.5x; 2x3x800x800: 1.522 -> 0.152 ms).
 ops.conv2d_small_cin_quantize_int8.register(
-    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0)), requires=[Feature.TRITON],
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 9), max_capability=(12, 0)), requires=[Feature.TRITON],
     when=_conv3x3_cin3_eligible, accepts=_conv3x3_cin3_accepts, prepare=_conv3x3_cin3_prepare,
 )(_conv3x3_cin3_quantize)
 
@@ -1136,13 +1143,14 @@ def _mxfp8_conv2d_scaled_block_k(configs, named_args, **kwargs):
 )
 @triton.jit(do_not_specialize=_SIZE_ARGS[1:])
 def _mxfp8_conv2d_scaled_kernel(
-    x_ptr, w_ptr, wexp_ptr, cexp_ptr, bias_ptr, out_ptr,
+    x_ptr, w_ptr, wexp_ptr, cexp_ptr, bias_ptr, out_ptr, oexp_ptr,
     H, W, HO, WO, rows, ROWS_BUCKET,
     res_ptr, res_channels, rs_b, rs_h, rs_w, rs_c, res_scale_ptr,
     CIN: tl.constexpr, COUT: tl.constexpr, TAPS: tl.constexpr,
     KH: tl.constexpr, KW: tl.constexpr, SH: tl.constexpr, SW: tl.constexpr,
     PH: tl.constexpr, PW: tl.constexpr, DH: tl.constexpr, DW: tl.constexpr,
     HAS_BIAS: tl.constexpr, RELU: tl.constexpr, HAS_RESIDUAL: tl.constexpr, HAS_RES_SCALE: tl.constexpr,
+    QUANT_OUT: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     """Implicit-GEMM static MXFP8 ``nn.Conv2d`` on block-scaled tensor cores: per filter tap, one ``tl.dot_scaled``
@@ -1203,26 +1211,35 @@ def _mxfp8_conv2d_scaled_kernel(
     if RELU:
         out = tl.maximum(out, 0.0)
     out_ptrs = out_ptr + offs_m[:, None].to(tl.int64) * COUT + offs_n[None, :]
-    tl.store(out_ptrs, out.to(tl.bfloat16), mask=mask_m[:, None] & mask_n[None, :])
+    if QUANT_OUT:
+        dense = out.to(tl.bfloat16).to(tl.float32)
+        exponent = tl.load(oexp_ptr + offs_n // 32, mask=mask_n, other=0).to(tl.float32)
+        scaled = dense * tl.exp2(-exponent)[None, :]
+        quantized = to_e4m3(tl.maximum(tl.minimum(scaled, 448.0), -448.0))
+        tl.store(out_ptrs, quantized, mask=mask_m[:, None] & mask_n[None, :])
+    else:
+        tl.store(out_ptrs, out.to(tl.bfloat16), mask=mask_m[:, None] & mask_n[None, :])
 
 
 def _mxfp8_conv2d_scaled_triton(
     x, channel_exponent, weight, weight_exponent, bias, kh, kw, sh, sw, ph, pw, dh, dw, *, relu=False, residual=None,
-    residual_scale=None,
+    out_exponent=None, residual_scale=None,
 ) -> Tensor:
     b, h, w, cin = x.shape
     cout = weight.shape[0]
     ho = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
     wo = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
-    out = torch.empty(b, ho, wo, cout, device=x.device, dtype=torch.bfloat16)
+    quantize = out_exponent is not None
+    out = torch.empty(b, ho, wo, cout, device=x.device, dtype=torch.float8_e4m3fn if quantize else torch.bfloat16)
     rows = b * ho * wo
     grid = lambda meta: (triton.cdiv(rows, meta["BLOCK_M"]) * triton.cdiv(cout, meta["BLOCK_N"]),)
     _mxfp8_conv2d_scaled_kernel[grid](
-        x, weight, weight_exponent, channel_exponent, bias, out, h, w, ho, wo, rows, triton.next_power_of_2(rows),
-        *_residual_args(residual, out), out if residual_scale is None else residual_scale,
+        x, weight, weight_exponent, channel_exponent, bias, out, out_exponent if quantize else channel_exponent,
+        h, w, ho, wo, rows, triton.next_power_of_2(rows), *_residual_args(residual, out),
+        out if residual_scale is None else residual_scale,
         CIN=cin, COUT=cout, TAPS=kh * kw, KH=kh, KW=kw, SH=sh, SW=sw, PH=ph, PW=pw, DH=dh, DW=dw,
         HAS_BIAS=bias is not None, RELU=relu, HAS_RESIDUAL=residual is not None,
-        HAS_RES_SCALE=residual_scale is not None,
+        HAS_RES_SCALE=residual_scale is not None, QUANT_OUT=quantize,
     )
     return out
 
@@ -1231,8 +1248,7 @@ def _mxfp8_conv2d_scaled_eligible(
     x, channel_exponent, weight, weight_exponent, bias, kh, kw, sh, sw, ph, pw, dh, dw, *, out_exponent=None, **_
 ) -> bool:
     return (
-        out_exponent is None  # a quantized output is the per-32 kernel's (``_mxfp8_conv2d_kernel``'s ``QUANT_OUT``)
-        and x.ndim == 4
+        x.ndim == 4
         and x.dtype == torch.float8_e4m3fn
         and x.is_contiguous()
         and x.shape[-1] % 32 == 0

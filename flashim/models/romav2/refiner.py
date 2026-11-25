@@ -67,6 +67,10 @@ class ConvRefiner(nn.Module):
         self.register_buffer(
             "head_bias", torch.cat((self.warp_head.bias, self.confidence_head.bias)).detach().float(), persistent=False
         )
+        self.register_buffer(
+            "emb_weight_fp32", self.disp_emb.weight.detach().reshape(-1, 2).float().contiguous(), persistent=False
+        )
+        self.register_buffer("emb_bias_fp32", self.disp_emb.bias.detach().float().contiguous(), persistent=False)
         self.fused_heads = True
 
     def project(self, f: Tensor) -> Tensor:
@@ -89,17 +93,19 @@ class ConvRefiner(nn.Module):
         """Refine ``prev_warp``. ``pair > 0`` (fused input only): ``f_a`` is the *already projected*
         stack of ``2*pair`` images, both match directions at once (image ``i`` with ``(i+pair) % 2*pair``)."""
         radius = -1 if self.cfg.local_corr_radius is None else self.cfg.local_corr_radius
+        emb_w = getattr(self, "emb_weight_fp32", self.disp_emb.weight)
+        emb_b = getattr(self, "emb_bias_fp32", self.disp_emb.bias)
         if pair:
             if not self.fused_input:
                 raise ValueError("stacked directions require the fused refiner input")
             d = ops.romav2_refiner_input(
-                f_a, f_a, prev_warp.contiguous(), self.disp_emb.weight, self.disp_emb.bias, scale_factor, radius, pair
+                f_a, f_a, prev_warp.contiguous(), emb_w, emb_b, scale_factor, radius, pair
             )
         else:
             f_a, f_b = self.project(f_a), self.project(f_b)
             if self.fused_input:
                 d = ops.romav2_refiner_input(
-                    f_a, f_b, prev_warp.contiguous(), self.disp_emb.weight, self.disp_emb.bias, scale_factor, radius
+                    f_a, f_b, prev_warp.contiguous(), emb_w, emb_b, scale_factor, radius
                 )
             else:
                 d = self._input(f_a, f_b, prev_warp, scale_factor)

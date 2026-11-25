@@ -893,8 +893,8 @@ def _linear_attn_kv_split_kernel(
     BF16_DOT: tl.constexpr,
 ):
     """Split-S accumulation of ``k_sum = sum_s (elu(k) + 1)`` and ``kv = sum_s (elu(k) + 1)^T (v / S)``."""
-    split = tl.program_id(0)
-    nh = tl.program_id(1)
+    nh = tl.program_id(0)
+    split = tl.program_id(1)
     n = (nh // H).to(tl.int64)
     h = (nh % H).to(tl.int64)
     d_idx = tl.arange(0, BLOCK_D)
@@ -959,8 +959,8 @@ def _linear_attn_q_kernel(
     BF16_DOT: tl.constexpr,
 ):
     """``((elu(q) + 1) @ kv) * (S / ((elu(q) + 1) . k_sum + eps))`` in one fused pass over ``q``."""
-    pid_l = tl.program_id(0)
-    nh = tl.program_id(1)
+    nh = tl.program_id(0)
+    pid_l = tl.program_id(1)
     n = (nh // H).to(tl.int64)
     h = (nh % H).to(tl.int64)
     l_idx = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
@@ -1028,7 +1028,7 @@ def elu_linear_attention(
     if num_splits == 1:
         kv = torch.empty((n * heads, block_d, block_v), device=device, dtype=torch.float32)
         k_sum = torch.empty((n * heads, block_d), device=device, dtype=torch.float32)
-        _linear_attn_kv_split_kernel[(1, n * heads)](
+        _linear_attn_kv_split_kernel[(n * heads, 1)](
             k, v, kv, k_sum,
             k.stride(0), k.stride(1), k.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
@@ -1039,7 +1039,7 @@ def elu_linear_attention(
     else:
         partial_kv = torch.empty((n * heads, num_splits, block_d, block_v), device=device, dtype=torch.float32)
         partial_ksum = torch.empty((n * heads, num_splits, block_d), device=device, dtype=torch.float32)
-        _linear_attn_kv_split_kernel[(num_splits, n * heads)](
+        _linear_attn_kv_split_kernel[(n * heads, num_splits)](
             k, v, partial_kv, partial_ksum,
             k.stride(0), k.stride(1), k.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
@@ -1054,7 +1054,7 @@ def elu_linear_attention(
             num_splits, BLOCK_D=block_d, BLOCK_V=block_v, num_warps=4,
         )
 
-    _linear_attn_q_kernel[(triton.cdiv(seq_l, block_l), n * heads)](
+    _linear_attn_q_kernel[(n * heads, triton.cdiv(seq_l, block_l))](
         q, kv, k_sum, out,
         q.stride(0), q.stride(1), q.stride(2),
         heads, seq_l, seq_s, float(eps),

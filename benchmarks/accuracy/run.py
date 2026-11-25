@@ -197,6 +197,7 @@ def main() -> None:
     parser.add_argument("--loaders", type=int, default=4, help="image decode threads")
     parser.add_argument("--prefetch", type=int, default=16, help="pairs decoded ahead of the GPU")
     parser.add_argument("--cv-threads", type=int, default=0, help="OpenCV/OMP/torch CPU threads (0 = all cores)")
+    parser.add_argument("--save-errors", default="", help=".npy of the pose errors, [pair*5] (paired comparisons)")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
@@ -222,6 +223,9 @@ def main() -> None:
     pool = PosePool(args.workers)
     pairs = run(model, data_root, pool, args.max_pairs, {"workers": args.loaders, "depth": args.prefetch})
     errors = pool.errors()  # drains the queue; GPU stage is already finished
+    if args.save_errors:
+        Path(args.save_errors).parent.mkdir(parents=True, exist_ok=True)
+        np.save(args.save_errors, np.asarray(errors, dtype=np.float32))
     result = {
         "dataset": args.dataset,
         "model": args.model,
@@ -236,7 +240,7 @@ def main() -> None:
         "seconds": time.time() - started,
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
-        "flashim_git": _git(Path(__file__).parent, "rev-parse", "HEAD"),
+        "flashim_git": _git(Path(flashim.__file__).parent, "rev-parse", "HEAD"),
         "calibration": getattr(model, "calibration_metadata", None),
         "packing": model.quant_report.summary() if getattr(model, "quant_report", None) else None,
     }

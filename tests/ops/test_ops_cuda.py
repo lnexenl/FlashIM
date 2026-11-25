@@ -549,8 +549,12 @@ def test_int8_conv2d_maxpool_odd_size_takes_the_reference():
 
 
 _needs_stem_tc = pytest.mark.skipif(
-    not torch.cuda.is_available() or platform_for(DEV).capability not in ((8, 9), (9, 0)),
-    reason="the tensor-core stem and the cuBLAS patch embedding are registered for sm_89 / sm_90 only",
+    not torch.cuda.is_available() or platform_for(DEV).capability not in ((8, 9), (9, 0), (12, 0)),
+    reason="the tensor-core stem is registered for sm_89 / sm_90 / sm_120 only",
+)
+_needs_patch_embed_tc = pytest.mark.skipif(
+    not torch.cuda.is_available() or platform_for(DEV).capability not in ((8, 9), (9, 0), (12, 0)),
+    reason="the cuBLAS patch embedding is registered for sm_89 / sm_90 / sm_120 only",
 )
 
 
@@ -573,7 +577,7 @@ def test_conv2d_small_cin_quantize_int8(batch, height, width, cout):
     assert bound.primary == "triton" and torch.equal(bound(x, scale).values, fast.values)
 
 
-@_needs_stem_tc
+@_needs_patch_embed_tc
 @pytest.mark.parametrize("hw", [(28, 42), (56, 28), (14, 14)])
 def test_patch_embed_tokens(hw):
     """Patch embedding as a GEMM into the token buffer: the reference's tokens up to the summation order (1 BF16 ulp)."""
@@ -595,7 +599,7 @@ def test_patch_embed_tokens(hw):
     assert batch2.shape == (2, 1 + h * w, 1024)  # batch > 1 takes the reference
 
 
-@_needs_stem_tc
+@_needs_patch_embed_tc
 def test_patch_embed_tokens_compiles():
     torch.manual_seed(0)
     image = torch.randn(1, 3, 56, 84, device=DEV).bfloat16()
@@ -603,7 +607,7 @@ def test_patch_embed_tokens_compiles():
     cls, pos = torch.randn(1, 1, 1024, device=DEV).bfloat16(), torch.randn(1, 1 + 4 * 6, 1024, device=DEV).bfloat16()
     bound = ops.patch_embed_tokens.bind(weight, bias).warmup()
     compiled = torch.compile(lambda x: bound(x, cls, pos), fullgraph=True)
-    torch.testing.assert_close(compiled(image), bound(image, cls, pos), atol=0.04, rtol=0)  # Inductor fuses the BF16 adds
+    torch.testing.assert_close(compiled(image), bound(image, cls, pos), atol=0.04, rtol=2**-7)  # Inductor fuses the BF16 adds (<= 1 BF16 ulp)
 
 
 @pytest.mark.parametrize("batch,height,width", [(1, 8, 40), (2, 13, 37), (1, 120, 160)])
@@ -651,6 +655,11 @@ def test_mxfp8_conv2d_scaled(cin, cout, kh, kw, sh, sw, ph, pw, dh, dw, has_bias
     assert ((fast.float() - ref.float()).norm() / ref.float().norm()) < 1e-3
     fused = ops.mxfp8_conv2d.get("triton_scaled")(*args, relu=True)
     assert torch.equal(fused, F.relu(fast))
+    if cout % 32 == 0:
+        out_exp = torch.randint(-6, 3, (cout // 32,), dtype=torch.int8, device=DEV)
+        chained = ops.mxfp8_conv2d.get("triton_scaled")(*args, relu=True, out_exponent=out_exp)
+        expected = ops.quantize_mxfp8.get("triton")(fused, out_exp).values
+        assert chained.dtype == torch.float8_e4m3fn and torch.equal(chained.view(torch.uint8), expected.view(torch.uint8))
 
 
 @pytest.mark.parametrize("impl", ["triton", "cublas"])
@@ -894,10 +903,10 @@ def test_upsample_concat_int8(size, coarse_size, layout):
     assert (fast.values.int() - ref.values.int()).abs().max() <= 1 and _mismatch(fast.values, ref.values) < 1e-3
 
 
-# The row kernels of ``backends/triton/resample.py`` (sm_89 / sm_90 only): bit-identical to the tile kernel they replace.
+# The row kernels of ``backends/triton/resample.py`` (sm_89 / sm_90 / sm_120): bit-identical to the tile kernel they replace.
 _needs_rows = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in {(8, 9), (9, 0)},
-    reason="the upsample row kernels are registered for sm_89 / sm_90",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in {(8, 9), (9, 0), (12, 0)},
+    reason="the upsample row kernels are registered for sm_89 / sm_90 / sm_120",
 )
 
 
@@ -926,6 +935,28 @@ def test_upsample_concat_int8_rows_is_bit_identical_to_the_tile_kernel(coarse_si
     want = ops.upsample_concat_int8.get("triton")(features, coarse, scale)
     assert got.values.shape == (2, 2 * h, 2 * w, c_features + c_coarse) and got.values.is_contiguous()
     assert got.scale is scale and torch.equal(got.values, want.values)
+
+
+@_needs_rows
+@pytest.mark.parametrize("coarse_size", [(1, 1), (3, 5), (19, 23), (112, 150), (7, 70)])
+@pytest.mark.parametrize("channels", [(256, 256), (128, 128), (64, 32), (24, 40), (512, 512)])
+@pytest.mark.parametrize("layout", ["nchw", "nhwc"])
+@pytest.mark.parametrize("coarse_first", [False, True])
+def test_upsample_concat_bf16_rows_is_bit_identical_to_the_tile_kernel(coarse_size, channels, layout, coarse_first):
+    """Exact 2x, BF16 taps: every product of the bilinear weights (1/4, 3/4) is exact, so the row-pair kernel gives the
+    tile kernel's BF16 values bit for bit (and declines non-2x / FP32 taps)."""
+    torch.manual_seed(0)
+    fmt = _channels(layout)
+    (c_features, c_coarse), (h, w) = channels, coarse_size
+    features = (torch.randn(2, c_features, 2 * h, 2 * w, device=DEV) * 2).bfloat16().contiguous(memory_format=fmt)
+    coarse = (torch.randn(2, c_coarse, h, w, device=DEV) * 2).bfloat16().contiguous(memory_format=fmt)
+    assert ops.upsample_concat.explain(features, coarse, coarse_first=coarse_first)["triton_rows"] == "selected"
+    ops.reset_call_counts()
+    got = ops.upsample_concat(features, coarse, coarse_first=coarse_first)
+    assert ops.call_counts()["upsample_concat"] == {"triton_rows": 1}
+    want = ops.upsample_concat.get("triton")(features, coarse, coarse_first=coarse_first)
+    assert got.shape == (2, c_features + c_coarse, 2 * h, 2 * w) and got.dtype == torch.bfloat16
+    assert got.is_contiguous(memory_format=torch.channels_last) and torch.equal(got, want)
 
 
 @_needs_rows
@@ -992,6 +1023,41 @@ def test_quantize_int8_rows(rows, k):
     assert torch.equal(fast[0], ref[0]) and torch.equal(fast[1], ref[1])
     cpu = ops.quantize_int8_rows.reference(x.cpu())
     assert torch.equal(cpu[0], ref[0].cpu()) and torch.equal(cpu[1], ref[1].cpu())
+
+
+@pytest.mark.parametrize(
+    "batch,heads,tokens,dim",
+    [(1, 16, 3137, 64), (2, 16, 5377, 64), (2, 16, 1201, 64), (1, 12, 2400, 64), (2, 4, 77, 64), (1, 12, 33, 48)],
+)
+@pytest.mark.parametrize("nhd", [False, True])
+def test_quantize_int8_rows_heads(batch, heads, tokens, dim, nhd):
+    """Per-token dynamic INT8 directly from [B, H, N, D] (both HND-contiguous and NHD-backed FlashAttention views):
+    bit-identical to transpose + quantize_int8_rows."""
+    torch.manual_seed(0)
+    x = torch.randn(batch, heads, tokens, dim, device=DEV, dtype=torch.bfloat16) * 3
+    x[0, :, tokens // 2, :] *= 200
+    x[-1, :, -1, :] = 0
+    if nhd:
+        x = x.transpose(1, 2).contiguous().transpose(1, 2)
+    assert ops.quantize_int8_rows_heads.explain(x)["triton"] == "selected"
+    fast, ref = _both(ops.quantize_int8_rows_heads, "triton", x)
+    assert fast[0].shape == (batch * tokens, heads * dim) and fast[1].shape == (batch * tokens, 1)
+    assert torch.equal(fast[0], ref[0]) and torch.equal(fast[1], ref[1])
+
+
+@pytest.mark.parametrize("rows,k", [(3137, 4096), (2402, 4096), (2400, 3072), (777, 1024), (333, 1024), (5, 64)])
+@pytest.mark.parametrize("approximate", ["none", "tanh"])
+def test_gelu_quantize_int8_rows(rows, k, approximate):
+    """Fused GELU + per-row dynamic INT8 vs reference (exact within <=1 INT8 step where libdevice erf differs)."""
+    torch.manual_seed(0)
+    x = torch.randn(rows, k, device=DEV, dtype=torch.bfloat16) * 3
+    x[rows // 2] *= 100
+    x[-1] = 0
+    assert ops.gelu_quantize_int8_rows.explain(x, approximate)["triton"] == "selected"
+    fast, ref = _both(ops.gelu_quantize_int8_rows, "triton", x, approximate)
+    assert fast[0].shape == ref[0].shape and fast[1].shape == ref[1].shape
+    assert (fast[0].int() - ref[0].int()).abs().max() <= 1 and _mismatch(fast[0], ref[0]) < 1e-4
+    torch.testing.assert_close(fast[1], ref[1], atol=1e-6, rtol=1e-5)
 
 
 @pytest.mark.parametrize("impl", ["triton", "cublas"])
@@ -1085,6 +1151,30 @@ def test_int8_linear_gelu_epilogue(rows, k, n):
     assert ops.int8_linear.get("reference")(q, w, scale, w_scale, bias, gelu=True).shape == plain.shape
 
 
+@pytest.mark.parametrize("align_corners", [True, False])
+@pytest.mark.parametrize("layout", ["nhwc", "nchw"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+def test_bilinear_sample_points(align_corners, layout, dtype, out_dtype):
+    """Multi-scale bilinear point sampling without upcasting full maps to FP32: matches F.grid_sample."""
+    torch.manual_seed(0)
+    fmt = torch.channels_last if layout == "nhwc" else torch.contiguous_format
+    features = [
+        torch.randn(1, c, h, w, device=DEV, dtype=dtype).contiguous(memory_format=fmt)
+        for c, h, w in [(64, 96, 128), (128, 48, 64), (256, 24, 32), (512, 12, 16)]
+    ]
+    grid = torch.rand(513, 2, device=DEV) * 2.2 - 1.1  # includes out-of-bounds zeros padding
+    grid[:4] = torch.tensor([[-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0], [1.0, -1.0]], device=DEV)
+    ops.reset_call_counts()
+    fast, ref = _both(ops.bilinear_sample_points, "triton", features, grid, align_corners=align_corners, out_dtype=out_dtype)
+    assert ops.call_counts()["bilinear_sample_points"] == {"triton": 1, "reference": 1}
+    assert fast.shape == ref.shape == (513, 960) and fast.dtype == out_dtype
+    tol = 2e-2 if out_dtype == torch.bfloat16 else 2e-5
+    torch.testing.assert_close(fast.float(), ref.float(), atol=tol, rtol=tol)
+    empty = ops.bilinear_sample_points(features, grid[:0], align_corners=align_corners, out_dtype=out_dtype)
+    assert empty.shape == (0, 960) and empty.dtype == out_dtype
+
+
 @pytest.mark.parametrize(
     "p,e,radius,c_pad,hw,pair",
     [
@@ -1149,32 +1239,6 @@ def test_upsample_bilinear(size, in_size, channels, align_corners, layout):
     unfused = ops.quantize_int8.get("triton")(fast.permute(0, 2, 3, 1), scale)
     assert (q_fast.values.int() - unfused.values.int()).abs().max() <= 1 and _mismatch(q_fast.values, unfused.values) < 1e-4
     assert (q_fast.values.int() - q_ref.values.int()).abs().max() <= 1 and _mismatch(q_fast.values, q_ref.values) < 1e-3
-
-
-@pytest.mark.parametrize("batch,heads,tokens,dim", [(2, 16, 1201, 64), (1, 12, 2400, 64), (2, 8, 77, 64)])
-def test_quantize_int8_rows_heads(batch, heads, tokens, dim):
-    """Per-token dynamic INT8 directly from ``[B, H, N, D]`` attention output: bit-identical to reference."""
-    torch.manual_seed(0)
-    x = torch.randn(batch, heads, tokens, dim, device=DEV, dtype=torch.bfloat16) * 3
-    x[0, 3, tokens // 2] *= 200
-    x[-1, :, -1] = 0
-    assert ops.quantize_int8_rows_heads.explain(x)["triton"] == "selected"
-    fast, ref = _both(ops.quantize_int8_rows_heads, "triton", x)
-    assert fast[0].shape == (batch * tokens, heads * dim) and fast[1].shape == (batch * tokens, 1)
-    assert torch.equal(fast[0], ref[0]) and torch.equal(fast[1], ref[1])
-
-
-@pytest.mark.parametrize("rows,k", [(2402, 4096), (2400, 3072), (333, 1024)])
-@pytest.mark.parametrize("approximate", ["none", "tanh"])
-def test_gelu_quantize_int8_rows(rows, k, approximate):
-    """Fused GELU + per-row dynamic INT8 vs reference (exact within <=1 INT8 step where libdevice erf differs)."""
-    torch.manual_seed(0)
-    x = torch.randn(rows, k, device=DEV, dtype=torch.bfloat16) * 2
-    assert ops.gelu_quantize_int8_rows.explain(x, approximate)["triton"] == "selected"
-    fast, ref = _both(ops.gelu_quantize_int8_rows, "triton", x, approximate)
-    assert fast[0].shape == ref[0].shape and fast[1].shape == ref[1].shape
-    assert (fast[0].int() - ref[0].int()).abs().max() <= 1 and _mismatch(fast[0], ref[0]) < 1e-4
-    torch.testing.assert_close(fast[1], ref[1], atol=1e-6, rtol=1e-5)
 
 
 @pytest.mark.parametrize("rows,cols,block", [(2402, 4096, 64), (2400, 3072, 64), (2402, 4096, 128), (37, 128, 32)])

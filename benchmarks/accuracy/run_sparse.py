@@ -411,7 +411,7 @@ def main() -> None:
         "seconds": time.time() - started,
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
-        "flashim_git": _git(Path(__file__).parent, "rev-parse", "HEAD"),
+        "flashim_git": _git(Path(flashim.__file__).parent, "rev-parse", "HEAD"),
         "calibration": getattr(model, "calibration_metadata", None) if model is not None else None,
         "packing": model.quant_report.summary() if getattr(model, "quant_report", None) else None,
     }

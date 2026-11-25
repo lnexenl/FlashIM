@@ -30,11 +30,12 @@ def _upsample_bilinear_reference(
 upsample_bilinear = Op("upsample_bilinear", _upsample_bilinear_reference)
 
 
-def _upsample_concat_reference(features: Tensor, coarse: Tensor) -> Tensor:
-    """``cat((features, upsample(coarse)), 1)``: ``coarse`` ``[B, Cc, h, w]`` upsampled bilinearly (``align_corners=False``,
-    in FP32) to ``features``' ``[B, Cf, H, W]`` size and cast to its dtype -> ``[B, Cf + Cc, H, W]``."""
-    upsampled = F.interpolate(coarse.float(), size=features.shape[-2:], mode="bilinear", align_corners=False)
-    return torch.cat((features, upsampled.to(features.dtype)), dim=1)
+def _upsample_concat_reference(features: Tensor, coarse: Tensor, *, coarse_first: bool = False) -> Tensor:
+    """``cat((features, upsample(coarse)), 1)`` (or ``cat((upsample(coarse), features), 1)`` when ``coarse_first``):
+    ``coarse`` ``[B, Cc, h, w]`` upsampled bilinearly (``align_corners=False``, in FP32) to ``features``'
+    ``[B, Cf, H, W]`` size and cast to its dtype -> ``[B, Cf + Cc, H, W]``."""
+    upsampled = F.interpolate(coarse.float(), size=features.shape[-2:], mode="bilinear", align_corners=False).to(features.dtype)
+    return torch.cat((upsampled, features), dim=1) if coarse_first else torch.cat((features, upsampled), dim=1)
 
 
 upsample_concat = Op("upsample_concat", _upsample_concat_reference)
@@ -91,6 +92,47 @@ def _pil_bicubic_resize_reference(image: Tensor, sizes: Sequence[tuple[int, int]
 
 
 pil_bicubic_resize = Op("pil_bicubic_resize", _pil_bicubic_resize_reference)
+
+
+def _bilinear_sample_points_reference(
+    features: Sequence[Tensor],
+    grid: Tensor,
+    *,
+    align_corners: bool = True,
+    out_dtype: torch.dtype | None = None,
+) -> Tensor:
+    """Bilinearly sample each ``[1, C_i, H_i, W_i]`` map of ``features`` in FP32 at normalized ``grid [K, 2]``
+    ``(x, y)`` coordinates (zeros padding) and concatenate along channels -> ``[K, sum(C_i)]``."""
+    dtype = torch.float32 if out_dtype is None else out_dtype
+    total_c = sum(f.shape[1] for f in features)
+    if grid.shape[0] == 0:
+        return torch.empty((0, total_c), device=grid.device, dtype=dtype)
+    g = grid.float().view(1, 1, -1, 2)
+    out = torch.cat(
+        [F.grid_sample(f.float(), g, mode="bilinear", align_corners=align_corners)[0, :, 0].t() for f in features],
+        dim=-1,
+    )
+    return out if out.dtype == dtype else out.to(dtype)
+
+
+bilinear_sample_points = Op("bilinear_sample_points", _bilinear_sample_points_reference)
+
+
+def _multiscale_score_reference(
+    f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, weight: Tensor, bias: Tensor | None = None
+) -> Tensor:
+    """4-scale bilinear fusion (``align_corners=True`` to ``f1``'s size) + 1-channel FP32 1x1 projection:
+    ``conv1x1(cat([f1, up(f2), up(f3), up(f4)], 1).float(), weight, bias)`` -> ``[B, 1, H, W]`` FP32.
+    ``weight`` is ``[4 * C]`` FP32, ``bias`` is ``[1]`` (or scalar) FP32 or ``None``."""
+    size = f1.shape[-2:]
+    upsampled = [F.interpolate(f.float(), size=size, mode="bilinear", align_corners=True) for f in (f2, f3, f4)]
+    fused = torch.cat([f1.float(), *upsampled], dim=1)
+    w = weight.float().reshape(1, -1, 1, 1)
+    b = None if bias is None else bias.float().reshape(1)
+    return F.conv2d(fused, w, b)
+
+
+multiscale_score = Op("multiscale_score", _multiscale_score_reference)
 
 
 def _gather_windows_reference(

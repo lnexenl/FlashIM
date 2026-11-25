@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from flashim.ops._registry import Op
@@ -136,7 +137,7 @@ def _elu_linear_attention_reference(
     normalizer and scaling stay FP32."""
     if q.shape[1] == 0 or k.shape[1] == 0:
         return q.new_zeros((q.shape[0], q.shape[1], q.shape[2], v.shape[3]))
-    qf, kf, vf = torch.nn.functional.elu(q.float()) + 1.0, torch.nn.functional.elu(k.float()) + 1.0, v.float()
+    qf, kf, vf = F.elu(q.float()) + 1.0, F.elu(k.float()) + 1.0, v.float()
     length = vf.shape[1]
     z = 1.0 / (torch.einsum("nlhd,nhd->nlh", qf, kf.sum(dim=1)) + eps)
     if gemm_dtype is None:

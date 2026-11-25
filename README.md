@@ -114,20 +114,23 @@ Default preset in **bold**; full registry and notes in [docs/models.md](https://
 | Detector-free | `xoftr` | `fp32`, **`bf16`**, `int8`, `fp8` | Apache-2.0 |
 | Sparse extractors | `rdd` | `fp32`, `bf16`, **`fp8`** | Apache-2.0 |
 | Sparse extractors | `aliked`, `raco`, `raco-aliked` | **`fp32`**, `bf16` | BSD-3-Clause (`aliked`) / Apache-2.0 (`raco`) |
-| Sparse extractors | `alike`, `disk`, `xfeat`, `dedode`, `dedode-g`, `dad` | `fp32`, **`bf16`**, `int8`, `fp8` | BSD-3-Clause / Apache-2.0 / MIT |
+| Sparse extractors | `alike`, `disk`, `xfeat`, `dedode`, `dedode-g`, `dad` | `fp32`, **`bf16`**, `int8`, `fp8` *(`dedode` degrades `fp8`->`int8`)* | BSD-3-Clause / Apache-2.0 / MIT |
 | Sparse extractors | `superpoint`, `ripe` | `fp32`, **`bf16`**, `int8`, `fp8` | **Non-commercial** (`superpoint_v1.pth` Magic Leap; `ripe` Fraunhofer; SuperPoint `sp_v6` is MIT) |
 | Sparse extractors | `sift`, `orb` | **`fp32`** | Apache-2.0 (OpenCV) |
-| Sparse matchers & pipelines | `lightglue`, `{rdd,aliked,raco-aliked,superpoint,disk,xfeat}-lightglue` | `fp32`, `bf16`, `int8`, **`fp8`** | Apache-2.0 (inherits extractor weight license) |
+| Sparse matchers & pipelines | `lightglue`, `{rdd,aliked,raco-aliked,superpoint,disk,xfeat}-lightglue` | `fp32`, `bf16`, `int8`, **`fp8`** *(`aliked`/`superpoint`/`disk-lightglue` degrade `fp8`->`int8`; `xfeat-lightglue` degrades `int8`/`fp8`->`bf16`)* | Apache-2.0 (inherits extractor weight license) |
 | Sparse matchers & pipelines | `loma`, `loma-{b128,b,l,g,r}`, `loma-{extractor,matcher}` | `fp32`, **`bf16`**, `int8`, `fp8` | MIT / Apache-2.0 |
-| Sparse matchers & pipelines | `superglue`, `superpoint-superglue` | `fp32`, **`bf16`**, `int8` *(pipeline adds `fp8`)* | **Magic Leap (academic/non-profit non-commercial)** |
-| Sparse matchers & pipelines | `omniglue`, `omniglue-{extractor,matcher}` | `fp32`, **`bf16`**, `int8`, `fp8` *(matcher degrades `fp8`->`int8`)* | Apache-2.0 (`sp_v6` MIT) |
+| Sparse matchers & pipelines | `superglue`, `superpoint-superglue` | `fp32`, **`bf16`**, `int8` *(pipeline degrades `fp8`->`int8`)* | **Magic Leap (academic/non-profit non-commercial)** |
+| Sparse matchers & pipelines | `omniglue`, `omniglue-{extractor,matcher}` | `fp32`, **`bf16`**, `int8` *(extractor adds `fp8`; pipeline & matcher degrade `fp8`->`int8`)* | Apache-2.0 (`sp_v6` MIT) |
 
 ## Results
 
-All numbers are from an RTX 5070 Ti. The latency of every model, preset and engine is in the
-[inference benchmark](https://github.com/lnexenl/FlashIM/blob/main/docs/benchmarks.md); models, presets and accuracy evidence are in [docs/models.md](https://github.com/lnexenl/FlashIM/blob/main/docs/models.md) and the page of each model.
+All numbers below are from an **NVIDIA GeForce RTX 5070 Ti (`sm_120`)**. Full latency tables (including the 2026-11
+`sm_120` eager speedup sweep) and MegaDepth-1500 / ScanNet-1500 accuracy gate results (`0 FAIL` across all models) are
+in the [inference benchmark](https://github.com/lnexenl/FlashIM/blob/main/docs/benchmarks.md); models, presets and
+per-architecture verification status are in [docs/models.md](https://github.com/lnexenl/FlashIM/blob/main/docs/models.md),
+[docs/platforms.md](https://github.com/lnexenl/FlashIM/blob/main/docs/platforms.md) and each model's page.
 
-**RoMaV2** (dense; 800² + 1024², both directions, forward only, `compile-full`):
+**RoMaV2** (dense; `mega1500` 800² + 1024², both directions, forward only, `engine="compile-full"`, RTX 5070 Ti `sm_120`):
 
 | preset | forward | vs `bf16` |
 |---|---|---|
@@ -135,13 +138,16 @@ All numbers are from an RTX 5070 Ti. The latency of every model, preset and engi
 | `fp8` | 110 ms | 1.77x |
 | `int8` | 104 ms | 1.87x |
 
-Pose AUC@5 vs `bf16` (3 seeds, MegaDepth-1500 / ScanNet-1500): `fp8` -0.0023 / +0.0007, `int8` -0.0010 / +0.0004, inside the RANSAC seed noise of about 0.003.
-On the 900 deliberately hard HardMatch pairs `fp8` costs 0.0074 mAA@10px, the same as RoMaV2's own FP8 recipe.
+In eager mode on RTX 5070 Ti (`sm_120`, `mega1500`, both directions), `fp8` runs in 113.9 ms (1.62x vs pre-sweep `fp8`)
+and `int8` in 110.8 ms (1.26x). Pose AUC@5 vs `bf16` (3 seeds, MegaDepth-1500 / ScanNet-1500, `sm_120`, `compile-full`):
+`fp8` -0.0023 / +0.0007, `int8` -0.0010 / +0.0004, inside the RANSAC seed noise of about 0.003 (and 0 FAIL under the
+2026-11 `compile` paired-bootstrap gate). On the 900 deliberately hard HardMatch pairs `fp8` costs 0.0074 mAA@10px, the
+same as RoMaV2's own FP8 recipe.
 
-**Sparse pipelines:**
+**Sparse pipelines (RTX 5070 Ti `sm_120`):**
 
-- **RaCo + ALIKED + LightGlue** (1024² pair, 1024 keypoints, exact ranker): 14.6 ms per pair, against 18.1 ms for the TensorRT-FP16 engine of LightGlue-ONNX.
-- **RDD** (1056x1600 extract): 110.9 ms in FP32, 35.4 ms with `fp8` + `compile`; the reference implementation without its CUDA extension runs out of memory on 16 GB.
+- **RaCo + ALIKED + LightGlue** (1024² pair, 1024 keypoints, exact ranker, `bf16` + `engine="compile"`): 14.6 ms per pair, against 18.1 ms for the TensorRT-FP16 engine of LightGlue-ONNX.
+- **RDD** (1056x1600 extract): 110.9 ms in `fp32` eager, 35.4 ms with `fp8` + `engine="compile"`; the reference implementation without its CUDA extension runs out of memory on 16 GB.
 
 ## Configuring a run
 

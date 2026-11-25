@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import torch
 from torch import nn
 
 from flashim.build import BuildContext, EngineSpec, ModelSpec, Pass, dtype
@@ -29,6 +30,18 @@ def _fused_ranker(model: RaCo, ctx: BuildContext) -> str:
     return model.ranker_backend
 
 
+def _fused_detector(model: RaCo, ctx: BuildContext) -> list[str]:
+    return model.use_fused_detector(ctx.option("ranker_backend", "auto"))
+
+
+def _channels_last(model: RaCo, ctx: BuildContext) -> str:
+    if ctx.config.precision.compute_dtype == "fp32":
+        return "skipped: fp32"
+    for module in (model.block2, model.block3, model.block4, model.conv1, model.conv2, model.conv3, model.conv4):
+        module.to(memory_format=torch.channels_last)
+    return "detector"
+
+
 def _set_precision(model: nn.Module, config: RunConfig) -> None:
     if config.precision.compute_dtype != "fp32":
         model.set_compute_dtype(dtype(config.precision.compute_dtype))
@@ -41,19 +54,32 @@ SPEC = ModelSpec(
     load=_load,
     presets={
         "fp32": {"optimize": {"passes": ["fold_batchnorm"]}},
-        "bf16": {"extends": "fp32", "precision": {"compute_dtype": "bf16"}, "optimize": {"passes+": ["fused_ranker"]}},
+        "bf16": {
+            "extends": "fp32",
+            "precision": {"compute_dtype": "bf16"},
+            "optimize": {"passes+": ["fused_ranker", "fused_detector", "channels_last"]},
+        },
     },
     default_preset="fp32",
     passes={
         "fold_batchnorm": Pass(_fold_batchnorm, stage="pre_quant", description="exact conv+BN fold"),
+        "fused_detector": Pass(
+            _fused_detector, requires=lambda p: p.device_type == "cuda", exact=False,
+            description="fused FP32 score_head[2:] (CUDA C++) and BF16 block1 (raco_resblock)",
+        ),
         "fused_ranker": Pass(
             _fused_ranker, requires=lambda p: p.device_type == "cuda", exact=False,
             description="ranker residual blocks + head as fused ops (batch 1); option ranker_backend",
         ),
+        "channels_last": Pass(
+            _channels_last, exact=False, description="NHWC detector convolutions (bf16)",
+        ),
     },
     engines={
         "eager": EngineSpec(),
-        "compile": EngineSpec(("block1", "block2", "block3", "block4", "ranker_head")),
+        "compile": EngineSpec(
+            ("block1", "block2", "block3", "block4", "conv1", "conv2", "conv3", "conv4", "score_head", "ranker_head")
+        ),
     },
     set_precision=_set_precision,
 )

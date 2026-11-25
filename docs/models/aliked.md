@@ -30,11 +30,17 @@ repo ([checkpoints](../checkpoints.md)):
 | preset | what it does |
 |---|---|
 | `fp32` (default) | the checkpoint's own precision. Dense maps, keypoints and scores match the reference bit-exactly; descriptors to cosine > 0.99999 |
-| `bf16` | encoder and `SDDH` in BF16; the score head and NMS / soft-argmax / sampling math stay FP32. Deformable convs run their `deform_conv2d` call in FP32 (no BF16 / FP16 kernel exists) |
+| `bf16` | encoder and `SDDH` in BF16; the score head, NMS / soft-argmax and SDDH pixel-coordinate sampling stay FP32 (preventing 2–8 px BF16 ULP quantization on `kpts_wh`). Deformable convs run their `deform_conv2d` call in FP32 (no BF16 / FP16 kernel exists) |
 
 Every preset folds each block's eval BatchNorm into its convolution. The fold is exact (< 1e-6 max abs diff), and the
-folded blocks are listed in `model.fused_batchnorm`. The multi-scale feature step (3 bilinear upsamples, channel concat,
-FP32 cast, L2 normalize) runs as one fused Triton kernel, `ops.multiscale_fuse`.
+folded blocks are listed in `model.fused_batchnorm`. Key hot paths run as custom kernels on CUDA:
+
+- `ops.multiscale_fuse` (Triton, NHWC): fuses the 3 bilinear upsamples, channel concat, FP32 cast and L2 normalize.
+- `ops.aliked_score_head` (CUDA C++): fuses the 4-layer score head convs, soft-NMS and soft-argmax.
+- `ops.aliked_sample_patches` and `ops.aliked_bilinear_sample` (Triton): SDDH descriptor sampling without `F.unfold` or
+  host syncs, keeping pixel coordinates in FP32. Restoring FP32 SDDH pixel coordinates in `bf16` lifted MegaDepth-1500 /
+  ScanNet-1500 pose AUC@5 by `+0.0559` / `+0.0068` (`aliked bf16`, RTX 5070 Ti `sm_120`, eager; see
+  [benchmarks.md](../benchmarks.md)).
 
 There is no quantized preset (`int8` / `fp8` build `bf16`): the network has no `nn.Linear`, and its small 1x1
 projections are memory-bound. The
@@ -48,5 +54,7 @@ schedules well. Eager is the practical default.
 
 ## Speed
 
-`extract()` at 1200 px, 4096 keypoints, RTX 5070 Ti: `fp32` 9.05 ms, `bf16` 5.34 ms. Method and every other model:
-[inference benchmark](../benchmarks.md#sparse-extractors).
+- **2026-11 `sm_120` eager sweep** (`extract()` at `832x1184`, 4096 keypoints, RTX 5070 Ti `sm_120`, `eager`): `bf16`
+  `5.42 -> 3.47 ms` (1.56x), `fp32` `6.36 -> 5.59 ms` (1.14x).
+- **2026-10 baseline** (`extract()` at 1200 px, 4096 keypoints, RTX 5070 Ti `sm_120`, `eager`): `fp32` 9.05 ms, `bf16`
+  5.34 ms. Method and every other model: [inference benchmark](../benchmarks.md#sparse-extractors).

@@ -9,10 +9,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim import ops
 from flashim.models import sparse
 from flashim.models.dedode import blocks
 from flashim.models.ripe import weights
 from flashim.platforms import default_device
+from flashim.types import Matches, SparseFeatures
 from flashim.utils import device_constant
 
 
@@ -66,9 +68,19 @@ class RIPE(sparse.SparseExtractor):
         return self._describe(self.heatmap(image)[1], keypoints, h, w)
 
     def _describe(self, features: list[Tensor], keypoints: Tensor, h: int, w: int) -> Tensor:
-        grid = (2.0 * keypoints.float() / device_constant([w - 1, h - 1], keypoints, torch.float32) - 1.0).view(1, 1, -1, 2)
-        hyper = torch.cat(
-            [F.grid_sample(f.float(), grid, mode="bilinear", align_corners=True)[0, :, 0] for f in features], dim=0
-        )  # [960, K]
-        desc = self.conv_dim_reduction_coarse_desc(hyper[None].to(self.conv_dim_reduction_coarse_desc.weight.dtype))[0].t()
+        grid = 2.0 * keypoints.float() / device_constant([w - 1, h - 1], keypoints, torch.float32) - 1.0
+        hyper = ops.bilinear_sample_points(
+            features, grid, align_corners=True, out_dtype=self.conv_dim_reduction_coarse_desc.weight.dtype
+        )  # [K, 960]
+        # Keep the 1x1 Conv1d call (instead of F.linear): cuDNN Conv1d and cuBLAS GEMM have different BF16
+        # rounding orders (max_diff 2.4e-3) which shifted MegaDepth RIPE BF16 AUC@5 by -0.0042.
+        desc = self.conv_dim_reduction_coarse_desc(hyper.t().contiguous()[None])[0].t()
         return F.normalize(desc.float(), dim=-1)
+
+    @torch.inference_mode()
+    def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
+        limit = self.match_threshold if threshold is None else threshold
+        # Keep FP32 descriptors (TF32 tiled Triton kernel: 2.30x faster and 13.5x less VRAM than dense FP32 at 32k^2,
+        # <0.4 ms at 4096^2): casting to BF16 dropped ScanNet MNN overlap from 99.95% to 99.47%.
+        ia, ib, score = ops.mutual_nn_match(a.descriptors[0], b.descriptors[0], limit)
+        return Matches(a.keypoints[0][ia], b.keypoints[0][ib], score, ia, ib)

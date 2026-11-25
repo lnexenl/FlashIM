@@ -49,3 +49,17 @@ def _head_reference(x: Tensor, weight: Tensor, bias: Tensor) -> Tensor:
 
 
 raco_head5x5 = Op("raco_head5x5", _head_reference, weights=2)
+
+
+def _score_head_reference(x: Tensor, w1: Tensor, w2: Tensor, w3: Tensor) -> Tensor:
+    """RaCo detector ``score_head[2:]`` in FP32: ``conv3x3(8->4) -> SELU -> conv3x3(4->4) -> SELU -> conv3x3(4->1)``.
+
+    ``x``: ``[B, 8, H, W]`` FP32; ``w1`` ``[4, 8, 3, 3]``, ``w2`` ``[4, 4, 3, 3]``, ``w3`` ``[1, 4, 3, 3]`` ->
+    ``[B, 1, H, W]`` FP32.
+    """
+    h = F.selu(F.conv2d(x.float(), w1.float(), padding=1))
+    h = F.selu(F.conv2d(h, w2.float(), padding=1))
+    return F.conv2d(h, w3.float(), padding=1)
+
+
+raco_score_head = Op("raco_score_head", _score_head_reference, weights=3)

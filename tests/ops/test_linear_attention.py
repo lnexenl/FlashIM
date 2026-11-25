@@ -22,14 +22,16 @@ def test_linear_attention_reference_cpu():
 @pytest.mark.parametrize(
     ("n", "seq_l", "seq_s", "h", "d", "v_dim"),
     [
-        (1, 8190, 8190, 8, 32, 32),  # LoFTR coarse self (840px)
-        (1, 8190, 8085, 8, 32, 32),  # LoFTR coarse cross (non-square)
-        (2, 4800, 4800, 8, 32, 32),  # batched coarse
-        (512, 25, 25, 8, 16, 16),    # LoFTR fine (5x5 windows)
-        (1, 1, 1, 8, 32, 32),        # tiny
-        (3, 7, 13, 4, 24, 20),       # odd non-power-of-2 dims
-        (1, 130, 129, 8, 32, 32),    # non-multiple of BLOCK_S/L=128
-        (1, 1025, 1023, 4, 64, 64),  # max supported D=64
+        (1, 16800, 16500, 8, 32, 32),  # LoFTR coarse at 1200 px
+        (1, 8190, 8190, 8, 32, 32),    # LoFTR coarse self (840px)
+        (1, 8190, 8085, 8, 32, 32),    # LoFTR coarse cross (non-square)
+        (2, 4800, 4800, 8, 32, 32),    # batched coarse
+        (512, 25, 25, 8, 16, 16),      # LoFTR fine (5x5 windows)
+        (10000, 25, 25, 8, 16, 16),    # LoFTR fine with N*H > 65535 (gridDim.y limit)
+        (1, 1, 1, 8, 32, 32),          # tiny
+        (3, 7, 13, 4, 24, 20),         # odd non-power-of-2 dims
+        (1, 130, 129, 8, 32, 32),      # non-multiple of BLOCK_S/L=128
+        (1, 1025, 1023, 4, 64, 64),    # max supported D=64
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

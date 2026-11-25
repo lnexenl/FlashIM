@@ -84,5 +84,9 @@ def test_spec_variants_and_presets():
             assert path.name == f"loma-extractor_{table}_{quant}.safetensors" and path.is_file()
     assert flashim.resolve("loma-extractor", "fp8").precision.quant == "fp8"
     assert flashim.resolve("loma-extractor").preset == "bf16"
+    assert spec.quant_configs["b128/fp8"].scheme_for("descriptor.encoder.layers.3") is not None
+    assert spec.quant_configs["b128/fp8"].scheme_for("descriptor.decoder.layers.4.block1.0") is None
+    assert spec.quant_configs["b128/fp8"].scheme_for("detector.decoder.layers.4.block1.0") is None
+    assert spec.quant_configs["fp8"].scheme_for("descriptor.decoder.layers.4.block1.0") is not None
     with pytest.raises(ValueError, match="variant"):
         flashim.resolve("loma-extractor", "fp32", config={"variant": "x"})

@@ -90,8 +90,14 @@ class Preset:
     fold_refiners: bool = False
     # VGG19-BN fine features with BatchNorm folded and channels-last weights (changes rounding).
     fold_fine_features: bool = False
-    # DINOv3's RoPE as the fused ``ops.rope_qk`` kernel instead of the upstream math (one BF16 ulp on 24% of q / k).
+    # DINOv3 / MV-ViT RoPE as the fused ``ops.rope_qk`` kernel instead of the pinned reference math.
     fused_rope: bool = False
+    # Fold DINOv3 LayerScale into attn.proj / mlp.fc2 before quantization (absorbs into per-channel weight scales).
+    fold_layer_scale: bool = False
+    # Fuse MXFP8 transformer block biases and residual adds into cuBLAS / LayerNorm / GELU epilogues.
+    fused_block_epilogues: bool = False
+    # Platform-gated SageAttention (QK INT8, PV FP8) on quantized transformer blocks when installed.
+    sage_attention: bool = False
     # Refiner stages whose BF16 conv blocks run as one fused kernel each (no quantization).
     fused_bf16_refiners: tuple[int, ...] = ()
     # Refiner glue as fused ops: block1 input (warp sampling, disp_emb, local corr) and
@@ -99,6 +105,8 @@ class Preset:
     fused_refiner_io: bool = False
     # Refine both match directions as one batch with one projection per feature map (bit-exact).
     batched_directions: bool = False
+    # Share logits_ba = logits_ab^T and batch AB+BA through a channels-last DPTHead.
+    batched_matcher: bool = False
     # Fuse each MXFP8 refiner block (depthwise + quantize + pointwise GEMM) into one kernel where supported.
     fused_mx_blocks: bool = False
     description: str = ""
@@ -114,9 +122,14 @@ PRESETS: dict[str, Preset] = {
             {"transformer": _INT8_TRANSFORMER, "dpt": _INT8_DPT, "refiner": _INT8_REFINER_S42}, name="int8"
         ),
         fold_refiners=True,
+        fold_fine_features=True,
+        fused_rope=True,
+        fold_layer_scale=True,
+        sage_attention=True,
         fused_bf16_refiners=(1,),
         fused_refiner_io=True,
         batched_directions=True,
+        batched_matcher=True,
         calibration=INT8_CALIBRATION,
         description="static INT8 transformer linears + DPT projections + stride-4/2 refiner blocks, FlashIM refiner "
         "kernels (fused BF16 stride-1 blocks, fused refiner input/heads, batched directions); not RoMaV2-exact",
@@ -125,9 +138,15 @@ PRESETS: dict[str, Preset] = {
         "fp8",
         QuantConfig({"transformer": _TRANSFORMER, "refiner": _refiner_scheme(4, 2)}, name="fp8"),
         fold_refiners=True,
+        fold_fine_features=True,
+        fused_rope=True,
+        fold_layer_scale=True,
+        fused_block_epilogues=True,
+        sage_attention=True,
         fused_bf16_refiners=(1,),
         fused_refiner_io=True,
         batched_directions=True,
+        batched_matcher=True,
         fused_mx_blocks=True,
         description="static MXFP8 transformer linears + fused MXFP8 stride-4/2 refiner blocks, FlashIM refiner "
         "kernels (fused BF16 stride-1 blocks, fused refiner input); not RoMaV2-exact",

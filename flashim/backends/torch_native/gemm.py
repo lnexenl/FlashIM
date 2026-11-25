@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -38,20 +40,40 @@ def _mxfp8_scaled_mm_cublas(a, b_t, a_scale, b_scale, bias=None):
 
 class _InputScales:
     """Swizzled static input scales per row count for one layer's calibrated input exponent (the first one seen;
-    another exponent object is converted per call, uncached)."""
+    another exponent object is converted per call, uncached). Bounded LRU so variable-row workloads (e.g. LoFTR's
+    fine stage across MegaDepth-1500) do not accumulate gigabytes of stale scale buffers, while any scale buffer
+    captured into a CUDA graph is pinned so the LRU never frees a pointer a live graph still reads."""
+
+    MAX_CACHED = 16
 
     def __init__(self) -> None:
         self.exponent: Tensor | None = None
-        self.by_rows: dict[int, Tensor] = {}
+        self.by_rows: OrderedDict[int, Tensor] = OrderedDict()
+        self.pinned: dict[int, Tensor] = {}
 
     def get(self, exponent: Tensor, rows: int) -> Tensor:
         if self.exponent is None:
             self.exponent = exponent
         if exponent is not self.exponent:
             return mx.static_input_scales(exponent, rows)
+        scales = self.pinned.get(rows)
+        if scales is not None:
+            return scales
+        capturing = exponent.is_cuda and torch.cuda.is_current_stream_capturing()
         scales = self.by_rows.get(rows)
+        if capturing:
+            if scales is not None:
+                self.pinned[rows] = self.by_rows.pop(rows)
+                return scales
+            # Uncached during capture (no warmup): let the graph own the private-pool allocation.
+            return mx.static_input_scales(exponent, rows)
         if scales is None:
-            scales = self.by_rows[rows] = mx.static_input_scales(exponent, rows)
+            scales = mx.static_input_scales(exponent, rows)
+            self.by_rows[rows] = scales
+            while len(self.by_rows) > self.MAX_CACHED:
+                self.by_rows.popitem(last=False)
+        else:
+            self.by_rows.move_to_end(rows)
         return scales
 
 
