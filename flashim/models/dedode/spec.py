@@ -329,7 +329,25 @@ def _loader(variant: str):
     return load
 
 
-def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ...] = (), vit: str | None = None):
+# Early VGG stem convs of DeDoDe-B's descriptor (64/128 ch) have sparse channel activity that shifts from MegaDepth
+# (outdoor calibration) to ScanNet (indoor): static per-tensor INT8 clips up to 2.96x (layers.3), 2.35x (layers.7),
+# and 2.43x (layers.10), and MegaDepth-calibrated SmoothQuant hurts ScanNet further. Keeping these three stem convs
+# BF16 restores ScanNet descriptor cosine (0.9941 -> 0.9975) and AUC while 61/64 convs stay INT8 (~1.84x faster).
+_DEDODE_B_INT8_IGNORE = (
+    "descriptor.encoder.layers.3",
+    "descriptor.encoder.layers.7",
+    "descriptor.encoder.layers.10",
+)
+
+
+def _spec(
+    name: str,
+    variant: str,
+    description: str,
+    int8_ignore: tuple[str, ...] = (),
+    int8_dynamic: tuple[str, ...] = (),
+    vit: str | None = None,
+):
     return extractor_spec(
         name=name,
         description=description,
@@ -337,6 +355,7 @@ def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ..
         calibration_dir=Path(__file__).parent / "calibration",
         quantized=QUANTIZED,
         protected=PROTECTED,
+        int8_ignore=int8_ignore,
         int8_dynamic=int8_dynamic,
         compile_regions=("detector", "descriptor"),
         # BF16 extract at 1200 px, interleaved in one process (sm_120): dedode 128 -> 102 ms, dedode-g 184 -> 160 ms.
@@ -358,7 +377,10 @@ def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ..
 
 
 # One spec per descriptor: the two descriptors' layers differ in names and shapes, so each has its own calibration table.
-SPEC = _spec("dedode", "B", "DeDoDe v2 detector (L) + descriptor B (VGG19), dual-softmax matching")
+SPEC = _spec(
+    "dedode", "B", "DeDoDe v2 detector (L) + descriptor B (VGG19), dual-softmax matching",
+    int8_ignore=_DEDODE_B_INT8_IGNORE,
+)
 SPEC_G = _spec(
     "dedode-g", "G", "DeDoDe v2 detector (L) + descriptor G (VGG19 + DINOv2 ViT-L/14), dual-softmax matching",
     int8_dynamic=VIT_LINEARS, vit="dedode-g",
