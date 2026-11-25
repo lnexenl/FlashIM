@@ -10,7 +10,6 @@ from flashim.models.dedode.spec import (
     DECODER_FUSION_PASSES,
     DECODER_UPSAMPLE_PASS,
     STEM_EXACT_PASSES,
-    STEM_TC_PASSES,
 )
 from flashim.models.ripe.model import RIPE
 from flashim.models.sparse_spec import extractor_spec
@@ -27,7 +26,16 @@ def _load(config: RunConfig) -> RIPE:
     return RIPE.from_pretrained(checkpoint=config.checkpoint, device=config.device, **config.arch)
 
 
-_PASSES = {**DECODER_UPSAMPLE_PASS, **DECODER_FUSION_PASSES, **STEM_EXACT_PASSES, **STEM_TC_PASSES}
+# Keep only the bit-exact INT8 passes on RIPE (``int8_refiner_input``, ``fused_pool_epilogue``,
+# ``fused_first_conv_epilogue``): the 3 non-exact DeDoDe passes (``fold_refiner_residual``, ``int8_decoder_producers``,
+# ``tensor_core_first_conv``) shift RIPE's heatmap logits by 5.9% relL2 (8% keypoint flips at the 0.5 threshold) and
+# dropped ScanNet-1500 int8 AUC@5 from 0.1505 (-0.0002 vs bf16, exact match to dev) to 0.1471 (-0.0036; -0.0046 with
+# TF32 MNN). Exact passes alone still run 2.20x faster than dev int8 (19.19 vs 42.28 ms at 1200 px; 1.64x vs bf16).
+_PASSES = {
+    **DECODER_UPSAMPLE_PASS,
+    "int8_refiner_input": DECODER_FUSION_PASSES["int8_refiner_input"],
+    **STEM_EXACT_PASSES,
+}
 
 # Early VGG stem convs (64/128 ch) hit E4M3's 3-bit mantissa floor (~2.6% input relL2 even with per-pixel dynamic
 # MXFP8 or channel smoothing), which RIPE's hypercolumn projection amplifies (ScanNet desc_cos 0.9880 -> 0.9991,
