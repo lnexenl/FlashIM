@@ -67,28 +67,28 @@ The calibration tables ship in `flashim/models/flexglue/calibration/`
 
 ## Speed and accuracy
 
-`match_keypoints` at 2048 RDD keypoints and dense `match()` (5000 KDE-sampled matches, 512x512 descriptor) on MegaDepth pair `505127/505128`, **RTX 5070 Ti (`sm_120`)**, torch `2.11.0+cu130`, `engine="eager"`, 2-round interleaved best-of-2 (`model/flexglue` `75077dc` base -> optimized):
+`match_keypoints` at 2048 RDD keypoints and dense `match()` (5000 KDE-sampled matches, 512x512 descriptor) on MegaDepth pair `505127/505128`, **RTX 5070 Ti (`sm_120`)**, torch `2.11.0+cu130`, `engine="eager"`, best of 2 interleaved rounds:
 
-| preset | attention | `match_keypoints` eager (base -> new) | dense `match()` eager (base -> new) | `match_keypoints` / `match()` compile¹ |
-|---|---|---|---|---|
-| `fp32` | torch SDPA | 163.42 -> 153.86 ms (1.06x) | 168.08 -> 154.86 ms (1.09x) | — |
-| `bf16` | torch SDPA | 45.76 -> 37.75 ms (1.21x) | 50.45 -> 38.78 ms (1.30x) | 32.5 / 36.6 ms |
-| `int8` | `sage` | 35.47 -> 22.97 ms (1.54x) | 40.35 -> 25.67 ms (1.57x) | 24.9 / 28.9 ms |
-| `fp8` | `sage-fp8-fast` | 32.30 -> **18.58 ms** (1.74x) | 36.85 -> **19.50 ms** (1.89x) | 19.4 / 23.5 ms |
+| preset | attention | `match_keypoints` | dense `match()` |
+|---|---|---:|---:|
+| `fp32` | torch SDPA | 145.1 ms | 146.3 ms |
+| `bf16` | torch SDPA | 35.1 ms | 36.1 ms |
+| `int8` | `sage` | 22.3 ms | 23.4 ms |
+| `fp8` | `sage-fp8-fast` | **18.0 ms** | **19.0 ms** |
 
-¹ Pre-sweep `engine="compile"` timings on RTX 5070 Ti (`sm_120`, before the eager kernel & pass fusions); eager `fp8` (`18.58 / 19.50 ms`) and `int8` (`22.97 / 25.67 ms`) now beat the previous compiled numbers with zero compile warmup.
+`engine="compile"` gains little (`bf16` 33.7 / 34.9 ms, `int8` 22.2 / 23.4 ms, `fp8` 17.9 / 19.1 ms; benchmark table).
 
-Eager speedups come from six named passes in `spec.py` plus custom Triton kernels: `fold_convnext_gamma`, `channels_last` (NHWC ConvNeXt + head), `fuse_convnext_int8` (LN+quantize, GELU+quantize, INT8 residual epilogue), `fuse_transformer_glue` (MXFP8 cuBLAS fused bias, `ops.quantize_mxfp8_heads` / `ops.quantize_int8_heads`, `ops.layernorm_cat_quantize_{mxfp8,int8}`, FFN LN+GELU+quantize, shared `to_qk`/`to_v` quantize), `sage_attention`, and fixed-shape descriptor `cuda_graph`, together with Triton `ops.flexglue_entmax_readout` (zero-sort safeguarded Newton + active-set quadratic), `ops.qkv_norm_rope_interleaved`, `ops.qk_norm_swap_heads`, 3D `ops.kde_density`, border-padded `ops.bilinear_sample_points`, tiled 4D `ops.reciprocal_nn`, and dense `MatchHead.match_dense_pair` reuse. Whole-transformer (`decode_pair`) CUDA graphing was also tested with `sdpa_graph_safe()` on `sm_120`: unpatched SageAttention fails `sdpa_graph_safe()` (legacy default stream), and with graph-safe torch SDPA `decode_pair` is GPU-bound at 4096 tokens/image (`bf16` 25.71 -> 25.70 ms, 1.001x), so only the descriptor is graphed.
+The eager speed comes from six named passes in `spec.py` plus custom Triton kernels: `fold_convnext_gamma`, `channels_last` (NHWC ConvNeXt + head), `fuse_convnext_int8` (LN+quantize, GELU+quantize, INT8 residual epilogue), `fuse_transformer_glue` (MXFP8 cuBLAS fused bias, `ops.quantize_mxfp8_heads` / `ops.quantize_int8_heads`, `ops.layernorm_cat_quantize_{mxfp8,int8}`, FFN LN+GELU+quantize, shared `to_qk`/`to_v` quantize), `sage_attention`, and fixed-shape descriptor `cuda_graph`, together with Triton `ops.flexglue_entmax_readout` (zero-sort safeguarded Newton + active-set quadratic), `ops.qkv_norm_rope_interleaved`, `ops.qk_norm_swap_heads`, 3D `ops.kde_density`, border-padded `ops.bilinear_sample_points`, tiled 4D `ops.reciprocal_nn`, and dense `MatchHead.match_dense_pair` reuse. Whole-transformer (`decode_pair`) CUDA graphing was also tested with `sdpa_graph_safe()` on `sm_120`: unpatched SageAttention fails `sdpa_graph_safe()` (legacy default stream), and with graph-safe torch SDPA `decode_pair` is GPU-bound at 4096 tokens/image (`bf16` 25.71 -> 25.70 ms, 1.001x), so only the descriptor is graphed.
 
-**Accuracy gate** (RTX 5070 Ti `sm_120`, `engine="eager"`, `FLASHIM_IMAGE_DECODER=pil`, dense `match()` at native 512x512, 5000 KDE-sampled matches, PoseLib LO-RANSAC 1.0 px, mean of seeds `17 / 29 / 42`, paired bootstrap 95% CI `B=10000` vs pre-sweep `model/flexglue` `75077dc` `bf16` baseline; **5 PASS, 1 BORDERLINE, 0 FAIL**):
+**Accuracy gate** (RTX 5070 Ti `sm_120`, `engine="eager"`, `FLASHIM_IMAGE_DECODER=pil`, dense `match()` at native 512x512, 5000 KDE-sampled matches, PoseLib LO-RANSAC 1.0 px, mean of seeds `17 / 29 / 42`, paired bootstrap 95% CI `B=10000` vs the unoptimized `bf16`; **5 PASS, 1 BORDERLINE, 0 FAIL**):
 
-| dataset | preset | AUC@5 | AUC@10 | AUC@20 | Δ AUC@5 vs `75077dc bf16` (95% CI) | gate |
+| dataset | preset | AUC@5 | AUC@10 | AUC@20 | Δ AUC@5 vs unoptimized `bf16` (95% CI) | gate |
 |---|---|---:|---:|---:|---|---|
-| MegaDepth-1500 | `75077dc bf16` | 0.6399 | 0.7728 | 0.8653 | — | BASE |
+| MegaDepth-1500 | unoptimized `bf16` | 0.6399 | 0.7728 | 0.8653 | — | BASE |
 | MegaDepth-1500 | `bf16` | 0.6394 | 0.7724 | 0.8653 | `-0.0005 [-0.0018, +0.0006]` | PASS |
 | MegaDepth-1500 | `int8` | 0.6387 | 0.7727 | 0.8659 | `-0.0012 [-0.0044, +0.0020]` | PASS |
 | MegaDepth-1500 | `fp8` | 0.6381 | 0.7715 | 0.8651 | `-0.0019 [-0.0057, +0.0021]` | BORDERLINE |
-| ScanNet-1500 | `75077dc bf16` | 0.3431 | 0.5712 | 0.7419 | — | BASE |
+| ScanNet-1500 | unoptimized `bf16` | 0.3431 | 0.5712 | 0.7419 | — | BASE |
 | ScanNet-1500 | `bf16` | 0.3429 | 0.5710 | 0.7420 | `-0.0002 [-0.0013, +0.0007]` | PASS |
 | ScanNet-1500 | `int8` | 0.3420 | 0.5702 | 0.7414 | `-0.0010 [-0.0040, +0.0019]` | PASS |
 | ScanNet-1500 | `fp8` | 0.3440 | 0.5709 | 0.7421 | `+0.0009 [-0.0023, +0.0041]` | PASS |

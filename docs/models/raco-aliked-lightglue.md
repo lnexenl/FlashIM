@@ -42,7 +42,7 @@ the extractor in FP32 under a quantized LightGlue.
   `ops.raco_score_head` (`backends/cuda/csrc/raco_score_head.cu`) fuses `score_head[2:]` (`0.780 -> 0.251 ms` at
   1024x1024 on RTX 5070 Ti `sm_120`, 3.10x), `block1` reuses `raco_resblock`, and `raco/keypoints.py` uses direct padded
   index gather instead of `F.unfold` (bit-identical, saving 28-69 MB). Together with `channels_last`, `raco bf16`
-  `extract_keypoints` at 1024x1024 (`sm_120`, `eager`) drops from `6.92 -> 3.67 ms` (1.88x).
+  `extract_keypoints` is fast at 1024x1024 (see [Speed](#speed)).
 - **BatchNorm folding** (exact).
 
 ## RaCo with other models
@@ -84,20 +84,10 @@ descriptors.
 
 ## Speed
 
-One 1024x1024 pair, 1024 keypoints, threshold 0.1, decode and resize excluded, RTX 5070 Ti (`sm_120`, 2026-10 baseline):
-
-| pipeline | ranker | time per pair |
-|---|---|---|
-| LightGlue-ONNX, TensorRT 11.3 fp16 | dense (exact) | 18.1 ms |
-| LightGlue-ONNX, TensorRT 11.3 fp16 | `boundary` (their default: reranks only a 512-candidate window) | 13.8 ms |
-| FlashIM, `bf16` + `compile` | dense (exact) | **14.6 ms** |
-| FlashIM, `bf16` eager | dense (exact) | 19.9 ms |
-| FlashIM, `fp32` eager | dense (exact) | 57.3 ms |
-
-On the same exact algorithm FlashIM is about 20% faster than their TensorRT fp16 engine. Their number is engine-only GPU
-time; FlashIM's includes Python launch overhead. FlashIM has no `boundary` ranker, so that row has no like-for-like
-counterpart. In the 2026-11 `sm_120` eager sweep, `raco bf16` `extract_keypoints` (1024x1024, RTX 5070 Ti `sm_120`,
-`eager`) dropped from `6.92 -> 3.67 ms` (1.88x); the compiled pair table above was not re-measured.
+`extract` of one 1200 px image (4096 keypoints, RTX 5070 Ti `sm_120`, `eager / compile`): `raco-aliked` `fp32` 26.8 / 18.1 ms,
+`bf16` 7.03 / 5.76 ms. Pair time of `raco-aliked-lightglue` (2 x `extract` + `match_features`): `fp32` 111.7 / 93.5 ms, `bf16`
+25.6 / 22.5 ms, `int8` 23.8 / 21.5 ms, `fp8` 24.4 / 30.0 ms. The comparison with the LightGlue-ONNX TensorRT engine is not
+measured on the current code.
 
 ## Accuracy
 
@@ -106,4 +96,4 @@ inliers are within run-to-run noise (73-81 across the FP32 / TF32 / BF16 variant
 fewer matches (155 vs 170) at the same inlier count. Restoring FP32 SDDH pixel coordinates in ALIKED lifted `raco-aliked`
 `bf16` by `+0.0397` / `+0.0056` and `raco-aliked-lightglue` `bf16` by `+0.0186` / `+0.0122` on MegaDepth-1500 /
 ScanNet-1500 (RTX 5070 Ti `sm_120`, `eager`, 3 seeds); full gate results: [LightGlue](lightglue.md#accuracy) and
-[benchmarks.md](../benchmarks.md#accuracy-of-the-pre-2026-11-models-2026-11-gate-sm_120).
+[benchmarks.md](../benchmarks.md#accuracy).

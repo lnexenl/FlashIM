@@ -54,7 +54,5 @@ schedules well. Eager is the practical default.
 
 ## Speed
 
-- **2026-11 `sm_120` eager sweep** (`extract()` at `832x1184`, 4096 keypoints, RTX 5070 Ti `sm_120`, `eager`): `bf16`
-  `5.42 -> 3.47 ms` (1.56x), `fp32` `6.36 -> 5.59 ms` (1.14x).
-- **2026-10 baseline** (`extract()` at 1200 px, 4096 keypoints, RTX 5070 Ti `sm_120`, `eager`): `fp32` 9.05 ms, `bf16`
-  5.34 ms. Method and every other model: [inference benchmark](../benchmarks.md#sparse-extractors).
+`extract()` of one 1200 px image, 4096 keypoints, RTX 5070 Ti (`sm_120`), `eager / compile`: `fp32` 5.94 / 5.10 ms, `bf16`
+3.72 / 2.70 ms. Method and every other model: [inference benchmark](../benchmarks.md#sparse-extractors).

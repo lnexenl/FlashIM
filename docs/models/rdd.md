@@ -41,20 +41,10 @@ changes about 12% of the 4096 keypoints.
 
 ## Speed
 
-`extract()` at 1056x1600, image preloaded, keypoints + descriptors included, RTX 5070 Ti (`sm_120`, 2026-10 baseline):
-
-| configuration | extract | peak memory |
-|---|---|---|
-| RDD reference (PyTorch deformable path, no CUDA extension) | OOM (16 GB) | |
-| `fp32` eager | 110.9 ms | 2.0 GiB |
-| `bf16` eager | 57.6 ms | 1.1 GiB |
-| `bf16` + `compile` | 40.3 ms | 1.1 GiB |
-| `fp8` eager | 49.3 ms | 1.3 GiB |
-| `fp8` + `compile` | 35.4 ms | 1.1 GiB |
-
-In the 2026-11 `sm_120` eager sweep (1600 px `toronto_A`, RTX 5070 Ti `sm_120`, `eager`), ConvNeXt `channels_last` +
-NHWC LayerNorm cut `extract()` by `5.8 ms` (`bf16` `62.72 -> 56.92 ms` [1.10x], `fp8` `53.59 -> 47.76 ms` [1.12x]);
-the `compile` rows above were not re-measured.
+`extract()` of one 1200 px image (4096 keypoints, image preloaded, keypoints + descriptors included), RTX 5070 Ti
+(`sm_120`), `eager / compile`: `fp32` 68.7 / 61.0 ms, `bf16` 31.8 / 25.3 ms, `fp8` 26.5 / 22.8 ms. Method and every other
+model: [inference benchmark](../benchmarks.md#sparse-extractors). The RDD reference (PyTorch deformable path, no CUDA
+extension) runs out of memory on 16 GB.
 
 ## Accuracy
 
@@ -68,8 +58,8 @@ unless noted), RGB input:
 | `fp8` | 0.5418 | 0.6974 | 0.8137 |
 | `fp8` + `compile` | 0.5287 | 0.6887 | 0.8071 |
 
-The run-to-run spread of these sparse pipelines is about ±0.01, so FP8 costs no measurable accuracy. Under the 2026-11
+The run-to-run spread of these sparse pipelines is about ±0.01, so FP8 costs no measurable accuracy. Under the
 MegaDepth-1500 / ScanNet-1500 paired-bootstrap gate (RTX 5070 Ti `sm_120`, `eager`, 3 seeds, PoseLib 1.0 px), both
-`rdd bf16` and `rdd fp8` pass on both datasets ([benchmarks.md](../benchmarks.md#accuracy-of-the-pre-2026-11-models-2026-11-gate-sm_120)).
+`rdd bf16` and `rdd fp8` pass on both datasets ([benchmarks.md](../benchmarks.md#accuracy)).
 RDD's own script feeds OpenCV BGR images; `fp32` scores 0.5155 AUC@5 that way. Run with `benchmarks/accuracy/run_sparse.py`;
 the matrix is `benchmarks/accuracy/rdd_matrix.sh`.

@@ -43,7 +43,7 @@ LayerNorm + GELU fused into the GEMMs and their producers; bit-identical) and `c
 keypoint-count pair, eager engine; bit-identical). On `sm_120`, `fp8` also enables DINOv2 SageAttention, matcher
 `fused_bias`, `cuda_graph` (with a `sdpa_graph_safe` guard), and `sage-fp8` on `dim >= 512`; `loma-b128 fp8` uses
 `ModelSpec.quant_configs` per-variant `<variant>/<quant>` lookup (`b128/fp8`) to keep `*.decoder.*` and matcher
-`transformers.{4,5}.*` in BF16 (recovering ScanNet-1500 AUC@5 from `-0.0154` on `dev` to `-0.0008`).
+`transformers.{4,5}.*` in BF16 (ScanNet-1500 AUC@5 `-0.0008` vs the unoptimized `bf16`).
 
 Measured eager latencies:
 
@@ -51,10 +51,10 @@ Measured eager latencies:
   L20 `int8` 1.68-1.77x and H20 `int8` 1.53-1.65x faster than `bf16` (e.g. `loma-l` L20 138.9 -> 82.5 ms, H20
   118.1 -> 77.0 ms), MegaDepth-1500 ΔAUC@5 vs `bf16` -0.30 to -0.10 (L20) and -0.09 to +0.23 (H20) over the five
   variants (OpenCV RANSAC 0.5 px, 10 seeds, paired).
-- **RTX 5070 Ti (`sm_120`, `eager`)**: `loma-b128` pair at 1024 px (`fp8` vs `bf16`): `40.11` vs `51.17 ms` at 4096 kp
-  (1.28x), `33.40` vs `44.19 ms` at 2048 kp (1.32x); matchers before -> after the `sm_120` sweep: `loma-b fp8` (2048 kp)
-  `7.21 -> 3.52 ms` (2.05x), `loma-l` (4096 kp) `int8` `20.32 -> 12.97 ms` (1.57x) / `fp8` `26.22 -> 18.61 ms` (1.41x),
-  `loma-g` (4096 kp) `int8` `43.57 -> 29.25 ms` (1.49x) / `fp8` `65.58 -> 39.30 ms` (1.67x).
+- **RTX 5070 Ti (`sm_120`)**, 1024 px, 4096 keypoints, `eager`: pair time (2 x `extract` + match) `int8` / `fp8`:
+  `loma-b128` 30.8 / 45.0 ms, `loma-b` 62.4 / 73.5 ms, `loma-l` 68.3 / 77.4 ms, `loma-g` 81.8 / 95.4 ms (`bf16`:
+  56.5, 130.1, 144.7 and 185.2 ms); the matcher alone `int8` / `fp8`: `loma-l` 13.0 / 14.2 ms, `loma-g` 29.2 / 32.2 ms. Every
+  variant is in the [inference benchmark](../benchmarks.md#pair-time-of-sparse-pipelines).
 
 Without the graph the 256-dim INT8 matcher is launch-bound and slower than BF16. The graph needs SageAttention launching
 on the current stream; otherwise the capture fails and the matcher runs eagerly (warned).
@@ -62,7 +62,7 @@ on the current stream; otherwise the capture fails and the matcher runs eagerly 
 Fidelity against `fp32` on 20 MegaDepth-1500 pairs (`benchmarks/accuracy/fidelity.py`, 1024 px, 4096 keypoints, RTX 5070 Ti
 `sm_120`, `eager`), the fraction of `fp32` matches kept: `bf16` 0.912-0.917, `int8` 0.857-0.871 (before the rotation),
 `fp8` 0.800-0.843. Full MegaDepth-1500 and ScanNet-1500 pose AUC@5 gate results on `sm_120` (`0 FAIL` across all five
-variants and all presets) are in [benchmarks.md](../benchmarks.md#accuracy-of-the-pre-2026-11-models-2026-11-gate-sm_120)
+variants and all presets) are in [benchmarks.md](../benchmarks.md#accuracy)
 and [platforms.md](../platforms.md).
 
 ## Licenses
