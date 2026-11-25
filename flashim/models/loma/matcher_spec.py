@@ -156,6 +156,16 @@ PASSES = {
     ),
 }
 
+# B128's residual stream peaks at layer 4 and cancels sharply at layer 5 (norm ~3134 -> ~1806 on ScanNet-1500),
+# amplifying E4M3's 3-bit mantissa noise from 6% to 45% relative error and dropping ScanNet-1500 AUC@5 by ~0.009
+# (AUC@10 by ~0.025) even on dev. Keeping layers 4-5 in BF16 recovers the matcher while keeping the other 7 layers
+# in MXFP8 with fused_bias and CUDA graph replay; B / L / G / R keep the shared fp8 config.
+_B128_FP8 = dataclasses.replace(
+    QUANT_CONFIGS["fp8"],
+    ignore=(*QUANT_CONFIGS["fp8"].ignore, "transformers.4.*", "transformers.5.*"),
+    name="b128/fp8",
+)
+
 SPEC = ModelSpec(
     name="loma-matcher",
     role="matcher",
@@ -185,7 +195,7 @@ SPEC = ModelSpec(
         },
     },
     default_preset="bf16",
-    quant_configs=QUANT_CONFIGS,
+    quant_configs={**QUANT_CONFIGS, "b128/fp8": _B128_FP8},
     calibrations={  # without a variant: B's
         **{name: CALIBRATION_DIR / f"loma_b_{name}_mega.safetensors" for name in QUANT_CONFIGS},
         **{f"{variant}/{name}": CALIBRATION_DIR / f"loma_{variant}_{name}_mega.safetensors"

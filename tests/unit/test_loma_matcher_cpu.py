@@ -112,6 +112,12 @@ def test_registered_with_every_preset_and_a_table_per_variant():
         for quant in ("int8", "fp8"):
             assert spec.calibrations[f"{variant}/{quant}"].is_file(), (variant, quant)
         assert flashim.resolve("loma-matcher", "int8", config={"variant": variant}).precision.quant == "int8"
+    b128_fp8 = spec.quant_configs["b128/fp8"]
+    assert b128_fp8.scheme_for("transformers.3.self_attn.Wqkv") is not None
+    assert b128_fp8.scheme_for("transformers.4.self_attn.Wqkv") is None
+    assert b128_fp8.scheme_for("transformers.5.cross_attn.ffn.3") is None
+    assert b128_fp8.scheme_for("transformers.6.self_attn.Wqkv") is not None
+    assert spec.quant_configs["fp8"].scheme_for("transformers.4.self_attn.Wqkv") is not None
 
 
 @pytest.mark.parametrize("input_dim", [16, 32])  # an input projection / nn.Identity (B, R)

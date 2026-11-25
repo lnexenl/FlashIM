@@ -78,7 +78,7 @@ class ModelSpec:
     load: Callable[[RunConfig], nn.Module] | None
     presets: Mapping[str, Mapping[str, Any]]  # a subset of PRECISIONS -> config overlay
     default_preset: str
-    quant_configs: Mapping[str, Any] = field(default_factory=dict)  # name -> QuantConfig
+    quant_configs: Mapping[str, Any] = field(default_factory=dict)  # quant (or "<variant>/<quant>") -> QuantConfig
     calibrations: Mapping[str, Path] = field(default_factory=dict)  # quant (or "<variant>/<quant>") -> default table
     protected: tuple[str, ...] = ()
     passes: Mapping[str, Pass] = field(default_factory=dict)
@@ -308,7 +308,10 @@ def _quantize(model: nn.Module, ctx: BuildContext) -> None:
     from flashim.quant.apply import quantize_model
 
     spec, config = ctx.spec, ctx.config
-    quant = spec.quant_configs[config.precision.quant]
+    quant = (
+        spec.quant_configs.get(f"{config.variant}/{config.precision.quant}")
+        or spec.quant_configs[config.precision.quant]
+    )
     int8 = any(scheme.weights.type == "int" for scheme in quant.config_groups.values())
     if not int8 and not ctx.platform.supports(Feature.MXFP8_SCALED_MM):
         message = f"{spec.name}: no native MXFP8 GEMM on {ctx.platform.describe()}; quantized linears are emulated"
