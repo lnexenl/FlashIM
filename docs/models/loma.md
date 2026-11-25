@@ -36,11 +36,13 @@ with per-channel SmoothQuant factors applied in the input quantization; scales s
 this raised match agreement with the bf16 matcher from 0.92-0.95 to 0.95-0.97 and put every variant within the pose-AUC
 gate on MegaDepth-1500 (ΔAUC@5 vs `bf16` +0.01 to -0.42, 10 RANSAC seeds, paired), for ~1.5 % of the matcher's time.
 
-On sm_89 / sm_90, `int8` also runs DeDoDe-G's int8 passes in the extractor (decoder and stem fusions, fused ViT glue,
+On sm_89 / sm_90 / sm_120, `int8` also runs DeDoDe-G's int8 passes in the extractor (decoder and stem fusions, fused ViT glue,
 patch-embedding GEMM, SageAttention on ViT blocks 2-23; `loma-l` keeps the bit-exact stem and blocks 4-23) and three in
 the matcher: `sage_attention`, `fused_int8_glue` (one residual stream for both images, quantize / RoPE / image swap /
 LayerNorm + GELU fused into the GEMMs and their producers; bit-identical) and `cuda_graph` (one CUDA graph per
-keypoint-count pair, eager engine; bit-identical). Pair (2 extracts from the JPEG at 1024 px, 4096 keypoints, + match,
+keypoint-count pair, eager engine; bit-identical). On `sm_120`, `fp8` also enables DINOv2 SageAttention, matcher
+`fused_bias`, `cuda_graph` (with a `sdpa_graph_safe` guard), and `sage-fp8` on `dim >= 512`, and `loma-b128 fp8` keeps
+`*.decoder.*` and matcher layers 4-5 in BF16 (recovering ScanNet-1500 AUC@5 from `-0.0154` on `dev` to `-0.0008`). Pair (2 extracts from the JPEG at 1024 px, 4096 keypoints, + match,
 eager): L20 1.68-1.77x and H20 1.53-1.65x faster than `bf16` (e.g. `loma-l` L20 138.9 -> 82.5 ms, H20 118.1 -> 77.0 ms),
 MegaDepth-1500 ΔAUC@5 vs `bf16` -0.30 to -0.10 (L20) and -0.09 to +0.23 (H20) over the five variants (OpenCV RANSAC
 0.5 px, 10 seeds, paired). Without the graph the 256-dim INT8 matcher is launch-bound and slower than BF16. The graph

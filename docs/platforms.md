@@ -79,14 +79,43 @@ AUC@5 of the quantized preset against the same model's `bf16`, on both datasets:
 | `superpoint-superglue` | 🔍 | ➡️ int8 |
 | `omniglue` | 🔍 | ➡️ int8 |
 
+### Accuracy gate of the pre-2026-11 models on sm_120
+
+Same protocol as above on MegaDepth-1500 and ScanNet-1500 (1500 pairs each, 3 seeds 17/29/42, poselib 1.0 px, paired
+bootstrap 95% CI vs `dev bf16` with `-0.005` gate; `romav2` uses `engine="compile"`, all others `eager`):
+**84 PASS, 42 BORDERLINE (🔍), 0 FAIL** across all 126 `(model, preset, dataset)` cells. `➡️ int8` / `➡️ bf16` mark
+presets omitted and resolved via `build.NEAREST`; `—` means the model only defines `fp32` / `bf16`.
+
+| model | bf16 | int8 | fp8 |
+|---|---|---|---|
+| `romav2` | ✅ | 🔍 | 🔍 |
+| `rdd` | ✅ | — | ✅ |
+| `aliked`, `raco-aliked` | ✅ | — | — |
+| `superpoint` | 🔍 | 🔍 | 🔍 |
+| `xfeat` | ✅ | 🔍 | ✅ |
+| `alike` | ✅ | ✅ | 🔍 |
+| `disk` | ✅ | ✅ | 🔍 |
+| `dedode` | ✅ | 🔍 | ➡️ int8 |
+| `dedode-g` | ✅ | 🔍 | 🔍 |
+| `dad` | ✅ | ✅ | 🔍 |
+| `ripe` | ✅ | 🔍 | 🔍 |
+| `loftr` | ✅ | ✅ | 🔍 |
+| `rdd-lightglue` | ✅ | 🔍 | 🔍 |
+| `aliked-lightglue` | ✅ | ✅ | ➡️ int8 |
+| `raco-aliked-lightglue` | ✅ | ✅ | ✅ |
+| `superpoint-lightglue` | ✅ | 🔍 | ➡️ int8 |
+| `disk-lightglue` | 🔍 | 🔍 | ➡️ int8 |
+| `xfeat-lightglue` | ✅ | ➡️ bf16 | ➡️ bf16 |
+| `loma-b128`, `loma-b`, `loma-l`, `loma-g`, `loma-r` | ✅¹ | 🔍 | 🔍 |
+| `orb`, `sift` (`fp32`) | ✅ | — | — |
+
+¹ `loma-r bf16` MegaDepth is 🔍 (`-0.0026 [-0.0051, -0.0000]`) in `perf` before unbatching `CrossBlock` FFN; `loma-b128 bf16`
+re-verified bit-exact (`+0.0000`) on both datasets after `e03fbe8`.
+
 ### Known failing checks on sm_120
 
-- ❌ `tests/ops/test_depthwise_cuda.py`: 21 failures (bit-identity against the Triton implementation), present before the
-  2026-11 models.
 - 🔍 `tests/parity/test_lightglue_parity.py::test_reduced_precision_tracks_fp32[fp8]` is an expected failure (MXFP8 noise at its
   0.9 threshold).
-- ❌ presets that fail the AUC gate on MegaDepth-1500 ([benchmarks.md](benchmarks.md#accuracy), 2026-10-05; they still build):
-  `xfeat` `int8` / `fp8`, `dedode` `fp8`, `superpoint-lightglue` `int8` / `fp8`, `xfeat-lightglue` `int8` / `fp8`.
 
 ## FP8 presets
 

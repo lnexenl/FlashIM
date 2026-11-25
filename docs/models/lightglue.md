@@ -45,5 +45,8 @@ MegaDepth-1500 AUC@5 (unified protocol, 4 seeds; ALIKED pipelines with the `fp32
 | `raco-aliked-lightglue` | | 0.640 | 0.638 | 0.634 |
 
 The AUC change of the SuperPoint, DISK and XFeat pairings is in the
-[inference benchmark](../benchmarks.md#accuracy); the `int8` / `fp8` presets of `superpoint-lightglue` and
-`xfeat-lightglue` fail the accuracy gate there.
+[inference benchmark](../benchmarks.md#accuracy). On `sm_120`, `lightglue` `int8` now folds Hadamard rotations
+(`rotate_residual_stream`) with SmoothQuant `ffn.3` and fused `int8_glue`; `aliked-lightglue`, `superpoint-lightglue`
+(keeping SuperPoint in `bf16` for `int8`), and `disk-lightglue` omit `fp8` (resolving `fp8 -> int8` via `build.NEAREST`),
+and `xfeat-lightglue` omits `int8` and `fp8` (`-> bf16`), so every pairing passes the MegaDepth-1500 and ScanNet-1500
+AUC@5 gate (`0 FAIL`, see [platforms.md](../platforms.md)).
