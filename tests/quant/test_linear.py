@@ -76,3 +76,21 @@ def test_cublas_input_scales_cache_is_bounded_lru():
     # Most recent row counts are retained; oldest were evicted.
     assert (_InputScales.MAX_CACHED + 19) * 32 in cache.by_rows
     assert 32 not in cache.by_rows
+
+
+@pytest.mark.cuda
+@pytest.mark.sm120
+def test_cublas_input_scales_pins_cuda_graph_captured_rows():
+    from flashim.backends.torch_native.gemm import _InputScales
+    from flashim.engines.cuda_graph import CudaGraphRunner
+
+    _, layer = _layer(256, 256, "cuda")
+    x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
+    expected = layer(x)
+    runner = CudaGraphRunner(layer)
+    assert torch.equal(runner(x), expected)
+    # Overflow the LRU with distinct row counts and churn allocator memory; the captured shape must stay pinned.
+    for extra in range(1, _InputScales.MAX_CACHED + 12):
+        _ = layer(torch.randn(128 + extra * 16, 256, device="cuda", dtype=torch.bfloat16))
+    _ = torch.full((4, 1024, 1024), 0x7F, device="cuda", dtype=torch.uint8)
+    assert torch.equal(runner(x), expected)
