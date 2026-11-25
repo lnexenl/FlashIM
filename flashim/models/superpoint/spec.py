@@ -13,13 +13,19 @@ from flashim.models.superpoint.model import SuperPoint
 # Quantized: every 3x3 trunk conv after the 1-channel stem and both 256-wide head convs. Protected (never
 # quantized): ``conv1a`` (K = 9, image-facing) and the 65-way score head ``convPb`` (softmax logits) and
 # ``convDb`` (final descriptor projection, normalized right after).
+# FP8-only ignore: ``conv1b`` stays BF16 in ``fp8`` (``conv1a`` has >1000x channel-magnitude spread and ``conv1b``
+# performs 2.26x DC cancellation, so 3-bit E4M3 weight quantization gives 8.77% rel-L2 error and drops isolated
+# descriptor cosine to 0.952 vs >=0.991 for every other conv, causing a -0.0099 ScanNet AUC@5 drop on dev; 7-bit
+# INT8 weights hold 3.69% rel-L2 and keep ``conv1b`` quantized with its fused pool-only epilogue).
 QUANTIZED = ("conv1b", "conv2a", "conv2b", "conv3a", "conv3b", "conv4a", "conv4b", "convPa", "convDa")
 PROTECTED = ("conv1a", "convPb", "convDb")
+FP8_IGNORE = ("conv1b",)
 
 
 def _fused_stem_conv(model: SuperPoint, ctx: BuildContext) -> str:
     """Replace cuDNN's slow 1->64 SIMT stem ``conv1a`` (+ bias + ReLU + optional INT8/MXFP8 quantize) with
-    Triton BF16 tensor-core ``ops.conv3x3_small_cin_relu``. Skipped for ``fp32`` (reference numerics)."""
+    Triton ``ops.conv3x3_small_cin_relu`` (exact 9-tap row-major FP32 FMA for Cin=1, bit-identical to cuDNN at
+    480x640). Skipped for ``fp32`` (reference numerics)."""
     if ctx.config.precision.compute_dtype == "fp32":
         return "skipped: fp32"
     bound = ops.conv3x3_small_cin_relu.bind(model.conv1a.weight, model.conv1a.bias).warmup()
@@ -49,6 +55,7 @@ SPEC = extractor_spec(
     calibration_dir=Path(__file__).parent / "calibration",
     quantized=QUANTIZED,
     protected=PROTECTED,
+    fp8_ignore=FP8_IGNORE,
     compile_regions=("conv1a", "conv1b", "conv2a", "conv2b", "conv3a", "conv3b", "conv4a", "conv4b"),
     has_batchnorm=False,
     channels_last=True,  # BF16 extract at 1200 px, interleaved in one process (sm_120): 7.8 -> 6.7 ms
@@ -56,7 +63,7 @@ SPEC = extractor_spec(
     extra_passes={
         "fused_stem_conv": Pass(
             _fused_stem_conv, exact=False,
-            description="bf16/int8/fp8: 1->64 stem conv1a + ReLU (+ quantize) on BF16 tensor cores",
+            description="bf16/int8/fp8: 1->64 stem conv1a + ReLU (+ quantize) via fused Triton 9-tap FMA",
         ),
         "fused_pool_epilogue": Pass(
             _fused_pool_epilogue,
