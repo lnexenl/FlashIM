@@ -125,11 +125,9 @@ class DeDoDe(sparse.SparseExtractor):
 
     @torch.inference_mode()
     def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:
-        d0, d1 = a.descriptors[0], b.descriptors[0]
-        if self.compute_dtype != torch.float32 and d0.is_cuda:
-            corr = ops.matmul_nt_fp32(d0.to(self.compute_dtype), d1.to(self.compute_dtype), self.inv_temperature)
-        else:
-            corr = (d0.float() @ d1.float().t()) * self.inv_temperature
+        # Keep FP32 similarity matmul: casting to BF16 (ops.matmul_nt_fp32) amplified rounding by inv_temperature=20,
+        # flipping up to 1.3% of ScanNet matches and shifting DeDoDe bf16/int8 AUC@5 by -0.0019/-0.0022 for ~0.18 ms.
+        corr = (a.descriptors[0].float() @ b.descriptors[0].float().t()) * self.inv_temperature
         # mutual maxima of softmax(corr, -2) * softmax(corr, -1) above the threshold, without the [M, N] probabilities:
         # measured 5.7 -> 0.74 ms for 4096 x 4096 keypoints (sm_120), identical match lists on 100 MegaDepth pairs
         log_conf, index, mutual = ops.dual_softmax_mutual(corr)

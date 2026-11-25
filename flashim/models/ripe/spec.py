@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 from flashim.config import RunConfig
@@ -28,7 +29,12 @@ def _load(config: RunConfig) -> RIPE:
 
 _PASSES = {**DECODER_UPSAMPLE_PASS, **DECODER_FUSION_PASSES, **STEM_EXACT_PASSES, **STEM_TC_PASSES}
 
-SPEC = extractor_spec(
+# Early VGG stem convs (64/128 ch) hit E4M3's 3-bit mantissa floor (~2.6% input relL2 even with per-pixel dynamic
+# MXFP8 or channel smoothing), which RIPE's hypercolumn projection amplifies (ScanNet desc_cos 0.9880 -> 0.9991,
+# heat_relL2 0.1358 -> 0.0434 when kept BF16; 32/35 convs remain MXFP8). INT8's 7-bit mantissa keeps them quantized.
+_FP8_IGNORE = ("net.encoder.layers.3", "net.encoder.layers.7", "net.encoder.layers.10")
+
+_SPEC = extractor_spec(
     name="ripe",
     description="RIPE detector/descriptor (VGG19 + ConvRefiner heatmap, hypercolumn 256-d descriptors, mutual-NN matching)",
     load=_load,
@@ -41,4 +47,11 @@ SPEC = extractor_spec(
     channels_last=True,  # BF16 extract at 1200 px, interleaved in one process (sm_120): 76 -> 56 ms
     extra_passes=_PASSES,
     structural_passes=tuple(_PASSES),
+)
+SPEC = dataclasses.replace(
+    _SPEC,
+    quant_configs={
+        **_SPEC.quant_configs,
+        "fp8": dataclasses.replace(_SPEC.quant_configs["fp8"], ignore=_FP8_IGNORE),
+    },
 )

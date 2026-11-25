@@ -34,3 +34,23 @@ def test_presets_never_target_protected(name):
     ]
     PRESETS[name].config.check_protected(names, PROTECTED)
     assert all(PRESETS[name].config.scheme_for(n) is None for n in names)
+
+
+def test_stem_ignore_rules_only_affect_target_presets():
+    from flashim.models.dedode.spec import SPEC as DEDODE
+    from flashim.models.dedode.spec import SPEC_G as DEDODE_G
+    from flashim.models.ripe.spec import SPEC as RIPE
+
+    # RIPE fp8 skips early VGG stem convs (E4M3 3-bit mantissa floor); int8 keeps them quantized.
+    for layer in ("net.encoder.layers.3", "net.encoder.layers.7", "net.encoder.layers.10"):
+        assert RIPE.quant_configs["fp8"].scheme_for(layer) is None
+        assert RIPE.quant_configs["int8"].scheme_for(layer) is not None
+    assert RIPE.quant_configs["fp8"].scheme_for("net.encoder.layers.14") is not None
+
+    # DeDoDe-B int8 skips early descriptor VGG stem convs (outdoor->indoor clipping); fp8 and DeDoDe-G keep them.
+    for layer in ("descriptor.encoder.layers.3", "descriptor.encoder.layers.7", "descriptor.encoder.layers.10"):
+        assert DEDODE.quant_configs["int8"].scheme_for(layer) is None
+        assert DEDODE.quant_configs["fp8"].scheme_for(layer) is not None
+    assert DEDODE.quant_configs["int8"].scheme_for("detector.encoder.layers.3") is not None
+    assert DEDODE.quant_configs["int8"].scheme_for("descriptor.encoder.layers.14") is not None
+    assert DEDODE_G.quant_configs["int8"].scheme_for("descriptor.encoder.vgg.layers.3") is not None
