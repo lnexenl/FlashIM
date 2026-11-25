@@ -133,3 +133,145 @@ def _eligible(rgb: Tensor, v_factor: int) -> bool:
 @ops.jpeg_fancy_upsample.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible)
 def _jpeg_fancy_upsample_impl(rgb: Tensor, v_factor: int) -> Tensor:
     return jpeg_fancy_upsample(rgb, v_factor)
+
+
+# -- parallel grayscale + 2D instance normalization ------------------------------------------------------
+
+
+@triton.jit
+def _rgb_gray_stats_kernel(
+    rgb_ptr,
+    gray_ptr,
+    part_cnt_ptr,
+    part_mean_ptr,
+    part_m2_ptr,
+    pixels,
+    num_blocks,
+    BLOCK_P: tl.constexpr,
+):
+    """Pass 1: RGB mean -> grayscale ``[B, P]`` + per-block ``(count, mean, m2)`` partials across all SMs."""
+    pid_p = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    offs = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+    mask = offs < pixels
+    base_rgb = rgb_ptr + pid_b.to(tl.int64) * 3 * pixels
+    r = tl.load(base_rgb + offs, mask=mask, other=0.0)
+    g = tl.load(base_rgb + pixels + offs, mask=mask, other=0.0)
+    b = tl.load(base_rgb + 2 * pixels + offs, mask=mask, other=0.0)
+    gray = (r + g + b) * (1.0 / 3.0)
+    tl.store(gray_ptr + pid_b.to(tl.int64) * pixels + offs, gray, mask=mask)
+    cnt = tl.sum(mask.to(tl.float32), axis=0)
+    mean = tl.sum(tl.where(mask, gray, 0.0), axis=0) / tl.maximum(cnt, 1.0)
+    diff = tl.where(mask, gray - mean, 0.0)
+    m2 = tl.sum(diff * diff, axis=0)
+    out_idx = pid_b.to(tl.int64) * num_blocks + pid_p
+    tl.store(part_cnt_ptr + out_idx, cnt)
+    tl.store(part_mean_ptr + out_idx, mean)
+    tl.store(part_m2_ptr + out_idx, m2)
+
+
+@triton.jit
+def _combine_instance_stats_kernel(
+    part_cnt_ptr,
+    part_mean_ptr,
+    part_m2_ptr,
+    mean_ptr,
+    inv_std_ptr,
+    num_blocks,
+    eps,
+    BLOCK_R: tl.constexpr,
+):
+    """Pass 2 (1 CTA per batch item): combine per-block ``(count, mean, m2)`` partials via Chan's formula."""
+    pid_b = tl.program_id(0)
+    base = pid_b.to(tl.int64) * num_blocks
+    tot_cnt = tl.zeros((), dtype=tl.float32)
+    tot_mean = tl.zeros((), dtype=tl.float32)
+    tot_m2 = tl.zeros((), dtype=tl.float32)
+    for start in range(0, num_blocks, BLOCK_R):
+        offs = start + tl.arange(0, BLOCK_R)
+        mask = offs < num_blocks
+        c = tl.load(part_cnt_ptr + base + offs, mask=mask, other=0.0)
+        m = tl.load(part_mean_ptr + base + offs, mask=mask, other=0.0)
+        v = tl.load(part_m2_ptr + base + offs, mask=mask, other=0.0)
+        chunk_cnt = tl.sum(c, axis=0)
+        chunk_mean = tl.sum(c * m, axis=0) / tl.maximum(chunk_cnt, 1.0)
+        delta_in = tl.where(mask, m - chunk_mean, 0.0)
+        chunk_m2 = tl.sum(v + c * delta_in * delta_in, axis=0)
+        new_cnt = tot_cnt + chunk_cnt
+        delta = chunk_mean - tot_mean
+        tot_mean = tot_mean + delta * (chunk_cnt / tl.maximum(new_cnt, 1.0))
+        tot_m2 = tot_m2 + chunk_m2 + delta * delta * (tot_cnt * chunk_cnt / tl.maximum(new_cnt, 1.0))
+        tot_cnt = new_cnt
+    var = tot_m2 / tl.maximum(tot_cnt, 1.0)
+    tl.store(mean_ptr + pid_b, tot_mean)
+    tl.store(inv_std_ptr + pid_b, tl.rsqrt(var + eps))
+
+
+@triton.jit
+def _apply_instance_norm_kernel(
+    gray_ptr,
+    mean_ptr,
+    inv_std_ptr,
+    out_ptr,
+    pixels,
+    BLOCK_P: tl.constexpr,
+):
+    """Pass 3: normalize L2-hot ``gray [B, P]`` with ``(mean, inv_std)`` and cast directly to output dtype."""
+    pid_p = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    offs = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+    mask = offs < pixels
+    mean = tl.load(mean_ptr + pid_b)
+    inv_std = tl.load(inv_std_ptr + pid_b)
+    idx = pid_b.to(tl.int64) * pixels + offs
+    gray = tl.load(gray_ptr + idx, mask=mask, other=0.0)
+    normed = (gray - mean) * inv_std
+    tl.store(out_ptr + idx, normed.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def gray_instance_norm(
+    rgb: Tensor,
+    eps: float = 1e-5,
+    out_dtype: torch.dtype | None = None,
+    *,
+    block_p: int = 4096,
+    num_warps: int = 8,
+) -> Tensor:
+    """Multi-SM RGB-to-gray + 2D instance normalization + cast (replaces 1-SM ``nn.InstanceNorm2d(1)``)."""
+    rgb = rgb.contiguous()
+    b, _, h, w = rgb.shape
+    pixels = h * w
+    num_blocks = triton.cdiv(pixels, block_p)
+    device = rgb.device
+    gray = torch.empty((b, pixels), device=device, dtype=torch.float32)
+    part_cnt = torch.empty((b, num_blocks), device=device, dtype=torch.float32)
+    part_mean = torch.empty((b, num_blocks), device=device, dtype=torch.float32)
+    part_m2 = torch.empty((b, num_blocks), device=device, dtype=torch.float32)
+    mean = torch.empty((b,), device=device, dtype=torch.float32)
+    inv_std = torch.empty((b,), device=device, dtype=torch.float32)
+    out = torch.empty((b, 1, h, w), device=device, dtype=rgb.dtype if out_dtype is None else out_dtype)
+    _rgb_gray_stats_kernel[(num_blocks, b)](
+        rgb, gray, part_cnt, part_mean, part_m2, pixels, num_blocks, BLOCK_P=block_p, num_warps=num_warps
+    )
+    _combine_instance_stats_kernel[(b,)](
+        part_cnt, part_mean, part_m2, mean, inv_std, num_blocks, eps, BLOCK_R=256, num_warps=4
+    )
+    _apply_instance_norm_kernel[(num_blocks, b)](
+        gray, mean, inv_std, out, pixels, BLOCK_P=block_p, num_warps=num_warps
+    )
+    return out
+
+
+def _gray_norm_eligible(rgb: Tensor, eps: float = 1e-5, out_dtype: torch.dtype | None = None) -> bool:
+    return (
+        rgb.ndim == 4
+        and rgb.shape[1] == 3
+        and rgb.dtype == torch.float32
+        and rgb.shape[2] * rgb.shape[3] >= 256
+        and out_dtype in (None, torch.float32, torch.bfloat16, torch.float16)
+    )
+
+
+@ops.gray_instance_norm.register("triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_gray_norm_eligible)
+def _gray_instance_norm_impl(rgb: Tensor, eps: float = 1e-5, out_dtype: torch.dtype | None = None) -> Tensor:
+    return gray_instance_norm(rgb, eps, out_dtype)

@@ -29,7 +29,10 @@ def test_triton_is_pointed_at_a_ptxas_that_knows_the_architecture(monkeypatch, t
     knows = {str(toolkit)}
     monkeypatch.setattr(nvidia, "_ptxas_assembles", lambda ptxas, arch: probed.append((ptxas, arch)) or ptxas in knows)
 
-    monkeypatch.delenv("TRITON_PTXAS_BLACKWELL_PATH", raising=False)
+    # Record pre-test state before triton_targets mutates os.environ directly, otherwise a later monkeypatch.setenv
+    # captures the fake tmp_path ptxas as the "original" value and restores it on teardown, breaking later Triton compiles.
+    monkeypatch.setenv("TRITON_PTXAS_BLACKWELL_PATH", "")
+    monkeypatch.delenv("TRITON_PTXAS_BLACKWELL_PATH")
     assert nvidia.triton_targets((12, 0)) and nvidia.triton_targets((8, 7)) and not probed  # known: no subprocess
     assert nvidia.triton_targets((11, 0))
     assert nvidia.os.environ["TRITON_PTXAS_BLACKWELL_PATH"] == str(toolkit)

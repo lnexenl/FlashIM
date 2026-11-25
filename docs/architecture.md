@@ -11,16 +11,16 @@ backend, a model or a platform, and how changes are verified) are in [AGENTS.md]
 | `flashim/ops/` | Op declarations: a signature and a torch reference. Files are named by computation (`attention`, `conv`, `correlation`, `density`, `gemm`, `image`, `quantize`). An op only one model can use lives in a file named after that model (`romav2.py`, `aliked.py`) |
 | `flashim/backends/` | Optimized implementations, one package per kernel language or library, with the same file names as `ops/`: `triton/`, `tilelang/`, `cuda/` (JIT CUDA C++), `torch_native/` (cuBLAS), `external/` (sageattention). Out-of-tree backends register through the `flashim.backends` entry point |
 | `flashim/layers/` | Building blocks the passes recognize by type (`TransformerBlock`, `SeparableConvBlock`, `DeformableEncoder`, ...). A model built from them gets quantization and fused kernels without model-specific code |
-| `flashim/quant/` | Formats (MX), `QuantizedTensor`, schemes (compressed-tensors vocabulary), calibration, methods (`StaticMXFP8Linear`, `StaticInt8Linear`) and fusion passes |
+| `flashim/quant/` | Formats (MX), `QuantizedTensor`, schemes (compressed-tensors vocabulary), calibration, methods (`StaticMXFP8Linear`, `StaticInt8Linear`, per-token `DynamicInt8Linear`), orthogonal / Hadamard rotations folded into weights (`rotation.py`) and fusion passes |
 | `flashim/config.py` | `RunConfig`: the typed, layered, serializable run configuration ([configuration.md](configuration.md)) |
 | `flashim/build.py` | `ModelSpec` (presets, passes, engines), the generic builder every model goes through and `flashim.load`, the one loader |
 | `flashim/engines/` | Region `torch.compile` and an experimental CUDA-graph runner |
 | `flashim/models/` | One package per model, typically `model.py` (a pure `nn.Module` that only calls ops), `config.py`, `weights.py`, `quant.py`, `spec.py`. `base.py` holds `ImageMatcher`, the `match(a, b) -> Matches` interface every image-pair model implements; `sparse.py` and `sparse_spec.py` are the base class and spec factory shared by the sparse extractors |
 | `flashim/geometry/` | Pose estimation and AUC metrics |
-| `flashim/image_io.py` | GPU (nvJPEG) decoding of JPEG paths for `load_image`, with libjpeg's chroma upsampling (`ops.jpeg_fancy_upsample`) |
+| `flashim/image_io.py` | GPU (nvJPEG) decoding of JPEG paths for `load_image`, with libjpeg's chroma upsampling (`ops.jpeg_fancy_upsample`). The decode runs on a private stream ordered against the caller's (torchvision's decoder allocates on the caller's stream but decodes on its own, which corrupted pixels next to GPU work) |
 | `flashim/log.py` | Logging (`FLASHIM_LOG`), dispatch tracing, profiler and NVTX ranges |
 | `benchmarks/` | `speed/`, `accuracy/` (MegaDepth-1500, ScanNet-1500, HardMatch), `profile/` |
-| `scripts/` | Calibration: `calibrate_romav2.py`, `calibrate_rdd.py`, `calibrate_extractor.py`, `calibrate_lightglue.py` |
+| `scripts/` | Calibration: `calibrate_romav2.py`, `calibrate_rdd.py`, `calibrate_extractor.py`, `calibrate_lightglue.py`, and one per newer model (`calibrate_roma.py`, `calibrate_mast3r.py`, `calibrate_dust3r.py`, `calibrate_ufm.py`, `calibrate_superglue.py`); `convert_omniglue_weights.py` converts OmniGlue's TF SavedModels |
 | `tests/` | `unit/`, `ops/` (implementation vs reference), `quant/`, `parity/` (vs the upstream code vendored in `tests/oracles/`) |
 
 Dependencies point one way: `platforms < quant.formats < ops < backends`, and `layers < quant.passes < models`.

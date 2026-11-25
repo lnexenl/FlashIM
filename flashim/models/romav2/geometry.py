@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from flashim.utils import grid_sample
+from flashim.utils import grid_sample, normalized_grid  # noqa: F401 (models import normalized_grid from here)
 
 _CONSTANTS: dict[tuple[torch.device, tuple[float, ...]], Tensor] = {}
 
@@ -26,15 +26,6 @@ def imagenet_normalize(img: Tensor) -> Tensor:
     mean = _constant(img.device, (0.485, 0.456, 0.406))
     std = _constant(img.device, (0.229, 0.224, 0.225))
     return (img - mean[None, :, None, None]) / std[None, :, None, None]
-
-
-def normalized_grid(batch: int, h: int, w: int, device: torch.device) -> Tensor:
-    """``[B, H, W, 2]`` pixel-center coordinates in ``[-1, 1]``."""
-    grid = torch.meshgrid(
-        *[torch.linspace(-1 + 1 / n, 1 - 1 / n, n, device=device) for n in (batch, h, w)],
-        indexing="ij",
-    )
-    return torch.stack((grid[2], grid[1]), dim=-1).reshape(batch, h, w, 2)
 
 
 def to_pixel(x: Tensor, *, h: int, w: int) -> Tensor:

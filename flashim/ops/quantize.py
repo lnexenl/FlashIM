@@ -3,6 +3,7 @@ linear writes its E4M3 input directly."""
 
 from __future__ import annotations
 
+import torch
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -145,35 +146,37 @@ bias_relu_quantize_int8 = Op("bias_relu_quantize_int8", _bias_relu_quantize_int8
 # -- INT8 producer: dynamic per-row FP32 scale --------------------------------------------------------
 
 
-def _quantize_int8_rows_reference(value: Tensor) -> tuple[Tensor, Tensor]:
+def _quantize_int8_rows_reference(
+    value: Tensor, *, channel_scale: Tensor | None = None
+) -> tuple[Tensor, Tensor]:
     """Per-row (per-token) dynamic INT8: ``scale = amax(|row|) * (1 / 127)`` (FP32, ``safe_scale``; the reciprocal
     product, which is what torch's CUDA division by a scalar computes, spelled out so every device agrees),
-    ``round(value / scale)`` saturated to +-127. Returns int8 values of ``value``'s shape and the FP32 scales
-    ``[*leading, 1]`` (the ``a_scale`` :func:`~flashim.ops.int8_linear` takes per row)."""
-    scale = safe_scale(value.float().abs().amax(-1, keepdim=True) * (1 / INT8_MAX))
-    return quantize_symmetric(value, scale), scale
+    ``round(value / scale)`` saturated to +-127. With ``channel_scale`` ``[K]`` (FP32 SmoothQuant ``1 / s``), scales
+    ``value`` column-wise in FP32 before computing the row scales. Returns int8 values of ``value``'s shape and the
+    FP32 scales ``[*leading, 1]`` (the ``a_scale`` :func:`~flashim.ops.int8_linear` takes per row)."""
+    x = value.float() * channel_scale.float() if channel_scale is not None else value.float()
+    scale = safe_scale(x.abs().amax(-1, keepdim=True) * (1 / INT8_MAX))
+    return quantize_symmetric(x, scale), scale
 
 
 quantize_int8_rows = Op("quantize_int8_rows", _quantize_int8_rows_reference)
 
 
-def _quantize_int8_rows_heads_reference(value: Tensor) -> tuple[Tensor, Tensor]:
-    """Per-token dynamic INT8 of an attention output ``[B, H, N, D]``:
-    ``quantize_int8_rows(value.transpose(1, 2).reshape(B * N, H * D))``, without the transposed BF16 copy."""
-    batch, heads, tokens, dim = value.shape
-    return _quantize_int8_rows_reference(value.transpose(1, 2).reshape(batch * tokens, heads * dim))
+def _rotate_quantize_int8_rows_reference(
+    value: Tensor, matrix: Tensor, *, channel_scale: Tensor | None = None
+) -> tuple[Tensor, Tensor]:
+    """Optional per-channel ``channel_scale``, block-wise orthogonal rotation by ``matrix [B, B]`` along the last
+    dimension (``x.reshape(..., K // B, B) @ matrix``), then per-row dynamic INT8 quantization as
+    :func:`quantize_int8_rows`. Used with ``W @ block_diag(matrix, ...)`` folded into a consuming linear's weights
+    to spread post-activation channel and weight outliers before INT8 quantization."""
+    x = value.float() * channel_scale.float() if channel_scale is not None else value.float()
+    b = matrix.shape[0]
+    k = value.shape[-1]
+    rotated = (x.reshape(*value.shape[:-1], k // b, b) @ matrix.float()).reshape(value.shape)
+    return _quantize_int8_rows_reference(rotated)
 
 
-quantize_int8_rows_heads = Op("quantize_int8_rows_heads", _quantize_int8_rows_heads_reference)
-
-
-def _gelu_quantize_int8_rows_reference(value: Tensor) -> tuple[Tensor, Tensor]:
-    """Per-row dynamic INT8 of exact ``nn.GELU()(value)`` (rounded to ``value.dtype`` first, as
-    ``quantize_int8_rows(F.gelu(value))``)."""
-    return _quantize_int8_rows_reference(F.gelu(value))
-
-
-gelu_quantize_int8_rows = Op("gelu_quantize_int8_rows", _gelu_quantize_int8_rows_reference)
+rotate_quantize_int8_rows = Op("rotate_quantize_int8_rows", _rotate_quantize_int8_rows_reference)
 
 
 def _layernorm_quantize_int8_rows_reference(
@@ -187,6 +190,24 @@ def _layernorm_quantize_int8_rows_reference(
 
 
 layernorm_quantize_int8_rows = Op("layernorm_quantize_int8_rows", _layernorm_quantize_int8_rows_reference)
+
+
+def _quantize_int8_rows_heads_reference(value: Tensor) -> tuple[Tensor, Tensor]:
+    """``quantize_int8_rows(value.transpose(1, 2).reshape(B * N, H * D))`` of an attention output ``[B, H, N, D]``:
+    per-row dynamic INT8 without materializing the transposed dense copy."""
+    batch, heads, tokens, dim = value.shape
+    return _quantize_int8_rows_reference(value.transpose(1, 2).reshape(batch * tokens, heads * dim))
+
+
+quantize_int8_rows_heads = Op("quantize_int8_rows_heads", _quantize_int8_rows_heads_reference)
+
+
+def _gelu_quantize_int8_rows_reference(value: Tensor, approximate: str = "none") -> tuple[Tensor, Tensor]:
+    """``quantize_int8_rows(F.gelu(value, approximate=approximate))`` in ``value.dtype``."""
+    return _quantize_int8_rows_reference(F.gelu(value, approximate=approximate))
+
+
+gelu_quantize_int8_rows = Op("gelu_quantize_int8_rows", _gelu_quantize_int8_rows_reference)
 
 
 # -- static INT8 for several consumers / from other layouts ------------------------------------------
@@ -226,3 +247,74 @@ def _layernorm_gelu_quantize_int8_reference(
 
 
 layernorm_gelu_quantize_int8 = Op("layernorm_gelu_quantize_int8", _layernorm_gelu_quantize_int8_reference)
+
+
+# -- residual + LayerNorm and cat([x, LayerNorm(value)]) (+ quantize) --------------------------------
+
+
+def _layernorm_add_reference(
+    residual: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+) -> Tensor:
+    """``residual + LayerNorm(value)`` with FP32 statistics, rounded to ``value.dtype``."""
+    normalized = F.layer_norm(
+        value.float(),
+        (value.shape[-1],),
+        weight.float() if weight is not None else None,
+        bias.float() if bias is not None else None,
+        eps,
+    ).to(value.dtype)
+    return residual + normalized
+
+
+layernorm_add = Op("layernorm_add", _layernorm_add_reference)
+
+
+def _layernorm_cat_reference(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float
+) -> Tensor:
+    """``cat([x, LayerNorm(value)], dim=-1)`` with FP32 statistics, rounded to ``value.dtype``."""
+    normalized = F.layer_norm(
+        value.float(),
+        (value.shape[-1],),
+        weight.float() if weight is not None else None,
+        bias.float() if bias is not None else None,
+        eps,
+    ).to(value.dtype)
+    return torch.cat((x, normalized), dim=-1)
+
+
+layernorm_cat = Op("layernorm_cat", _layernorm_cat_reference)
+
+
+def _layernorm_cat_quantize_int8_reference(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float, scale: Tensor
+) -> Int8Tensor:
+    """``quantize_int8(cat([x, LayerNorm(value)], dim=-1), scale)`` with static per-tensor INT8 scale."""
+    return quantize_int8_static(_layernorm_cat_reference(x, value, weight, bias, eps), scale)
+
+
+layernorm_cat_quantize_int8 = Op("layernorm_cat_quantize_int8", _layernorm_cat_quantize_int8_reference)
+
+
+def _layernorm_cat_quantize_int8_rows_reference(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float,
+    *, channel_scale: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """``quantize_int8_rows(cat([x, LayerNorm(value)], dim=-1) [* channel_scale])`` with dynamic per-row INT8 scale."""
+    cat = _layernorm_cat_reference(x, value, weight, bias, eps)
+    if channel_scale is not None:
+        cat = cat.float() * channel_scale.float()
+    return _quantize_int8_rows_reference(cat)
+
+
+layernorm_cat_quantize_int8_rows = Op("layernorm_cat_quantize_int8_rows", _layernorm_cat_quantize_int8_rows_reference)
+
+
+def _layernorm_cat_quantize_mxfp8_reference(
+    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float, scale_exponent: Tensor
+) -> QuantizedTensor:
+    """``quantize_static(cat([x, LayerNorm(value)], dim=-1), scale_exponent)`` for static MXFP8."""
+    return quantize_static(_layernorm_cat_reference(x, value, weight, bias, eps), scale_exponent)
+
+
+layernorm_cat_quantize_mxfp8 = Op("layernorm_cat_quantize_mxfp8", _layernorm_cat_quantize_mxfp8_reference)

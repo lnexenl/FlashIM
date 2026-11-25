@@ -64,6 +64,7 @@ class ResNetFPN_8_2(nn.Module):
         self.layer2_outconv2 = nn.Sequential(conv3x3(d3, d3), nn.BatchNorm2d(d3), nn.LeakyReLU(), conv3x3(d3, d2))
         self.layer1_outconv = conv1x1(d1, d2)
         self.layer1_outconv2 = nn.Sequential(conv3x3(d2, d2), nn.BatchNorm2d(d2), nn.LeakyReLU(), conv3x3(d2, d1))
+        self.fused_upsample: bool = False
 
     def forward(self, x: Tensor) -> list[Tensor]:
         x1 = self.layer1(self.relu(self.bn1(self.conv1(x))))
@@ -71,15 +72,27 @@ class ResNetFPN_8_2(nn.Module):
         x3 = self.layer3(x2)
         x3_out = self.layer3_outconv(x3)
         x2_out = self.layer2_outconv(x2)
-        x2_out = self.layer2_outconv2(x2_out + F.interpolate(x3_out, size=x2_out.shape[2:], mode="bilinear", align_corners=True))
-        x1_out = self.layer1_outconv(x1)
-        x1_out = self.layer1_outconv2(x1_out + F.interpolate(x2_out, size=x1_out.shape[2:], mode="bilinear", align_corners=True))
+        if self.fused_upsample:
+            x2_out = self.layer2_outconv2(ops.upsample_add(x3_out, x2_out, align_corners=True, out_dtype=x2_out.dtype))
+            x1_out = self.layer1_outconv(x1)
+            x1_out = self.layer1_outconv2(ops.upsample_add(x2_out, x1_out, align_corners=True, out_dtype=x1_out.dtype))
+        else:
+            x2_out = self.layer2_outconv2(x2_out + F.interpolate(x3_out, size=x2_out.shape[2:], mode="bilinear", align_corners=True))
+            x1_out = self.layer1_outconv(x1)
+            x1_out = self.layer1_outconv2(x1_out + F.interpolate(x2_out, size=x1_out.shape[2:], mode="bilinear", align_corners=True))
         return [x3_out, x1_out]
 
 
 def linear_attention(q: Tensor, k: Tensor, v: Tensor, eps: float = 1e-6, gemm_dtype: torch.dtype | None = None) -> Tensor:
-    """ELU+1 kernel attention on ``[N, L, H, D]`` / ``[N, S, H, D]`` via ``ops.linear_attention``."""
-    return ops.linear_attention(q, k, v, eps, gemm_dtype)
+    """ELU+1 kernel attention on ``[N, L, H, D]`` / ``[N, S, H, D]`` (pure-torch reference, used in FP32)."""
+    qf, kf, vf = F.elu(q.float()) + 1.0, F.elu(k.float()) + 1.0, v.float()
+    length = vf.shape[1]
+    z = 1.0 / (torch.einsum("nlhd,nhd->nlh", qf, kf.sum(dim=1)) + eps)
+    if gemm_dtype is None:
+        kv = torch.einsum("nshd,nshv->nhdv", kf, vf / length)
+        return (torch.einsum("nlhd,nhdv,nlh->nlhv", qf, kv, z) * length).to(q.dtype)
+    kv = torch.einsum("nshd,nshv->nhdv", kf.to(gemm_dtype), (vf / length).to(gemm_dtype))
+    return (torch.einsum("nlhd,nhdv->nlhv", qf.to(gemm_dtype), kv).float() * z[..., None] * length).to(q.dtype)
 
 
 class LoFTREncoderLayer(nn.Module):
@@ -91,6 +104,54 @@ class LoFTREncoderLayer(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(2 * d_model, 2 * d_model, bias=False), nn.ReLU(True), nn.Linear(2 * d_model, d_model, bias=False))
         self.norm1, self.norm2 = nn.LayerNorm(d_model), nn.LayerNorm(d_model)
         self.attention_gemm_dtype: torch.dtype | None = None
+        self.use_fused_linear_attention: bool = False
+        self.fused_epilogues: bool = False
+        self.qkv_proj: nn.Module | None = None
+        self.kv_proj: nn.Module | None = None
+
+    def _mlp_and_residual(self, x: Tensor, message: Tensor) -> Tensor:
+        if not self.fused_epilogues:
+            message = self._mlp_forward(torch.cat([x, self.norm1(message)], dim=2))
+            return x + self.norm2(message)
+        from flashim.quant.methods.int8_linear import DynamicInt8Linear, StaticInt8Linear
+        from flashim.quant.methods.linear import StaticMXFP8Linear
+
+        fc1, fc2 = self.mlp[0], self.mlp[2]
+        if isinstance(fc1, DynamicInt8Linear):
+            q, s = ops.layernorm_cat_quantize_int8_rows(
+                x, message, self.norm1.weight, self.norm1.bias, self.norm1.eps, channel_scale=fc1.channel_scale
+            )
+            h = ops.int8_linear(
+                q.reshape(-1, fc1.in_features), fc1.weight_int8, s.reshape(-1, 1), fc1.weight_scale, fc1.bias, relu=True
+            ).reshape(*x.shape[:-1], fc1.out_features).to(x.dtype)
+            out = fc2(h)
+        elif isinstance(fc1, StaticInt8Linear) and fc1.channel_scale is None:
+            q = ops.layernorm_cat_quantize_int8(
+                x, message, self.norm1.weight, self.norm1.bias, self.norm1.eps, fc1.input_scale
+            )
+            out = fc2(fc1.forward_prequantized(q, relu=True).to(x.dtype))
+        elif isinstance(fc1, StaticMXFP8Linear):
+            q = ops.layernorm_cat_quantize_mxfp8(
+                x, message, self.norm1.weight, self.norm1.bias, self.norm1.eps, fc1.input_exponent
+            )
+            out = fc2(F.relu(fc1.forward_prequantized(q).to(x.dtype)))
+        else:
+            out = self.mlp(ops.layernorm_cat(x, message, self.norm1.weight, self.norm1.bias, self.norm1.eps))
+        return ops.layernorm_add(x, out, self.norm2.weight, self.norm2.bias, self.norm2.eps)
+
+    def forward_self_pair(self, feat0: Tensor, feat1: Tensor) -> tuple[Tensor, Tensor]:
+        """Batch token-wise projections/MLP across two different-length images while keeping self-attention separate."""
+        l0, l1 = feat0.shape[1], feat1.shape[1]
+        both = torch.cat((feat0, feat1), dim=1)
+        qkv = self.qkv_proj(both)
+        qkv0 = qkv[:, :l0].view(1, l0, 3, self.nhead, self.dim)
+        qkv1 = qkv[:, l0:].view(1, l1, 3, self.nhead, self.dim)
+        gemm_dt = torch.bfloat16 if qkv0.dtype in (torch.bfloat16, torch.float16) else None
+        a0 = ops.elu_linear_attention(qkv0[:, :, 0], qkv0[:, :, 1], qkv0[:, :, 2], 1e-6, gemm_dt).reshape(1, l0, -1)
+        a1 = ops.elu_linear_attention(qkv1[:, :, 0], qkv1[:, :, 1], qkv1[:, :, 2], 1e-6, gemm_dt).reshape(1, l1, -1)
+        message = self.merge(torch.cat((a0, a1), dim=1))
+        out = self._mlp_and_residual(both, message)
+        return out[:, :l0].contiguous(), out[:, l0:].contiguous()
 
     def _project_qkv(self, x: Tensor, source: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         from flashim.quant.methods.int8_linear import StaticInt8Linear
@@ -138,13 +199,29 @@ class LoFTREncoderLayer(nn.Module):
 
     def forward(self, x: Tensor, source: Tensor) -> Tensor:
         bs = x.shape[0]
-        q, k, v = self._project_qkv(x, source)
-        q = q.reshape(bs, -1, self.nhead, self.dim)
-        k = k.reshape(bs, -1, self.nhead, self.dim)
-        v = v.reshape(bs, -1, self.nhead, self.dim)
-        message = self.merge(linear_attention(q, k, v, gemm_dtype=self.attention_gemm_dtype).reshape(bs, -1, self.nhead * self.dim))
-        message = self._mlp_forward(torch.cat([x, self.norm1(message)], dim=2))
-        return x + self.norm2(message)
+        if self.qkv_proj is not None:
+            qkv = self.qkv_proj(x).view(bs, -1, 3, self.nhead, self.dim)
+            q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        elif self.kv_proj is not None:
+            q = self.q_proj(x).reshape(bs, -1, self.nhead, self.dim)
+            kv = self.kv_proj(source).view(bs, -1, 2, self.nhead, self.dim)
+            k, v = kv[:, :, 0], kv[:, :, 1]
+        else:
+            q, k, v = self._project_qkv(x, source)
+            q = q.reshape(bs, -1, self.nhead, self.dim)
+            k = k.reshape(bs, -1, self.nhead, self.dim)
+            v = v.reshape(bs, -1, self.nhead, self.dim)
+        if self.use_fused_linear_attention:
+            gemm_dt = (
+                self.attention_gemm_dtype
+                if self.attention_gemm_dtype is not None
+                else (torch.bfloat16 if q.dtype in (torch.bfloat16, torch.float16) else None)
+            )
+            attn_out = ops.elu_linear_attention(q, k, v, 1e-6, gemm_dt)
+        else:
+            attn_out = linear_attention(q, k, v, gemm_dtype=self.attention_gemm_dtype).to(x.dtype)
+        message = self.merge(attn_out.reshape(bs, -1, self.nhead * self.dim))
+        return self._mlp_and_residual(x, message)
 
 
 class LocalFeatureTransformer(nn.Module):
@@ -152,13 +229,17 @@ class LocalFeatureTransformer(nn.Module):
         super().__init__()
         self.layer_names = layer_names
         self.layers = nn.ModuleList(LoFTREncoderLayer(d_model, nhead) for _ in layer_names)
+        self.batch_self: bool = False
 
     def forward(self, feat0: Tensor, feat1: Tensor) -> tuple[Tensor, Tensor]:
         for layer, name in zip(self.layers, self.layer_names):
             if name == "self":
-                if feat0.shape == feat1.shape:
+                if self.batch_self and feat0.shape == feat1.shape:
                     both = torch.cat((feat0, feat1), dim=0)
-                    feat0, feat1 = layer(both, both).chunk(2, dim=0)
+                    both = layer(both, both)
+                    feat0, feat1 = both[: feat0.shape[0]], both[feat0.shape[0] :]
+                elif self.batch_self and layer.qkv_proj is not None and layer.use_fused_linear_attention and feat0.shape[0] == 1:
+                    feat0, feat1 = layer.forward_self_pair(feat0, feat1)
                 else:
                     feat0, feat1 = layer(feat0, feat0), layer(feat1, feat1)
             else:  # sequential, like upstream: image 1 attends to the *updated* image-0 features
@@ -195,7 +276,8 @@ class LoFTR(ImageMatcher, nn.Module):
 
     div_by = 8
     fold_temperature = False  # see spec.py's fold_similarity_temperature pass
-    low_precision_similarity = False  # see spec.py's low_precision_similarity pass (ops.matmul_nt_fp32)
+    bf16_similarity = False   # see spec.py's bf16_coarse_similarity pass (ops.matmul_nt_fp32)
+    batch_backbone = False    # see spec.py's batch_backbone pass (minima-loftr only; regresses loftr int8/fp8)
     preset: str | None = None
     engine: str | None = None
     quant_report = None
@@ -218,8 +300,9 @@ class LoFTR(ImageMatcher, nn.Module):
     @classmethod
     def from_pretrained(cls, *, variant: str = "outdoor", checkpoint: str | Path | None = None,
                         device: torch.device | str | None = None, **kwargs) -> LoFTR:
+        temp_bug_fix = kwargs.pop("temp_bug_fix", variant != "outdoor")
         with torch.device("meta"):
-            model = cls(temp_bug_fix=variant == "indoor", **kwargs)
+            model = cls(temp_bug_fix=temp_bug_fix, **kwargs)
         model.load_state_dict(weights.load_state_dict(variant, checkpoint), strict=True, assign=True)
         return model.to(torch.device(device or default_device())).eval()
 
@@ -277,8 +360,12 @@ class LoFTR(ImageMatcher, nn.Module):
         """``[1, 1, H, W]`` grayscale pair (sides multiples of 8) -> matches ``(kpts0 [M, 2], kpts1 [M, 2], conf [M])`` in
         the inputs' pixel coordinates."""
         h0, h1 = gray0.shape[-2], gray1.shape[-2]
-        # Keep B=1 x2 for backbone: B=2 regressed quantized presets heavily on sm_120 (int8 44.5->76.9 ms, fp8 48.4->181.4 ms).
-        (c0, f0), (c1, f1) = self.coarse_features(gray0), self.coarse_features(gray1)
+        if self.batch_backbone and gray0.shape == gray1.shape:
+            c, f = self.coarse_features(torch.cat((gray0, gray1), dim=0))
+            c0, c1, f0, f1 = c[:1], c[1:], f[:1], f[1:]
+        else:
+            # Keep B=1 x2 for loftr: B=2 regressed quantized presets heavily on sm_120 (int8 44.5->76.9 ms, fp8 48.4->181.4 ms).
+            (c0, f0), (c1, f1) = self.coarse_features(gray0), self.coarse_features(gray1)
         (hc0, wc0), (hc1, wc1) = c0.shape[-2:], c1.shape[-2:]
         tokens0 = (c0.float() + self.positions(hc0, wc0)).to(c0.dtype).permute(0, 2, 3, 1).reshape(1, -1, c0.shape[1])
         tokens1 = (c1.float() + self.positions(hc1, wc1)).to(c1.dtype).permute(0, 2, 3, 1).reshape(1, -1, c1.shape[1])
@@ -287,16 +374,17 @@ class LoFTR(ImageMatcher, nn.Module):
         # coarse matching: dual softmax over the normalized similarity, mutual maxima above the threshold. The
         # ``[L, S]`` probabilities are never formed (``ops.dual_softmax_mutual``): measured 35 -> 4 ms and 2.1 GB less
         # peak memory at 1200 px (16.8k x 16.5k tokens) with identical matches.
-        if self.low_precision_similarity and tokens0.dtype in (torch.bfloat16, torch.float16):
-            sim_2d = ops.matmul_nt_fp32(tokens0[0], tokens1[0], 1.0 / (tokens0.shape[-1] * 0.1))
+        if self.bf16_similarity and tokens0.dtype in (torch.bfloat16, torch.float16):
+            sim = ops.matmul_nt_fp32(tokens0[0], tokens1[0], 1.0 / (tokens0.shape[-1] * 0.1))
+            log_conf, all_j, mutual = ops.dual_softmax_mutual(sim)
         else:
             a, b = (t.float() / t.shape[-1] ** 0.5 for t in (tokens0, tokens1))
             if self.fold_temperature:  # 1 / temperature on the [L, C] operand, not a pass over the [L, S] FP32 matrix
-                sim_2d = torch.einsum("nlc,nsc->nls", a / 0.1, b)[0]
+                sim = torch.einsum("nlc,nsc->nls", a / 0.1, b)
             else:
-                sim_2d = (torch.einsum("nlc,nsc->nls", a, b) / 0.1)[0]
-        log_conf, all_j, mutual = ops.dual_softmax_mutual(sim_2d)
-        del sim_2d
+                sim = torch.einsum("nlc,nsc->nls", a, b) / 0.1
+            log_conf, all_j, mutual = ops.dual_softmax_mutual(sim[0])
+        del sim
         conf = log_conf.exp()
         valid = mutual & (conf > self.threshold)
         r = self.border_rm

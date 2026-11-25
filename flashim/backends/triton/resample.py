@@ -21,9 +21,12 @@ from flashim.quant.tensor import Int8Tensor
 
 
 @triton.jit
-def _bilinear_source(dst, n_in, scale):
-    """PyTorch's ``align_corners=False`` source index: ``max(scale * (dst + 0.5) - 0.5, 0)``, its two taps, weights."""
-    src = tl.maximum(scale * (dst.to(tl.float32) + 0.5) - 0.5, 0.0)
+def _bilinear_source(dst, n_in, scale, ALIGN_CORNERS: tl.constexpr = False):
+    """PyTorch's bilinear source index (``align_corners=False`` or ``True``), its two taps, and linear weights."""
+    if ALIGN_CORNERS:
+        src = dst.to(tl.float32) * scale
+    else:
+        src = tl.maximum(scale * (dst.to(tl.float32) + 0.5) - 0.5, 0.0)
     i0 = src.to(tl.int32)
     i1 = tl.where(i0 < n_in - 1, i0 + 1, i0)
     lam1 = src - i0.to(tl.float32)
@@ -121,9 +124,62 @@ def upsample_concat_int8(features: Tensor, coarse: Tensor, scale: Tensor) -> Int
     return Int8Tensor(_launch(coarse, features, out, concat=True, scale=scale), scale)
 
 
-def upsample_add(coarse: Tensor, delta: Tensor) -> Tensor:
-    out = torch.empty(delta.shape, device=delta.device, dtype=torch.float32, memory_format=torch.channels_last)
-    return _launch(coarse, delta, out, concat=False)
+@triton.jit
+def _upsample_add_nhwc_kernel(
+    coarse_ptr, other_ptr, out_ptr,
+    H, W, h, w, scale_h, scale_w,
+    cs_b, cs_c, cs_h, cs_w, os_b, os_c, os_h, os_w,
+    C: tl.constexpr, BLOCK_X: tl.constexpr, PC: tl.constexpr,
+    ALIGN_CORNERS: tl.constexpr, ROUND_BF16: tl.constexpr,
+):
+    """Row-wise bilinear upsample + add for channels-last output (supports ``align_corners=True`` and BF16 output)."""
+    row = tl.program_id(1)
+    b = (row // H).to(tl.int64)
+    y = row % H
+    x = tl.program_id(0) * BLOCK_X + tl.arange(0, BLOCK_X)
+    x_ok = x < W
+    x = tl.where(x_ok, x, 0)
+    y0, y1, ly0, ly1 = _bilinear_source(y, h, scale_h, ALIGN_CORNERS)
+    x0, x1, lx0, lx1 = _bilinear_source(x, w, scale_w, ALIGN_CORNERS)
+    base = coarse_ptr + b * cs_b
+    r0, r1 = base + y0.to(tl.int64) * cs_h, base + y1.to(tl.int64) * cs_h
+    c = tl.arange(0, PC)
+    m = x_ok[:, None] & (c < C)[None, :]
+    cc = c[None, :] * cs_c
+    v00 = tl.load(r0 + (x0 * cs_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v01 = tl.load(r0 + (x1 * cs_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v10 = tl.load(r1 + (x0 * cs_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v11 = tl.load(r1 + (x1 * cs_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    d = tl.load(other_ptr + b * os_b + y.to(tl.int64) * os_h + (x.to(tl.int64) * os_w)[:, None] + c[None, :] * os_c,
+                mask=m, other=0.0).to(tl.float32)
+    lx0, lx1 = lx0[:, None], lx1[:, None]
+    sample = ly0 * (lx0 * v00 + lx1 * v01) + ly1 * (lx0 * v10 + lx1 * v11)
+    if ROUND_BF16:
+        value = sample.to(tl.bfloat16) + d.to(tl.bfloat16)
+    else:
+        value = (sample + d).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + ((row.to(tl.int64) * W + x) * C)[:, None] + c[None, :], value, mask=m)
+
+
+def upsample_add(
+    coarse: Tensor, delta: Tensor, *, align_corners: bool = False, out_dtype: torch.dtype | None = None
+) -> Tensor:
+    if not align_corners and out_dtype is None:
+        out = torch.empty(delta.shape, device=delta.device, dtype=torch.float32, memory_format=torch.channels_last)
+        return _launch(coarse, delta, out, concat=False)
+    batch, channels, height, width = delta.shape
+    h, w = coarse.shape[2:]
+    dtype = out_dtype or torch.float32
+    out = torch.empty(delta.shape, device=delta.device, dtype=dtype, memory_format=torch.channels_last)
+    scale_h = (h - 1) / (height - 1) if (align_corners and height > 1) else (0.0 if align_corners else h / height)
+    scale_w = (w - 1) / (width - 1) if (align_corners and width > 1) else (0.0 if align_corners else w / width)
+    block_x = 8 if channels >= 256 else 16
+    _upsample_add_nhwc_kernel[(triton.cdiv(width, block_x), batch * height)](
+        coarse, delta, out, height, width, h, w, scale_h, scale_w, *coarse.stride(), *delta.stride(),
+        C=channels, BLOCK_X=block_x, PC=triton.next_power_of_2(channels),
+        ALIGN_CORNERS=align_corners, ROUND_BF16=dtype == torch.bfloat16, num_warps=4,
+    )
+    return out
 
 
 # -- exact 2x upsampling at the memory roofline (sm_89 / sm_90) ---------------------------------------------------------
@@ -318,8 +374,14 @@ def _eligible_concat(features: Tensor, coarse: Tensor, *, coarse_first: bool = F
     return features.ndim == 4 and coarse.ndim == 4 and features.shape[0] == coarse.shape[0] and features.is_cuda
 
 
-def _eligible_add(coarse: Tensor, delta: Tensor) -> bool:
-    return coarse.ndim == 4 and delta.ndim == 4 and coarse.shape[:2] == delta.shape[:2] and delta.is_cuda
+def _eligible_add(
+    coarse: Tensor, delta: Tensor, *, align_corners: bool = False, out_dtype: torch.dtype | None = None
+) -> bool:
+    if not (coarse.ndim == 4 and delta.ndim == 4 and coarse.shape[:2] == delta.shape[:2] and delta.is_cuda):
+        return False
+    if align_corners or out_dtype is not None:
+        return delta.shape[1] <= 512 and (out_dtype in (None, torch.float32, torch.bfloat16, torch.float16))
+    return True
 
 
 ops.upsample_concat.register(
@@ -344,7 +406,11 @@ def _rows_eligible_concat(features: Tensor, coarse: Tensor, scale: Tensor) -> bo
     return _rows_eligible_concat_bf16(features, coarse)
 
 
-def _rows_eligible_add(coarse: Tensor, delta: Tensor) -> bool:
+def _rows_eligible_add(
+    coarse: Tensor, delta: Tensor, *, align_corners: bool = False, out_dtype: torch.dtype | None = None
+) -> bool:
+    if align_corners or out_dtype is not None:
+        return False
     # Wide channels-last maps only (the decoders' 256-channel deltas; with 64 channels the row kernel differs in the last bit on sm_90). With NCHW operands the tile kernel's codegen
     # contracts the FP32 sum differently (last-bit differences), and with 1 channel (RIPE's logit map) the row kernel
     # differs from it in the last bit too and is 8x slower (a 1-wide channel tile).
@@ -763,3 +829,209 @@ def _multiscale_score_eligible(
 ops.multiscale_score.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_multiscale_score_eligible
 )(_multiscale_score_triton)
+
+
+# -- strided spatial window gather -----------------------------------------------------------------------
+
+
+@triton.jit
+def _gather_windows_kernel(
+    feat_ptr,
+    ids_ptr,
+    out_ptr,
+    sc,
+    sh,
+    sw,
+    H,
+    W,
+    COARSE_W,
+    STRIDE: tl.constexpr,
+    WIN: tl.constexpr,
+    HALF: tl.constexpr,
+    C: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """One program per ``(match m, window row wy)``: gathers ``WIN`` horizontal pixels x ``C`` channels from
+    ``feat [1, C, H, W]`` (arbitrary strides) into ``out [M, WIN*WIN, C]`` contiguous."""
+    m = tl.program_id(0).to(tl.int64)
+    wy = tl.program_id(1)
+    cell = tl.load(ids_ptr + m).to(tl.int64)
+    cy = cell // COARSE_W
+    cx = cell - cy * COARSE_W
+    iy = cy * STRIDE + wy - HALF
+    wx = tl.arange(0, BLOCK_W)
+    c = tl.arange(0, BLOCK_C)
+    ix = cx * STRIDE + wx - HALF
+    in_y = (iy >= 0) & (iy < H)
+    ok_w = wx < WIN
+    ok_c = c < C
+    in_bounds = in_y & ok_w & (ix >= 0) & (ix < W)
+    ptrs = feat_ptr + iy * sh + ix[:, None] * sw + c[None, :] * sc
+    vals = tl.load(ptrs, mask=in_bounds[:, None] & ok_c[None, :], other=0.0)
+    out_base = out_ptr + (m * (WIN * WIN) + wy * WIN) * C
+    tl.store(out_base + wx[:, None] * C + c[None, :], vals, mask=ok_w[:, None] & ok_c[None, :])
+
+
+def gather_windows(feat: Tensor, ids: Tensor, coarse_w: int, win: int, stride: int) -> Tensor:
+    m = ids.shape[0]
+    c, h, w = feat.shape[1], feat.shape[2], feat.shape[3]
+    if m == 0:
+        return feat.new_empty((0, win * win, c))
+    out = torch.empty((m, win * win, c), device=feat.device, dtype=feat.dtype)
+    block_w = triton.next_power_of_2(win)
+    block_c = triton.next_power_of_2(c)
+    _gather_windows_kernel[(m, win)](
+        feat,
+        ids,
+        out,
+        feat.stride(1),
+        feat.stride(2),
+        feat.stride(3),
+        h,
+        w,
+        coarse_w,
+        STRIDE=stride,
+        WIN=win,
+        HALF=win // 2,
+        C=c,
+        BLOCK_W=block_w,
+        BLOCK_C=block_c,
+        num_warps=4,
+    )
+    return out
+
+
+def _gather_windows_eligible(feat: Tensor, ids: Tensor, coarse_w: int, win: int, stride: int) -> bool:
+    return (
+        not torch.is_grad_enabled()
+        and feat.ndim == 4
+        and feat.shape[0] == 1
+        and ids.ndim == 1
+        and feat.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and feat.shape[1] <= 512
+        and 1 <= win <= 9
+        and win % 2 == 1
+    )
+
+
+ops.gather_windows.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_gather_windows_eligible
+)(gather_windows)
+
+
+# -- standalone bilinear upsampling (+ optional static INT8 output quantization) --------------------------------------
+
+
+@triton.jit
+def _upsample_bilinear_kernel(
+    x_ptr, out_ptr, scale_ptr,
+    H_in, W_in, H_out, W_out,
+    sx_b, sx_h, sx_w, sx_c,
+    scale_h, scale_w,
+    C: tl.constexpr, BLOCK_X: tl.constexpr, BLOCK_C: tl.constexpr,
+    ALIGN_CORNERS: tl.constexpr, INT8: tl.constexpr, NHWC: tl.constexpr,
+):
+    """One ``[BLOCK_X pixels of one row, BLOCK_C channels]`` tile of bilinear upsampling (channels-last output).
+
+    ``ALIGN_CORNERS`` uses exact integer quotient/remainder + ``tl.div_rn`` (no FP64) to match PyTorch's FP64
+    coordinate calculation without sm_120's 1/64 FP64 penalty. ``INT8`` fuses BF16 rounding + static INT8
+    quantization (``_store_quantized`` arithmetic) into the write pass.
+    """
+    row = tl.program_id(1)
+    b = (row // H_out).to(tl.int64)
+    y = row % H_out
+    x = tl.program_id(0) * BLOCK_X + tl.arange(0, BLOCK_X)
+    x_ok = x < W_out
+    x_c = tl.where(x_ok, x, 0)
+    c = tl.program_id(2) * BLOCK_C + tl.arange(0, BLOCK_C)
+    m = x_ok[:, None] & (c < C)[None, :]
+
+    if ALIGN_CORNERS:
+        den_h = tl.maximum(H_out - 1, 1)
+        num_y = y * (H_in - 1)
+        y0 = num_y // den_h
+        y1 = tl.minimum(y0 + 1, H_in - 1)
+        ly1 = tl.div_rn((num_y - y0 * den_h).to(tl.float32), den_h.to(tl.float32))
+        ly0 = 1.0 - ly1
+        den_w = tl.maximum(W_out - 1, 1)
+        num_x = x_c * (W_in - 1)
+        x0 = num_x // den_w
+        x1 = tl.minimum(x0 + 1, W_in - 1)
+        lx1 = tl.div_rn((num_x - x0 * den_w).to(tl.float32), den_w.to(tl.float32))
+        lx0 = 1.0 - lx1
+    else:
+        y0, y1, ly0, ly1 = _bilinear_source(y, H_in, scale_h)
+        x0, x1, lx0, lx1 = _bilinear_source(x_c, W_in, scale_w)
+
+    base = x_ptr + b * sx_b
+    r0 = base + y0.to(tl.int64) * sx_h
+    r1 = base + y1.to(tl.int64) * sx_h
+    cc = c[None, :] if NHWC else c[None, :].to(tl.int64) * sx_c
+    v00 = tl.load(r0 + (x0.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v01 = tl.load(r0 + (x1.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v10 = tl.load(r1 + (x0.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    v11 = tl.load(r1 + (x1.to(tl.int64) * sx_w)[:, None] + cc, mask=m, other=0.0).to(tl.float32)
+    lx0, lx1 = lx0[:, None], lx1[:, None]
+    val = ly0 * (lx0 * v00 + lx1 * v01) + ly1 * (lx0 * v10 + lx1 * v11)
+    out_off = ((row.to(tl.int64) * W_out + x_c) * C)[:, None] + c[None, :]
+    if INT8:
+        scaled = libdevice.rint(val.to(tl.bfloat16).to(tl.float32) * (1.0 / tl.load(scale_ptr)))
+        tl.store(out_ptr + out_off, tl.maximum(tl.minimum(scaled, 127.0), -127.0).to(tl.int8), mask=m)
+    else:
+        tl.store(out_ptr + out_off, val.to(out_ptr.dtype.element_ty), mask=m)
+
+
+def upsample_bilinear(
+    x: Tensor, size: tuple[int, int], *, align_corners: bool = True, out_scale: Tensor | None = None
+) -> Tensor | Int8Tensor:
+    """Standalone bilinear upsampling (channels-last output) with optional fused static INT8 output quantization.
+
+    Tile picks for NHWC dense output measured on sm_120 (RTX 5070 Ti, FP16 NHWC, DUSt3R DPT shapes):
+    ``(8, 256, 8 warps)`` hits 46.6 us on ``[1, 256, 96, 128]`` (4.43x vs PyTorch); ``(16, 64, 4 warps)`` hits
+    92.0 us on ``[1, 128, 192, 256]`` (4.53x vs PyTorch).
+    """
+    batch, channels, hi, wi = x.shape
+    ho, wo = size
+    sh, sw = (0.0, 0.0) if align_corners else (hi / ho, wi / wo)
+    nhwc = x.stride(1) == 1
+    if out_scale is None:
+        out = torch.empty((batch, channels, ho, wo), device=x.device, dtype=x.dtype, memory_format=torch.channels_last)
+    else:
+        out = torch.empty((batch, ho, wo, channels), device=x.device, dtype=torch.int8)
+    if out_scale is None and nhwc and channels >= 256:
+        block_x, block_c, num_warps = 8, 256, 8
+    elif out_scale is None and nhwc and channels >= 64:
+        block_x, block_c, num_warps = 16, 64, 4
+    else:
+        block_c = min(128, max(16, triton.next_power_of_2(channels)))
+        block_x = 16 if block_c >= 64 else 32
+        num_warps = 4
+    grid = (triton.cdiv(wo, block_x), batch * ho, triton.cdiv(channels, block_c))
+    _upsample_bilinear_kernel[grid](
+        x, out, out if out_scale is None else out_scale,
+        hi, wi, ho, wo,
+        x.stride(0), x.stride(2), x.stride(3), x.stride(1),
+        sh, sw, C=channels, BLOCK_X=block_x, BLOCK_C=block_c,
+        ALIGN_CORNERS=align_corners, INT8=out_scale is not None, NHWC=nhwc, num_warps=num_warps,
+    )
+    return out if out_scale is None else Int8Tensor(out, out_scale)
+
+
+def _eligible_upsample_bilinear(
+    x: Tensor, size: tuple[int, int], *, align_corners: bool = True, out_scale: Tensor | None = None
+) -> bool:
+    return (
+        x.is_cuda
+        and x.ndim == 4
+        and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and len(size) == 2
+        and size[0] > 0
+        and size[1] > 0
+        and (out_scale is None or (out_scale.is_cuda and out_scale.numel() == 1))
+    )
+
+
+ops.upsample_bilinear.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_eligible_upsample_bilinear
+)(upsample_bilinear)

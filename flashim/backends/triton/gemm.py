@@ -296,6 +296,7 @@ def _int8_gemm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
+    OUT_FP16: tl.constexpr = False,
 ):
     """``int8[M,K] x int8[N,K]^T`` with INT32 accumulation; epilogue ``acc * (a_scale * w_scale[n]) + bias`` (then ReLU
     with ``RELU``: it commutes with the BF16 rounding, so it equals a separate ReLU pass bit for bit). ``ROW_SCALE``:
@@ -341,17 +342,19 @@ def _int8_gemm_kernel(
         out = tl.maximum(out, 0.0)
     offsets = offs_m[:, None].to(tl.int64) * N + offs_n[None, :]
     mask = mask_m[:, None] & mask_n[None, :]
+    out_tl = tl.float16 if OUT_FP16 else tl.bfloat16
     if GELU or RESIDUAL:
-        out = out.to(tl.bfloat16).to(tl.float32)
+        out = out.to(out_tl).to(tl.float32)
         if GELU:
-            out = gelu_erf(out).to(tl.bfloat16).to(tl.float32)
+            out = gelu_erf(out).to(out_tl).to(tl.float32)
         if RESIDUAL:
             out = tl.load(res_ptr + offsets, mask=mask, other=0.0).to(tl.float32) + out
-    tl.store(out_ptr + offsets, out.to(tl.bfloat16), mask=mask)
+    tl.store(out_ptr + offsets, out.to(out_tl), mask=mask)
 
 
 def _int8_gemm_config(
-    rows: int, n: int, small_tiles: bool = False, four_warps: bool = False, *, k: int = 0, sm90: bool = False
+    rows: int, n: int, small_tiles: bool = False, four_warps: bool = False, *, k: int = 0, sm90: bool = False,
+    sm120: bool = False,
 ) -> tuple[int, int, int, int, int]:
     """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages). ``small_tiles`` (sm_89, sm_90): 4-warp 64-row tiles
     measured faster than 128 x 128 with 8 warps on an L20 (exact INT32 accumulation: bit-identical), e.g. 2505 x 1024
@@ -365,12 +368,16 @@ def _int8_gemm_config(
     128 x 64 (K block 128 when ``k >= 96``). In situ (CUDA graph, L2-warm, real call sites at 1200 px) dedode-g's
     decoder GEMMs take 0.82 ms less per extract (65856 x 256 -> 256 0.057 -> 0.043 ms, 263424 x 64 -> 256
     0.104 -> 0.048, 1053696 x 32 -> 96 0.262 -> 0.100, 1053696 x 64 -> 64 0.163 -> 0.090); on an L20 the same rule is
-    within noise (-0.02 ms), so it stays H20-only. Exact (INT32 accumulation: bit-identical)."""
+    within noise (-0.02 ms), so it stays H20-only. ``sm120`` (RTX 5070 Ti): 128 x 64 x 64 with 4 warps avoids
+    under-utilizing the 70 SMs on medium shapes (512 <= rows <= 1536, 512 <= n <= 1536: 1536x4096->1024 67.5 ->
+    61.6 us, 768x768->1536 26.8 -> 24.4 us). Exact (INT32 accumulation: bit-identical)."""
     if sm90 and rows >= 2048 and n < 512:
         tiny = n <= 32
         return 128 if tiny else 64, 64, 128 if tiny and k >= 96 else 64, 4, 3
     if small_tiles and rows >= 2048 and n >= 512:
         return 64, 128 if rows >= 32768 else 64, 64, 4, 3
+    if sm120 and 512 <= rows <= 1536 and 512 <= n <= 1536:
+        return 128, 64, 64, 4, 3
     if rows >= 512:
         return 128, 128, 64, 4 if four_warps else 8, 3
     if rows >= 128:
@@ -380,16 +387,17 @@ def _int8_gemm_config(
 
 def int8_gemm_bf16(
     a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, config=None, *, relu: bool = False,
-    gelu: bool = False, residual: Tensor | None = None,
+    gelu: bool = False, residual: Tensor | None = None, out_dtype: torch.dtype | None = None,
 ) -> Tensor:
-    """``[rows, K] int8 x [N, K] int8^T`` -> BF16 ``[rows, N]`` with the dequantizing epilogue fused; ``a_scale``: one
-    FP32 value or ``[rows, 1]`` (contiguous) per-row scales; ``gelu`` / ``residual``: see :func:`_int8_gemm_kernel`."""
+    """``[rows, K] int8 x [N, K] int8^T`` -> BF16/FP16 ``[rows, N]`` with the dequantizing epilogue fused; ``a_scale``:
+    one FP32 value or ``[rows, 1]`` (contiguous) per-row scales; ``gelu`` / ``residual``: see :func:`_int8_gemm_kernel`."""
     rows, k = a.shape
     n = weight.shape[0]
-    out = torch.empty(rows, n, device=a.device, dtype=torch.bfloat16)
+    dtype = out_dtype if out_dtype is not None else (residual.dtype if residual is not None else torch.bfloat16)
+    out = torch.empty(rows, n, device=a.device, dtype=dtype)
+    cap = platform_for(a.device).capability
     block_m, block_n, block_k, num_warps, num_stages = config or _int8_gemm_config(
-        rows, n, _is_sm89(a.device) or _is_sm90(a.device), platform_for(a.device).capability == (8, 7), k=k,
-        sm90=_is_sm90(a.device),
+        rows, n, cap in ((8, 9), (9, 0)), cap == (8, 7), k=k, sm90=cap == (9, 0), sm120=cap == (12, 0),
     )
     _int8_gemm_kernel[(triton.cdiv(rows, block_m) * triton.cdiv(n, block_n),)](
         a,
@@ -411,6 +419,7 @@ def int8_gemm_bf16(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         GROUP_M=8,
+        OUT_FP16=dtype == torch.float16,
         num_warps=num_warps,
         num_stages=num_stages,
         **(gelu_launch_kwargs(a.device) if gelu else {}),
@@ -760,13 +769,18 @@ def _mxfp8_scaled_mm_impl(a, b_t, a_scale, b_scale, bias=None):
 
 
 # The fused-epilogue Triton GEMM beats cuBLAS ``_int_mm`` + separate dequant passes at every shape.
-def _int8_linear_eligible(a, weight, a_scale, w_scale, bias, *, relu=False, gelu=False, residual=None) -> bool:
+def _int8_linear_eligible(
+    a, weight, a_scale, w_scale, bias, *, relu=False, gelu=False, residual=None, out_dtype=None
+) -> bool:
     """The epilogues are exact where they equal the unfused torch ops: ``gelu`` needs a libdevice whose ``erf`` is
-    torch's (:mod:`~flashim.backends.triton._libdevice`), ``residual`` a contiguous BF16 ``[rows, N]``; one activation."""
+    torch's (:mod:`~flashim.backends.triton._libdevice`), ``residual`` a contiguous BF16/FP16 ``[rows, N]``; one activation."""
+    dtype = out_dtype if out_dtype is not None else (residual.dtype if residual is not None else torch.bfloat16)
+    if dtype not in (torch.bfloat16, torch.float16):
+        return False
     if gelu and (relu or torch_gelu_libdevice(a.device) is None):
         return False
     return residual is None or (
-        residual.dtype == torch.bfloat16 and residual.is_contiguous() and residual.shape == (a.shape[0], weight.shape[0])
+        residual.dtype == dtype and residual.is_contiguous() and residual.shape == (a.shape[0], weight.shape[0])
     )
 
 
@@ -774,8 +788,12 @@ def _int8_linear_eligible(a, weight, a_scale, w_scale, bias, *, relu=False, gelu
     "triton", device=DeviceSpec("cuda", min_capability=(7, 5)), requires=[Feature.TRITON], priority=1,
     when=_int8_linear_eligible,
 )
-def _int8_linear_impl(a, weight, a_scale, w_scale, bias, *, relu: bool = False, gelu: bool = False, residual=None):
-    return int8_gemm_bf16(a.contiguous(), weight, a_scale, w_scale, bias, relu=relu, gelu=gelu, residual=residual)
+def _int8_linear_impl(
+    a, weight, a_scale, w_scale, bias, *, relu: bool = False, gelu: bool = False, residual=None, out_dtype=None
+):
+    return int8_gemm_bf16(
+        a.contiguous(), weight, a_scale, w_scale, bias, relu=relu, gelu=gelu, residual=residual, out_dtype=out_dtype
+    )
 
 
 def _static_gemm_eligible(a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None) -> bool:
@@ -875,3 +893,216 @@ def _mxfp8_gelu_mlp_chain_impl(x, w1, b1, hidden_exponent, w2):
     hidden = fp8_gemm_bf16(x, w1, None)
     activated = gelu_quantize(hidden, hidden_exponent.to(x.device, torch.int8), "none", input_bias=b1)
     return fp8_gemm_bf16(activated, w2, None)
+
+
+# -- fused dual-input BF16/FP16 GELU MLP (+ optional residual LayerNorm) -------------------------------
+
+
+@triton.jit
+def _cat_gelu_mlp_kernel(
+    a_ptr,
+    b_ptr,
+    w1_ptr,
+    b1_ptr,
+    w2_ptr,
+    b2_ptr,
+    nw_ptr,
+    nb_ptr,
+    out_ptr,
+    rows,
+    eps,
+    C: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HAS_B1: tl.constexpr,
+    HAS_B2: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+    KEEP_AB: tl.constexpr,
+):
+    """On-chip ``fc2(GELU(fc1(cat(a, b, -1))))`` (+ optional ``a + LayerNorm(out)``) keeping the GELU hidden
+    activation and pre-LayerNorm output in registers (eliminates 4 intermediate DRAM buffers).
+
+    For ``C <= 128`` (``KEEP_AB=True``), ``a`` and ``b`` stay in registers across the ``H`` loop. For larger ``C``
+    (e.g. 196 -> ``BLOCK_C=256``), the first projection loops over ``BLOCK_K=64`` chunks so shared memory stays well
+    under the 101 KB hardware limit while ``a``/``b`` hit L1 cache."""
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < rows
+    offs_c = tl.arange(0, BLOCK_C)
+    mask_c = offs_c < C
+    mc = mask_m[:, None] & mask_c[None, :]
+    row_base = offs_m.to(tl.int64)[:, None] * C
+
+    if KEEP_AB:
+        a = tl.load(a_ptr + row_base + offs_c[None, :], mask=mc, other=0.0)
+        b = tl.load(b_ptr + row_base + offs_c[None, :], mask=mc, other=0.0)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_C), dtype=tl.float32)
+    h_ar = tl.arange(0, BLOCK_H)
+    k_ar = tl.arange(0, BLOCK_K)
+    for h0 in range(0, H, BLOCK_H):
+        offs_h = h0 + h_ar
+        mask_h = offs_h < H
+        if KEEP_AB:
+            w1_base = offs_h[None, :].to(tl.int64) * (2 * C) + offs_c[:, None]
+            w1a = tl.load(w1_ptr + w1_base, mask=mask_c[:, None] & mask_h[None, :], other=0.0)
+            w1b = tl.load(w1_ptr + w1_base + C, mask=mask_c[:, None] & mask_h[None, :], other=0.0)
+            h = tl.dot(a, w1a)
+            h = tl.dot(b, w1b, h)
+        else:
+            h = tl.zeros((BLOCK_M, BLOCK_H), dtype=tl.float32)
+            for k0 in tl.static_range(0, C, BLOCK_K):
+                offs_k = k0 + k_ar
+                mask_k = offs_k < C
+                mk = mask_m[:, None] & mask_k[None, :]
+                ak = tl.load(a_ptr + row_base + offs_k[None, :], mask=mk, other=0.0)
+                w1a = tl.load(
+                    w1_ptr + offs_h[None, :].to(tl.int64) * (2 * C) + offs_k[:, None],
+                    mask=mask_k[:, None] & mask_h[None, :],
+                    other=0.0,
+                )
+                h = tl.dot(ak, w1a, h)
+                bk = tl.load(b_ptr + row_base + offs_k[None, :], mask=mk, other=0.0)
+                w1b = tl.load(
+                    w1_ptr + offs_h[None, :].to(tl.int64) * (2 * C) + C + offs_k[:, None],
+                    mask=mask_k[:, None] & mask_h[None, :],
+                    other=0.0,
+                )
+                h = tl.dot(bk, w1b, h)
+        if HAS_B1:
+            b1 = tl.load(b1_ptr + offs_h, mask=mask_h, other=0.0).to(tl.float32)
+            h = h + b1[None, :]
+        h = h.to(out_ptr.dtype.element_ty).to(tl.float32)
+        h = 0.5 * h * (1.0 + tl.math.erf(h * 0.7071067811865476))
+        h = h.to(out_ptr.dtype.element_ty)
+        w2 = tl.load(
+            w2_ptr + offs_c[None, :].to(tl.int64) * H + offs_h[:, None],
+            mask=mask_h[:, None] & mask_c[None, :],
+            other=0.0,
+        )
+        acc = tl.dot(h, w2, acc)
+
+    if HAS_B2:
+        b2 = tl.load(b2_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+        acc = acc + b2[None, :]
+
+    if HAS_NORM:
+        acc = tl.where(mask_c[None, :], acc.to(out_ptr.dtype.element_ty).to(tl.float32), 0.0)
+        mean = tl.sum(acc, axis=1) / C
+        diff = tl.where(mask_c[None, :], acc - mean[:, None], 0.0)
+        var = tl.sum(diff * diff, axis=1) / C
+        rstd = tl.rsqrt(var + eps)
+        nw = tl.load(nw_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+        nb = tl.load(nb_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+        normed = ((diff * rstd[:, None]) * nw[None, :] + nb[None, :]).to(out_ptr.dtype.element_ty)
+        if KEEP_AB:
+            res = a
+        else:
+            res = tl.load(a_ptr + row_base + offs_c[None, :], mask=mc, other=0.0)
+        y = (res.to(tl.float32) + normed.to(tl.float32)).to(out_ptr.dtype.element_ty)
+    else:
+        y = acc.to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + row_base + offs_c[None, :], y, mask=mc)
+
+
+def cat_gelu_mlp(
+    a: Tensor,
+    b: Tensor,
+    w1: Tensor,
+    b1: Tensor | None,
+    w2: Tensor,
+    b2: Tensor | None,
+    norm_weight: Tensor | None = None,
+    norm_bias: Tensor | None = None,
+    eps: float = 1e-5,
+    *,
+    block_m: int | None = None,
+    block_h: int | None = None,
+    block_k: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
+) -> Tensor:
+    c = a.shape[-1]
+    h = w1.shape[0]
+    rows = a.numel() // c
+    if rows == 0:
+        return torch.empty_like(a)
+    a_c = a.contiguous()
+    b_c = b.contiguous()
+    w1_c = w1.contiguous()
+    w2_c = w2.contiguous()
+    out = torch.empty_like(a_c)
+    block_c = max(16, triton.next_power_of_2(c))
+    keep_ab = block_c <= 128
+    # Measured on RTX 5070 Ti (sm_120):
+    # - [123050, 128->256->128]+LN (ref 1.014 ms): (128, 64, 128, 8w, 1s) = 0.401 ms (2.53x),
+    #   beating (64, 128, 8w, 1s) 0.437 ms, (64, 64, 8w, 2s) 0.446 ms, (64, 64, 4w, 1s) 0.548 ms.
+    # - [44298, 196->392->196]+LN (ref 0.670 ms): (64, 32, 64, 4w, 1s) = 0.539 ms (1.24x),
+    #   beating (32, 32, 4w, 2s) 0.560 ms, (32, 64, 4w, 1s) 0.590 ms; (64, 64) overflows 101 KB SMEM.
+    bm = (128 if keep_ab else 64) if block_m is None else block_m
+    bh = (64 if keep_ab else 32) if block_h is None else block_h
+    bk = (block_c if keep_ab else 64) if block_k is None else block_k
+    nw = (8 if keep_ab else 4) if num_warps is None else num_warps
+    ns = 1 if num_stages is None else num_stages
+    _cat_gelu_mlp_kernel[(triton.cdiv(rows, bm),)](
+        a_c,
+        b_c,
+        w1_c,
+        b1 if b1 is not None else out,
+        w2_c,
+        b2 if b2 is not None else out,
+        norm_weight if norm_weight is not None else out,
+        norm_bias if norm_bias is not None else out,
+        out,
+        rows,
+        eps,
+        C=c,
+        H=h,
+        BLOCK_M=bm,
+        BLOCK_C=block_c,
+        BLOCK_H=bh,
+        BLOCK_K=bk,
+        HAS_B1=b1 is not None,
+        HAS_B2=b2 is not None,
+        HAS_NORM=norm_weight is not None,
+        KEEP_AB=keep_ab,
+        num_warps=nw,
+        num_stages=ns,
+    )
+    return out
+
+
+def _cat_gelu_mlp_eligible(
+    a: Tensor,
+    b: Tensor,
+    w1: Tensor,
+    b1: Tensor | None,
+    w2: Tensor,
+    b2: Tensor | None,
+    norm_weight: Tensor | None = None,
+    norm_bias: Tensor | None = None,
+    eps: float = 1e-5,
+) -> bool:
+    if torch.is_grad_enabled() or a.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    c = a.shape[-1]
+    h = w1.shape[0]
+    if b.shape != a.shape or b.dtype != a.dtype or w1.dtype != a.dtype or w2.dtype != a.dtype:
+        return False
+    if w1.shape != (h, 2 * c) or w2.shape != (c, h) or c > 256 or h > 1024:
+        return False
+    if b1 is not None and (b1.shape != (h,) or b1.dtype != a.dtype):
+        return False
+    if b2 is not None and (b2.shape != (c,) or b2.dtype != a.dtype):
+        return False
+    if (norm_weight is None) != (norm_bias is None):
+        return False
+    return norm_weight is None or (norm_weight.dtype == a.dtype and norm_bias.dtype == a.dtype)
+
+
+ops.cat_gelu_mlp.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 0)), requires=[Feature.TRITON], when=_cat_gelu_mlp_eligible
+)(cat_gelu_mlp)

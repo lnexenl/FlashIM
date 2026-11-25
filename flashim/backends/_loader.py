@@ -28,13 +28,15 @@ BACKENDS: tuple[Backend, ...] = (
     Backend("torch_native", ("torch_native.gemm", "torch_native.patchify")),
     Backend(
         "triton",
-        tuple(f"triton.{m}" for m in ("aliked", "attention", "conv", "correlation", "density", "gemm", "image", "lightglue",
-                                      "matching", "nms", "norm", "point_conv", "quantize", "raco", "resample", "romav2",
-                                      "stem_conv")),
+        tuple(f"triton.{m}" for m in (
+            "activation", "aliked", "assignment", "attention", "conv", "correlation", "density", "dust3r",
+            "eloftr", "gemm", "image", "lightglue", "matching", "nms", "norm", "point_conv", "quantize",
+            "raco", "resample", "roma", "romav2", "stem_conv", "tiny_roma",
+        )),
         packages=("triton",),
     ),
     Backend("tilelang", ("tilelang.conv", "tilelang.gemm"), packages=("tilelang",)),
-    Backend("cuda", ("cuda.raco", "cuda.conv", "cuda.aliked", "cuda.nms")),  # JIT CUDA C++: needs nvcc (Feature.NVCC), built on first eligible call
+    Backend("cuda", ("cuda.aliked", "cuda.assignment", "cuda.conv", "cuda.correlation", "cuda.nms", "cuda.raco")),  # JIT CUDA C++: needs nvcc (Feature.NVCC), built on first eligible call
     Backend("sageattention", ("external.sageattention",), packages=("sageattention",)),
 )
 

@@ -1,7 +1,9 @@
-"""SuperPoint's :class:`~flashim.build.ModelSpec` (presets ``fp32`` / ``bf16`` / ``int8`` / ``fp8``)."""
+"""SuperPoint's :class:`~flashim.build.ModelSpec` (presets ``fp32`` / ``bf16`` / ``int8`` / ``fp8``;
+variants ``v1`` (default, Magic Leap) and ``sp_v6`` (rpautrat/SuperPoint with BatchNorm, used by OmniGlue))."""
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 from flashim import ops
@@ -20,14 +22,17 @@ from flashim.models.superpoint.model import SuperPoint
 QUANTIZED = ("conv1b", "conv2a", "conv2b", "conv3a", "conv3b", "conv4a", "conv4b", "convPa", "convDa")
 PROTECTED = ("conv1a", "convPb", "convDb")
 FP8_IGNORE = ("conv1b",)
+VARIANTS = ("v1", "sp_v6")
 
 
 def _fused_stem_conv(model: SuperPoint, ctx: BuildContext) -> str:
     """Replace cuDNN's slow 1->64 SIMT stem ``conv1a`` (+ bias + ReLU + optional INT8/MXFP8 quantize) with
     Triton ``ops.conv3x3_small_cin_relu`` (exact 9-tap row-major FP32 FMA for Cin=1, bit-identical to cuDNN at
-    480x640). Skipped for ``fp32`` (reference numerics)."""
+    480x640). Skipped for ``fp32`` (reference numerics) and ``sp_v6`` (post-ReLU BatchNorm)."""
     if ctx.config.precision.compute_dtype == "fp32":
         return "skipped: fp32"
+    if model.has_bn:
+        return "skipped: sp_v6"
     bound = ops.conv3x3_small_cin_relu.bind(model.conv1a.weight, model.conv1a.bias).warmup()
     if bound.primary == "reference":
         return f"skipped: no kernel on {ctx.platform.describe()}"
@@ -40,24 +45,33 @@ def _fused_pool_epilogue(model: SuperPoint, ctx: BuildContext) -> list[str] | st
     ``ops.int8_conv2d_maxpool_only`` (no unpooled BF16 store); bit-identical."""
     if ctx.config.precision.quant != "int8":
         return "skipped: not int8"
+    if model.has_bn:
+        return "skipped: sp_v6"
     model.fused_pool_epilogue = True
     return ["conv1b", "conv2b", "conv3b"]
 
 
 def _load(config: RunConfig) -> SuperPoint:
-    return SuperPoint.from_pretrained(checkpoint=config.checkpoint, device=config.device, **config.arch)
+    variant = config.variant or "v1"
+    return SuperPoint.from_pretrained(checkpoint=config.checkpoint, device=config.device, variant=variant, **config.arch)
 
 
-SPEC = extractor_spec(
+def _validate(config: RunConfig) -> None:
+    variant = config.variant or "v1"
+    if variant not in VARIANTS:
+        raise ValueError(f"superpoint: unknown variant {variant!r}; choose from {VARIANTS}")
+
+
+_SPEC = extractor_spec(
     name="superpoint",
-    description="SuperPoint detector/descriptor (VGG encoder, 256-d descriptors)",
+    description="SuperPoint detector/descriptor (VGG encoder, 256-d descriptors; variant v1 | sp_v6)",
     load=_load,
     calibration_dir=Path(__file__).parent / "calibration",
     quantized=QUANTIZED,
     protected=PROTECTED,
     fp8_ignore=FP8_IGNORE,
     compile_regions=("conv1a", "conv1b", "conv2a", "conv2b", "conv3a", "conv3b", "conv4a", "conv4b"),
-    has_batchnorm=False,
+    has_batchnorm=True,  # no-op for v1 (empty batchnorm_pairs), folds convPb/convDb BN for sp_v6
     channels_last=True,  # BF16 extract at 1200 px, interleaved in one process (sm_120): 7.8 -> 6.7 ms
     cuda_graph=True,
     extra_passes={
@@ -72,3 +86,4 @@ SPEC = extractor_spec(
     },
     structural_passes=("fused_stem_conv", "fused_pool_epilogue"),
 )
+SPEC = dataclasses.replace(_SPEC, validate=_validate)

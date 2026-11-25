@@ -15,6 +15,7 @@ from flashim.ops._registry import (
     reset_call_counts,
     set_strict,
 )
+from flashim.ops.activation import relu_affine
 from flashim.ops.aliked import (
     aliked_bilinear_sample,
     aliked_sample_patches,
@@ -22,12 +23,22 @@ from flashim.ops.aliked import (
     deform_patches_int8,
     multiscale_fuse,
 )
-from flashim.ops.attention import deformable_attention, linear_attention, rope_qk, rope_qk_interleaved, sdpa
+from flashim.ops.assignment import log_optimal_transport, sinkhorn_mutual
+from flashim.ops.attention import (
+    bidirectional_cross_attention,
+    deformable_attention,
+    elu_linear_attention,
+    rope_qk,
+    rope_qk_2d,
+    rope_qk_interleaved,
+    sdpa,
+)
 from flashim.ops.conv import (
     conv2d_at_points,
     conv2d_single_output,
     conv2d_small_cin_quantize_int8,
     conv3x3_small_cin_relu,
+    depthwise5x5_relu,
     depthwise5x5_relu_int8,
     depthwise5x5_relu_mxfp8,
     depthwise5x5_relu_pointwise,
@@ -39,9 +50,27 @@ from flashim.ops.conv import (
     int8_conv2d_maxpool_only,
     mxfp8_conv2d,
 )
-from flashim.ops.correlation import dual_softmax_mutual, local_corr, mutual_nn_match
+from flashim.ops.correlation import (
+    batched_dual_softmax_argmax,
+    dual_softmax_mutual,
+    fast_reciprocal_nn,
+    local_corr,
+    mutual_nn_match,
+    reciprocal_nn,
+    union_softmax_match,
+)
 from flashim.ops.density import kde_density
+from flashim.ops.dust3r import dust3r_pts3d_conf
+from flashim.ops.eloftr import (
+    eloftr_agg_norm,
+    eloftr_leaky_relu_quantize,
+    eloftr_pool_norm,
+    eloftr_post_norm_add,
+    eloftr_upsample_add_leaky_relu,
+    eloftr_upsample_gather_windows,
+)
 from flashim.ops.gemm import (
+    cat_gelu_mlp,
     int8_linear,
     int8_linear_quantize,
     linear_fp32,
@@ -50,17 +79,28 @@ from flashim.ops.gemm import (
     mxfp8_linear,
     mxfp8_scaled_mm,
 )
-from flashim.ops.image import jpeg_fancy_upsample
+from flashim.ops.image import gray_instance_norm, jpeg_fancy_upsample
 from flashim.ops.lightglue import lightglue_qkv_rope, lightglue_swapped_linear
 from flashim.ops.matching import hamming_distances, hamming_ratio_mutual_match, ratio_mutual_match
-from flashim.ops.nms import simple_nms, strict_nms_mask
-from flashim.ops.norm import instance_norm_prelu, rgb_mean_instance_norm
+from flashim.ops.nms import box_nms_2d, simple_nms, strict_nms_mask
+from flashim.ops.norm import (
+    cat_layernorm,
+    instance_norm_prelu,
+    pos_cat_layernorm,
+    residual_layernorm,
+    rgb_mean_instance_norm,
+)
 from flashim.ops.patchify import patch_embed_tokens
 from flashim.ops.quantize import (
     bias_relu_quantize_int8,
     gelu_quantize,
     gelu_quantize_int8,
     gelu_quantize_int8_rows,
+    layernorm_add,
+    layernorm_cat,
+    layernorm_cat_quantize_int8,
+    layernorm_cat_quantize_int8_rows,
+    layernorm_cat_quantize_mxfp8,
     layernorm_gelu_quantize_int8,
     layernorm_quantize,
     layernorm_quantize_int8,
@@ -71,17 +111,22 @@ from flashim.ops.quantize import (
     quantize_int8_rows,
     quantize_int8_rows_heads,
     quantize_mxfp8,
+    rotate_quantize_int8_rows,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock, raco_score_head
 from flashim.ops.resample import (
     bilinear_sample_points,
+    gather_windows,
     multiscale_score,
     pil_bicubic_resize,
     upsample_add,
+    upsample_bilinear,
     upsample_concat,
     upsample_concat_int8,
 )
+from flashim.ops.roma import roma_refiner_head, roma_refiner_input
 from flashim.ops.romav2 import romav2_refiner_heads, romav2_refiner_input
+from flashim.ops.tiny_roma import tiny_roma_corr_pos_embed
 
 __all__ = [
     "OPS",
@@ -91,9 +136,14 @@ __all__ = [
     "aliked_bilinear_sample",
     "aliked_sample_patches",
     "aliked_score_head",
+    "batched_dual_softmax_argmax",
     "bias_relu_quantize_int8",
+    "bidirectional_cross_attention",
     "bilinear_sample_points",
+    "box_nms_2d",
     "call_counts",
+    "cat_gelu_mlp",
+    "cat_layernorm",
     "configure",
     "conv2d_at_points",
     "conv2d_single_output",
@@ -101,15 +151,27 @@ __all__ = [
     "conv3x3_small_cin_relu",
     "deform_patches_int8",
     "deformable_attention",
+    "depthwise5x5_relu",
     "depthwise5x5_relu_int8",
     "depthwise5x5_relu_mxfp8",
     "depthwise5x5_relu_pointwise",
     "depthwise5x5_relu_pointwise_int8",
     "depthwise5x5_relu_pointwise_mxfp8",
     "dual_softmax_mutual",
+    "dust3r_pts3d_conf",
+    "eloftr_agg_norm",
+    "eloftr_leaky_relu_quantize",
+    "eloftr_pool_norm",
+    "eloftr_post_norm_add",
+    "eloftr_upsample_add_leaky_relu",
+    "eloftr_upsample_gather_windows",
+    "elu_linear_attention",
+    "fast_reciprocal_nn",
+    "gather_windows",
     "gelu_quantize",
     "gelu_quantize_int8",
     "gelu_quantize_int8_rows",
+    "gray_instance_norm",
     "hamming_distances",
     "hamming_ratio_mutual_match",
     "im2col_gather",
@@ -121,15 +183,20 @@ __all__ = [
     "int8_linear_quantize",
     "jpeg_fancy_upsample",
     "kde_density",
+    "layernorm_add",
+    "layernorm_cat",
+    "layernorm_cat_quantize_int8",
+    "layernorm_cat_quantize_int8_rows",
+    "layernorm_cat_quantize_mxfp8",
     "layernorm_gelu_quantize_int8",
     "layernorm_quantize",
     "layernorm_quantize_int8",
     "layernorm_quantize_int8_rows",
     "lightglue_qkv_rope",
     "lightglue_swapped_linear",
-    "linear_attention",
     "linear_fp32",
     "local_corr",
+    "log_optimal_transport",
     "matmul_nt_fp32",
     "multiscale_fuse",
     "multiscale_score",
@@ -140,6 +207,7 @@ __all__ = [
     "mxfp8_scaled_mm",
     "patch_embed_tokens",
     "pil_bicubic_resize",
+    "pos_cat_layernorm",
     "quantize_int8",
     "quantize_int8_heads",
     "quantize_int8_multi",
@@ -150,17 +218,28 @@ __all__ = [
     "raco_resblock",
     "raco_score_head",
     "ratio_mutual_match",
+    "reciprocal_nn",
+    "relu_affine",
     "reset_call_counts",
+    "residual_layernorm",
     "rgb_mean_instance_norm",
+    "roma_refiner_head",
+    "roma_refiner_input",
     "romav2_refiner_heads",
     "romav2_refiner_input",
     "rope_qk",
+    "rope_qk_2d",
     "rope_qk_interleaved",
+    "rotate_quantize_int8_rows",
     "sdpa",
     "set_strict",
     "simple_nms",
+    "sinkhorn_mutual",
     "strict_nms_mask",
+    "tiny_roma_corr_pos_embed",
+    "union_softmax_match",
     "upsample_add",
+    "upsample_bilinear",
     "upsample_concat",
     "upsample_concat_int8",
 ]

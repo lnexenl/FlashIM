@@ -59,3 +59,12 @@ def import_cv2():
     except ImportError as exc:
         raise ImportError("OpenCV is needed here: pip install 'flashim[cv]' (or opencv-python)") from exc
     return cv2
+
+
+def normalized_grid(batch: int, h: int, w: int, device: torch.device) -> Tensor:
+    """``[B, H, W, 2]`` pixel-center coordinates in ``[-1, 1]``, last dim ``(x, y)``."""
+    grid = torch.meshgrid(
+        *[torch.linspace(-1 + 1 / n, 1 - 1 / n, n, device=device) for n in (batch, h, w)],
+        indexing="ij",
+    )
+    return torch.stack((grid[2], grid[1]), dim=-1).reshape(batch, h, w, 2)

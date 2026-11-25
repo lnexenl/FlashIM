@@ -77,20 +77,21 @@ mxfp8_linear = Op("mxfp8_linear", _mxfp8_linear_reference, weights=1)
 
 def _int8_linear_reference(
     a: Tensor, weight: Tensor, a_scale: Tensor, w_scale: Tensor, bias: Tensor | None, *, relu: bool = False,
-    gelu: bool = False, residual: Tensor | None = None,
+    gelu: bool = False, residual: Tensor | None = None, out_dtype: torch.dtype | None = None,
 ) -> Tensor:
-    """``[M, K] int8 x [N, K] int8^T`` in INT32, then ``acc * (a_scale * w_scale) + bias`` rounded to BF16, then the
-    epilogue in the order ``relu`` (ReLU commutes with the BF16 rounding, so ``relu=True`` equals ``F.relu`` of the plain
-    result bit for bit), ``gelu`` (``F.gelu`` of the BF16 result, exact erf form, rounded to BF16: ``nn.GELU`` after an
-    ``nn.Linear``), ``residual`` (``[M, N]`` BF16 added in BF16: ``x + linear(...)``). ``a_scale``: one static FP32
-    value, or ``[M, 1]`` per-row scales (dynamic per-token activations, :func:`~flashim.ops.quantize_int8_rows`)."""
+    """``[M, K] int8 x [N, K] int8^T`` in INT32, then ``acc * (a_scale * w_scale) + bias`` rounded to ``out_dtype``
+    (default: ``residual.dtype`` if given, else BF16), then the epilogue in the order ``relu`` (ReLU commutes with the
+    output rounding), ``gelu`` (``F.gelu`` of the rounded result, exact erf form), ``residual`` (``[M, N]`` added in
+    ``out_dtype``: ``x + linear(...)``). ``a_scale``: one static FP32 value, or ``[M, 1]`` per-row scales (dynamic
+    per-token activations, :func:`~flashim.ops.quantize_int8_rows`)."""
+    dtype = out_dtype if out_dtype is not None else (residual.dtype if residual is not None else torch.bfloat16)
     acc = a.long() @ weight.long().t() if a.device.type == "cpu" else a.double() @ weight.double().t()
     out = acc.float() * (a_scale.float() * w_scale.float())
     if bias is not None:
         out = out + bias.float()
     if relu:
         out = out.relu()
-    out = out.to(torch.bfloat16)
+    out = out.to(dtype)
     if gelu:
         out = F.gelu(out)
     if residual is not None:
@@ -155,3 +156,28 @@ def _mxfp8_gelu_mlp_reference(
 
 
 mxfp8_gelu_mlp = Op("mxfp8_gelu_mlp", _mxfp8_gelu_mlp_reference)
+
+
+# -- fused dual-input GELU MLP (+ optional residual LayerNorm) -------------------------------------------
+
+
+def _cat_gelu_mlp_reference(
+    a: Tensor,
+    b: Tensor,
+    w1: Tensor,
+    b1: Tensor | None,
+    w2: Tensor,
+    b2: Tensor | None,
+    norm_weight: Tensor | None = None,
+    norm_bias: Tensor | None = None,
+    eps: float = 1e-5,
+) -> Tensor:
+    """``fc2(GELU(fc1(cat((a, b), -1))))``, optionally followed by ``a + LayerNorm(out, norm_weight, norm_bias, eps)``."""
+    h = F.gelu(F.linear(torch.cat((a, b), dim=-1), w1, b1))
+    out = F.linear(h, w2, b2)
+    if norm_weight is not None:
+        out = a + F.layer_norm(out, (out.shape[-1],), norm_weight, norm_bias, eps)
+    return out
+
+
+cat_gelu_mlp = Op("cat_gelu_mlp", _cat_gelu_mlp_reference)
