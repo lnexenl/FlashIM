@@ -70,3 +70,16 @@ def test_aliked_bilinear_sample(c, m, dtype, nhwc):
     assert fast.shape == ref.shape and fast.dtype == ref.dtype
     tol = 1e-4 if dtype == torch.float32 else 2e-2
     torch.testing.assert_close(fast.float(), ref.float(), atol=tol, rtol=tol)
+
+
+def test_aliked_bilinear_sample_bf16_fp32_pos():
+    """SDDH keeps pixel coordinates in FP32 while sampling BF16 NHWC features."""
+    torch.manual_seed(3)
+    h, w, c, m = 480, 640, 128, 4096
+    feat = torch.randn(1, c, h, w, device=DEV, dtype=torch.bfloat16).contiguous(memory_format=torch.channels_last)[0]
+    pos = torch.stack([torch.rand(m, device=DEV) * (w - 1), torch.rand(m, device=DEV) * (h - 1)], dim=1)
+    assert ops.aliked_bilinear_sample.explain(feat, pos)["triton"] == "selected"
+    fast = ops.aliked_bilinear_sample.get("triton")(feat, pos)
+    ref = ops.aliked_bilinear_sample.get("reference")(feat, pos)
+    assert fast.dtype == torch.bfloat16
+    torch.testing.assert_close(fast.float(), ref.float(), atol=2e-2, rtol=2e-2)

@@ -34,6 +34,18 @@ def test_conv3x3_small_cin_relu_bf16(cin, cout, hw):
     assert ((fast.float() - ref.float()).abs() <= ref.float().abs() * 2**-6 + 1e-3).all()
 
 
+def test_conv3x3_cin1_exact_480x640_bf16():
+    """Cin=1 9-tap row-major FP32 FMA matches cuDNN SIMT bit-for-bit (or <1e-5 midpoint ties)."""
+    torch.manual_seed(0)
+    x = torch.rand(1, 1, 480, 640, device=DEV, dtype=torch.bfloat16)
+    w = (torch.randn(64, 1, 3, 3, device=DEV) * 0.2).to(torch.bfloat16)
+    b = (torch.randn(64, device=DEV) * 0.1).to(torch.bfloat16)
+    fast = ops.conv3x3_small_cin_relu.get("triton")(x, w, b)
+    ref = ops.conv3x3_small_cin_relu.get("reference")(x, w, b)
+    mismatch = (fast != ref).float().mean().item()
+    assert mismatch < 1e-5, f"Cin=1 mismatch rate {mismatch:.2e} too high"
+
+
 @pytest.mark.parametrize("cin,cout", [(1, 64), (3, 64)])
 @pytest.mark.parametrize("hw", [(37, 45), (224, 300)])
 def test_conv3x3_small_cin_relu_int8(cin, cout, hw):
