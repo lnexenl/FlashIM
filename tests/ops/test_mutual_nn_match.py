@@ -30,12 +30,13 @@ def test_mutual_nn_match_matches_reference(shape, dtype, threshold):
     if m == 0 or n == 0:
         assert len(ia) == len(ref_ia) == 0
         return
-    tol = 2e-2 if dtype == torch.bfloat16 else 2e-3
-    # TF32 / BF16 rounding can flip rare borderline non-planted pairs; planted pairs and scores must match.
+    tol = 2e-2 if dtype == torch.bfloat16 else 1e-4
+    # BF16 rounding can flip rare borderline non-planted pairs; FP32 <= 8192^2 uses IEEE precision and matches exactly.
     ours = set(zip(ia.tolist(), ib.tolist()))
     theirs = set(zip(ref_ia.tolist(), ref_ib.tolist()))
     overlap = len(ours & theirs) / max(len(theirs), 1)
-    assert overlap > 0.99, f"overlap={overlap:.4f} ({len(ours)} vs {len(theirs)})"
+    min_overlap = 0.99 if dtype == torch.bfloat16 else 0.999
+    assert overlap >= min_overlap, f"overlap={overlap:.4f} ({len(ours)} vs {len(theirs)})"
     common_scores = {
         (i, j): s for i, j, s in zip(ia.tolist(), ib.tolist(), sc.tolist())
     }

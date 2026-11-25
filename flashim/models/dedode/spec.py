@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import torch
@@ -332,7 +333,15 @@ def _loader(variant: str):
 # Early VGG stem convs of DeDoDe-B's descriptor (64/128 ch) have sparse channel activity that shifts from MegaDepth
 # (outdoor calibration) to ScanNet (indoor): static per-tensor INT8 clips up to 2.96x (layers.3), 2.35x (layers.7),
 # and 2.43x (layers.10), and MegaDepth-calibrated SmoothQuant hurts ScanNet further. Keeping these three stem convs
-# BF16 restores ScanNet descriptor cosine (0.9941 -> 0.9975) and AUC while 61/64 convs stay INT8 (~1.84x faster).
+# BF16 restores ScanNet descriptor cosine (0.9941 -> 0.9975) and AUC@5 (-0.0093 -> +0.0011 PASS; MegaDepth -0.0022)
+# while 61/64 convs stay INT8 (30.37 vs 55.81 ms BF16, 1.84x).
+#
+# MXFP8 on DeDoDe-B (pure VGG19 + ConvRefiner, no DINOv2 ViT) is strictly Pareto-dominated by INT8: E4M3's 3-bit
+# mantissa floor drops MegaDepth-1500 AUC@5 by -0.0074 [-0.0137, -0.0011] even on dev (0.6090 vs 0.6164 bf16,
+# desc_cos 0.9861, 39.48 ms); ignoring the 3 descriptor stem convs still sits at -0.0045 [-0.0105, +0.0015] while
+# running 1.42x slower (43.26 vs 30.37 ms; 138.2 vs 95.4 s MegaDepth) and larger (27.9 vs 26.8 MB) than INT8, and
+# ignoring all 6 encoder stem convs slows it to 46.85 ms (1.54x slower than INT8). Omitting ``fp8`` from ``dedode``
+# lets ``build.NEAREST`` resolve ``fp8 -> int8`` (``dedode-g`` keeps ``fp8`` for its DINOv2 ViT-L/14).
 _DEDODE_B_INT8_IGNORE = (
     "descriptor.encoder.layers.3",
     "descriptor.encoder.layers.7",
@@ -347,8 +356,9 @@ def _spec(
     int8_ignore: tuple[str, ...] = (),
     int8_dynamic: tuple[str, ...] = (),
     vit: str | None = None,
+    has_fp8: bool = True,
 ):
-    return extractor_spec(
+    spec = extractor_spec(
         name=name,
         description=description,
         load=_loader(variant),
@@ -374,12 +384,20 @@ def _spec(
             *(VIT_ATTENTION_PASSES if vit == "dedode-g" else ()),
         ),
     )
+    if not has_fp8:
+        spec = dataclasses.replace(
+            spec,
+            presets={k: v for k, v in spec.presets.items() if k != "fp8"},
+            quant_configs={k: v for k, v in spec.quant_configs.items() if k != "fp8"},
+            calibrations={k: v for k, v in spec.calibrations.items() if k != "fp8"},
+        )
+    return spec
 
 
 # One spec per descriptor: the two descriptors' layers differ in names and shapes, so each has its own calibration table.
 SPEC = _spec(
     "dedode", "B", "DeDoDe v2 detector (L) + descriptor B (VGG19), dual-softmax matching",
-    int8_ignore=_DEDODE_B_INT8_IGNORE,
+    int8_ignore=_DEDODE_B_INT8_IGNORE, has_fp8=False,
 )
 SPEC_G = _spec(
     "dedode-g", "G", "DeDoDe v2 detector (L) + descriptor G (VGG19 + DINOv2 ViT-L/14), dual-softmax matching",

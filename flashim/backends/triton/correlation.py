@@ -411,7 +411,7 @@ def _dual_softmax_mutual_impl(
 def _mnn_tiled_kernel(
     a_ptr, b_ptr, row_val_ptr, row_idx_ptr, col_val_ptr, col_idx_ptr,
     M, N, D, sa_m, sa_k, sb_n, sb_k,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, USE_TF32: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, PRECISION: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -430,7 +430,9 @@ def _mnn_tiled_kernel(
             k_ok = ks < D
             a = tl.load(a_row_base + ks[None, :].to(tl.int64) * sa_k, mask=row_ok[:, None] & k_ok[None, :], other=0.0)
             b = tl.load(b_col_base + ks[:, None].to(tl.int64) * sb_k, mask=k_ok[:, None] & col_ok[None, :], other=0.0)
-            if USE_TF32:
+            if PRECISION == 2:
+                acc = tl.dot(a, b, acc, input_precision="ieee")
+            elif PRECISION == 1:
                 acc = tl.dot(a, b, acc, input_precision="tf32")
             else:
                 acc = tl.dot(a, b, acc)
@@ -464,6 +466,12 @@ def _mnn_col_reduce_kernel(col_val_ptr, col_idx_ptr, nn10_ptr, N, M_BLOCKS, BLOC
     tl.store(nn10_ptr + cols, best_idx, mask=col_ok)
 
 
+# Above 8192^2 (256 MB materialized FP32), TF32 tensor cores run 4.4x faster than IEEE FP32 (9.92 vs 43.50 ms at
+# 32k x 24k); at <= 8192^2 (all standard <=4096-kpt benchmarks), IEEE FP32 takes 0.56 ms (vs 0.39 ms TF32) and
+# matches PyTorch's dense FP32 matmul exactly (no borderline MNN match flips).
+_MNN_TF32_MIN_PAIRS = 64 * 1024 * 1024
+
+
 def mutual_nn_match(desc0: Tensor, desc1: Tensor, threshold: float = 0.0) -> tuple[Tensor, Tensor, Tensor]:
     m, d = desc0.shape
     n = desc1.shape[0]
@@ -471,10 +479,11 @@ def mutual_nn_match(desc0: Tensor, desc1: Tensor, threshold: float = 0.0) -> tup
     if m == 0 or n == 0:
         empty = torch.zeros(0, dtype=torch.long, device=device)
         return empty, empty, desc0.new_zeros(0, dtype=torch.float32)
-    use_tf32 = desc0.dtype == torch.float32
-    block_m = 64 if (m < 2048 or use_tf32) else 128
-    block_n = 64 if n < 1024 else 128
-    block_k = 32 if use_tf32 else 64
+    is_fp32 = desc0.dtype == torch.float32
+    precision = (1 if m * n > _MNN_TF32_MIN_PAIRS else 2) if is_fp32 else 0
+    block_m = 64 if (m < 2048 or is_fp32) else 128
+    block_n = 64 if (n < 1024 or precision == 2) else 128
+    block_k = 32 if is_fp32 else 64
     # Measured on sm_120 (32320 x 23731 x 256 BF16): (128, 128, 64, nw=4, ns=2) = 5.38 ms vs 6.57 ms at nw=8
     # (and 22.54 ms / 3.23 GB peak VRAM for the materialized FP32 reference).
     num_warps = 4
@@ -486,7 +495,7 @@ def mutual_nn_match(desc0: Tensor, desc1: Tensor, threshold: float = 0.0) -> tup
     _mnn_tiled_kernel[(m_blocks,)](
         desc0, desc1, row_val, row_idx, col_val, col_idx,
         m, n, d, desc0.stride(0), desc0.stride(1), desc1.stride(0), desc1.stride(1),
-        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, USE_TF32=use_tf32,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, PRECISION=precision,
         num_warps=num_warps, num_stages=2,
     )
     nn10 = torch.empty(n, device=device, dtype=torch.int32)
