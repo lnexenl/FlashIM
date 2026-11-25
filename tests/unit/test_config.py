@@ -289,3 +289,10 @@ def test_match_defaults_come_from_the_inference_section():
     for bad in (0, -1, 2.5, True):
         with pytest.raises(ValueError, match="max_matches"):
             model.match(None, None, max_matches=bad)
+
+
+def test_superpoint_fp8_ignores_conv1b_only():
+    spec = get_spec("superpoint")
+    assert spec.quant_configs["fp8"].scheme_for("conv1b") is None
+    assert spec.quant_configs["fp8"].scheme_for("conv2a") is not None
+    assert spec.quant_configs["int8"].scheme_for("conv1b") is not None

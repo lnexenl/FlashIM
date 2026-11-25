@@ -28,6 +28,8 @@ def test_instance_norm_prelu(shape, dtype, in_nhwc, out_cl):
     assert fast.is_contiguous(memory_format=torch.channels_last if out_cl else torch.contiguous_format)
     tol = 1e-5 if dtype == torch.float32 else 2e-2
     torch.testing.assert_close(fast.float(), ref.float(), atol=tol, rtol=tol)
+    if dtype == torch.bfloat16:
+        assert (fast != ref).float().mean().item() < 1e-3
 
 
 @pytest.mark.parametrize("shape", [(1, 3, 896, 1200), (2, 3, 64, 96), (1, 3, 480, 640)])

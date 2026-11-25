@@ -82,7 +82,8 @@ def _in_prelu_nchw_kernel(
     idx = pid_s * BLOCK + tl.arange(0, BLOCK)
     mask = idx < S
     val = tl.load(x_ptr + bc.to(tl.int64) * S + idx, mask=mask, other=0.0).to(tl.float32)
-    y = (val - mean) * inv_std
+    # Match unfused nn.InstanceNorm2d -> nn.PReLU intermediate rounding (no-op for FP32).
+    y = ((val - mean) * inv_std).to(out_ptr.dtype.element_ty).to(tl.float32)
     y = tl.where(y > 0.0, y, y * w)
     if OUT_NHWC:
         out_off = (b.to(tl.int64) * S + idx.to(tl.int64)) * C + c
@@ -162,7 +163,8 @@ def _in_prelu_nhwc_kernel(
     ok = p_mask[:, None] & c_mask[None, :]
     val = tl.load(x_ptr + (b.to(tl.int64) * S + ps[:, None].to(tl.int64)) * C + cs[None, :],
                   mask=ok, other=0.0).to(tl.float32)
-    y = (val - mean[None, :]) * inv_std[None, :]
+    # Match unfused nn.InstanceNorm2d -> nn.PReLU intermediate rounding (no-op for FP32).
+    y = ((val - mean[None, :]) * inv_std[None, :]).to(out_ptr.dtype.element_ty).to(tl.float32)
     y = tl.where(y > 0.0, y, y * w[None, :])
     if OUT_NHWC:
         out_off = (b.to(tl.int64) * S + ps[:, None].to(tl.int64)) * C + cs[None, :]

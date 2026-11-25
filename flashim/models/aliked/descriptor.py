@@ -41,12 +41,13 @@ class SDDH(nn.Module):
         """``features``: ``[C, H, W]``; ``keypoints``: ``[N, 2]`` normalized ``(x, y)`` in ``[-1, 1]``.
         Returns L2-normalized descriptors ``[N, C]``."""
         c, h, w = features.shape
-        keypoints = keypoints.to(features.dtype)  # keeps the sampling grid in `features`' dtype for grid_sample
-        wh = device_constant([w - 1, h - 1], features)
+        # Keep pixel coordinates in FP32: BF16 pixel indices in [0, 1200] have 2-8 px ULP, which shifts
+        # bilinear sample positions by multiple pixels; ops.aliked_bilinear_sample reads pos in FP32 directly.
+        wh = device_constant([w - 1, h - 1], features, torch.float32)
         max_offset = max(h, w) / 4.0
         num_kpts = keypoints.shape[0]
 
-        kpts_wh = (keypoints / 2 + 0.5) * wh
+        kpts_wh = (keypoints.float() / 2 + 0.5) * wh
         patch = sample_patches(features, kpts_wh.long(), self.kernel_size)  # [N, C, K, K]
         c0, gate, c2 = self.offset_conv[0], self.offset_conv[1], self.offset_conv[2]
         if isinstance(c0, nn.Conv2d) and isinstance(c2, nn.Conv2d):
@@ -56,7 +57,7 @@ class SDDH(nn.Module):
             offset = self.offset_conv(patch)[:, :, 0, 0].clamp(-max_offset, max_offset)
         offset = offset.view(num_kpts, 2, self.n_pos).permute(0, 2, 1)  # [N, n_pos, 2]
 
-        pos = kpts_wh.unsqueeze(1) + offset  # [N, n_pos, 2] in pixel coordinates
+        pos = kpts_wh.unsqueeze(1) + offset.float()  # [N, n_pos, 2] in FP32 pixel coordinates
         sampled = ops.aliked_bilinear_sample(features, pos.reshape(-1, 2)).reshape(num_kpts, self.n_pos, c)
         sampled = torch.selu(F.linear(sampled, self.sf_conv.weight.reshape(c, c)))  # [N, n_pos, C]
         descriptors = torch.einsum("npc,pcd->nd", sampled, self.agg_weights)

@@ -7,9 +7,9 @@ ships, built from a model's list of quantizable convolution / linear globs.
   stay FP32.
 - ``int8`` / ``fp8``: ``bf16`` + the ``quantized`` convolutions / linears as static INT8 (per-channel weights, one
   calibrated per-tensor activation scale) or static MXFP8 (E4M3 + E8M0 block-32 scales), as im2col + GEMM for
-  convolutions (:mod:`flashim.quant.methods.conv2d`). ``int8_ignore`` removes layers from the INT8 preset only;
-  ``int8_dynamic`` quantizes linears there with per-token dynamic activation scales instead of the static one (e.g. a
-  ViT whose outlier tokens one per-tensor scale cannot represent; no calibration entries).
+  convolutions (:mod:`flashim.quant.methods.conv2d`). ``int8_ignore`` / ``fp8_ignore`` remove layers from that
+  preset only; ``int8_dynamic`` quantizes linears there with per-token dynamic activation scales instead of the
+  static one (e.g. a ViT whose outlier tokens one per-tensor scale cannot represent; no calibration entries).
 """
 
 from __future__ import annotations
@@ -93,6 +93,7 @@ def extractor_spec(
     protected: Sequence[str] = (),
     int8_ignore: Sequence[str] = (),
     int8_dynamic: Sequence[str] = (),
+    fp8_ignore: Sequence[str] = (),
     compile_regions: Sequence[str] = (),
     has_batchnorm: bool = True,
     extra_passes: Mapping[str, Pass] | None = None,
@@ -134,7 +135,7 @@ def extractor_spec(
             },
             ignore=tuple(int8_ignore), name="int8",
         ),
-        "fp8": QuantConfig({"conv": QuantScheme(tuple(quantized), MXFP8, MXFP8)}, ignore=(), name="fp8"),
+        "fp8": QuantConfig({"conv": QuantScheme(tuple(quantized), MXFP8, MXFP8)}, ignore=tuple(fp8_ignore), name="fp8"),
     }
     presets = {
         "fp32": fp32,
