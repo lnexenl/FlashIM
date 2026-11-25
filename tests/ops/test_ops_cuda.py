@@ -1261,3 +1261,29 @@ def test_rotate_quantize_int8_rows(rows, cols, block, with_cs):
     # have BF16-rounded +-1/sqrt(B) entries.
     tol_frac = 0.08 if with_cs else (1e-3 if block == 64 else 0.02)
     assert (diff > 0).float().mean().item() < tol_frac
+
+
+def test_triton_float_scalar_ops_torch_compile():
+    """Regression: Inductor passes Python float scalars as fp64; Triton kernels must stay fp32 under torch.compile."""
+    torch.manual_seed(0)
+    feat = torch.randn(1, 32, 32, 32, device=DEV, dtype=torch.bfloat16)
+    coarse = torch.randn(1, 32, 16, 16, device=DEV, dtype=torch.bfloat16)
+    scale = torch.tensor(0.1, device=DEV, dtype=torch.float32)
+
+    def up_i8(a, b, s):
+        return ops.upsample_concat_int8(a, b, s).values
+
+    torch._dynamo.reset()
+    with torch.inference_mode():
+        assert torch.equal(torch.compile(up_i8)(feat, coarse, scale), up_i8(feat, coarse, scale))
+
+    f0 = torch.randn(1, 32, 16, 16, device=DEV, dtype=torch.float32)
+    f1 = torch.randn(1, 32, 16, 16, device=DEV, dtype=torch.float32)
+    warp = torch.zeros(1, 16, 16, 2, device=DEV, dtype=torch.float32)
+
+    def corr(a, b, w):
+        return ops.local_corr(a, b, w, 1)
+
+    torch._dynamo.reset()
+    with torch.inference_mode():
+        assert torch.equal(torch.compile(corr)(f0, f1, warp), corr(f0, f1, warp))

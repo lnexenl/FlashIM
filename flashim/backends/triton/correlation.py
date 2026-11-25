@@ -87,7 +87,7 @@ def _local_corr_kernel(
                 f1_ptr + (b * s1b + cy * s1h + cx * s1w)[:, None] + ch[None, :] * s1c,
                 mask=inb[:, None] & cmask[None, :], other=0.0,
             )
-            dot = tl.sum(f0 * f1, axis=1) * scale
+            dot = tl.sum(f0 * f1, axis=1) * tl.cast(scale, tl.float32)
             # corner column u is the left corner of tap column u and the right corner of tap column u - 1
             hx = tl.where(t[None, :] == u, 1.0 - frac_x, tl.where(t[None, :] == u - 1, frac_x, 0.0))
             hx = hx * dot[:, None]
@@ -614,9 +614,9 @@ def _morton3d_kernel(
     uy = tl.where(y >= 0.0, tl.log(1.0 + y), -tl.log(1.0 - y))
     uz = tl.where(z >= 0.0, tl.log(1.0 + z), -tl.log(1.0 - z))
 
-    ix = tl.minimum(tl.maximum(((ux - lo_x) * inv_x).to(tl.int32), 0), 1023)
-    iy = tl.minimum(tl.maximum(((uy - lo_y) * inv_y).to(tl.int32), 0), 1023)
-    iz = tl.minimum(tl.maximum(((uz - lo_z) * inv_z).to(tl.int32), 0), 1023)
+    ix = tl.minimum(tl.maximum(((ux - tl.cast(lo_x, tl.float32)) * tl.cast(inv_x, tl.float32)).to(tl.int32), 0), 1023)
+    iy = tl.minimum(tl.maximum(((uy - tl.cast(lo_y, tl.float32)) * tl.cast(inv_y, tl.float32)).to(tl.int32), 0), 1023)
+    iz = tl.minimum(tl.maximum(((uz - tl.cast(lo_z, tl.float32)) * tl.cast(inv_z, tl.float32)).to(tl.int32), 0), 1023)
 
     ix = (ix | (ix << 16)) & 0x030000FF
     ix = (ix | (ix << 8)) & 0x0300F00F
@@ -1209,7 +1209,7 @@ def _batched_dual_softmax_argmax_kernel(
 
     a = tl.load(f0_ptr + (m * W0 + r[:, None]) * C + c[None, :], mask=mr[:, None] & mc[None, :], other=0.0)
     b = tl.load(f1_ptr + (m * W1 + k[:, None]) * C + c[None, :], mask=mk[:, None] & mc[None, :], other=0.0)
-    sim = tl.dot(a, tl.trans(b)) * scale
+    sim = tl.dot(a, tl.trans(b)) * tl.cast(scale, tl.float32)
 
     s_row = tl.where(mk[None, :], sim, -float("inf"))
     rmax = tl.max(s_row, axis=1)

@@ -30,6 +30,7 @@
 
 ### Fixed
 
+- `engine="compile"` crashed for `disk` and `disk-lightglue` (`bf16` / `int8` / `fp8`): torch 2.11 Inductor passes non-constexpr Python float arguments of Triton kernels as fp64, so the InstanceNorm+PReLU kernels (`eps`) failed with `Expected dtype ['fp32'] but got fp64`. The float scalars of the Triton kernels in `norm.py`, `resample.py`, `correlation.py`, `quantize.py` and `_layernorm_stats.py` are cast to fp32 inside the kernel (eager PTX unchanged; `rgb_mean_instance_norm`, `upsample_concat_int8` and `local_corr` also crashed under compile, ten more kernels were silently promoted to fp64). `ripe` `engine="compile"` still fails (`KeyError` in the Inductor scheduler, also on the previous release).
 - `decode_jpeg_cuda`: fixed stream/allocator race in nvJPEG GPU decoding causing intermittent pixel corruption (`fix/jpeg-decode`).
 - `tests/ops/test_depthwise_cuda.py` on `sm_120`: swept and enabled `PRODUCER_TILE` / `DWPW_TILE` tables and `cuda_composite` (`51/51` passing, bit-identical to Triton; unmeasured `sm_100` / `sm_110` keep fallbacks).
 - Bounded cuBLAS MXFP8 `_InputScales.by_rows` (16-entry LRU, pinning CUDA-graph-captured row counts) and LoFTR `_pe` / `_inner_cache` (fixes LoFTR `fp8` MegaDepth-1500 OOM at pair 1417).

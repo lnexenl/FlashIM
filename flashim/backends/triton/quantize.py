@@ -651,7 +651,7 @@ def _layernorm_quantize_int8_rows_general_kernel(
     mean = tl.sum(x, 0) / N
     diff = tl.where(mask, x - mean, 0.0)
     var = tl.sum(diff * diff, 0) / N
-    rstd = libdevice.rsqrt(var + eps)
+    rstd = libdevice.rsqrt(var + tl.cast(eps, tl.float32))
     w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(b_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     y = (diff * rstd * w + b).to(tl.bfloat16).to(tl.float32)
