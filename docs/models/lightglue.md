@@ -44,26 +44,14 @@ The `int8` / `fp8` presets use calibration tables computed on each pairing's fea
   in `fp8`, and repeat-shape `cuda_graph` capture (triggers at `hits >= 2` for `max(N0, N1) <= 8192`, releasing pools on
   fallback).
 
-Measured `lightglue` matcher latencies on **RTX 5070 Ti (`sm_120`, `eager`)**:
-
-| variant | keypoints | `fp8` (base -> new) | `int8` (base -> new) |
-|---|---|---:|---:|
-| `rdd` | N = 1024 | `7.09 -> 1.56 ms` (4.55x) | `6.29 -> 1.48 ms` (4.25x) |
-| `aliked` | N = 2048 | `7.07 -> 3.44 ms` (2.06x) | `6.03 -> 3.36 ms` (1.79x) |
-| `rdd` | N = 4096 | `13.01 -> 10.24 ms` (1.27x) | `12.60 -> 9.90 ms` (1.27x) |
+Matcher and pair latencies of every pairing (`eager / compile`, 4096 keypoints per image, RTX 5070 Ti `sm_120`) are in the
+[inference benchmark](../benchmarks.md#sparse-matchers): for example `rdd-lightglue` `match_features` takes 11.7 / 11.1 ms in
+`bf16`, 9.93 / 9.98 ms in `int8` and 10.3 / 18.3 ms in `fp8`.
 
 ## Accuracy
 
-Historical MegaDepth-1500 AUC@5 (2026-10 unified protocol, 4 seeds, RTX 5070 Ti `sm_120`, `eager`; ALIKED pipelines with
-`components.extractor.preset=fp32`):
-
-| pipeline | `fp32` | `bf16` | `int8` | `fp8` |
-|---|---|---|---|---|
-| `aliked-lightglue` | 0.627 | 0.627 | 0.620 | 0.613 |
-| `raco-aliked-lightglue` | | 0.640 | 0.638 | 0.634 |
-
-Final 2026-11 MegaDepth-1500 and ScanNet-1500 paired-bootstrap gate results on RTX 5070 Ti (`sm_120`, `eager`, 3 seeds)
+MegaDepth-1500 and ScanNet-1500 paired-bootstrap gate results on RTX 5070 Ti (`sm_120`, `eager`, 3 seeds)
 for every LightGlue pairing (`0 FAIL`, including `+0.0126` / `+0.0073` on `aliked-lightglue bf16` and `+0.0186` /
 `+0.0122` on `raco-aliked-lightglue bf16` from restoring FP32 SDDH coordinates) are in
-[benchmarks.md](../benchmarks.md#accuracy-of-the-pre-2026-11-models-2026-11-gate-sm_120) and
+[benchmarks.md](../benchmarks.md#accuracy) and
 [platforms.md](../platforms.md).

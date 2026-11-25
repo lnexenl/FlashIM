@@ -31,34 +31,22 @@ config that targets them is rejected.
 
 `mega1500` setting (800² LR + 1024² HR), both directions, B=1, preloaded forward, **RTX 5070 Ti (`sm_120`)**:
 
-- **`engine="compile-full"`** (2026-10 baseline; compiled table not re-measured in the 2026-11 sweep):
+| preset | `eager` | `compile` | `compile-full` | vs `bf16` (`compile-full`) |
+|---|---:|---:|---:|---:|
+| `bf16` | 348.5 ms | 335.4 ms | 194.3 ms | 1.00x |
+| `int8` | 107.1 ms | 106.7 ms | 93.4 ms | 2.08x |
+| `fp8` | 110.7 ms | 119.6 ms | 106.5 ms | 1.82x |
 
-| preset | forward | vs `bf16` |
-|---|---|---|
-| `bf16` | 195.0 ms | 1.00x |
-| `int8` | 104.0 ms | 1.87x |
-| `fp8` | 110.0 ms | 1.77x |
-
-- **`engine="eager"`** (2026-11 `sm_120` sweep, before -> after): `fp8` `184.07 -> 113.94 ms` (1.62x), `int8`
-  `139.75 -> 110.83 ms` (1.26x).
-
-Method and the full table: [inference benchmark](../benchmarks.md#romav2-dense).
+Method and the full table: [inference benchmark](../benchmarks.md#dense-and-semi-dense-models).
 
 ## Accuracy
 
 Pose AUC@5 change vs `bf16` (3 seeds, RTX 5070 Ti `sm_120`). The gate is a paired-bootstrap 95% CI above -0.005; RANSAC
 seed noise is about 0.003.
 
-- **2026-10 `compile-full`** vs `bf16`:
-
-| preset | MegaDepth-1500 | ScanNet-1500 |
-|---|---|---|
-| `fp8` | -0.0023 | +0.0007 |
-| `int8` | -0.0010 | +0.0004 |
-
-- **2026-11 `compile` paired-bootstrap gate** vs `dev bf16` (`0 FAIL`, PoseLib 1.0 px, 3 seeds 17/29/42): `bf16`
+- **`compile` paired-bootstrap gate** vs the unoptimized `bf16` (`0 FAIL`, PoseLib 1.0 px, 3 seeds 17/29/42): `bf16`
   `-0.0007` / `-0.0006`, `int8` `-0.0032` / `+0.0010`, `fp8` `-0.0044` / `-0.0027` on MegaDepth-1500 / ScanNet-1500
-  ([benchmarks.md](../benchmarks.md#accuracy-of-the-pre-2026-11-models-2026-11-gate-sm_120)).
+  ([benchmarks.md](../benchmarks.md#accuracy)).
 
 HardMatch (LoMa, ECCV 2026: 900 hand-labelled hard pairs, mAA@10px, 3 seeds, `wxbs` setting; run with
 `benchmarks/accuracy/run_hardmatch.py`):

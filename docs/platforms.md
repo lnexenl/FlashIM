@@ -32,64 +32,80 @@ The only GPU that runs the full test suite and the accuracy runs is the sm_120 o
 GPUs are LoMa's accuracy gate on L20 and H20 ([loma.md](models/loma.md)) and the INT8 / FP8-fallback runs on Jetson AGX Orin;
 everything else on them is compile-checked or tuned, not validated.
 
+### Dense and semi-dense models
+
 | model | sm_120 RTX 5070 Ti | sm_100 | sm_90 H20 | sm_89 L20 | sm_87 Orin | sm_80 / sm_86 |
 |---|---|---|---|---|---|---|
-| **added 2026-11** | | | | | | |
+| `romav2` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
 | `roma`, `roma-indoor`, `minima-roma` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
 | `tiny-roma` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
 | `mast3r`, `dust3r` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
 | `ufm` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
-| `eloftr`, `xoftr`, `minima-loftr` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
-| `superglue`, `superpoint-superglue` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
-| `omniglue` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
-| `flexglue` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
-| **before 2026-11** | | | | | | |
-| `romav2` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
-| `rdd`, `rdd-lightglue` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
-| `aliked`, `raco`, `raco-aliked`, `aliked-lightglue`, `raco-aliked-lightglue` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
-| `superpoint`, `alike`, `disk`, `xfeat`, `dedode`, `dedode-g`, `dad`, `ripe`, `superpoint-lightglue`, `disk-lightglue`, `xfeat-lightglue` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
 | `loftr` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
-| `loma-*` | ✅ | 🔍 | ✅ | ✅ | 🔍 | ➖ |
+| `eloftr`, `xoftr`, `minima-loftr` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
+
+### Sparse extractors
+
+| model | sm_120 RTX 5070 Ti | sm_100 | sm_90 H20 | sm_89 L20 | sm_87 Orin | sm_80 / sm_86 |
+|---|---|---|---|---|---|---|
+| `rdd` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
+| `aliked`, `raco`, `raco-aliked` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
+| `superpoint`, `alike`, `disk`, `xfeat`, `dedode`, `dedode-g`, `dad`, `ripe` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
 | `sift`, `orb` | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
 
-- **Models added 2026-11 on sm_120**: parity test against the upstream code, unit and op tests, and the accuracy gate on
-  MegaDepth-1500 and ScanNet-1500 (1500 pairs each; 0 FAIL, details in the next table and in [benchmarks.md](benchmarks.md#accuracy-of-the-2026-11-additions)).
-- **Models added 2026-11 on sm_80 / 89 / 90 / 100**: their new Triton / CUDA kernels were compiled for these architectures, not run.
+### Sparse matchers and pipelines
+
+| model | sm_120 RTX 5070 Ti | sm_100 | sm_90 H20 | sm_89 L20 | sm_87 Orin | sm_80 / sm_86 |
+|---|---|---|---|---|---|---|
+| `rdd-lightglue`, `aliked-lightglue`, `raco-aliked-lightglue`, `superpoint-lightglue`, `disk-lightglue`, `xfeat-lightglue` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
+| `loma-*` | ✅ | 🔍 | ✅ | ✅ | 🔍 | ➖ |
+| `superglue`, `superpoint-superglue` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
+| `omniglue` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
+
+### Sparse-to-dense
+
+| model | sm_120 RTX 5070 Ti | sm_100 | sm_90 H20 | sm_89 L20 | sm_87 Orin | sm_80 / sm_86 |
+|---|---|---|---|---|---|---|
+| `flexglue` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
+
+- **sm_120**: parity test against the upstream code, unit and op tests, and the accuracy gate on MegaDepth-1500 and
+  ScanNet-1500 (1500 pairs each; 0 FAIL, details in the tables below and in [benchmarks.md](benchmarks.md#accuracy)).
+- **sm_80 / 89 / 90 / 100 (except LoMa on sm_89 / sm_90, below)**: the Triton / CUDA kernels were compiled for these architectures, not run.
 - **LoMa on sm_89 / sm_90**: the INT8 pipeline passes the gate (AUC@5 vs `bf16` -0.30 to -0.10 on L20, -0.09 to +0.23 on H20
   over the five variants, gate 0.5 points on 1500 pairs; `loma-l` needs a per-variant extractor overlay on L20).
 - **Jetson AGX Orin (sm_87)**: the INT8 path runs and `fp8` builds `int8`; no per-model accuracy runs are recorded.
 - **sm_80 / sm_86**: not run; they share the `mma.sync` path that runs on sm_87.
 
-### Accuracy gate of the 2026-11 models on sm_120
+### Accuracy gate on sm_120
 
-AUC@5 of the quantized preset against the same model's `bf16`, on both datasets: ✅ every cell passes (95% CI above -0.005),
-🔍 inconclusive on at least one dataset (the CI straddles -0.005; 1500 pairs resolve about +-0.005), ❌ fails. No cell fails.
-`➡️ int8`: the pipeline has no `fp8` preset and builds `int8`, because MXFP8 lost accuracy in its extractor.
+AUC@5 of each preset on MegaDepth-1500 and ScanNet-1500 (1500 pairs each, 3 seeds 17/29/42, poselib 1.0 px, paired
+bootstrap 95% CI, `-0.005` gate; `romav2` uses `engine="compile"`, all others `eager`): ✅ every cell passes (95% CI above
+-0.005), 🔍 inconclusive on at least one dataset (the CI straddles -0.005; 1500 pairs resolve about +-0.005), ❌ fails. **84
+PASS, 42 BORDERLINE (🔍), 0 FAIL** across the 126 `(model, preset, dataset)` cells of the models with a reference `bf16`.
+`➡️ int8` / `➡️ bf16` mark presets omitted and resolved via `build.NEAREST` (a pipeline whose extractor loses accuracy under
+MXFP8 has no `fp8` preset and builds `int8`); `—` means the model does not define that preset, or that `bf16` is the
+reference the other columns are measured against. The numbers are in [benchmarks.md](benchmarks.md#accuracy).
 
-| model | int8 | fp8 |
-|---|---|---|
-| `roma, roma-indoor` | ✅ | ✅ |
-| `tiny-roma` | 🔍 | 🔍 |
-| `minima-roma` | ✅ | 🔍 |
-| `mast3r` | 🔍 | ✅ |
-| `dust3r` | 🔍 | 🔍 |
-| `ufm` | 🔍 | 🔍 |
-| `eloftr` | ✅ | ✅ |
-| `xoftr` | ✅ | ✅ |
-| `minima-loftr` | ✅ | 🔍 |
-| `superpoint-superglue` | 🔍 | ➡️ int8 |
-| `omniglue` | 🔍 | ➡️ int8 |
-
-### Accuracy gate of the pre-2026-11 models on sm_120
-
-Same protocol as above on MegaDepth-1500 and ScanNet-1500 (1500 pairs each, 3 seeds 17/29/42, poselib 1.0 px, paired
-bootstrap 95% CI vs `dev bf16` with `-0.005` gate; `romav2` uses `engine="compile"`, all others `eager`):
-**84 PASS, 42 BORDERLINE (🔍), 0 FAIL** across all 126 `(model, preset, dataset)` cells. `➡️ int8` / `➡️ bf16` mark
-presets omitted and resolved via `build.NEAREST`; `—` means the model only defines `fp32` / `bf16`.
+#### Dense and semi-dense models
 
 | model | bf16 | int8 | fp8 |
 |---|---|---|---|
 | `romav2` | ✅ | 🔍 | 🔍 |
+| `roma, roma-indoor` | — | ✅ | ✅ |
+| `minima-roma` | — | ✅ | 🔍 |
+| `tiny-roma` | — | 🔍 | 🔍 |
+| `mast3r` | — | 🔍 | ✅ |
+| `dust3r` | — | 🔍 | 🔍 |
+| `ufm` | — | 🔍 | 🔍 |
+| `loftr` | ✅ | ✅ | 🔍 |
+| `eloftr` | — | ✅ | ✅ |
+| `xoftr` | — | ✅ | ✅ |
+| `minima-loftr` | — | ✅ | 🔍 |
+
+#### Sparse extractors
+
+| model | bf16 | int8 | fp8 |
+|---|---|---|---|
 | `rdd` | ✅ | — | ✅ |
 | `aliked`, `raco-aliked` | ✅ | — | — |
 | `superpoint` | 🔍 | 🔍 | 🔍 |
@@ -100,7 +116,12 @@ presets omitted and resolved via `build.NEAREST`; `—` means the model only def
 | `dedode-g` | ✅ | 🔍 | 🔍 |
 | `dad` | ✅ | ✅ | 🔍 |
 | `ripe` | ✅ | 🔍 | 🔍 |
-| `loftr` | ✅ | ✅ | 🔍 |
+| `orb`, `sift` (`fp32`) | ✅ | — | — |
+
+#### Sparse matchers and pipelines
+
+| model | bf16 | int8 | fp8 |
+|---|---|---|---|
 | `rdd-lightglue` | ✅ | 🔍 | 🔍 |
 | `aliked-lightglue` | ✅ | ✅ | ➡️ int8 |
 | `raco-aliked-lightglue` | ✅ | ✅ | ✅ |
@@ -108,11 +129,17 @@ presets omitted and resolved via `build.NEAREST`; `—` means the model only def
 | `disk-lightglue` | 🔍 | 🔍 | ➡️ int8 |
 | `xfeat-lightglue` | ✅ | ➡️ bf16 | ➡️ bf16 |
 | `loma-b128`, `loma-b`, `loma-l`, `loma-g`, `loma-r` | ✅¹ | 🔍 | 🔍 |
-| `flexglue` | ✅ | ✅ | 🔍 |
-| `orb`, `sift` (`fp32`) | ✅ | — | — |
+| `superpoint-superglue` | — | 🔍 | ➡️ int8 |
+| `omniglue` | — | 🔍 | ➡️ int8 |
 
-¹ `loma-r bf16` MegaDepth is 🔍 (`-0.0026 [-0.0051, -0.0000]`) in `perf` before unbatching `CrossBlock` FFN; `loma-b128 bf16`
-re-verified bit-exact (`+0.0000`) on both datasets after `e03fbe8`.
+¹ `bf16` of every LoMa variant is bit-identical to the unoptimized code: `loma-b128` and `loma-g` on both full datasets, the
+other variants on every pair checked (test pair, 3 MegaDepth-1500 and 3 ScanNet-1500 pairs).
+
+#### Sparse-to-dense
+
+| model | bf16 | int8 | fp8 |
+|---|---|---|---|
+| `flexglue` | ✅ | ✅ | 🔍 |
 
 ### Known failing checks on sm_120
 
@@ -121,7 +148,7 @@ re-verified bit-exact (`+0.0000`) on both datasets after `e03fbe8`.
 
 On RTX 5070 Ti (`sm_120`, `FLASHIM_IMAGE_DECODER=pil`), the full test suite passes all 96 test files (**1,842 passed, 24
 skipped, 1 expected xfail, 0 failed**), including `tests/ops/test_depthwise_cuda.py` (`51/51` passing after sweeping
-`sm_120` tile tables). All 44 `(model, preset)` configs of the 2026-11 additions were also checked against the base tree
+`sm_120` tile tables). All 44 `(model, preset)` configs of `roma`, `tiny-roma`, `minima-roma`, `mast3r`, `dust3r`, `ufm`, `eloftr`, `xoftr`, `minima-loftr`, `superpoint-superglue` and `omniglue` were also checked against the base tree
 via `benchmarks/profile/output_hashes.py`: 31 bit-identical, 8 keypoint-identical with `<= 1.88e-6` FP32 confidence diff
 from 2-pass `ops.dual_softmax_mutual`, and 5 with `<= 1` BF16 ULP reduction-order differences from `cublas`
 `patch_embed_tokens` / Triton `conv3x3_small_cin_relu`.

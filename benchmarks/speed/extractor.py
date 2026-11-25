@@ -39,7 +39,7 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--preset", default=None)
     parser.add_argument("--engine", default="eager")
-    parser.add_argument("--resize", type=int, default=1600)
+    parser.add_argument("--resize", type=int, default=1600, help="long side in px; 0 = the model's own default")
     parser.add_argument("--top-k", type=int, default=4096)
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
@@ -47,6 +47,7 @@ def main() -> None:
     parser.add_argument("--tag", default="", help="copied to the JSON line (sparse_matrix.sh uses it to resume)")
     args = parser.parse_args()
 
+    resize = args.resize or None
     model = flashim.load(args.model, args.preset, engine=args.engine, overrides=args.overrides)
     from flashim.models.romav2.model import load_image
 
@@ -55,7 +56,7 @@ def main() -> None:
         image_b = load_image(str(IMAGE_B), model.device)
         top_k = args.top_k if args.top_k > 0 else None
         times, result = timed(
-            lambda: model.match(image, image_b, resize=args.resize, max_matches=top_k),
+            lambda: model.match(image, image_b, resize=resize, max_matches=top_k),
             args.warmups, args.iterations,
         )
         print(json.dumps({
@@ -65,10 +66,10 @@ def main() -> None:
             "gpu": torch.cuda.get_device_name(),
         }))
         return
-    times, feats = timed(lambda: model.extract(image, resize=args.resize, top_k=args.top_k), args.warmups, args.iterations)
+    times, feats = timed(lambda: model.extract(image, resize=resize, top_k=args.top_k), args.warmups, args.iterations)
     match_ms = match_count = None
     if hasattr(model, "match_features"):  # RaCo-ALIKED only feeds LightGlue: no matcher of its own
-        other = model.extract(str(IMAGE_B), resize=args.resize, top_k=args.top_k)
+        other = model.extract(str(IMAGE_B), resize=resize, top_k=args.top_k)
         match_times, matches = timed(lambda: model.match_features(feats, other), 3, 20)
         match_ms, match_count = round(statistics.median(match_times), 3), len(matches.confidence)
     print(json.dumps({
