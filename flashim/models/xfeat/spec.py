@@ -8,13 +8,18 @@ from flashim.config import RunConfig
 from flashim.models.sparse_spec import extractor_spec
 from flashim.models.xfeat.model import XFeat
 
-# Quantized: the convolutions of blocks 2-5, the fusion block and the head trunks (24-128 channels). Protected:
-# the 1/8-resolution stem (``block1``, ``skip1``: 1-8 input channels, image-facing), the fusion output projection
-# (feeds the L2-normalized descriptor) and the two output convs (keypoint logits / reliability, FP32).
-QUANTIZED = (
-    "block[2345].*.layer.0", "block_fusion.[01].layer.0", "heatmap_head.[01].layer.0", "keypoint_head.[012].layer.0",
+# Quantized: the 64/128-channel trunk convolutions (blocks 3-5), the fusion block and the reliability heatmap trunk.
+# Protected: the 1/4-resolution stem (``block1``, ``skip1``, ``block2``: 1-24 channels, not block-32-aligned; keeping
+# ``block2`` BF16 cuts FP8 descriptor cosine error 3x from 0.9942 -> 0.9980 and INT8 0.9985 -> 0.9995), the
+# standalone image-facing keypoint detector ``keypoint_head.*`` (three 64->64 1x1 convs on unfolded raw pixels feeding
+# the 65-way cell softmax; quantizing it dropped MegaDepth keypoint overlap to 0.517 FP8 / 0.729 INT8 and caused a
+# -0.0086 dev / -0.0137 integration FP8 MegaDepth AUC@5 regression; protecting it restores 0.969 FP8 / 0.987 INT8
+# overlap while keeping extract faster than BF16), the fusion output projection (feeds the L2-normalized descriptor)
+# and the final output convs.
+QUANTIZED = ("block[345].*.layer.0", "block_fusion.[01].layer.0", "heatmap_head.[01].layer.0")
+PROTECTED = (
+    "block1.*", "skip1.*", "block2.*", "block_fusion.2", "heatmap_head.2", "keypoint_head.*", "fine_matcher.*",
 )
-PROTECTED = ("block1.*", "skip1.*", "block_fusion.2", "heatmap_head.2", "keypoint_head.3", "fine_matcher.*")
 
 
 def _load(config: RunConfig) -> XFeat:

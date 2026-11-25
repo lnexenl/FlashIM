@@ -275,3 +275,13 @@ def test_superpoint_fp8_ignores_conv1b_only():
     assert spec.quant_configs["fp8"].scheme_for("conv1b") is None
     assert spec.quant_configs["fp8"].scheme_for("conv2a") is not None
     assert spec.quant_configs["int8"].scheme_for("conv1b") is not None
+
+
+def test_xfeat_protects_keypoint_head_and_block2():
+    spec = get_spec("xfeat")
+    for preset in ("fp8", "int8"):
+        cfg = spec.quant_configs[preset]
+        assert cfg.scheme_for("keypoint_head.0.layer.0") is None
+        assert cfg.scheme_for("block2.0.layer.0") is None
+        assert cfg.scheme_for("block3.0.layer.0") is not None
+        assert cfg.scheme_for("block_fusion.0.layer.0") is not None
