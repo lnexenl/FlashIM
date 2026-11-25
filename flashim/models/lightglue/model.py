@@ -125,14 +125,14 @@ class CrossBlock(nn.Module):
         if x0.shape == x1.shape:
             x = torch.cat((x0, x1))
             qk, v = self._heads(self.to_qk(x)), self._heads(self.to_v(x))
-            m = self.to_out(sdpa(qk, qk.flip(0), v.flip(0)).transpose(1, 2).reshape(x.shape))
-            x = x + ffn_forward(self.ffn, torch.cat((x, m), -1))
-            x0, x1 = x.chunk(2)
-            return x0, x1
-        qk0, qk1 = (self._heads(self.to_qk(x)) for x in (x0, x1))
-        v0, v1 = (self._heads(self.to_v(x)) for x in (x0, x1))
-        m0 = self.to_out(sdpa(qk0, qk1, v1).transpose(1, 2).reshape(x0.shape))
-        m1 = self.to_out(sdpa(qk1, qk0, v0).transpose(1, 2).reshape(x1.shape))
+            m0, m1 = self.to_out(sdpa(qk, qk.flip(0), v.flip(0)).transpose(1, 2).reshape(x.shape)).chunk(2)
+        else:
+            qk0, qk1 = (self._heads(self.to_qk(x)) for x in (x0, x1))
+            v0, v1 = (self._heads(self.to_v(x)) for x in (x0, x1))
+            m0 = self.to_out(sdpa(qk0, qk1, v1).transpose(1, 2).reshape(x0.shape))
+            m1 = self.to_out(sdpa(qk1, qk0, v0).transpose(1, 2).reshape(x1.shape))
+        # Keep the two FFNs separate (as on dev): batching M=2N changes cuBLAS BF16 reduction order enough to shift
+        # loma-b128 bf16 ScanNet-1500 AUC@5 by -0.0035 while saving only 0.22 ms at N=4096 (1.8% of the matcher).
         x0 = x0 + ffn_forward(self.ffn, torch.cat((x0, m0), -1))
         x1 = x1 + ffn_forward(self.ffn, torch.cat((x1, m1), -1))
         return x0, x1

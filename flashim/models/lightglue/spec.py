@@ -217,8 +217,9 @@ def _pipeline(
 
 
 RDD_LIGHTGLUE = _pipeline("rdd-lightglue", "rdd", "rdd", "fp8", "RDD detector/descriptor + LightGlue")
-# MXFP8 fails the -0.005 AUC@5 gate on ALIKED, SuperPoint and XFeat LightGlue (see quant.py for measured evidence):
-# omitting unsupported presets lets build.NEAREST resolve ``fp8`` to each pairing's nearest passing config.
+# MXFP8 fails or borders the -0.005 AUC@5 gate on ALIKED, SuperPoint, DISK and XFeat LightGlue (see quant.py for
+# measured evidence): omitting unsupported presets lets build.NEAREST resolve ``fp8`` to each pairing's nearest
+# passing config.
 ALIKED_LIGHTGLUE = _pipeline(
     "aliked-lightglue", "aliked", "aliked", "fp32", "ALIKED + LightGlue (cvg's ALIKED-trained weights)",
     presets=("fp32", "bf16", "int8"),
@@ -234,7 +235,13 @@ SUPERPOINT_LIGHTGLUE = _pipeline(
     presets=("fp32", "bf16", "int8"),
     extractor_presets={"int8": "bf16"},
 )
-DISK_LIGHTGLUE = _pipeline("disk-lightglue", "disk", "disk", "fp32", "DISK + LightGlue (cvg weights)")
+# DISK + LightGlue MXFP8 drops -0.0047 on dev ScanNet-1500 (-0.0042 / AUC@10 -0.0063 even with bf16 extractor) and
+# -0.0061 on integrated MegaDepth-1500 while running 1.5-2.4x slower than int8/bf16 on ScanNet; rotated INT8 passes
+# both datasets (+0.0039 mega / +0.0010 scannet) and is faster.
+DISK_LIGHTGLUE = _pipeline(
+    "disk-lightglue", "disk", "disk", "fp32", "DISK + LightGlue (cvg weights)",
+    presets=("fp32", "bf16", "int8"),
+)
 # XFeat's dim=96 1-head LighterGlue fails MXFP8 (-0.138 mega / -0.070 scannet) and exceeds -0.005 under rotated INT8
 # (-0.0066 at p=0.9999, -0.0049 at p=1.0), while BF16 is faster on ScanNet (16.3 vs 19.5s) and exact (+0.0000).
 XFEAT_LIGHTGLUE = _pipeline(
