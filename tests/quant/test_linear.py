@@ -62,3 +62,17 @@ def test_prequantized_requires_same_scale():
     assert out.dtype == torch.bfloat16 and out.shape == (10, 768)
     with pytest.raises(ValueError):
         native.forward_prequantized(quantize_static(x, native.input_exponent + 1))
+
+
+def test_cublas_input_scales_cache_is_bounded_lru():
+    from flashim.backends.torch_native.gemm import _InputScales
+
+    cache = _InputScales()
+    exp = torch.zeros(4, dtype=torch.int8)
+    for rows in range(1, _InputScales.MAX_CACHED + 20):
+        out = cache.get(exp, rows * 32)
+        assert out.ndim == 1
+    assert len(cache.by_rows) == _InputScales.MAX_CACHED
+    # Most recent row counts are retained; oldest were evicted.
+    assert (_InputScales.MAX_CACHED + 19) * 32 in cache.by_rows
+    assert 32 not in cache.by_rows

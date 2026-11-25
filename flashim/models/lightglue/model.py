@@ -399,6 +399,16 @@ class LightGlue(nn.Module):
         if runner is not None:
             cache.move_to_end(key)
             return runner(desc0, desc1, enc0, enc1)
+        # Only capture a shape once it repeats: variable-keypoint extractors (SuperPoint, DISK on ScanNet) emit a
+        # unique (N0, N1) almost every pair, where capturing a throwaway graph per pair ran 2-4x slower than eager.
+        seen = self.__dict__.setdefault("_graph_seen", OrderedDict())
+        hits = seen.get(key, 0) + 1
+        seen[key] = hits
+        seen.move_to_end(key)
+        while len(seen) > 256:
+            seen.popitem(last=False)
+        if hits < 2:
+            return self._best_matches(desc0, desc1, enc0, enc1)
         runner = CudaGraphRunner(self._best_matches)
         failed = False
         try:

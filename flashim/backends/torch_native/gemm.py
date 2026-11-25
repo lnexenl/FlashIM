@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -38,11 +40,15 @@ def _mxfp8_scaled_mm_cublas(a, b_t, a_scale, b_scale, bias=None):
 
 class _InputScales:
     """Swizzled static input scales per row count for one layer's calibrated input exponent (the first one seen;
-    another exponent object is converted per call, uncached)."""
+    another exponent object is converted per call, uncached). Bounded LRU so variable-row workloads (e.g. LoFTR's
+    fine stage across MegaDepth-1500) do not accumulate gigabytes of stale scale buffers while keeping fixed /
+    CUDA-graphed shapes resident."""
+
+    MAX_CACHED = 16
 
     def __init__(self) -> None:
         self.exponent: Tensor | None = None
-        self.by_rows: dict[int, Tensor] = {}
+        self.by_rows: OrderedDict[int, Tensor] = OrderedDict()
 
     def get(self, exponent: Tensor, rows: int) -> Tensor:
         if self.exponent is None:
@@ -51,7 +57,12 @@ class _InputScales:
             return mx.static_input_scales(exponent, rows)
         scales = self.by_rows.get(rows)
         if scales is None:
-            scales = self.by_rows[rows] = mx.static_input_scales(exponent, rows)
+            scales = mx.static_input_scales(exponent, rows)
+            self.by_rows[rows] = scales
+            while len(self.by_rows) > self.MAX_CACHED:
+                self.by_rows.popitem(last=False)
+        else:
+            self.by_rows.move_to_end(rows)
         return scales
 
 

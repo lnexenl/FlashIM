@@ -192,6 +192,25 @@ def test_lightglue_variants_default_to_their_own_calibration_table(monkeypatch):
         "lightglue_aliked_int8_mega", "lightglue_raco-aliked_fp8_mega", "lightglue_fp8_mega", "lightglue_int8_mega",
     ]
 
+
+def test_lightglue_failing_fp8_pairings_fall_back_via_nearest():
+    """ALIKED / SuperPoint / XFeat LightGlue pipelines omit failing FP8 presets so build.NEAREST resolves ``fp8`` to
+    their nearest passing preset, while RDD / DISK / RaCo-ALIKED keep ``fp8``."""
+    for name in ("rdd-lightglue", "disk-lightglue", "raco-aliked-lightglue"):
+        cfg = resolve(name, "fp8", platform=WITH_FP8)
+        assert cfg.preset == "fp8" and cfg.components["matcher"].preset == "fp8"
+
+    for name, expected in (
+        ("aliked-lightglue", ("int8", "bf16", "int8")),
+        ("superpoint-lightglue", ("int8", "bf16", "int8")),
+        ("xfeat-lightglue", ("bf16", "bf16", "bf16")),
+    ):
+        fallbacks: dict[str, str] = {}
+        cfg = resolve(name, "fp8", platform=WITH_FP8, fallbacks=fallbacks)
+        assert (cfg.preset, cfg.components["extractor"].preset, cfg.components["matcher"].preset) == expected
+        assert name in fallbacks and f"fp8 -> {expected[0]}" in fallbacks[name]
+        assert not _uses_fp8(cfg)
+
 # -- builder stages on a fake model ------------------------------------------------------------------------
 
 
