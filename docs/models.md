@@ -34,6 +34,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | `sift`, `orb` | OpenCV baselines (CPU detection, GPU matching) | `fp32` |
 | [`lightglue`](models/lightglue.md) | LightGlue sparse matcher (variants `rdd`, `aliked`, `raco-aliked`, `superpoint`, `disk`, `xfeat`) | `fp32`, `bf16`, `int8`, **`fp8`** |
 | [`rdd-lightglue`](models/lightglue.md) | RDD + LightGlue | `fp32`, `bf16`, `int8`, **`fp8`** |
+| [`flexglue`](models/flexglue.md) | FlexGlue sparse-to-dense matcher (DINOv3-ConvNeXt search map, entmax readout) | `fp32`, `bf16`, `int8`, **`fp8`** |
 | [`aliked-lightglue`](models/lightglue.md) | ALIKED + LightGlue (cvg's ALIKED-trained weights) | **`fp32`**, `bf16`, `int8` |
 | [`raco-aliked-lightglue`](models/raco-aliked-lightglue.md) | RaCo keypoints + ALIKED descriptors + LightGlue (cvg's RaCo + ALIKED weights) | **`fp32`**, `bf16`, `int8`, `fp8` |
 | [`superpoint-lightglue`](models/lightglue.md) | SuperPoint + LightGlue (cvg weights) | **`fp32`**, `bf16`, `int8` |
@@ -54,7 +55,7 @@ Every learned model is a native PyTorch port that is checked against its upstrea
   - `fp8` -> `int8`: `dedode` (pure VGG19; `dedode-g` keeps `fp8`), `aliked-lightglue`, `superpoint-lightglue` (runs SuperPoint in `bf16` and LightGlue in rotated `int8`), `disk-lightglue`, `superpoint-superglue`, and `omniglue`.
   - `fp8` / `int8` -> `bf16`: `xfeat-lightglue` (96-dim LighterGlue drops AUC under both MXFP8 and rotated INT8 and is slower than BF16 on ScanNet-1500).
 - Targeted BF16 layer exclusions for quantization fidelity: `xfeat` protects `keypoint_head.*` and `block2.*` in `int8` / `fp8`; `superpoint` keeps `conv1b` in BF16 for `fp8` (`extractor_spec(..., fp8_ignore=...)`); `dedode` excludes `descriptor.encoder.layers.{3,7,10}` in `int8`; `ripe` excludes `net.encoder.layers.{3,7,10}` in `fp8`; `loma-b128` keeps `*.decoder.*` and matcher `transformers.{4,5}.*` in BF16 for `fp8` via `ModelSpec.quant_configs` per-variant `<variant>/<quant>` lookup (other LoMa variants keep full MXFP8).
-- Licenses that restrict use: `superglue` / `superpoint-superglue` (Magic Leap, non-commercial), `mast3r` / `dust3r` / `ufm` weights (CC BY-NC-SA 4.0), and `eloftr`, whose upstream changed its license to ZJU3DV's PRL v1.0 on 2026-09-15 (the vendored oracle and the weights are Apache-2.0 from before that); see `THIRD_PARTY_NOTICES.md`.
+- Licenses that restrict use: `romav2` and `flexglue` (`descriptor.backbone.*` in `flexglue.pth`) contain DINOv3 weights (DINOv3 License), `superglue` / `superpoint-superglue` (Magic Leap, non-commercial), `mast3r` / `dust3r` / `ufm` weights (CC BY-NC-SA 4.0), and `eloftr`, whose upstream changed its license to ZJU3DV's PRL v1.0 on 2026-09-15 (the vendored oracle and the weights are Apache-2.0 from before that); see `THIRD_PARTY_NOTICES.md`.
 
 **Presets** name a precision:
 

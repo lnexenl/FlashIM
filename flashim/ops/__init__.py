@@ -28,6 +28,8 @@ from flashim.ops.attention import (
     bidirectional_cross_attention,
     deformable_attention,
     elu_linear_attention,
+    qk_norm_swap_heads,
+    qkv_norm_rope_interleaved,
     rope_qk,
     rope_qk_2d,
     rope_qk_interleaved,
@@ -69,6 +71,7 @@ from flashim.ops.eloftr import (
     eloftr_upsample_add_leaky_relu,
     eloftr_upsample_gather_windows,
 )
+from flashim.ops.flexglue import flexglue_entmax_readout
 from flashim.ops.gemm import (
     cat_gelu_mlp,
     int8_linear,
@@ -111,6 +114,7 @@ from flashim.ops.quantize import (
     quantize_int8_rows,
     quantize_int8_rows_heads,
     quantize_mxfp8,
+    quantize_mxfp8_heads,
     rotate_quantize_int8_rows,
 )
 from flashim.ops.raco import raco_head5x5, raco_resblock, raco_score_head
@@ -167,6 +171,7 @@ __all__ = [
     "eloftr_upsample_gather_windows",
     "elu_linear_attention",
     "fast_reciprocal_nn",
+    "flexglue_entmax_readout",
     "gather_windows",
     "gelu_quantize",
     "gelu_quantize_int8",
@@ -208,12 +213,15 @@ __all__ = [
     "patch_embed_tokens",
     "pil_bicubic_resize",
     "pos_cat_layernorm",
+    "qk_norm_swap_heads",
+    "qkv_norm_rope_interleaved",
     "quantize_int8",
     "quantize_int8_heads",
     "quantize_int8_multi",
     "quantize_int8_rows",
     "quantize_int8_rows_heads",
     "quantize_mxfp8",
+    "quantize_mxfp8_heads",
     "raco_head5x5",
     "raco_resblock",
     "raco_score_head",

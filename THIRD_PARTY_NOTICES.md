@@ -21,7 +21,7 @@ upstream code or licenses nevertheless apply.
   per-thread Welford update and combine, reduction tree) so fused kernels reproduce `nn.LayerNorm` bit for bit. No ATen
   source is copied.
 
-Other models (ALIKED and ALIKE: BSD-3-Clause; DaD, DeDoDe, RoMa, Tiny-RoMa: MIT, DINOv2 parts Apache-2.0, Tiny-RoMa's XFeat backbone Apache-2.0; LoMa: MIT, its
+Other models (ALIKED and ALIKE: BSD-3-Clause; DaD, DeDoDe, FlexGlue, RoMa, Tiny-RoMa: MIT, DINOv2 parts Apache-2.0, Tiny-RoMa's XFeat backbone Apache-2.0; LoMa: MIT, its
 LightGlue-derived matcher Apache-2.0, built on `flashim/models/lightglue/`; OmniGlue and DINOv2 ViT-B/14: Apache-2.0,
 with rpautrat/SuperPoint `sp_v6`: MIT; RDD, XFeat, LoFTR, EfficientLoFTR @ `ffd4a46440`, XoFTR, DISK, RaCo, MINIMA: Apache-2.0;
 UFM and UniCeption: BSD-3-Clause, CroCo DPT blocks CC BY-NC-SA 4.0, DINOv2 Apache-2.0;
@@ -38,7 +38,8 @@ research use only), **RIPE** (Fraunhofer academic-use license: internal non-comm
 (`MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only),
 **DUSt3R** (`DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only),
 and **UFM** (`ufm_base.safetensors`, CC BY-NC-SA 4.0, non-commercial use only).
-The DINOv3 weights inside the RoMaV2 checkpoint are under the DINOv3 License.
+The DINOv3 weights inside the RoMaV2 checkpoint, and the DINOv3 ConvNeXt-B backbone inside FlexGlue's `flexglue.pth`
+(`extractor.backbone.*`), are under the DINOv3 License (`licenses/DINOv3-License.md`).
 
 ## Test references (`tests/oracles/`)
 

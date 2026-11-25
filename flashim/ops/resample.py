@@ -99,17 +99,24 @@ def _bilinear_sample_points_reference(
     grid: Tensor,
     *,
     align_corners: bool = True,
+    padding_mode: str = "zeros",
     out_dtype: torch.dtype | None = None,
 ) -> Tensor:
     """Bilinearly sample each ``[1, C_i, H_i, W_i]`` map of ``features`` in FP32 at normalized ``grid [K, 2]``
-    ``(x, y)`` coordinates (zeros padding) and concatenate along channels -> ``[K, sum(C_i)]``."""
+    ``(x, y)`` coordinates (``padding_mode`` ``"zeros"`` or ``"border"``) and concatenate along channels ->
+    ``[K, sum(C_i)]``."""
     dtype = torch.float32 if out_dtype is None else out_dtype
     total_c = sum(f.shape[1] for f in features)
     if grid.shape[0] == 0:
         return torch.empty((0, total_c), device=grid.device, dtype=dtype)
     g = grid.float().view(1, 1, -1, 2)
     out = torch.cat(
-        [F.grid_sample(f.float(), g, mode="bilinear", align_corners=align_corners)[0, :, 0].t() for f in features],
+        [
+            F.grid_sample(f.float(), g, mode="bilinear", padding_mode=padding_mode, align_corners=align_corners)[
+                0, :, 0
+            ].t()
+            for f in features
+        ],
         dim=-1,
     )
     return out if out.dtype == dtype else out.to(dtype)

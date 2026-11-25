@@ -634,7 +634,7 @@ ops.pil_bicubic_resize.register(
 def _bilinear_sample_points_kernel(
     feat_ptr, grid_ptr, out_ptr,
     K, C, C_OFF, C_TOTAL, H, W, s_c, s_h, s_w, gs_k, gs_xy,
-    ALIGN_CORNERS: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_C: tl.constexpr,
+    ALIGN_CORNERS: tl.constexpr, BORDER: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_C: tl.constexpr,
 ):
     k = tl.program_id(0) * BLOCK_K + tl.arange(0, BLOCK_K)
     c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -648,28 +648,48 @@ def _bilinear_sample_points_kernel(
     else:
         ix = ((gx + 1.0) * W - 1.0) * 0.5
         iy = ((gy + 1.0) * H - 1.0) * 0.5
-    x0 = tl.floor(ix).to(tl.int32)
-    y0 = tl.floor(iy).to(tl.int32)
-    x1 = x0 + 1
-    y1 = y0 + 1
-    w00 = (x1.to(tl.float32) - ix) * (y1.to(tl.float32) - iy)
-    w01 = (ix - x0.to(tl.float32)) * (y1.to(tl.float32) - iy)
-    w10 = (x1.to(tl.float32) - ix) * (iy - y0.to(tl.float32))
-    w11 = (ix - x0.to(tl.float32)) * (iy - y0.to(tl.float32))
-
-    x0_ok = k_ok & (x0 >= 0) & (x0 < W)
-    x1_ok = k_ok & (x1 >= 0) & (x1 < W)
-    y0_ok = k_ok & (y0 >= 0) & (y0 < H)
-    y1_ok = k_ok & (y1 >= 0) & (y1 < H)
     c_off_in = c[None, :].to(tl.int64) * s_c
-    y0o, y1o = y0[:, None].to(tl.int64) * s_h, y1[:, None].to(tl.int64) * s_h
-    x0o, x1o = x0[:, None].to(tl.int64) * s_w, x1[:, None].to(tl.int64) * s_w
+    if BORDER:
+        ix = tl.minimum(tl.maximum(ix, 0.0), (W - 1.0))
+        iy = tl.minimum(tl.maximum(iy, 0.0), (H - 1.0))
+        x0 = tl.floor(ix).to(tl.int32)
+        y0 = tl.floor(iy).to(tl.int32)
+        x1 = tl.minimum(x0 + 1, W - 1)
+        y1 = tl.minimum(y0 + 1, H - 1)
+        wx = ix - x0.to(tl.float32)
+        wy = iy - y0.to(tl.float32)
+        mask = k_ok[:, None] & c_ok[None, :]
+        y0o, y1o = y0[:, None].to(tl.int64) * s_h, y1[:, None].to(tl.int64) * s_h
+        x0o, x1o = x0[:, None].to(tl.int64) * s_w, x1[:, None].to(tl.int64) * s_w
+        v00 = tl.load(feat_ptr + y0o + x0o + c_off_in, mask=mask, other=0.0).to(tl.float32)
+        v01 = tl.load(feat_ptr + y0o + x1o + c_off_in, mask=mask, other=0.0).to(tl.float32)
+        v10 = tl.load(feat_ptr + y1o + x0o + c_off_in, mask=mask, other=0.0).to(tl.float32)
+        v11 = tl.load(feat_ptr + y1o + x1o + c_off_in, mask=mask, other=0.0).to(tl.float32)
+        top = v00 + wx[:, None] * (v01 - v00)
+        bot = v10 + wx[:, None] * (v11 - v10)
+        val = top + wy[:, None] * (bot - top)
+    else:
+        x0 = tl.floor(ix).to(tl.int32)
+        y0 = tl.floor(iy).to(tl.int32)
+        x1 = x0 + 1
+        y1 = y0 + 1
+        w00 = (x1.to(tl.float32) - ix) * (y1.to(tl.float32) - iy)
+        w01 = (ix - x0.to(tl.float32)) * (y1.to(tl.float32) - iy)
+        w10 = (x1.to(tl.float32) - ix) * (iy - y0.to(tl.float32))
+        w11 = (ix - x0.to(tl.float32)) * (iy - y0.to(tl.float32))
 
-    v00 = tl.load(feat_ptr + y0o + x0o + c_off_in, mask=(y0_ok & x0_ok)[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
-    v01 = tl.load(feat_ptr + y0o + x1o + c_off_in, mask=(y0_ok & x1_ok)[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
-    v10 = tl.load(feat_ptr + y1o + x0o + c_off_in, mask=(y1_ok & x0_ok)[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
-    v11 = tl.load(feat_ptr + y1o + x1o + c_off_in, mask=(y1_ok & x1_ok)[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
-    val = w00[:, None] * v00 + w01[:, None] * v01 + w10[:, None] * v10 + w11[:, None] * v11
+        x0_ok = k_ok & (x0 >= 0) & (x0 < W)
+        x1_ok = k_ok & (x1 >= 0) & (x1 < W)
+        y0_ok = k_ok & (y0 >= 0) & (y0 < H)
+        y1_ok = k_ok & (y1 >= 0) & (y1 < H)
+        y0o, y1o = y0[:, None].to(tl.int64) * s_h, y1[:, None].to(tl.int64) * s_h
+        x0o, x1o = x0[:, None].to(tl.int64) * s_w, x1[:, None].to(tl.int64) * s_w
+
+        v00 = tl.load(feat_ptr + y0o + x0o + c_off_in, mask=(y0_ok & x0_ok)[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
+        v01 = tl.load(feat_ptr + y0o + x1o + c_off_in, mask=(y0_ok & x1_ok)[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
+        v10 = tl.load(feat_ptr + y1o + x0o + c_off_in, mask=(y1_ok & x0_ok)[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
+        v11 = tl.load(feat_ptr + y1o + x1o + c_off_in, mask=(y1_ok & x1_ok)[:, None] & c_ok[None, :], other=0.0).to(tl.float32)
+        val = w00[:, None] * v00 + w01[:, None] * v01 + w10[:, None] * v10 + w11[:, None] * v11
     out_off = k[:, None].to(tl.int64) * C_TOTAL + (C_OFF + c)[None, :]
     tl.store(out_ptr + out_off, val.to(out_ptr.dtype.element_ty), mask=k_ok[:, None] & c_ok[None, :])
 
@@ -679,6 +699,7 @@ def bilinear_sample_points(
     grid: Tensor,
     *,
     align_corners: bool = True,
+    padding_mode: str = "zeros",
     out_dtype: torch.dtype | None = None,
 ) -> Tensor:
     dtype = torch.float32 if out_dtype is None else out_dtype
@@ -696,7 +717,8 @@ def bilinear_sample_points(
             feat, grid, out,
             k, c, c_off, total_c, h, w, feat.stride(1), feat.stride(2), feat.stride(3),
             grid.stride(0), grid.stride(1),
-            ALIGN_CORNERS=align_corners, BLOCK_K=block_k, BLOCK_C=block_c, num_warps=4,
+            ALIGN_CORNERS=align_corners, BORDER=padding_mode == "border",
+            BLOCK_K=block_k, BLOCK_C=block_c, num_warps=4,
         )
         c_off += c
     return out
@@ -707,14 +729,22 @@ def _eligible_bilinear_sample(
     grid: Tensor,
     *,
     align_corners: bool = True,
+    padding_mode: str = "zeros",
     out_dtype: torch.dtype | None = None,
 ) -> bool:
+    if padding_mode not in ("zeros", "border"):
+        return False
     if not features or grid.ndim != 2 or grid.shape[1] != 2 or not grid.is_cuda:
         return False
     if out_dtype is not None and out_dtype not in (torch.float32, torch.bfloat16, torch.float16):
         return False
     return all(
-        f.ndim == 4 and f.shape[0] == 1 and f.is_cuda and f.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        f.ndim == 4
+        and f.shape[0] == 1
+        and f.shape[2] > 0
+        and f.shape[3] > 0
+        and f.is_cuda
+        and f.dtype in (torch.float32, torch.bfloat16, torch.float16)
         for f in features
     )
 

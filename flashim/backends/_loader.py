@@ -30,7 +30,7 @@ BACKENDS: tuple[Backend, ...] = (
         "triton",
         tuple(f"triton.{m}" for m in (
             "activation", "aliked", "assignment", "attention", "conv", "correlation", "density", "dust3r",
-            "eloftr", "gemm", "image", "lightglue", "matching", "nms", "norm", "point_conv", "quantize",
+            "eloftr", "flexglue", "gemm", "image", "lightglue", "matching", "nms", "norm", "point_conv", "quantize",
             "raco", "resample", "roma", "romav2", "stem_conv", "tiny_roma",
         )),
         packages=("triton",),

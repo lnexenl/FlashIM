@@ -249,6 +249,19 @@ def _layernorm_gelu_quantize_int8_reference(
 layernorm_gelu_quantize_int8 = Op("layernorm_gelu_quantize_int8", _layernorm_gelu_quantize_int8_reference)
 
 
+# -- MXFP8 attention-output producer -----------------------------------------------------------------
+
+
+def _quantize_mxfp8_heads_reference(value: Tensor, scale_exponent: Tensor) -> QuantizedTensor:
+    """``quantize_mxfp8(value.transpose(1, 2).reshape(B * N, H * D), scale_exponent)`` of an attention output
+    ``[B, H, N, D]``: the token-major E4M3 input of the output projection, without the transposed BF16 copy."""
+    batch, heads, tokens, dim = value.shape
+    return quantize_static(value.transpose(1, 2).reshape(batch * tokens, heads * dim), scale_exponent)
+
+
+quantize_mxfp8_heads = Op("quantize_mxfp8_heads", _quantize_mxfp8_heads_reference)
+
+
 # -- residual + LayerNorm and cat([x, LayerNorm(value)]) (+ quantize) --------------------------------
 
 
@@ -311,10 +324,27 @@ layernorm_cat_quantize_int8_rows = Op("layernorm_cat_quantize_int8_rows", _layer
 
 
 def _layernorm_cat_quantize_mxfp8_reference(
-    x: Tensor, value: Tensor, weight: Tensor | None, bias: Tensor | None, eps: float, scale_exponent: Tensor
+    x: Tensor,
+    value: Tensor,
+    weight: Tensor | None,
+    bias: Tensor | None,
+    eps: float,
+    scale_exponent: Tensor,
+    *,
+    input_bias: Tensor | None = None,
 ) -> QuantizedTensor:
-    """``quantize_static(cat([x, LayerNorm(value)], dim=-1), scale_exponent)`` for static MXFP8."""
-    return quantize_static(_layernorm_cat_reference(x, value, weight, bias, eps), scale_exponent)
+    """``quantize_static(cat([x, LayerNorm(value [+ input_bias])], dim=-1), scale_exponent)`` for static MXFP8."""
+    if input_bias is None:
+        return quantize_static(_layernorm_cat_reference(x, value, weight, bias, eps), scale_exponent)
+    dense = value.float() + input_bias.float()
+    normalized = F.layer_norm(
+        dense,
+        (value.shape[-1],),
+        weight.float() if weight is not None else None,
+        bias.float() if bias is not None else None,
+        eps,
+    ).to(value.dtype)
+    return quantize_static(torch.cat((x, normalized), dim=-1), scale_exponent)
 
 
 layernorm_cat_quantize_mxfp8 = Op("layernorm_cat_quantize_mxfp8", _layernorm_cat_quantize_mxfp8_reference)

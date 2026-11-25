@@ -50,6 +50,7 @@ def configs() -> list[tuple[str, str, str, list[str], str]]:
     native = ("roma", "tiny-roma", "minima-roma", "mast3r", "dust3r", "ufm", "eloftr", "xoftr", "minima-loftr",
               "superpoint-superglue", "omniglue")
     out += [(f"{m}-{p}", m, p, [], "native") for m in native for p in ("bf16", "int8")]
+    out += [(f"flexglue-{p}", "flexglue", p, [], "native") for p in ("fp32", "bf16", "int8", "fp8")]
     return out
 
 

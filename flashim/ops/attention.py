@@ -86,6 +86,60 @@ def _rope_qk_interleaved_reference(q: Tensor, k: Tensor, cos: Tensor, sin: Tenso
 
 rope_qk_interleaved = Op("rope_qk_interleaved", _rope_qk_interleaved_reference)
 
+
+def _qkv_norm_rope_interleaved_reference(
+    qkv: Tensor,
+    q_weight: Tensor | None,
+    q_bias: Tensor | None,
+    k_weight: Tensor | None,
+    k_bias: Tensor | None,
+    eps: float,
+    cos: Tensor,
+    sin: Tensor,
+    num_heads: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Unpack interleaved ``(H, D, 3)`` ``qkv [B, N, 3*H*D]``, apply per-head LayerNorm to Q and K, apply FP32
+    interleaved-pair RoPE with ``cos, sin [1|B, N, D]``, and return contiguous ``[B, H, N, D]`` ``(q, k, v)``."""
+    q, k, v = qkv.unflatten(-1, (num_heads, -1, 3)).unbind(-1)
+    head_dim = q.shape[-1]
+    q = torch.nn.functional.layer_norm(q, (head_dim,), q_weight, q_bias, eps).to(v.dtype)
+    k = torch.nn.functional.layer_norm(k, (head_dim,), k_weight, k_bias, eps).to(v.dtype)
+    q_hnd = q.transpose(1, 2)
+    k_hnd = k.transpose(1, 2)
+    v_hnd = v.transpose(1, 2).contiguous()
+    cos_b = cos.unsqueeze(1)
+    sin_b = sin.unsqueeze(1)
+    q_rot = (q_hnd.float() * cos_b.float() + _rotate_pairs(q_hnd.float()) * sin_b.float()).to(v.dtype)
+    k_rot = (k_hnd.float() * cos_b.float() + _rotate_pairs(k_hnd.float()) * sin_b.float()).to(v.dtype)
+    return q_rot.contiguous(), k_rot.contiguous(), v_hnd
+
+
+qkv_norm_rope_interleaved = Op("qkv_norm_rope_interleaved", _qkv_norm_rope_interleaved_reference)
+
+
+def _qk_norm_swap_heads_reference(
+    qk: Tensor,
+    v: Tensor,
+    qk_weight: Tensor | None,
+    qk_bias: Tensor | None,
+    eps: float,
+    num_heads: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Per-head LayerNorm on ``qk [2B, N, H*D]`` and batch-half swap for stacked cross-attention: returns contiguous
+    ``[2B, H, N, D]`` ``(q, swap(q), swap(v))`` where ``swap(t) = cat([t[B:], t[:B]])``."""
+    half = qk.shape[0] // 2
+    qk_h = qk.unflatten(-1, (num_heads, -1))
+    v_h = v.unflatten(-1, (num_heads, -1))
+    q = torch.nn.functional.layer_norm(qk_h, (qk_h.shape[-1],), qk_weight, qk_bias, eps).to(v.dtype)
+    q_hnd = q.transpose(1, 2).contiguous()
+    v_hnd = v_h.transpose(1, 2)
+    k_swap = torch.cat((q_hnd[half:], q_hnd[:half]), dim=0).contiguous()
+    v_swap = torch.cat((v_hnd[half:], v_hnd[:half]), dim=0).contiguous()
+    return q_hnd, k_swap, v_swap
+
+
+qk_norm_swap_heads = Op("qk_norm_swap_heads", _qk_norm_swap_heads_reference)
+
 # -- scaled dot-product attention (non-causal, no mask) ------------------------------------------------
 
 

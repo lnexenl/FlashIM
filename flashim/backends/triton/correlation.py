@@ -1304,6 +1304,64 @@ ops.fast_reciprocal_nn.register(
 )(fast_reciprocal_nn)
 
 
+# -- tiled low-D squared-L2 reciprocal nearest neighbors (ops.reciprocal_nn for D <= 8) ------------------
+
+
+@triton.jit
+def _argmin_sqdist_kernel(
+    x_ptr, y_ptr, out_ptr, M, N, D: tl.constexpr, DP: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    dims = tl.arange(0, DP)
+    row_ok = rows < M
+    xi = tl.load(
+        x_ptr + rows[:, None].to(tl.int64) * D + dims[None, :],
+        mask=row_ok[:, None] & (dims[None, :] < D),
+        other=0.0,
+    ).to(tl.float32)
+    best_d = tl.full((BLOCK_M,), float("inf"), dtype=tl.float32)
+    best_j = tl.zeros((BLOCK_M,), dtype=tl.int32)
+    for start in range(0, N, BLOCK_N):
+        cols = start + tl.arange(0, BLOCK_N)
+        col_ok = cols < N
+        d2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for c in tl.static_range(D):
+            xc = tl.sum(tl.where(dims[None, :] == c, xi, 0.0), axis=1)
+            yc = tl.load(y_ptr + cols.to(tl.int64) * D + c, mask=col_ok, other=0.0).to(tl.float32)
+            diff = xc[:, None] - yc[None, :]
+            d2 += diff * diff
+        d2 = tl.where(col_ok[None, :], d2, float("inf"))
+        tile_min = tl.min(d2, axis=1)
+        tile_j = tl.min(tl.where(d2 == tile_min[:, None], cols[None, :], N), axis=1)
+        better = tile_min < best_d
+        best_d = tl.where(better, tile_min, best_d)
+        best_j = tl.where(better, tile_j, best_j)
+    tl.store(out_ptr + rows, best_j.to(tl.int64), mask=row_ok)
+
+
+def reciprocal_nn_tiled(pts1: Tensor, pts2: Tensor, block_size: int = 4096) -> tuple[Tensor, Tensor]:
+    """Tiled exact L2 reciprocal nearest neighbors for small ``D <= 8`` (avoids O(M*N) distance buffers)."""
+    n1, d = pts1.shape
+    n2 = pts2.shape[0]
+    if n1 == 0 or n2 == 0:
+        empty = torch.empty(0, dtype=torch.int64, device=pts1.device)
+        return empty, empty
+    p1, p2 = pts1.float().contiguous(), pts2.float().contiguous()
+    nn1_in_2 = torch.empty(n1, device=pts1.device, dtype=torch.int64)
+    nn2_in_1 = torch.empty(n2, device=pts2.device, dtype=torch.int64)
+    dp = triton.next_power_of_2(d)
+    block_m, block_n = 64, 128
+    _argmin_sqdist_kernel[(triton.cdiv(n1, block_m),)](
+        p1, p2, nn1_in_2, n1, n2, D=d, DP=dp, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=4
+    )
+    _argmin_sqdist_kernel[(triton.cdiv(n2, block_m),)](
+        p2, p1, nn2_in_1, n2, n1, D=d, DP=dp, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=4
+    )
+    idx2 = torch.arange(n2, device=pts2.device, dtype=torch.int64)
+    reciprocal = nn1_in_2[nn2_in_1] == idx2
+    return nn2_in_1[reciprocal], idx2[reciprocal]
+
+
 def _reciprocal_nn_eligible(pts1: Tensor, pts2: Tensor, block_size: int = 4096) -> bool:
     return (
         pts1.ndim == 2
@@ -1317,6 +1375,21 @@ def _reciprocal_nn_eligible(pts1: Tensor, pts2: Tensor, block_size: int = 4096) 
     )
 
 
+def _reciprocal_nn_tiled_eligible(pts1: Tensor, pts2: Tensor, block_size: int = 4096) -> bool:
+    return (
+        pts1.is_cuda
+        and pts2.is_cuda
+        and pts1.ndim == 2
+        and pts2.ndim == 2
+        and pts1.shape[1] == pts2.shape[1]
+        and 1 <= pts1.shape[1] <= 8
+        and not _reciprocal_nn_eligible(pts1, pts2, block_size)
+    )
+
+
 ops.reciprocal_nn.register(
     "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_reciprocal_nn_eligible
 )(reciprocal_nn)
+ops.reciprocal_nn.register(
+    "triton_tiled", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_reciprocal_nn_tiled_eligible
+)(reciprocal_nn_tiled)
