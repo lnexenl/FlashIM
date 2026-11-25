@@ -134,10 +134,15 @@ def main() -> None:
     parser.add_argument("--datasets", nargs="+", default=["mega1500", "scannet1500"])
     parser.add_argument("--models", nargs="*", default=[])
     parser.add_argument("--no-dev", action="store_true", help="skip dev baseline jobs")
+    parser.add_argument(
+        "--skip", nargs="*", default=[],
+        help="skip new jobs matching '<model>:<preset>' or '<dataset>:<model>:<preset>' (e.g. proven bit-identical)",
+    )
     args = parser.parse_args()
 
     wanted_datasets = set(args.datasets)
     wanted_models = set(args.models)
+    skip_specs = set(args.skip)
 
     if not args.list_jobs:
         for proto in PROTOCOLS:
@@ -163,6 +168,9 @@ def main() -> None:
         for preset, reason in skipped:
             print(f"# SKIP|new|{proto.dataset}|{proto.model}|{preset}|{reason}")
         for preset, fb_note in kept:
+            if f"{proto.model}:{preset}" in skip_specs or f"{proto.dataset}:{proto.model}:{preset}" in skip_specs:
+                print(f"# SKIP|new|{proto.dataset}|{proto.model}|{preset}|skipped via --skip")
+                continue
             print(
                 f"RUN|new|{proto.runner}|{proto.dataset}|{proto.model}|{preset}"
                 f"|{proto.resize}|{proto.top_k}|{ov_str}|{fb_note}"

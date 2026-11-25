@@ -40,6 +40,11 @@ fi
 # shellcheck disable=SC2206
 ds_arr=($DATASETS)
 list_args=(--list-jobs --datasets "${ds_arr[@]}")
+if [ -n "${SKIP_SPECS:-}" ]; then
+  # shellcheck disable=SC2206
+  skip_arr=($SKIP_SPECS)
+  list_args+=(--skip "${skip_arr[@]}")
+fi
 if [ $# -gt 0 ]; then
   list_args+=(--models "$@")
 fi
