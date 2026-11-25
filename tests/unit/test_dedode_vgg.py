@@ -94,8 +94,8 @@ def test_tensor_core_first_conv_and_patch_embed():
     up to the FP32 summation order (checked at the op level), and ``DinoV2`` takes the bound patch-embedding op."""
     from flashim.platforms import platform_for
 
-    if platform_for("cuda").capability not in ((8, 9), (9, 0)):
-        pytest.skip("registered for sm_89 / sm_90")
+    if platform_for("cuda").capability not in ((8, 9), (9, 0), (12, 0)):
+        pytest.skip("registered for sm_89 / sm_90 / sm_120")
     vgg = _int8_vgg(device="cuda")
     x = (torch.randn(1, 3, 96, 128, device="cuda") * 2).bfloat16()
     want, _ = _maps(vgg, x)

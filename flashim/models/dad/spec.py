@@ -14,11 +14,16 @@ from flashim.models.dedode import blocks
 from flashim.models.dedode import weights as dedode_weights
 from flashim.models.dedode.model import DAD_SAMPLER, DeDoDe
 from flashim.models.dedode.spec import (
+    DECODER_FUSION_PASSES,
     DECODER_UPSAMPLE_PASS,
+    PATCH_EMBED_PASS,
     PROTECTED,
     QUANTIZED,
+    STEM_EXACT_PASSES,
+    STEM_TC_PASSES,
+    VIT_ATTENTION_PASSES,
     VIT_EPILOGUE_PASSES,
-    VIT_IGNORE,
+    VIT_LINEARS,
 )
 from flashim.models.sparse_spec import extractor_spec
 
@@ -33,6 +38,11 @@ def _load(config: RunConfig) -> DeDoDe:
     )
 
 
+_PASSES = {
+    **DECODER_UPSAMPLE_PASS, **DECODER_FUSION_PASSES, **STEM_EXACT_PASSES, **STEM_TC_PASSES, **VIT_EPILOGUE_PASSES,
+    **PATCH_EMBED_PASS, **VIT_ATTENTION_PASSES,
+}
+
 SPEC = extractor_spec(
     name="dad",
     description="DaD keypoint detector (VGG11) + DeDoDe-G descriptors, dual-softmax matching",
@@ -40,11 +50,11 @@ SPEC = extractor_spec(
     calibration_dir=Path(__file__).parent / "calibration",
     quantized=QUANTIZED,
     protected=PROTECTED,
-    int8_ignore=VIT_IGNORE,  # see dedode.spec.VIT_IGNORE
+    int8_dynamic=VIT_LINEARS,  # per-token dynamic INT8 ViT, as dedode-g / loma-extractor (see dedode.spec.VIT_IGNORE)
     compile_regions=("detector", "descriptor"),
     # 16 ConvRefiner hidden blocks (32 / 64 channels) as one BF16 kernel each: BF16 extract 141.0 -> 133.0 ms
     fused_bf16_blocks=("detector.decoder.", "descriptor.decoder."),
     channels_last=True,  # BF16 extract at 1200 px, interleaved in one process (sm_120): 135 -> 127 ms
-    extra_passes={**DECODER_UPSAMPLE_PASS, **VIT_EPILOGUE_PASSES},
-    structural_passes=(*DECODER_UPSAMPLE_PASS, *VIT_EPILOGUE_PASSES),
+    extra_passes=_PASSES,
+    structural_passes=tuple(_PASSES),
 )

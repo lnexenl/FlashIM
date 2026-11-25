@@ -2,23 +2,51 @@
 
 ## Unreleased
 
-### Models
+### Added
 
 - FlexGlue (`flexglue`, cvg/FlexGlue v0.1): sparse-to-dense matcher with a DINOv3-ConvNeXt descriptor.
   `match_keypoints` matches any extractor's keypoints, `match` samples the dense warp with upstream's gates. Presets
   `fp32` / `bf16` / `int8` / `fp8` (default: MXFP8 transformer linears + INT8 descriptor MLP); `int8` / `fp8` run
   SageAttention (pass `sage_attention`: `sage` / `sage-fp8-fast` on sm_89 and sm_120, `sage` also on sm_80-87;
   torch SDPA on Hopper, where the sm_89 kernels are slower); opt-in early stopping and `arch.num_layers` truncation.
-  MegaDepth-1500 AUC@5 (dense, 5000 matches, 3 seeds): bf16 0.6397, fp8 0.6371, int8 0.6380; compiled
-  `match_keypoints` at 2048 keypoints on an RTX 5070 Ti: bf16 32.5 ms, fp8 19.4 ms, int8 24.9 ms.
-
-### Interface
-
 - `optimize.attention="sage-fp8-fast"`: `sage-fp8` with FP16 PV accumulation (SageAttention2++), sm_89+.
 - Quant configs may mix MXFP8 and INT8 schemes: `quantize_model` takes one table of each kind, a spec's default
   calibration may be a tuple of files, and a table passed with `calibration=` replaces only the default of its kind.
+- Ten new image-matching model families (all verified against upstream parity oracles with `fp32` / `bf16` / `int8` / `fp8` presets and custom Triton / CUDA C++ kernels):
+  - Dense matchers: `roma`, `roma-indoor`, `tiny-roma`, `ufm`, `mast3r`, `dust3r` (`mast3r` and `dust3r` use FP16 compute under `bf16`/`int8`/`fp8` to avoid BF16 ULP loss on CroCo's ~344–649 residual peaks).
+  - Detector-free / cross-modal matchers: `eloftr`, `xoftr`, `minima-loftr`, `minima-roma`.
+  - Sparse matchers & pipelines: `superglue`, `superpoint-superglue`, `omniglue`, `omniglue-extractor`, `omniglue-matcher` (adding SuperPoint `sp_v6` variant).
+- Shared ops & quantization infrastructure:
+  - Unified register-resident + L2-streaming CUDA Sinkhorn library (`csrc/sinkhorn.cu`, `ops.log_optimal_transport` and `ops.sinkhorn_mutual`); CUDA BVH 3D reciprocal NN (`csrc/reciprocal_nn.cu`, `ops.reciprocal_nn`); Triton ops for 2D/interleaved RoPE, ELU linear attention, bilinear upsampling (+ INT8 quantize), 2D box NMS, ReLU-affine, window gather, and fused LayerNorm/GELU/rotation per-row dynamic INT8 quantization (`layernorm_orthogonal`, `signed_hadamard`, FP16 `DynamicInt8Linear` / `DynamicInt8TransformerBlock`).
+  - Dynamic-only quantization configs skip calibration table loading unless explicitly supplied or registered (`calibration_metadata = None`).
+  - `ModelSpec.quant_configs` per-variant `<variant>/<quant>` lookup (mirroring `ModelSpec.calibrations`, used by `loma-b128` `fp8`), `extractor_spec` `fp8_ignore` and `cuda_graph` options, and resumable pre-2026-11 accuracy matrix tooling (`benchmarks/accuracy/perf_matrix.sh` with `SKIP_SPECS`, `perf_protocol.py`, `perf_report.py`).
+
+### Changed
+
+- **Intended output improvement (ALIKED family)**: keeping SDDH pixel-space keypoint coordinates in FP32 under `bf16` fixes 2–8 px BF16 ULP quantization on `kpts_wh`, lifting MegaDepth-1500 / ScanNet-1500 pose AUC@5 (RTX 5070 Ti `sm_120`, `eager`, 3 seeds, PoseLib 1.0 px) on `aliked bf16` (`+0.0559` / `+0.0068`), `raco-aliked bf16` (`+0.0397` / `+0.0056`), `aliked-lightglue bf16` (`+0.0126` / `+0.0073`), and `raco-aliked-lightglue bf16` (`+0.0186` / `+0.0122`).
+- **Preset fallbacks via `build.NEAREST`** (presets that lost pose AUC or were Pareto-dominated by the fallback are omitted and recorded in `model.build_report.fallbacks`):
+  - `fp8 -> int8`: `dedode` (`dedode-g` keeps `fp8`), `aliked-lightglue`, `superpoint-lightglue` (runs SuperPoint in `bf16` + LightGlue in rotated `int8`), `disk-lightglue`, `superpoint-superglue`, `superglue`, `omniglue`, and `omniglue-matcher`.
+  - `int8` / `fp8 -> bf16`: `xfeat-lightglue`.
+
+### Fixed
+
+- `decode_jpeg_cuda`: fixed stream/allocator race in nvJPEG GPU decoding causing intermittent pixel corruption (`fix/jpeg-decode`).
+- `tests/ops/test_depthwise_cuda.py` on `sm_120`: swept and enabled `PRODUCER_TILE` / `DWPW_TILE` tables and `cuda_composite` (`51/51` passing, bit-identical to Triton; unmeasured `sm_100` / `sm_110` keep fallbacks).
+- Bounded cuBLAS MXFP8 `_InputScales.by_rows` (16-entry LRU, pinning CUDA-graph-captured row counts) and LoFTR `_pe` / `_inner_cache` (fixes LoFTR `fp8` MegaDepth-1500 OOM at pair 1417).
+- Guarded LightGlue / `SparseExtractor` CUDA graph captures (`hits >= 2` repeat-shape gate, `max(N0, N1) <= 8192` guard, pool release outside `except` before eager fallback) and added `sdpa_graph_safe` probe so unpatched SageAttention never captures corrupt graphs.
+- Quantization accuracy & numerics fixes (verified on RTX 5070 Ti `sm_120` MegaDepth-1500 & ScanNet-1500, 3 seeds, paired bootstrap gate `-0.005` AUC@5, **84 PASS, 42 BORDERLINE, 0 FAIL**):
+  - Targeted BF16 layer exclusions: `xfeat` protects `keypoint_head.*` and `block2.*` (`int8`/`fp8`); `superpoint` keeps `conv1b` in BF16 (`fp8`); `dedode` excludes `descriptor.encoder.layers.{3,7,10}` (`int8`); `ripe` excludes `net.encoder.layers.{3,7,10}` (`fp8`); `loma-b128` keeps `*.decoder.*` and matcher `transformers.{4,5}.*` in BF16 (`fp8`).
+  - Restored intermediate BF16 round in `ops.instance_norm_prelu`, exact 9-tap FMA in `ops.conv3x3_small_cin_relu` (`Cin=1`), IEEE FP32 in `ops.mutual_nn_match` for `M*N <= 8192^2`, FP32 similarity in `DeDoDe.match_features`, and exact-only INT8 passes on RIPE.
 
 ### Performance
+
+- **Broad `sm_120` (RTX 5070 Ti) kernel, fusion, and dispatch sweep** across all 26 pre-2026-11 models (measured on RTX 5070 Ti `sm_120`, `eager`; non-`sm_120` CUDA C++ / Triton kernels compile-checked only):
+  - **Shared runtime & ops**: cached per-platform dispatch and `BoundOp._usable` in `ops/_registry.py`; enabled `sm_120` for `depthwise.cu` (`PRODUCER_TILE`, `DWPW_TILE`, `cuda_composite`), `upsample_concat_int8` / `upsample_add` `triton_rows`, `conv2d_small_cin_quantize_int8`, `patch_embed_tokens` cuBLAS GEMM, `layernorm_quantize_int8_rows`, `layernorm_gelu_quantize_int8`, 2-pass `dual_softmax_mutual`, and INT8/MXFP8 conv chaining (`QUANT_OUT`); added exact 2x BF16 `upsample_concat` `triton_rows`, `ops.quantize_int8_rows_heads` / `ops.gelu_quantize_int8_rows` + zero-copy NHD FlashAttention layout, CUDA C++ `ops.simple_nms`, `ops.aliked_score_head`, `ops.raco_score_head`, and Triton `ops.hamming_distances`, `ops.hamming_ratio_mutual_match`, `ops.ratio_mutual_match`, `ops.conv3x3_small_cin_relu`, `ops.int8_conv2d_maxpool_only`, `ops.multiscale_score`, `ops.instance_norm_prelu`, `ops.rgb_mean_instance_norm`, `ops.conv2d_at_points`, `ops.strict_nms_mask`, `ops.bilinear_sample_points`, `ops.mutual_nn_match`.
+  - **RoMaV2 (RTX 5070 Ti `sm_120`, `eager`, `mega1500` 800² + 1024², both directions, B=1)**: preserved `rope_impl` through quantization (`42/42` Triton RoPE), enabled `fold_fine_features`, `fold_layer_scale`, `fused_block_epilogues`, `batched_matcher` (reusing `logits_ba = logits_ab^T` + batched B=2 `DPTHead` in channels-last), `sage_attention`, and `depthwise.cu` (`fp8` 184.07 -> 113.94 ms [1.62x], `int8` 139.75 -> 110.83 ms [1.26x]).
+  - **LoMa (`loma-*`, RTX 5070 Ti `sm_120`, `eager`)**: enabled all DeDoDe/LoMa extractor fusions + DINOv2 `sage-fp8-warp` (`int8` / `fp8`) + matcher `cuda_graph`, `fused_bias` (`fp8`), and `sage-fp8` (`dim >= 512`): `loma-b fp8` matcher (N=2048) 7.21 -> 3.52 ms (2.05x), `loma-l int8`/`fp8` matcher (N=4096) 20.32 -> 12.97 ms / 26.22 -> 18.61 ms, `loma-g int8`/`fp8` matcher (N=4096) 43.57 -> 29.25 ms / 65.58 -> 39.30 ms, `loma-b128` 1024 px pair (4096 kp) `fp8` 40.11 ms vs `bf16` 51.17 ms (1.28x).
+  - **LightGlue (RTX 5070 Ti `sm_120`, `eager`)**: repeat-shape `cuda_graph`, `low_precision_similarity`, `fused_bias` (`fp8`), batched `CrossBlock.to_out`, `rotate_residual_stream` (Paley-12 Hadamard for `dim=96`) + SmoothQuant `ffn.3` + `fused_int8_glue` (`rdd` N=1024 `fp8` 7.09 -> 1.56 ms, `int8` 6.29 -> 1.48 ms; `aliked` N=2048 `fp8` 7.07 -> 3.44 ms, `int8` 6.03 -> 3.36 ms; `rdd` N=4096 `fp8` 13.01 -> 10.24 ms, `int8` 12.60 -> 9.90 ms).
+  - **LoFTR (RTX 5070 Ti `sm_120`, `eager`, diff pair 896x1200 / 880x1200)**: unified 2-kernel Triton `ops.elu_linear_attention` (`N*H` on `gridDim.x`), `low_precision_similarity`, `quantize_int8_multi` QKV, fused MLP ReLU, same-shape self-attention batching, indexed 5x5 fine gather (-214 MB VRAM): `bf16` 94.03 -> 79.62 ms, `int8` 60.73 -> 37.99 ms (1.60x), `fp8` 57.91 -> 45.81 ms (1.26x).
+  - **Sparse extractors (RTX 5070 Ti `sm_120`, `eager`)**: `orb` `fp32` match (4096x4096) 34.06 -> 0.31 ms (109.1x), `sift` `fp32` match (4096x3629) 1.34 -> 0.85 ms; `superpoint` extract (856x1200, 4096 kp) `bf16` 8.15 -> 4.42 ms, `int8` 6.03 -> 1.35 ms, `fp8` 6.09 -> 3.82 ms; `alike` extract (832x1184, 4096 kp) `bf16`/`int8`/`fp8` 7.17–7.59 -> 1.78–2.09 ms (3.44–4.11x); `aliked` extract (832x1184, 4096 kp) `bf16` 5.42 -> 3.47 ms, `fp32` 6.36 -> 5.59 ms; `raco` `bf16` `extract_keypoints` (1024x1024) 6.92 -> 3.67 ms (1.88x); `disk` extract (1200 px, 4096 kp) `bf16`/`int8`/`fp8` 12.73–15.40 -> 5.75–7.47 ms (1.74–2.68x); `xfeat` extract (1200 px, 4096 kp) `bf16`/`int8`/`fp8` 2.01–2.44 -> 1.13–1.42 ms (1.53–1.99x); `rdd` match (4096x4096, `bf16`) 5.76 -> 0.75 ms (7.67x) and extract (1600 px) `bf16` 62.72 -> 56.92 ms, `fp8` 53.59 -> 47.76 ms; `dedode` extract (1200 px, 4096 kp) `int8` 30.37 vs `bf16` 55.94 ms (1.84x); `dedode-g` extract (1200 px) `int8` 101.55 -> 76.14 ms, `fp8` 116.36 -> 101.22 ms; `dad` extract (1200 px) `int8` 136.5 -> 78.47 ms, `fp8` 102.79 -> 85.97 ms; `ripe` extract (1200 px) `int8` 42.28 -> 19.19 ms (`_describe` 4.8x, -492 MB VRAM) and `fp32` match (32320x23731x256) 22.54 -> 9.81 ms (-2.97 GB VRAM).
 
 - LoMa `int8` (`loma-*` pipelines, sm_89 / sm_90), from the LoMa tuning prototypes:
   - extractor: the DINOv2 ViT as per-token dynamic INT8 and every DeDoDe int8 pass (decoder fusions, encoder stem,
@@ -54,8 +82,8 @@
   `proj`'s / `fc2`'s (`ops.int8_linear(gelu=True, residual=...)`; GELU only where a `libdevice` with torch's `erf` is
   installed, probed once per process). 16 kernels per block become 9. Extract at 1200 px (eager, interleaved): L20
   104.9 -> 102.6 ms, H20 93.5 -> 90.1 ms (with the next item); ViT alone in a CUDA graph 49.6 -> 47.4 ms (L20),
-  40.1 -> 38.4 ms (H20). The layer-norm kernel is registered for sm_89 / sm_90 only (the architectures it was checked
-  on); other GPUs run the unfused modules.
+  40.1 -> 38.4 ms (H20). The layer-norm kernel was initially registered for sm_89 / sm_90 only (subsequently enabled on
+  sm_120 in the sweep above); other GPUs run the unfused modules.
 - INT8 GEMM on sm_90: 64 x 64 / 4-warp tiles for the decoders' small-N 1x1 convolutions (`n < 512`), exact under INT32
   accumulation; dedode-g's decoder GEMMs take 0.82 ms less per extract on an H20.
 - Decoder upsampling at the memory roofline on sm_89 / sm_90 (bit-identical): `ops.upsample_concat_int8` has a second

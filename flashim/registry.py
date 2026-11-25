@@ -6,7 +6,11 @@ from __future__ import annotations
 from flashim.build import register_spec
 
 SPECS = {
+    "roma": "flashim.models.roma.spec:SPEC",
+    "roma-indoor": "flashim.models.roma.spec:SPEC_INDOOR",
+    "minima-roma": "flashim.models.roma.spec:SPEC_MINIMA",
     "romav2": "flashim.models.romav2.spec:SPEC",
+    "tiny-roma": "flashim.models.tiny_roma.spec:SPEC",
     "rdd": "flashim.models.rdd.spec:SPEC",
     "lightglue": "flashim.models.lightglue.spec:SPEC",
     "flexglue": "flashim.models.flexglue.spec:SPEC",
@@ -25,14 +29,25 @@ SPECS = {
     "dad": "flashim.models.dad.spec:SPEC",
     "ripe": "flashim.models.ripe.spec:SPEC",
     "loftr": "flashim.models.loftr.spec:SPEC",
+    "eloftr": "flashim.models.eloftr.spec:SPEC",
+    "xoftr": "flashim.models.xoftr.spec:SPEC",
+    "minima-loftr": "flashim.models.loftr.spec:SPEC_MINIMA",
     "sift": "flashim.models.sift.spec:SPEC",
     "orb": "flashim.models.orb.spec:SPEC",
     "xfeat-lightglue": "flashim.models.lightglue.spec:XFEAT_LIGHTGLUE",
     "superpoint-lightglue": "flashim.models.lightglue.spec:SUPERPOINT_LIGHTGLUE",
+    "superglue": "flashim.models.superglue.spec:SPEC",
+    "superpoint-superglue": "flashim.models.superglue.spec:SUPERPOINT_SUPERGLUE",
     "disk-lightglue": "flashim.models.lightglue.spec:DISK_LIGHTGLUE",
     "loma-matcher": "flashim.models.loma.matcher_spec:SPEC",
     "loma-extractor": "flashim.models.loma.extractor_spec:SPEC",
     "loma": "flashim.models.loma.spec:LOMA",
+    "mast3r": "flashim.models.mast3r.spec:SPEC",
+    "dust3r": "flashim.models.dust3r.spec:SPEC",
+    "ufm": "flashim.models.ufm.spec:SPEC",
+    "omniglue-matcher": "flashim.models.omniglue.spec:MATCHER_SPEC",
+    "omniglue-extractor": "flashim.models.omniglue.spec:EXTRACTOR_SPEC",
+    "omniglue": "flashim.models.omniglue.spec:SPEC",
 }
 
 # RaCo keypoints + the descriptors of any model that can describe given keypoints (raco-superpoint, raco-disk, ...).

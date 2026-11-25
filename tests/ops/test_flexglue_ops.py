@@ -144,9 +144,9 @@ def test_layernorm_cat_quantize_mxfp8_and_int8(rows, c):
     msg_bias = torch.randn(c, device="cuda", dtype=torch.float32) * 0.1
     exp = torch.randint(-3, 3, (2 * c // 32,), device="cuda", dtype=torch.int8)
 
-    assert ops.layernorm_cat_quantize_mxfp8.explain(x, msg, w, b, 1e-5, exp, msg_bias=msg_bias)["triton"] == "selected"
-    ref_fp8 = ops.layernorm_cat_quantize_mxfp8.get("reference")(x, msg, w, b, 1e-5, exp, msg_bias=msg_bias)
-    tri_fp8 = ops.layernorm_cat_quantize_mxfp8.get("triton")(x, msg, w, b, 1e-5, exp, msg_bias=msg_bias)
+    assert ops.layernorm_cat_quantize_mxfp8.explain(x, msg, w, b, 1e-5, exp, input_bias=msg_bias)["triton"] == "selected"
+    ref_fp8 = ops.layernorm_cat_quantize_mxfp8.get("reference")(x, msg, w, b, 1e-5, exp, input_bias=msg_bias)
+    tri_fp8 = ops.layernorm_cat_quantize_mxfp8.get("triton")(x, msg, w, b, 1e-5, exp, input_bias=msg_bias)
     # Left half (x) is bit-exact; right half (LayerNorm) allows tiny 1-ulp rounding diff.
     assert torch.equal(tri_fp8.values[..., :c].view(torch.uint8), ref_fp8.values[..., :c].view(torch.uint8))
     diff_fp8 = (tri_fp8.values[..., c:].view(torch.uint8) != ref_fp8.values[..., c:].view(torch.uint8)).float().mean().item()
@@ -161,28 +161,29 @@ def test_layernorm_cat_quantize_mxfp8_and_int8(rows, c):
 
 
 @pytest.mark.parametrize("channels_last", [False, True])
-@pytest.mark.parametrize("b,c,hw,n", [(1, 512, (64, 64), 2048), (1, 512, (64, 64), 4096), (2, 2, (64, 64), 4096), (1, 37, (17, 23), 99)])
+@pytest.mark.parametrize("c,hw,n", [(512, (64, 64), 2048), (512, (64, 64), 4096), (2, (64, 64), 4096), (37, (17, 23), 99)])
 @torch.inference_mode()
-def test_bilinear_sample_border(channels_last, b, c, hw, n):
+def test_bilinear_sample_points_border(channels_last, c, hw, n):
     torch.manual_seed(0)
-    feat = torch.randn(b, c, *hw, device="cuda", dtype=torch.float32)
+    feat = torch.randn(1, c, *hw, device="cuda", dtype=torch.float32)
     if channels_last:
         feat = feat.to(memory_format=torch.channels_last)
     # Include out-of-range coordinates to exercise border clamping.
-    pts = torch.rand(b, n, 2, device="cuda", dtype=torch.float32) * 2.6 - 1.3
-    assert ops.bilinear_sample_border.explain(feat, pts)["triton"] == "selected"
-    ref = ops.bilinear_sample_border.get("reference")(feat, pts)
-    tri = ops.bilinear_sample_border.get("triton")(feat, pts)
+    pts = torch.rand(n, 2, device="cuda", dtype=torch.float32) * 2.6 - 1.3
+    kw = {"align_corners": False, "padding_mode": "border", "out_dtype": feat.dtype}
+    assert ops.bilinear_sample_points.explain((feat,), pts, **kw)["triton"] == "selected"
+    ref = ops.bilinear_sample_points.get("reference")((feat,), pts, **kw)
+    tri = ops.bilinear_sample_points.get("triton")((feat,), pts, **kw)
     assert torch.allclose(tri, ref, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("m,n,d", [(2048, 2048, 4), (77, 133, 4), (0, 10, 4), (1, 1, 2)])
 @torch.inference_mode()
-def test_mutual_nn_sqdist(m, n, d):
+def test_reciprocal_nn_tiled(m, n, d):
     torch.manual_seed(0)
     x = torch.randn(m, d, device="cuda", dtype=torch.float32) * 100.0
     y = torch.randn(n, d, device="cuda", dtype=torch.float32) * 100.0
-    assert ops.mutual_nn_sqdist.explain(x, y)["triton"] == "selected"
-    rm0, rm1 = ops.mutual_nn_sqdist.get("reference")(x, y)
-    tm0, tm1 = ops.mutual_nn_sqdist.get("triton")(x, y)
-    assert torch.equal(tm0, rm0) and torch.equal(tm1, rm1)
+    assert ops.reciprocal_nn.explain(x, y)["triton_tiled"] == "selected"
+    r1, r2 = ops.reciprocal_nn.get("reference")(x, y)
+    t1, t2 = ops.reciprocal_nn.get("triton_tiled")(x, y)
+    assert torch.equal(t1, r1) and torch.equal(t2, r2)

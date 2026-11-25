@@ -38,6 +38,11 @@ the extractor in FP32 under a quantized LightGlue.
   (`backends/cuda/csrc/raco_resblock.cu`), JIT-built with `nvcc` on first use and cached in `~/.cache/flashim/cuda`. It
   falls back to a Triton kernel (`backends/triton/raco.py`) without a toolchain; pick one with
   `RaCo.use_fused_ranker(backend=...)` (`"auto"`, `"cuda"` or `"triton"`).
+- **Fused detector score head & NHWC trunk** (`fused_detector`, `channels_last` passes in `bf16`): CUDA C++
+  `ops.raco_score_head` (`backends/cuda/csrc/raco_score_head.cu`) fuses `score_head[2:]` (`0.780 -> 0.251 ms` at
+  1024x1024 on RTX 5070 Ti `sm_120`, 3.10x), `block1` reuses `raco_resblock`, and `raco/keypoints.py` uses direct padded
+  index gather instead of `F.unfold` (bit-identical, saving 28-69 MB). Together with `channels_last`, `raco bf16`
+  `extract_keypoints` at 1024x1024 (`sm_120`, `eager`) drops from `6.92 -> 3.67 ms` (1.88x).
 - **BatchNorm folding** (exact).
 
 ## RaCo with other models
@@ -52,8 +57,10 @@ m = flashim.load("raco-dedode", "bf16").match(a, b, resize=1024, max_matches=204
 pipeline = flashim.load("raco-superpoint-lightglue", overrides=["components.extractor.preset=bf16"])
 ```
 
-The presets are the descriptor model's (`fp32`, `bf16`, `int8`, `fp8`); RaCo builds the nearest it has (`fp32` for
-`fp32`, `bf16` otherwise), and `components.raco` / `components.descriptor` take their own presets and settings. Images are resized to a
+The presets of `raco-<model>` are the descriptor model's (e.g. `raco-dedode` omits `fp8` -> `int8`), while
+`raco-<model>-lightglue` exposes `fp32`, `bf16`, `int8`, `fp8` (`raco-rdd-lightglue` defaults to `fp8`, the others to
+`fp32`); RaCo builds the nearest it has (`fp32` for `fp32`, `bf16` otherwise), and `components.raco` /
+`components.descriptor` take their own presets and settings. Images are resized to a
 multiple of 32 (224 for DeDoDe-G, whose ViT needs 56). Keypoints come back in the pixel-center convention of every
 other model; LightGlue still sees RaCo's own pixel-edge ones (pixel index + 0.5), as in `raco-aliked-lightglue`. These models never saw RaCo's keypoints in training, so a LightGlue checkpoint trained on their own
 detector is applied out of distribution, and DISK (whole-pixel descriptors) rounds RaCo's sub-pixel positions. MegaDepth-1500 AUC@5 (1200 px, 4096 keypoints, poselib 1.0 px, mean of 3 RANSAC seeds, BF16; RaCo runs at multiples of
@@ -77,7 +84,7 @@ descriptors.
 
 ## Speed
 
-One 1024x1024 pair, 1024 keypoints, threshold 0.1, decode and resize excluded, RTX 5070 Ti:
+One 1024x1024 pair, 1024 keypoints, threshold 0.1, decode and resize excluded, RTX 5070 Ti (`sm_120`, 2026-10 baseline):
 
 | pipeline | ranker | time per pair |
 |---|---|---|
@@ -89,10 +96,14 @@ One 1024x1024 pair, 1024 keypoints, threshold 0.1, decode and resize excluded, R
 
 On the same exact algorithm FlashIM is about 20% faster than their TensorRT fp16 engine. Their number is engine-only GPU
 time; FlashIM's includes Python launch overhead. FlashIM has no `boundary` ranker, so that row has no like-for-like
-counterpart.
+counterpart. In the 2026-11 `sm_120` eager sweep, `raco bf16` `extract_keypoints` (1024x1024, RTX 5070 Ti `sm_120`,
+`eager`) dropped from `6.92 -> 3.67 ms` (1.88x); the compiled pair table above was not re-measured.
 
 ## Accuracy
 
 The fast path against the exact FP32 reference on the test pair: 98.5-98.9% of the keypoints are the same pixels, RANSAC
 inliers are within run-to-run noise (73-81 across the FP32 / TF32 / BF16 variants), and BF16 descriptors give about 9%
-fewer matches (155 vs 170) at the same inlier count. MegaDepth-1500 AUC@5: [LightGlue](lightglue.md#accuracy).
+fewer matches (155 vs 170) at the same inlier count. Restoring FP32 SDDH pixel coordinates in ALIKED lifted `raco-aliked`
+`bf16` by `+0.0397` / `+0.0056` and `raco-aliked-lightglue` `bf16` by `+0.0186` / `+0.0122` on MegaDepth-1500 /
+ScanNet-1500 (RTX 5070 Ti `sm_120`, `eager`, 3 seeds); full gate results: [LightGlue](lightglue.md#accuracy) and
+[benchmarks.md](../benchmarks.md#accuracy-of-the-pre-2026-11-models-2026-11-gate-sm_120).

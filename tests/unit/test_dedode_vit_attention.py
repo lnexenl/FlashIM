@@ -16,18 +16,24 @@ def test_parse_layers():
         spec.parse_layers("20-24")
 
 
-def test_only_dedode_g_has_the_pass():
+def test_only_vit_models_have_the_pass():
     assert "vit_sage_attention" in spec.SPEC_G.passes
     assert "vit_sage_attention" not in spec.SPEC.passes
     from flashim.models.dad.spec import SPEC as DAD
+    from flashim.models.loma.extractor_spec import SPEC as LOMA_EXT
 
-    assert "vit_sage_attention" not in DAD.passes  # dad shares the ViT but keeps its BF16 attention
+    assert "vit_sage_attention" in DAD.passes
+    assert "vit_sage_attention" in LOMA_EXT.passes
 
 
 def test_platform_gate():
+    import importlib.util
     from types import SimpleNamespace
 
     gate = spec.SPEC_G.passes["vit_sage_attention"].requires
+    has_sage = importlib.util.find_spec("sageattention") is not None
     assert gate(SimpleNamespace(capability=(8, 6))) is False
-    assert gate(SimpleNamespace(capability=(12, 0))) is False
+    assert gate(SimpleNamespace(capability=(8, 9))) is has_sage
+    assert gate(SimpleNamespace(capability=(9, 0))) is has_sage
+    assert gate(SimpleNamespace(capability=(12, 0))) is has_sage
     assert gate(SimpleNamespace(capability=None)) is False

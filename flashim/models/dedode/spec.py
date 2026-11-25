@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import torch
@@ -107,7 +108,8 @@ def int8_decoder_producers(model: nn.Module, ctx: BuildContext) -> list[str] | s
         return "skipped: not int8"
     from flashim.quant.passes.separable_conv_block import fuse_int8_producers
 
-    return fuse_int8_producers(model, _DECODERS)
+    prefixes = tuple(f"{name}." for name, module in model.named_modules() if isinstance(module, blocks.ConvRefiner))
+    return fuse_int8_producers(model, prefixes) if prefixes else []
 
 
 def int8_refiner_input(model: nn.Module, ctx: BuildContext) -> list[str] | str:
@@ -209,11 +211,11 @@ def tensor_core_first_conv(model: nn.Module, ctx: BuildContext) -> list[str] | s
 
 
 def patch_embed_gemm(model: nn.Module, ctx: BuildContext) -> list[str] | str:
-    """int8: DINOv2's patch convolution + class token + positional embedding as one GEMM into the token buffer
+    """int8 / fp8: DINOv2's patch convolution + class token + positional embedding as one GEMM into the token buffer
     (``ops.patch_embed_tokens``; FP32 summation order differs from cuDNN's convolution). Only where the op has a kernel
-    (sm_89 / sm_90)."""
-    if ctx.config.precision.quant != "int8":
-        return "skipped: not int8"
+    (sm_89 / sm_90 / sm_120)."""
+    if ctx.config.precision.quant not in ("int8", "fp8"):
+        return "skipped: not quantized"
     found = []
     for name, module in model.named_modules():
         if isinstance(module, blocks.DinoV2) and module.patch_embed.proj.weight.dtype == torch.bfloat16:
@@ -256,8 +258,9 @@ VIT_EPILOGUE_PASSES = {
 
 
 # SageAttention impl per architecture (``flashim.backends.external.sageattention``): QK INT8 with per-warp scales, PV FP8.
-# sm_89 kernel on Ada, the WGMMA kernel on Hopper (the sm_89 kernel on an H20 is slower than cuDNN SDPA).
-_SAGE_IMPLS = {(8, 9): "sage-fp8-warp", (9, 0): "sage-fp8-sm90-warp"}
+# sm_89 kernel on Ada and consumer Blackwell (sm_120: 1.29 -> 0.66 ms per ViT-L/14 attention layer, 1.95x over FlashAttention),
+# the WGMMA kernel on Hopper (the sm_89 kernel on an H20 is slower than cuDNN SDPA).
+_SAGE_IMPLS = {(8, 9): "sage-fp8-warp", (9, 0): "sage-fp8-sm90-warp", (12, 0): "sage-fp8-warp"}
 VIT_SAGE_LAYERS = "2-23"
 
 
@@ -284,15 +287,15 @@ def _sage_platform(platform) -> bool:
 
 
 def _vit_sage_attention(model: nn.Module, ctx: BuildContext) -> list[str] | str:
-    """int8: SageAttention (QK INT8, PV FP8) on a subset of the DINOv2 blocks, the rest stay on torch SDPA. Option
+    """int8 / fp8: SageAttention (QK INT8, PV FP8) on a subset of the DINOv2 blocks, the rest stay on torch SDPA. Option
     ``optimize.options.vit_attention = {"layers": "2-23", "impl": "auto"}`` (``layers``: see :func:`parse_layers`, ``""``
     = none; ``impl``: an ``ops.sdpa`` impl name, ``auto`` = :data:`_SAGE_IMPLS` of the platform). Layers 0 and 1 stay
     out by default. Relative L2 error of the ViT output against the same ViT with FP32 attention in every layer (10
     MegaDepth images at 1200 px; the INT8 ViT with torch SDPA sits at 7.1e-2): sage on all 24 layers 8.2e-2 (L20) / 8.6e-2
     (H20), on layers 2-23 7.5e-2 / 7.4e-2; layers 0 and 1 alone give 8.0e-2 and 7.7e-2 on L20, any single later layer
     7.1-7.5e-2. Per-warp QK scales measured faster than per-thread at the same error class."""
-    if ctx.config.precision.quant != "int8":
-        return "skipped: not int8"
+    if ctx.config.precision.quant not in ("int8", "fp8"):
+        return "skipped: not quantized"
     dinov2 = getattr(getattr(model.descriptor, "encoder", None), "dinov2", None)
     if dinov2 is None:  # a VGG-only descriptor (LoMa-B128)
         return "skipped: no ViT"
@@ -306,11 +309,10 @@ def _vit_sage_attention(model: nn.Module, ctx: BuildContext) -> list[str] | str:
     return {"impl": impl, "layers": layers}
 
 
-# dedode-g only (dad shares the ViT but keeps its BF16 numerics).
 VIT_ATTENTION_PASSES = {
     "vit_sage_attention": Pass(
         _vit_sage_attention, requires=_sage_platform, exact=False,
-        description="int8: SageAttention (QK INT8 per warp, PV FP8) on DINOv2 blocks 2-23 (sm_89, sm_90)",
+        description="int8 / fp8: SageAttention (QK INT8 per warp, PV FP8) on DINOv2 blocks 2-23 (sm_89, sm_90, sm_120)",
     ),
 }
 
@@ -328,14 +330,42 @@ def _loader(variant: str):
     return load
 
 
-def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ...] = (), vit: str | None = None):
-    return extractor_spec(
+# Early VGG stem convs of DeDoDe-B's descriptor (64/128 ch) have sparse channel activity that shifts from MegaDepth
+# (outdoor calibration) to ScanNet (indoor): static per-tensor INT8 clips up to 2.96x (layers.3), 2.35x (layers.7),
+# and 2.43x (layers.10), and MegaDepth-calibrated SmoothQuant hurts ScanNet further. Keeping these three stem convs
+# BF16 restores ScanNet descriptor cosine (0.9941 -> 0.9975) and AUC@5 (-0.0093 -> +0.0011 PASS; MegaDepth -0.0022)
+# while 61/64 convs stay INT8 (30.37 vs 55.81 ms BF16, 1.84x).
+#
+# MXFP8 on DeDoDe-B (pure VGG19 + ConvRefiner, no DINOv2 ViT) is strictly Pareto-dominated by INT8: E4M3's 3-bit
+# mantissa floor drops MegaDepth-1500 AUC@5 by -0.0074 [-0.0137, -0.0011] even on dev (0.6090 vs 0.6164 bf16,
+# desc_cos 0.9861, 39.48 ms); ignoring the 3 descriptor stem convs still sits at -0.0045 [-0.0105, +0.0015] while
+# running 1.42x slower (43.26 vs 30.37 ms; 138.2 vs 95.4 s MegaDepth) and larger (27.9 vs 26.8 MB) than INT8, and
+# ignoring all 6 encoder stem convs slows it to 46.85 ms (1.54x slower than INT8). Omitting ``fp8`` from ``dedode``
+# lets ``build.NEAREST`` resolve ``fp8 -> int8`` (``dedode-g`` keeps ``fp8`` for its DINOv2 ViT-L/14).
+_DEDODE_B_INT8_IGNORE = (
+    "descriptor.encoder.layers.3",
+    "descriptor.encoder.layers.7",
+    "descriptor.encoder.layers.10",
+)
+
+
+def _spec(
+    name: str,
+    variant: str,
+    description: str,
+    int8_ignore: tuple[str, ...] = (),
+    int8_dynamic: tuple[str, ...] = (),
+    vit: str | None = None,
+    has_fp8: bool = True,
+):
+    spec = extractor_spec(
         name=name,
         description=description,
         load=_loader(variant),
         calibration_dir=Path(__file__).parent / "calibration",
         quantized=QUANTIZED,
         protected=PROTECTED,
+        int8_ignore=int8_ignore,
         int8_dynamic=int8_dynamic,
         compile_regions=("detector", "descriptor"),
         # BF16 extract at 1200 px, interleaved in one process (sm_120): dedode 128 -> 102 ms, dedode-g 184 -> 160 ms.
@@ -354,10 +384,21 @@ def _spec(name: str, variant: str, description: str, int8_dynamic: tuple[str, ..
             *(VIT_ATTENTION_PASSES if vit == "dedode-g" else ()),
         ),
     )
+    if not has_fp8:
+        spec = dataclasses.replace(
+            spec,
+            presets={k: v for k, v in spec.presets.items() if k != "fp8"},
+            quant_configs={k: v for k, v in spec.quant_configs.items() if k != "fp8"},
+            calibrations={k: v for k, v in spec.calibrations.items() if k != "fp8"},
+        )
+    return spec
 
 
 # One spec per descriptor: the two descriptors' layers differ in names and shapes, so each has its own calibration table.
-SPEC = _spec("dedode", "B", "DeDoDe v2 detector (L) + descriptor B (VGG19), dual-softmax matching")
+SPEC = _spec(
+    "dedode", "B", "DeDoDe v2 detector (L) + descriptor B (VGG19), dual-softmax matching",
+    int8_ignore=_DEDODE_B_INT8_IGNORE, has_fp8=False,
+)
 SPEC_G = _spec(
     "dedode-g", "G", "DeDoDe v2 detector (L) + descriptor G (VGG19 + DINOv2 ViT-L/14), dual-softmax matching",
     int8_dynamic=VIT_LINEARS, vit="dedode-g",

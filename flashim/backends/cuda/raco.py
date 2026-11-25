@@ -92,3 +92,63 @@ def _eligible(x: Tensor, cin: int, w1: Tensor, *_) -> bool:
 )
 def _resblock_impl(x: Tensor, cin: int, weights: Tensor, bias: Tensor) -> Tensor:
     return resblock(x, weights, bias)
+
+
+# -- fused detector score_head[2:] (``csrc/raco_score_head.cu``) -----------------------------------------
+
+
+def _score_head_library() -> ctypes.CDLL | None:
+    library = load("raco_score_head")
+    if library is not None and not getattr(library, "_flashim_ready", False):
+        library.launch_score_head.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int] * 3 + [ctypes.c_void_p]
+        library.launch_score_head.restype = ctypes.c_int
+        library._flashim_ready = True
+    return library
+
+
+def prepare_score_head(w1: Tensor, w2: Tensor, w3: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    return (
+        w1.detach().float().contiguous(),
+        w2.detach().float().contiguous(),
+        w3.detach().float().contiguous(),
+    )
+
+
+@torch.library.custom_op("flashim::raco_score_head_cuda", mutates_args=())
+def score_head(x: Tensor, w1: Tensor, w2: Tensor, w3: Tensor) -> Tensor:
+    """``x``: ``[B, 8, H, W]`` contiguous FP32 -> ``[B, 1, H, W]`` FP32."""
+    b, _, h, w = x.shape
+    out = torch.empty(b, 1, h, w, device=x.device, dtype=torch.float32)
+    code = _score_head_library().launch_score_head(
+        x.data_ptr(), out.data_ptr(), w1.data_ptr(), w2.data_ptr(), w3.data_ptr(), b, h, w,
+        torch.cuda.current_stream(x.device).cuda_stream,
+    )
+    if code != 0:
+        raise RuntimeError(f"raco_score_head launch failed (CUDA error {code}) for {tuple(x.shape)}")
+    return out
+
+
+@score_head.register_fake
+def _(x: Tensor, w1: Tensor, w2: Tensor, w3: Tensor) -> Tensor:
+    return x.new_empty(x.shape[0], 1, x.shape[2], x.shape[3], dtype=torch.float32)
+
+
+def _score_head_eligible(x: Tensor, w1: Tensor, w2: Tensor, w3: Tensor) -> bool:
+    return (
+        x.ndim == 4
+        and x.shape[1] == 8
+        and x.dtype == torch.float32
+        and x.is_contiguous()
+        and tuple(w1.shape) == (4, 8, 3, 3)
+        and tuple(w2.shape) == (4, 4, 3, 3)
+        and tuple(w3.shape) == (1, 4, 3, 3)
+        and _score_head_library() is not None
+    )
+
+
+@ops.raco_score_head.register(
+    "cuda", device=DeviceSpec("cuda"), requires=[Feature.NVCC], priority=1,
+    when=_score_head_eligible, prepare=prepare_score_head,
+)
+def _score_head_impl(x: Tensor, w1: Tensor, w2: Tensor, w3: Tensor) -> Tensor:
+    return score_head(x, w1, w2, w3)

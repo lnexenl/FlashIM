@@ -191,9 +191,15 @@ class RoMaV2(ImageMatcher, nn.Module):
     def _scale_factor(self, img: Tensor) -> Tensor:
         """``(W / anchor_W, H / anchor_H)`` of a stage's images, for the displacement embedding."""
         _, _, height, width = img.shape
-        scale_factor = torch.empty(2, device=img.device, dtype=img.dtype)
-        scale_factor[0].fill_(width / self.config.anchor_width)
-        scale_factor[1].fill_(height / self.config.anchor_height)
+        cache = self.__dict__.setdefault("_scale_factors", {})
+        key = (height, width, img.device, img.dtype)
+        scale_factor = cache.get(key)
+        if scale_factor is None:
+            scale_factor = torch.tensor(
+                [width / self.config.anchor_width, height / self.config.anchor_height],
+                device=img.device, dtype=img.dtype,
+            )
+            cache[key] = scale_factor
         return scale_factor
 
     def _fine_features(self, img_a: Tensor, img_b: Tensor) -> tuple[dict[int, Tensor], dict[int, Tensor]]:

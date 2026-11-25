@@ -80,17 +80,77 @@ deform_patches_int8 = Op("deform_patches_int8", _deform_patches_int8_reference)
 
 
 def _multiscale_fuse_reference(
-    f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, head_weight: Tensor | None = None, *, normalize: bool = True
+    f1: Tensor,
+    f2: Tensor,
+    f3: Tensor,
+    f4: Tensor,
+    head_weight: Tensor | None = None,
+    *,
+    normalize: bool = True,
+    selu_f1: bool = False,
 ) -> tuple[Tensor | None, Tensor | None]:
     """ALIKED's / RaCo's multi-scale feature fusion: ``fused = cat([f1, up(f2), up(f3), up(f4)])`` (bilinear,
     ``align_corners=True``, to ``f1``'s size), then ``head = selu(conv1x1(fused.float(), head_weight))`` (the score
     head's first layer, FP32; ``head_weight`` ``[8, 4C]``) and ``feature_map = F.normalize(fused, p=2, dim=1)`` in
-    ``f1``'s dtype. Either output can be skipped. See ``backends/triton/aliked.py`` for the fused kernel."""
+    ``f1``'s dtype. With ``selu_f1=True``, ``F.selu`` is applied to ``f1`` in registers (fusing RaCo's full-resolution
+    ``gate(conv1(x1))``). Either output can be skipped. See ``backends/triton/aliked.py`` for the fused kernel."""
     size = f1.shape[-2:]
+    v1 = F.selu(f1.float()) if selu_f1 else f1.float()
     upsampled = [F.interpolate(f.float(), size=size, mode="bilinear", align_corners=True) for f in (f2, f3, f4)]
-    fused = torch.cat([f1.float(), *upsampled], dim=1)
+    fused = torch.cat([v1, *upsampled], dim=1)
     head = None if head_weight is None else F.selu(F.conv2d(fused, head_weight[:, :, None, None]))
     return head, (F.normalize(fused, p=2, dim=1).to(f1.dtype) if normalize else None)
 
 
 multiscale_fuse = Op("multiscale_fuse", _multiscale_fuse_reference)
+
+
+def _aliked_score_head_reference(
+    head: Tensor, w1: Tensor, w2: Tensor, w3: Tensor, *, apply_sigmoid: bool = True
+) -> Tensor:
+    """ALIKED's ``score_head[2:]``: ``conv3x3(8->4) -> SELU -> conv3x3(4->4) -> SELU -> conv3x3(4->1)``
+    (all bias-free FP32, padding=1), optionally followed by ``sigmoid``."""
+    x = F.selu(F.conv2d(head.float(), w1.float(), padding=1))
+    x = F.selu(F.conv2d(x, w2.float(), padding=1))
+    x = F.conv2d(x, w3.float(), padding=1)
+    return torch.sigmoid(x) if apply_sigmoid else x
+
+
+aliked_score_head = Op("aliked_score_head", _aliked_score_head_reference)
+
+
+def _aliked_sample_patches_reference(features: Tensor, corners: Tensor, size: int) -> Tensor:
+    """``size x size`` integer-pixel patches of ``features`` ``[C, H, W]`` centered near ``corners`` ``[N, 2]``
+    ``(x, y)`` (clamped to ``[0, W-1-size] x [0, H-1-size]``) -> ``[N, C, size, size]``."""
+    c, h, w = features.shape
+    if corners.shape[0] == 0:
+        return features.new_empty(0, c, size, size)
+    corner = (corners - size / 2 + 1).long()
+    corner[:, 0] = corner[:, 0].clamp(min=0, max=w - 1 - size)
+    corner[:, 1] = corner[:, 1].clamp(min=0, max=h - 1 - size)
+    offset = torch.arange(size, device=features.device)
+    x, y = torch.meshgrid(offset, offset, indexing="ij")
+    patches = torch.stack((x, y)).permute(2, 1, 0).unsqueeze(2).to(corner) + corner[None, None]
+    pts = patches.reshape(-1, 2)
+    sampled = features.permute(1, 2, 0)[tuple(pts.T)[::-1]]
+    return sampled.reshape(size, size, -1, c).permute(2, 3, 0, 1)
+
+
+aliked_sample_patches = Op("aliked_sample_patches", _aliked_sample_patches_reference)
+
+
+def _aliked_bilinear_sample_reference(features: Tensor, pos: Tensor) -> Tensor:
+    """Bilinear sample (``align_corners=True``, zero padding) of ``features`` ``[C, H, W]`` at pixel coordinates
+    ``pos`` ``[M, 2]`` ``(x, y)`` in ``[0, W-1] x [0, H-1]`` -> ``[M, C]`` in ``features.dtype`` (computed in FP32)."""
+    from flashim.utils import device_constant
+
+    c, h, w = features.shape
+    if pos.shape[0] == 0:
+        return features.new_empty(0, c)
+    wh = device_constant([w - 1, h - 1], features, torch.float32)
+    grid = (2.0 * pos.float() / wh - 1.0).reshape(1, pos.shape[0], 1, 2)
+    out = F.grid_sample(features.float().unsqueeze(0), grid, mode="bilinear", align_corners=True)  # [1, C, M, 1]
+    return out[0, :, :, 0].t().contiguous().to(features.dtype)
+
+
+aliked_bilinear_sample = Op("aliked_bilinear_sample", _aliked_bilinear_sample_reference)

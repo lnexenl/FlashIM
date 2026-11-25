@@ -17,6 +17,132 @@ the vendor, the dispatch key and the ISA features.
 
 Other architectures (sm_103, sm_110, sm_121) use the default configs.
 
+## Test status by hardware
+
+What was actually run where, per model. The table above says what is tuned; this one says what is verified.
+
+| mark | meaning |
+|---|---|
+| ✅ | tested on this hardware and passes: the parity test and the unit / op tests, and for quantized presets the task-level AUC gate had no FAIL |
+| ❌ | tested on this hardware and fails |
+| 🔍 | needs further inspection: only compile-checked, tuned but without a recorded per-model validation, or the test was inconclusive |
+| ➖ | not tested |
+
+The only GPU that runs the full test suite and the accuracy runs is the sm_120 one (RTX 5070 Ti). Recorded results on other
+GPUs are LoMa's accuracy gate on L20 and H20 ([loma.md](models/loma.md)) and the INT8 / FP8-fallback runs on Jetson AGX Orin;
+everything else on them is compile-checked or tuned, not validated.
+
+| model | sm_120 RTX 5070 Ti | sm_100 | sm_90 H20 | sm_89 L20 | sm_87 Orin | sm_80 / sm_86 |
+|---|---|---|---|---|---|---|
+| **added 2026-11** | | | | | | |
+| `roma`, `roma-indoor`, `minima-roma` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
+| `tiny-roma` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
+| `mast3r`, `dust3r` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
+| `ufm` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
+| `eloftr`, `xoftr`, `minima-loftr` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
+| `superglue`, `superpoint-superglue` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
+| `omniglue` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
+| **before 2026-11** | | | | | | |
+| `romav2` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
+| `rdd`, `rdd-lightglue` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
+| `aliked`, `raco`, `raco-aliked`, `aliked-lightglue`, `raco-aliked-lightglue` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
+| `superpoint`, `alike`, `disk`, `xfeat`, `dedode`, `dedode-g`, `dad`, `ripe`, `superpoint-lightglue`, `disk-lightglue`, `xfeat-lightglue` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
+| `loftr` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
+| `loma-*` | ✅ | 🔍 | ✅ | ✅ | 🔍 | ➖ |
+| `sift`, `orb` | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
+
+- **Models added 2026-11 on sm_120**: parity test against the upstream code, unit and op tests, and the accuracy gate on
+  MegaDepth-1500 and ScanNet-1500 (1500 pairs each; 0 FAIL, details in the next table and in [benchmarks.md](benchmarks.md#accuracy-of-the-2026-11-additions)).
+- **Models added 2026-11 on sm_80 / 89 / 90 / 100**: their new Triton / CUDA kernels were compiled for these architectures, not run.
+- **LoMa on sm_89 / sm_90**: the INT8 pipeline passes the gate (AUC@5 vs `bf16` -0.30 to -0.10 on L20, -0.09 to +0.23 on H20
+  over the five variants, gate 0.5 points on 1500 pairs; `loma-l` needs a per-variant extractor overlay on L20).
+- **Jetson AGX Orin (sm_87)**: the INT8 path runs and `fp8` builds `int8`; no per-model accuracy runs are recorded.
+- **sm_80 / sm_86**: not run; they share the `mma.sync` path that runs on sm_87.
+
+### Accuracy gate of the 2026-11 models on sm_120
+
+AUC@5 of the quantized preset against the same model's `bf16`, on both datasets: ✅ every cell passes (95% CI above -0.005),
+🔍 inconclusive on at least one dataset (the CI straddles -0.005; 1500 pairs resolve about +-0.005), ❌ fails. No cell fails.
+`➡️ int8`: the pipeline has no `fp8` preset and builds `int8`, because MXFP8 lost accuracy in its extractor.
+
+| model | int8 | fp8 |
+|---|---|---|
+| `roma, roma-indoor` | ✅ | ✅ |
+| `tiny-roma` | 🔍 | 🔍 |
+| `minima-roma` | ✅ | 🔍 |
+| `mast3r` | 🔍 | ✅ |
+| `dust3r` | 🔍 | 🔍 |
+| `ufm` | 🔍 | 🔍 |
+| `eloftr` | ✅ | ✅ |
+| `xoftr` | ✅ | ✅ |
+| `minima-loftr` | ✅ | 🔍 |
+| `superpoint-superglue` | 🔍 | ➡️ int8 |
+| `omniglue` | 🔍 | ➡️ int8 |
+
+### Accuracy gate of the pre-2026-11 models on sm_120
+
+Same protocol as above on MegaDepth-1500 and ScanNet-1500 (1500 pairs each, 3 seeds 17/29/42, poselib 1.0 px, paired
+bootstrap 95% CI vs `dev bf16` with `-0.005` gate; `romav2` uses `engine="compile"`, all others `eager`):
+**84 PASS, 42 BORDERLINE (🔍), 0 FAIL** across all 126 `(model, preset, dataset)` cells. `➡️ int8` / `➡️ bf16` mark
+presets omitted and resolved via `build.NEAREST`; `—` means the model only defines `fp32` / `bf16`.
+
+| model | bf16 | int8 | fp8 |
+|---|---|---|---|
+| `romav2` | ✅ | 🔍 | 🔍 |
+| `rdd` | ✅ | — | ✅ |
+| `aliked`, `raco-aliked` | ✅ | — | — |
+| `superpoint` | 🔍 | 🔍 | 🔍 |
+| `xfeat` | ✅ | 🔍 | ✅ |
+| `alike` | ✅ | ✅ | 🔍 |
+| `disk` | ✅ | ✅ | 🔍 |
+| `dedode` | ✅ | 🔍 | ➡️ int8 |
+| `dedode-g` | ✅ | 🔍 | 🔍 |
+| `dad` | ✅ | ✅ | 🔍 |
+| `ripe` | ✅ | 🔍 | 🔍 |
+| `loftr` | ✅ | ✅ | 🔍 |
+| `rdd-lightglue` | ✅ | 🔍 | 🔍 |
+| `aliked-lightglue` | ✅ | ✅ | ➡️ int8 |
+| `raco-aliked-lightglue` | ✅ | ✅ | ✅ |
+| `superpoint-lightglue` | ✅ | 🔍 | ➡️ int8 |
+| `disk-lightglue` | 🔍 | 🔍 | ➡️ int8 |
+| `xfeat-lightglue` | ✅ | ➡️ bf16 | ➡️ bf16 |
+| `loma-b128`, `loma-b`, `loma-l`, `loma-g`, `loma-r` | ✅¹ | 🔍 | 🔍 |
+| `orb`, `sift` (`fp32`) | ✅ | — | — |
+
+¹ `loma-r bf16` MegaDepth is 🔍 (`-0.0026 [-0.0051, -0.0000]`) in `perf` before unbatching `CrossBlock` FFN; `loma-b128 bf16`
+re-verified bit-exact (`+0.0000`) on both datasets after `e03fbe8`.
+
+### Known failing checks on sm_120
+
+- 🔍 `tests/parity/test_lightglue_parity.py::test_reduced_precision_tracks_fp32[fp8]` is an expected failure (MXFP8 noise at its
+  0.9 threshold).
+
+On RTX 5070 Ti (`sm_120`, `FLASHIM_IMAGE_DECODER=pil`), the full test suite passes all 96 test files (**1,842 passed, 24
+skipped, 1 expected xfail, 0 failed**), including `tests/ops/test_depthwise_cuda.py` (`51/51` passing after sweeping
+`sm_120` tile tables). All 44 `(model, preset)` configs of the 2026-11 additions were also checked against the base tree
+via `benchmarks/profile/output_hashes.py`: 31 bit-identical, 8 keypoint-identical with `<= 1.88e-6` FP32 confidence diff
+from 2-pass `ops.dual_softmax_mutual`, and 5 with `<= 1` BF16 ULP reduction-order differences from `cublas`
+`patch_embed_tokens` / Triton `conv3x3_small_cin_relu`.
+
+### Kernels enabled on sm_120 (and compile-checked architectures)
+
+- **Enabled and verified on `sm_120` (RTX 5070 Ti)**:
+  - Previously `sm_89`/`sm_90`-only kernels now measured and enabled on `sm_120`: CUDA C++ `depthwise.cu`
+    (`PRODUCER_TILE`, `DWPW_TILE`, `cuda_composite`), `upsample_concat_int8` / `upsample_add` `triton_rows`,
+    `conv2d_small_cin_quantize_int8`, cuBLAS `patch_embed_tokens`, exact `layernorm_quantize_int8_rows` /
+    `layernorm_gelu_quantize_int8`, 2-pass `dual_softmax_mutual`, INT8 / MXFP8 conv chaining (`QUANT_OUT`), and DINOv2 /
+    matcher SageAttention (`sage-fp8`, `sage-fp8-warp`).
+  - New CUDA C++ (`ops.simple_nms`, `ops.aliked_score_head`, `ops.raco_score_head`) and Triton (`ops.hamming_distances`,
+    `ops.hamming_ratio_mutual_match`, `ops.ratio_mutual_match`, `ops.conv3x3_small_cin_relu`,
+    `ops.int8_conv2d_maxpool_only`, `ops.multiscale_score`, `ops.instance_norm_prelu`, `ops.rgb_mean_instance_norm`,
+    `ops.conv2d_at_points`, `ops.strict_nms_mask`, `ops.bilinear_sample_points`, `ops.mutual_nn_match`,
+    `ops.quantize_int8_rows_heads`, `ops.gelu_quantize_int8_rows`, exact 2x BF16 `upsample_concat` `triton_rows`,
+    `ops.aliked_sample_patches`, `ops.aliked_bilinear_sample`, `ops.elu_linear_attention`) kernels.
+- **Compile-checked only**: the new CUDA C++ kernels and `ops.elu_linear_attention` were compile-checked for `sm_80`,
+  `sm_89`, `sm_90a`, and `sm_100a` without running on hardware. Capability-tuned ops explicitly gate on measured
+  capabilities (`(8, 9)`, `(9, 0)`, `(12, 0)`), so unmeasured architectures (`sm_100`, `sm_110`) intentionally keep safe
+  fallbacks.
+
 ## FP8 presets
 
 | arch | how an FP8 preset runs |

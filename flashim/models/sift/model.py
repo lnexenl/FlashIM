@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from flashim import ops
 from flashim.models import sparse
 from flashim.types import Matches, SparseFeatures
 from flashim.utils import import_cv2
@@ -23,14 +24,7 @@ def gray_uint8(image: Tensor) -> np.ndarray:
 
 def ratio_mutual_match(dist: Tensor, ratio: float) -> tuple[Tensor, Tensor, Tensor]:
     """``dist`` ``[N, M]`` (smaller = closer): mutual nearest neighbours passing ``d1 < ratio * d2``."""
-    if dist.shape[0] == 0 or dist.shape[1] < 2:
-        empty = torch.empty(0, dtype=torch.long, device=dist.device)
-        return empty, empty, dist.new_empty(0)
-    best, index = dist.topk(2, dim=1, largest=False)
-    ids = torch.arange(dist.shape[0], device=dist.device)
-    keep = (best[:, 0] < ratio * best[:, 1]) & (dist.argmin(dim=0)[index[:, 0]] == ids)
-    ia, ib = ids[keep], index[keep, 0]
-    return ia, ib, 1.0 - best[keep, 0] / best[keep, 1]
+    return ops.ratio_mutual_match(dist, ratio)
 
 
 class SIFT(sparse.SparseExtractor):
@@ -44,6 +38,7 @@ class SIFT(sparse.SparseExtractor):
         super().__init__()
         import_cv2()  # fail at load time, not at the first match
         self.contrast_threshold, self.edge_threshold, self.sigma = contrast_threshold, edge_threshold, sigma
+        self._detectors: dict[int, object] = {}
         self.register_buffer("_device_anchor", torch.zeros(()), persistent=False)  # carries the device of matching
 
     @classmethod
@@ -56,19 +51,24 @@ class SIFT(sparse.SparseExtractor):
     def device(self) -> torch.device:
         return self._device_anchor.device
 
-    def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
-        cv2 = import_cv2()
+    def _detector(self, nfeatures: int):
+        sift = self._detectors.get(nfeatures)
+        if sift is None:
+            cv2 = import_cv2()
+            sift = cv2.SIFT_create(
+                nfeatures=nfeatures, contrastThreshold=self.contrast_threshold, edgeThreshold=self.edge_threshold, sigma=self.sigma
+            )
+            self._detectors[nfeatures] = sift
+        return sift
 
-        sift = cv2.SIFT_create(
-            nfeatures=top_k or 0, contrastThreshold=self.contrast_threshold, edgeThreshold=self.edge_threshold, sigma=self.sigma
-        )
-        keypoints, descriptors = sift.detectAndCompute(gray_uint8(image), None)
+    def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
+        keypoints, descriptors = self._detector(top_k or 0).detectAndCompute(gray_uint8(image), None)
         if not keypoints:
             return image.new_zeros(0, 2), image.new_zeros(0), image.new_zeros(0, 128)
-        xy = torch.tensor([kp.pt for kp in keypoints], dtype=torch.float32, device=image.device)
-        scores = torch.tensor([kp.response for kp in keypoints], dtype=torch.float32, device=image.device)
+        kpt_arr = np.array([(kp.pt[0], kp.pt[1], kp.response) for kp in keypoints], dtype=np.float32)
+        kpt_t = torch.from_numpy(kpt_arr).to(image.device)
         desc = torch.from_numpy(descriptors).to(image.device)
-        return xy, scores, torch.nn.functional.normalize(desc, dim=-1)
+        return kpt_t[:, :2].contiguous(), kpt_t[:, 2].contiguous(), torch.nn.functional.normalize(desc, dim=-1)
 
     @torch.inference_mode()
     def match_features(self, a: SparseFeatures, b: SparseFeatures, threshold: float | None = None) -> Matches:

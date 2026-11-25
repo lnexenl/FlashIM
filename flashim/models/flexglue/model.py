@@ -50,7 +50,23 @@ def cell_centers(h: int, w: int, scale: tuple, device: torch.device) -> Tensor:
 
 def sample_features(features: Tensor, points_n: Tensor) -> Tensor:
     """Bilinearly sample ``(B, C, H, W)`` features at points ``(B, N, 2)`` in ``[-1, 1]`` -> ``(B, N, C)``."""
-    return ops.bilinear_sample_border(features, points_n)
+    if features.shape[0] == 1:
+        return ops.bilinear_sample_points(
+            (features,), points_n[0], align_corners=False, padding_mode="border", out_dtype=features.dtype
+        ).unsqueeze(0)
+    return torch.stack(
+        [
+            ops.bilinear_sample_points(
+                (features[b : b + 1],),
+                points_n[b],
+                align_corners=False,
+                padding_mode="border",
+                out_dtype=features.dtype,
+            )
+            for b in range(features.shape[0])
+        ],
+        dim=0,
+    )
 
 
 def rotate_half(x: Tensor) -> Tensor:
@@ -103,7 +119,7 @@ def _post_attention_ffn(
             msg_bias = None if proj.bias is None else proj.bias[: proj.out_features]
             f0_in = ops.layernorm_cat_quantize_mxfp8(
                 x, msg, message_norm.weight, message_norm.bias, message_norm.eps, first.input_exponent,
-                msg_bias=msg_bias,
+                input_bias=msg_bias,
             )
             hidden = first.matmul(f0_in, bias=False)
             f0_bias = None if first.bias is None else first.bias[: first.out_features]
@@ -481,7 +497,7 @@ class FlexGlue(ImageMatcher, nn.Module):
         # matches will use (upstream's ``pair_context``), so ``is_covisible`` is never stale
         if layer == cfg.num_layers or score is None:
             score = self.covisibility_score(x0, x1, layer)
-        # Keep channels-last layout (x0 is already [B, H*W, C]) so bilinear_sample_border and to_search read coalesced.
+        # Keep channels-last layout (x0 is already [B, H*W, C]) so bilinear_sample_points and to_search read coalesced.
         cf0 = x0.float().unflatten(1, f0.shape[-2:]).permute(0, 3, 1, 2)
         cf1 = x1.float().unflatten(1, f1.shape[-2:]).permute(0, 3, 1, 2)
         return layer, score, cf0, cf1
@@ -567,26 +583,22 @@ class FlexGlue(ImageMatcher, nn.Module):
         descriptor's resized pixel frame (upstream's ``sparse_matches`` / ``gate_points``)."""
         cfg = self.config
         valids = [inside[i] & is_covisible[0] for i in (0, 1)]
-        # mutual NN on the bidirectional warp in one GEMM, centered on each resized image for fp32 precision
+        # mutual NN on the bidirectional warp, centered on each resized image for fp32 precision
         c0, c1 = resized_wh[0][0] / 2, resized_wh[1][0] / 2
         x = torch.cat([p2d_r[0] - c1, kpts_r[0] - c0], -1)
         y = torch.cat([kpts_r[1] - c1, p2d_r[1] - c0], -1)
-        m0, _ = ops.mutual_nn_sqdist(x.float(), y.float())
-
-        def take(t, m):
-            return t.gather(0, m.clamp(0)[:, None].expand(-1, 2))
-
-        m0c = m0.clamp(0)
-        dist0 = 0.5 * (
-            (p2d_r[0] - take(kpts_r[1], m0c)).norm(dim=-1) + (kpts_r[0] - take(p2d_r[1], m0c)).norm(dim=-1)
+        # Swap (y, x) so reciprocal_nn returns (ib, ia) sorted by ia (matching nonzero(valid0)).
+        ib_cand, ia_cand = ops.reciprocal_nn(y.float(), x.float())
+        dist = 0.5 * (
+            (p2d_r[0][ia_cand] - kpts_r[1][ib_cand]).norm(dim=-1)
+            + (kpts_r[0][ia_cand] - p2d_r[1][ib_cand]).norm(dim=-1)
         )
-        scores0 = (conf[0] * conf[1].gather(0, m0c)).sqrt()
-        valid0 = (m0 > -1) & (scores0 >= threshold) & valids[0] & valids[1].gather(0, m0c)
+        scores = (conf[0][ia_cand] * conf[1][ib_cand]).sqrt()
+        keep = (scores >= threshold) & valids[0][ia_cand] & valids[1][ib_cand]
         if cfg.max_distance_px > 0:  # dist in resized pixels of the (shared) descriptor frame
-            valid0 &= dist0 < cfg.max_distance_px
-        ia = torch.nonzero(valid0)[:, 0]
-        ib = m0[ia]
-        return Matches(kpts[0][ia], kpts[1][ib], scores0[ia], ia, ib)
+            keep &= dist < cfg.max_distance_px
+        ia, ib = ia_cand[keep], ib_cand[keep]
+        return Matches(kpts[0][ia], kpts[1][ib], scores[keep], ia, ib)
 
     def _match(self, img_a: ImageLike, img_b: ImageLike, *, resize: int | None, max_matches: int | None,
                threshold: float | None, generator: torch.Generator | None = None) -> Matches:

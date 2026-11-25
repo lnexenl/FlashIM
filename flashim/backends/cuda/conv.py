@@ -30,7 +30,7 @@ from torch import Tensor
 from flashim import ops
 from flashim.backends.cuda import load
 from flashim.ops._registry import DeviceSpec
-from flashim.platforms import Feature
+from flashim.platforms import Feature, platform_for
 
 _DTYPES = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
 MAX_CHANNELS = 256
@@ -104,14 +104,18 @@ def _conv2d_single_output_impl(x: Tensor, weight: Tensor, bias: Tensor | None) -
 #: DeDoDe's real shapes at 1200 px (512 x 112 x 150, 256 x 224 x 300, 768 x 64 x 84, and the odd-width dedode-g ones),
 #: 54 tiles: all bit-identical to Triton; (4, 8) won on both GPUs, ``CY`` (column groups per CTA) 2 on the L20 and 1 on
 #: the H20, within 1% of CY 4 (the tile LoMa's prototype used).
-PRODUCER_TILE = {(8, 9): (4, 8, 2), (9, 0): (4, 8, 1)}
+PRODUCER_TILE = {(8, 9): (4, 8, 2), (9, 0): (4, 8, 1), (12, 0): (4, 8, 2)}
 #: ``(COLS, TH, NG)`` of the fused BF16 block per capability and channel count (same sweeps, 5 tiles x 2 occupancy caps,
 #: all bit-identical to Triton). The L20 is DRAM-bound on the full-resolution 32 / 64-channel blocks (every tile within
 #: 3% of the best, ~10% over Triton there); one tile for every channel count is within 0.3% of the per-shape best.
+#: sm_120 (RTX 5070 Ti): 1.17-1.29x vs Triton on 32-ch (RoMaV2/DeDoDe), 1.52x on 64-ch, 1.39x on 128-ch;
+#: producer 2.3-3.7x over TileLang and 2.1-2.8x over Triton, bit-identical.
 DWPW_TILE = {
     (8, 9): {32: (4, 4, 4), 64: (4, 4, 4), 128: (4, 4, 4)},
     (9, 0): {32: (4, 8, 4), 64: (4, 8, 4), 128: (4, 8, 8)},
+    (12, 0): {32: (4, 4, 4), 64: (4, 4, 4), 128: (4, 8, 8)},
 }
+_MEASURED_CAPABILITIES = ((8, 9), (9, 0), (12, 0))
 _DWPW_CHANNELS = (32, 64, 128)
 _GRID_LIMIT = 65535
 
@@ -164,6 +168,8 @@ def _(value: Tensor, weight: Tensor, bias: Tensor, scale: Tensor) -> Tensor:
 def _producer_eligible(value: Tensor, weight: Tensor, bias: Tensor, scale: Tensor) -> bool:
     if value.ndim != 4 or value.dtype != torch.bfloat16 or value.shape[1] % 64:
         return False
+    if platform_for(value.device).capability not in _MEASURED_CAPABILITIES:
+        return False
     batch, channels, height, _ = value.shape
     return (
         value.is_contiguous(memory_format=torch.channels_last)
@@ -177,6 +183,8 @@ def _producer_eligible(value: Tensor, weight: Tensor, bias: Tensor, scale: Tenso
 
 def _dwpw_eligible(value: Tensor, dw_weight: Tensor, dw_bias: Tensor, pw_weight: Tensor, pw_bias: Tensor) -> bool:
     if value.ndim != 4 or value.dtype != torch.bfloat16 or value.shape[1] not in _DWPW_CHANNELS:
+        return False
+    if platform_for(value.device).capability not in _MEASURED_CAPABILITIES:
         return False
     batch, channels, height, _ = value.shape
     return (
@@ -225,9 +233,9 @@ def _(value: Tensor, dw_weight: Tensor, dw_bias: Tensor, pw_weight: Tensor, pw_b
     return value.new_empty((batch, height, width, channels), dtype=torch.bfloat16)
 
 
-# sm_89 (L20) and sm_90 (H20): the architectures this was measured on. Compiled for sm_80 / 86 / 87 / 100 / 120 but not
-# run there, so those keep their Triton / TileLang impls.
-_MEASURED = DeviceSpec("cuda", min_capability=(8, 9), max_capability=(9, 0))
+# sm_89 (L20), sm_90 (H20), and sm_120 (RTX 5070 Ti): the architectures this was measured on (checked explicitly
+# via _MEASURED_CAPABILITIES in _producer_eligible / _dwpw_eligible so unmeasured sm_100/sm_110 keep their fallback).
+_MEASURED = DeviceSpec("cuda", min_capability=(8, 9), max_capability=(12, 0))
 
 
 @ops.depthwise5x5_relu_int8.register("cuda", device=_MEASURED, requires=[Feature.NVCC], priority=2, when=_producer_eligible)
@@ -242,3 +250,24 @@ def _depthwise5x5_relu_pointwise_impl(
     value: Tensor, dw_weight: Tensor, dw_bias: Tensor, pw_weight: Tensor, pw_bias: Tensor
 ) -> Tensor:
     return _depthwise5x5_relu_pointwise(value, dw_weight, dw_bias, pw_weight, pw_bias).permute(0, 3, 1, 2)
+
+
+# On sm_120 the CUDA depthwise producer + Triton INT8 GEMM beats triton_fused on RoMaV2's 128-ch stride-2 blocks
+# (2x128x400x400: 0.344 -> 0.304 ms, 2x128x512x512: 0.547 -> 0.505 ms; RoMaV2 int8 -4.2 ms, bit-identical).
+@ops.depthwise5x5_relu_pointwise_int8.register(
+    "cuda_composite",
+    device=DeviceSpec("cuda", min_capability=(12, 0), max_capability=(12, 0)),
+    requires=[Feature.NVCC, Feature.TRITON],
+    priority=1,
+    when=lambda value, dw_weight, dw_bias, pw_weight, pw_wscale, pw_bias, scale: _producer_eligible(
+        value, dw_weight, dw_bias, scale
+    ),
+)
+def _depthwise5x5_relu_pointwise_int8_cuda(
+    value: Tensor, dw_weight: Tensor, dw_bias: Tensor, pw_weight: Tensor, pw_wscale: Tensor, pw_bias: Tensor,
+    scale: Tensor,
+) -> Tensor:
+    batch, channels, height, width = value.shape
+    quantized = ops.depthwise5x5_relu_int8(value, dw_weight, dw_bias, scale)
+    out = ops.int8_linear(quantized, pw_weight, scale, pw_wscale, pw_bias)
+    return out.reshape(batch, height, width, channels).permute(0, 3, 1, 2)
