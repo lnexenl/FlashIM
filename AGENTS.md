@@ -15,9 +15,9 @@ planned) and **quantization** (MXFP8, INT8). Models are native PyTorch ports ver
 - Python is `.venv/bin/python` (torch 2.11, triton 3.6). **Never run Python from inside `flashim/`**: `flashim/types.py`
   shadows the stdlib `types`. A worktree without a `.venv` runs the main checkout's interpreter with `PYTHONPATH=<worktree>`.
 - Tests: `.venv/bin/python -m pytest -q -p no:cacheprovider tests` (several minutes with a GPU; without one add
-  `-m "not cuda"`). Markers: `cuda`, `sm120`, `weights`, `oracle`, `slow`. Known failures (2026-11): all of
-  `tests/ops/test_depthwise_cuda.py` on `dev`; `tests/parity/test_lightglue_parity.py::test_reduced_precision_tracks_fp32[fp8]`
-  is an xfail.
+  `-m "not cuda"`). Markers: `cuda`, `sm120`, `weights`, `oracle`, `slow`. Known xfails (2026-11):
+  `tests/parity/test_lightglue_parity.py::test_reduced_precision_tracks_fp32[fp8]` is an expected xfail
+  (`tests/ops/test_depthwise_cuda.py` passes all 51 tests on `sm_120`).
 - Lint: `.venv/bin/ruff check <files you changed>` (line length 110). **Only `--fix` files you changed**: a directory `--fix`
   once rewrote the user's uncommitted files.
 - Use a model: `flashim.load(name, preset)` then `model.match(a, b)`; `flashim.available_models()` lists the names.

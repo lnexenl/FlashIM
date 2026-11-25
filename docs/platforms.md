@@ -117,6 +117,32 @@ re-verified bit-exact (`+0.0000`) on both datasets after `e03fbe8`.
 - 🔍 `tests/parity/test_lightglue_parity.py::test_reduced_precision_tracks_fp32[fp8]` is an expected failure (MXFP8 noise at its
   0.9 threshold).
 
+On RTX 5070 Ti (`sm_120`, `FLASHIM_IMAGE_DECODER=pil`), the full test suite passes all 96 test files (**1,842 passed, 24
+skipped, 1 expected xfail, 0 failed**), including `tests/ops/test_depthwise_cuda.py` (`51/51` passing after sweeping
+`sm_120` tile tables). All 44 `(model, preset)` configs of the 2026-11 additions were also checked against the base tree
+via `benchmarks/profile/output_hashes.py`: 31 bit-identical, 8 keypoint-identical with `<= 1.88e-6` FP32 confidence diff
+from 2-pass `ops.dual_softmax_mutual`, and 5 with `<= 1` BF16 ULP reduction-order differences from `cublas`
+`patch_embed_tokens` / Triton `conv3x3_small_cin_relu`.
+
+### Kernels enabled on sm_120 (and compile-checked architectures)
+
+- **Enabled and verified on `sm_120` (RTX 5070 Ti)**:
+  - Previously `sm_89`/`sm_90`-only kernels now measured and enabled on `sm_120`: CUDA C++ `depthwise.cu`
+    (`PRODUCER_TILE`, `DWPW_TILE`, `cuda_composite`), `upsample_concat_int8` / `upsample_add` `triton_rows`,
+    `conv2d_small_cin_quantize_int8`, cuBLAS `patch_embed_tokens`, exact `layernorm_quantize_int8_rows` /
+    `layernorm_gelu_quantize_int8`, 2-pass `dual_softmax_mutual`, INT8 / MXFP8 conv chaining (`QUANT_OUT`), and DINOv2 /
+    matcher SageAttention (`sage-fp8`, `sage-fp8-warp`).
+  - New CUDA C++ (`ops.simple_nms`, `ops.aliked_score_head`, `ops.raco_score_head`) and Triton (`ops.hamming_distances`,
+    `ops.hamming_ratio_mutual_match`, `ops.ratio_mutual_match`, `ops.conv3x3_small_cin_relu`,
+    `ops.int8_conv2d_maxpool_only`, `ops.multiscale_score`, `ops.instance_norm_prelu`, `ops.rgb_mean_instance_norm`,
+    `ops.conv2d_at_points`, `ops.strict_nms_mask`, `ops.bilinear_sample_points`, `ops.mutual_nn_match`,
+    `ops.quantize_int8_rows_heads`, `ops.gelu_quantize_int8_rows`, exact 2x BF16 `upsample_concat` `triton_rows`,
+    `ops.aliked_sample_patches`, `ops.aliked_bilinear_sample`, `ops.elu_linear_attention`) kernels.
+- **Compile-checked only**: the new CUDA C++ kernels and `ops.elu_linear_attention` were compile-checked for `sm_80`,
+  `sm_89`, `sm_90a`, and `sm_100a` without running on hardware. Capability-tuned ops explicitly gate on measured
+  capabilities (`(8, 9)`, `(9, 0)`, `(12, 0)`), so unmeasured architectures (`sm_100`, `sm_110`) intentionally keep safe
+  fallbacks.
+
 ## FP8 presets
 
 | arch | how an FP8 preset runs |

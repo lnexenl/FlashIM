@@ -18,12 +18,19 @@ to single models only. Everything model-specific (`arch.setting`, `variant`, `ch
 
 ## Presets
 
-Every model's presets are among `fp32` (checkpoint precision, the upstream numerics), `bf16`, `int8` (static INT8) and
-`fp8` (static MXFP8). A model without the one asked for builds the nearest it has, in the order `fp8` -> `int8` -> `bf16`
--> `fp32` (`fp32` -> `bf16`): RoMaV2 has no `fp32`, RDD no `int8`, ALIKED and RaCo neither `int8` nor `fp8`, SIFT and ORB
-only `fp32`. A pipeline's preset is each component's, and each builds its own nearest one: `aliked-lightglue` `int8` runs
-ALIKED in `bf16` and LightGlue in `int8`. On a GPU without FP8 `fp8` is replaced the same way ([platforms.md](platforms.md)).
-What was replaced is logged and listed in `model.build_report.fallbacks`; `optimize.strict=true` raises instead.
+Every model's presets are among `fp32` (checkpoint precision, the upstream numerics), `bf16`, `int8` (static per-tensor
+or per-token dynamic INT8) and `fp8` (static MXFP8). A model without the one asked for builds the nearest it has, in the
+order `fp8` -> `int8` -> `bf16` -> `fp32` (`fp32` -> `bf16`):
+
+- `romav2` has no `fp32`; `rdd` has no `int8`; `aliked`, `raco` and `raco-aliked` have neither `int8` nor `fp8`; `sift` and `orb` have only `fp32`.
+- Presets omitted because quantization lost pose AUC or was dominated by the fallback: `dedode`, `aliked-lightglue`,
+  `superpoint-lightglue`, `disk-lightglue`, `superpoint-superglue`, `superglue`, `omniglue` and `omniglue-matcher` omit
+  `fp8` (`fp8` -> `int8`); `xfeat-lightglue` omits both `int8` and `fp8` (`-> bf16`).
+
+A pipeline's preset is each component's, and each builds its own nearest one: `aliked-lightglue` `int8` runs ALIKED in
+`bf16` and LightGlue in `int8`; `superpoint-lightglue` `int8` explicitly keeps SuperPoint in `bf16` and runs LightGlue in
+`int8`. On a GPU without FP8 `fp8` is replaced the same way ([platforms.md](platforms.md)). What was replaced is logged
+and listed in `model.build_report.fallbacks`; `optimize.strict=true` raises instead.
 
 ## Matching
 
@@ -90,7 +97,7 @@ max_matches = 1024
 | `optimize.passes+=x` | appends to a list (a plain `=` replaces the list) |
 | `components.matcher.optimize.attention=sage` | reaches into a pipeline component |
 | `components.extractor.preset=bf16` | picks a component's preset (the pipeline's preset is every component's otherwise) |
-| `optimize.options.vit_attention={"layers":"4-23"}` | a pass option: `dedode-g` `int8` on sm_89 / sm_90 runs SageAttention on these DINOv2 blocks (default `2-23`; `""` = none; `"impl"` picks another `ops.sdpa` impl) |
+| `optimize.options.vit_attention={"layers":"4-23"}` | a pass option: `dedode-g`, `dad` and `loma-*` `int8` / `fp8` on `sm_89` / `sm_90` / `sm_120` run SageAttention on these DINOv2 blocks (default `2-23`; `""` = none; `"impl"` picks another `ops.sdpa` impl) |
 
 ## Errors and warnings
 

@@ -32,8 +32,10 @@ python benchmarks/profile/output_hashes.py --compare results/hashes/base results
   mAA@10px for hard pairs. A 1500-pair AUC@5 delta resolves about +-0.005: decide with a paired bootstrap over pairs, not
   the point estimate (`PASS` / `FAIL` / `BORDERLINE`).
 - Models added in 2026-11: `benchmarks/accuracy/b_models_matrix.sh` (resumable, one GPU lock per run) and
-  `b_models_report.py`; new models go into `b_models_protocol.py`. `run_sparse.py` is the generic runner (any model that
-  returns `Matches`; `--dataset scannet1500`), `run.py` is RoMaV2's.
+  `benchmarks/accuracy/b_models_report.py`; new models go into `benchmarks/accuracy/b_models_protocol.py`. Pre-2026-11
+  models: `benchmarks/accuracy/perf_matrix.sh` (resumable, supports `SKIP_SPECS` to skip unchanged `(model, preset)`
+  entries), `benchmarks/accuracy/perf_protocol.py`, and `benchmarks/accuracy/perf_report.py`. `run_sparse.py` is the
+  generic runner (any model that returns `Matches`; `--dataset scannet1500`), `run.py` is RoMaV2's.
 - Compare numerics in eager in one process: `compile-full` is not reproducible across processes (max-autotune) and two
   compiled instances in one process share Dynamo graphs.
 - Long runs (one command over about 10 minutes, or a whole dataset) need the user's OK; the matrix scripts are resumable.
