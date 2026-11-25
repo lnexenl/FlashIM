@@ -90,8 +90,13 @@ def _fuse_transformer_glue(model: FlexGlue, ctx: BuildContext) -> int | str:
 
 def _cuda_graph(model: FlexGlue, ctx: BuildContext) -> str:
     """Eager engine: replay the fixed-shape DINOv3-ConvNeXt descriptor from a CUDA graph (bit-identical; removes
-    ~1.5 ms of ConvNeXt Python/Triton launch overhead on fp8/int8). Transformer layers are not graphed because
-    SageAttention launches on the legacy default stream and corrupts CUDA graph replay."""
+    ~1.5 ms of ConvNeXt Python/Triton launch overhead on fp8/int8).
+
+    Whole-transformer (``decode_pair``) graphing was also tested with ``sdpa_graph_safe()`` on sm_120 (RTX 5070 Ti):
+    unpatched SageAttention fails ``sdpa_graph_safe()`` (legacy default stream), and with graph-safe torch SDPA
+    ``decode_pair`` is GPU-bound at 4096 tokens/image (3-round interleaved min: bf16 25.71 -> 25.70 ms, 1.001x;
+    fp8 sdpa=ref 19.41 -> 19.33 ms, 1.004x; int8 sdpa=ref 18.98 -> 19.01 ms, 0.998x), so only the descriptor is
+    graphed."""
     if ctx.config.engine.kind != "eager":
         return f"skipped: engine {ctx.config.engine.kind}"
     if not ctx.platform.supports(Feature.CUDA_GRAPHS):

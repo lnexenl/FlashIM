@@ -19,7 +19,7 @@
   <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/architecture.md">Architecture</a>
 </p>
 
-FlashIM runs image-matching models (dense RoMa, RoMa v2, Tiny-RoMa, MASt3R, DUSt3R, UFM; detector-free LoFTR, EfficientLoFTR and XoFTR; sparse RDD, ALIKED, RaCo, SuperPoint, DISK, DeDoDe and others; LightGlue, SuperGlue, LoMa and OmniGlue matching) faster than their reference
+FlashIM runs image-matching models (dense RoMa, RoMa v2, Tiny-RoMa, MASt3R, DUSt3R, UFM; sparse-to-dense FlexGlue; detector-free LoFTR, EfficientLoFTR and XoFTR; sparse RDD, ALIKED, RaCo, SuperPoint, DISK, DeDoDe and others; LightGlue, SuperGlue, LoMa and OmniGlue matching) faster than their reference
 implementations, without giving up measured accuracy. Every model is a native PyTorch port checked against the upstream code, and the
 speedups come from quantization (MXFP8, INT8), fused kernels (Triton, TileLang, CUDA C++) and `torch.compile`.
 
@@ -87,6 +87,9 @@ m = ufm.match("a.jpg", "b.jpg", max_matches=5000)            # 5000 balanced sam
 
 og = flashim.load("omniglue")                                # OmniGlue: SuperPoint (sp_v6) + DINOv2 ViT-B/14 + matcher
 m = og.match("a.jpg", "b.jpg", threshold=0.02)               # 1024 keypoints per image (default)
+
+fg = flashim.load("flexglue")                                # FlexGlue: DINOv3-ConvNeXt search map + entmax readout (fp8)
+m = fg.match("a.jpg", "b.jpg", max_matches=5000)             # dense warp samples (or fg.match_keypoints(...))
 ```
 
 `match(a, b, *, resize, max_matches, threshold)` is the same for every model: `resize` is the long side of the working
@@ -121,6 +124,7 @@ Default preset in **bold**; full registry and notes in [docs/models.md](https://
 | Sparse matchers & pipelines | `loma`, `loma-{b128,b,l,g,r}`, `loma-{extractor,matcher}` | `fp32`, **`bf16`**, `int8`, `fp8` | MIT / Apache-2.0 |
 | Sparse matchers & pipelines | `superglue`, `superpoint-superglue` | `fp32`, **`bf16`**, `int8` *(pipeline degrades `fp8`->`int8`)* | **Magic Leap (academic/non-profit non-commercial)** |
 | Sparse matchers & pipelines | `omniglue`, `omniglue-{extractor,matcher}` | `fp32`, **`bf16`**, `int8` *(extractor adds `fp8`; pipeline & matcher degrade `fp8`->`int8`)* | Apache-2.0 (`sp_v6` MIT) |
+| Sparse-to-dense | `flexglue` | `fp32`, `bf16`, `int8`, **`fp8`** | MIT + **DINOv3 License** (`descriptor.backbone.*` weights) |
 
 ## Results
 
@@ -148,6 +152,7 @@ same as RoMaV2's own FP8 recipe.
 
 - **RaCo + ALIKED + LightGlue** (1024² pair, 1024 keypoints, exact ranker, `bf16` + `engine="compile"`): 14.6 ms per pair, against 18.1 ms for the TensorRT-FP16 engine of LightGlue-ONNX.
 - **RDD** (1056x1600 extract): 110.9 ms in `fp32` eager, 35.4 ms with `fp8` + `engine="compile"`; the reference implementation without its CUDA extension runs out of memory on 16 GB.
+- **FlexGlue** (512x512 descriptor, MegaDepth pair `505127/505128`, `engine="eager"`, RTX 5070 Ti `sm_120`): `fp8` runs in **18.58 ms** (`match_keypoints`, 2048 RDD kp; 1.74x vs pre-sweep `fp8`) and **19.50 ms** (dense `match()`, 5000 samples; 1.89x); `int8` runs in **22.97 / 25.67 ms** (1.54x / 1.57x); MegaDepth-1500 / ScanNet-1500 pose AUC@5 vs `bf16` baseline (3 seeds, PoseLib 1.0 px): `fp8` `-0.0019 / +0.0009`, `int8` `-0.0012 / -0.0010` (0 FAIL).
 
 ## Configuring a run
 
@@ -210,7 +215,7 @@ FlashIM is released under the Apache License 2.0 ([LICENSE](https://github.com/l
 
 The package's license expression is therefore `Apache-2.0 AND MIT AND LicenseRef-DINOv3`. Model weights are downloaded
 from their publishers, never shipped, and keep their upstream licenses, some more restrictive than Apache-2.0: the RoMaV2
-checkpoint contains DINOv3 weights (DINOv3 License), SuperPoint (`superpoint_v1.pth`; `sp_v6` is MIT),
+checkpoint and FlexGlue's `flexglue.pth` backbone (`descriptor.backbone.*`) contain DINOv3 weights (DINOv3 License), SuperPoint (`superpoint_v1.pth`; `sp_v6` is MIT),
 SuperGlue (Magic Leap academic/non-profit non-commercial research only) and RIPE are for non-commercial use only,
 MASt3R, DUSt3R and UFM weights are CC BY-NC-SA 4.0 (non-commercial use only); RoMa (v1) is MIT with frozen DINOv2
 weights (Apache-2.0); MINIMA (`minima-loftr`, `minima-roma`) is Apache-2.0 (with frozen DINOv2 Apache-2.0 for

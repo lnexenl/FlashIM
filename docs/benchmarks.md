@@ -103,6 +103,8 @@ Before/after eager timings measured during the 2026-11 `sm_120` optimization swe
 | `dad` `extract` | 1200 px | `int8` / `fp8` | 136.5 / 102.79 | 78.47 / 85.97 | 1.74x / 1.20x |
 | `ripe` `extract` | 1200 px | `int8` | 42.28 | 19.19 | 2.20x |
 | `ripe` `match_features` | 32320 x 23731 x 256 | `fp32` (TF32 > 8192²) | 22.54 | 9.81 | 2.30x (-2.97 GB VRAM) |
+| `flexglue` `match_keypoints` (2048 RDD kp) | 512x512 | `bf16` / `int8` / `fp8` | 45.76 / 35.47 / 32.30 | 37.75 / 22.97 / 18.58 | 1.21x / 1.54x / 1.74x |
+| `flexglue` dense `match()` (5000 samples) | 512x512 | `bf16` / `int8` / `fp8` | 50.45 / 40.35 / 36.85 | 38.78 / 25.67 / 19.50 | 1.30x / 1.57x / 1.89x |
 
 ## Accuracy
 
@@ -140,6 +142,7 @@ Gate: an AUC@5 drop below 0.005, decided with a 95% paired bootstrap CI over pai
 | `loma-l` | 0.6821 | -0.0012 | +0.0011 | -0.0022† | 0.3250 | -0.0013 | -0.0016† | -0.0006† |
 | `loma-g` | 0.6789 | +0.0000 | +0.0031 | +0.0008 | 0.3282 | +0.0000 | -0.0018† | -0.0019† |
 | `romav2` (`compile`) | 0.6231 | -0.0007 | -0.0032† | -0.0044† | 0.3374 | -0.0006 | +0.0010 | -0.0027 |
+| `flexglue` (512x512 dense) | 0.6399 | -0.0005 | -0.0012 | -0.0019† | 0.3431 | -0.0002 | -0.0010 | +0.0009 |
 
 - ¹ `loma-b128 bf16` was subsequently re-verified bit-exact (`+0.0000` on both MegaDepth-1500 and ScanNet-1500) after unbatching `CrossBlock` FFN.
 - **ALIKED family gain**: `aliked`, `raco-aliked`, `aliked-lightglue`, and `raco-aliked-lightglue` score higher than `dev bf16` because SDDH pixel-space keypoint coordinates now stay in FP32 instead of quantizing to BF16 (2–8 px ULP).

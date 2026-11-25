@@ -94,6 +94,17 @@ _ORDERED_PAIRS: tuple[tuple[ModelProtocol, ModelProtocol], ...] = (
             "romav2", "scannet1500", "romav2", "dense", 0, 5000, "bf16", ("bf16", "int8", "fp8"), (), "compile"
         ),
     ),
+    # Sparse-to-dense matcher (FlexGlue dense match() at native 512x512, 5000 KDE-sampled matches)
+    (
+        ModelProtocol(
+            "flexglue", "mega1500", "flexglue", "sparse", 0, 5000, "bf16", ("fp32", "bf16", "int8", "fp8"), (),
+            "dense 512x512",
+        ),
+        ModelProtocol(
+            "flexglue", "scannet1500", "flexglue", "sparse", 0, 5000, "bf16", ("fp32", "bf16", "int8", "fp8"), (),
+            "dense 512x512",
+        ),
+    ),
 )
 
 PROTOCOLS: tuple[ModelProtocol, ...] = tuple(p for pair in _ORDERED_PAIRS for p in pair)

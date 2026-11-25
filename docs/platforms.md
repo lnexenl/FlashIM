@@ -42,6 +42,7 @@ everything else on them is compile-checked or tuned, not validated.
 | `eloftr`, `xoftr`, `minima-loftr` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
 | `superglue`, `superpoint-superglue` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
 | `omniglue` | ✅ | 🔍 | 🔍 | 🔍 | ➖ | ➖ |
+| `flexglue` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
 | **before 2026-11** | | | | | | |
 | `romav2` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
 | `rdd`, `rdd-lightglue` | ✅ | 🔍 | 🔍 | 🔍 | 🔍 | ➖ |
@@ -107,6 +108,7 @@ presets omitted and resolved via `build.NEAREST`; `—` means the model only def
 | `disk-lightglue` | 🔍 | 🔍 | ➡️ int8 |
 | `xfeat-lightglue` | ✅ | ➡️ bf16 | ➡️ bf16 |
 | `loma-b128`, `loma-b`, `loma-l`, `loma-g`, `loma-r` | ✅¹ | 🔍 | 🔍 |
+| `flexglue` | ✅ | ✅ | 🔍 |
 | `orb`, `sift` (`fp32`) | ✅ | — | — |
 
 ¹ `loma-r bf16` MegaDepth is 🔍 (`-0.0026 [-0.0051, -0.0000]`) in `perf` before unbatching `CrossBlock` FFN; `loma-b128 bf16`
@@ -137,11 +139,14 @@ from 2-pass `ops.dual_softmax_mutual`, and 5 with `<= 1` BF16 ULP reduction-orde
     `ops.int8_conv2d_maxpool_only`, `ops.multiscale_score`, `ops.instance_norm_prelu`, `ops.rgb_mean_instance_norm`,
     `ops.conv2d_at_points`, `ops.strict_nms_mask`, `ops.bilinear_sample_points`, `ops.mutual_nn_match`,
     `ops.quantize_int8_rows_heads`, `ops.gelu_quantize_int8_rows`, exact 2x BF16 `upsample_concat` `triton_rows`,
-    `ops.aliked_sample_patches`, `ops.aliked_bilinear_sample`, `ops.elu_linear_attention`) kernels.
-- **Compile-checked only**: the new CUDA C++ kernels and `ops.elu_linear_attention` were compile-checked for `sm_80`,
-  `sm_89`, `sm_90a`, and `sm_100a` without running on hardware. Capability-tuned ops explicitly gate on measured
-  capabilities (`(8, 9)`, `(9, 0)`, `(12, 0)`), so unmeasured architectures (`sm_100`, `sm_110`) intentionally keep safe
-  fallbacks.
+    `ops.aliked_sample_patches`, `ops.aliked_bilinear_sample`, `ops.elu_linear_attention`,
+    `ops.flexglue_entmax_readout`, `ops.qkv_norm_rope_interleaved`, `ops.qk_norm_swap_heads`,
+    `ops.quantize_mxfp8_heads`, 3D `ops.kde_density`, border-padded `ops.bilinear_sample_points`,
+    `input_bias` on `ops.layernorm_cat_quantize_mxfp8`, and tiled low-D `ops.reciprocal_nn` (`triton_tiled`) kernels.
+- **Compile-checked only**: the new CUDA C++ kernels, `ops.elu_linear_attention`, and the new FlexGlue Triton kernels
+  above (`sm_89+` for FP8 E4M3 kernels) were compile-checked for `sm_80`, `sm_89`, `sm_90a` / `sm_90`, and `sm_100a` /
+  `sm_100` without running on hardware. Capability-tuned ops explicitly gate on measured capabilities (`(8, 9)`, `(9, 0)`,
+  `(12, 0)`), so unmeasured architectures (`sm_100`, `sm_110`) intentionally keep safe fallbacks.
 
 ## FP8 presets
 
