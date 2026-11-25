@@ -94,3 +94,58 @@ def test_conv2d_at_points_triton(cin, cout, k, npts, dtype, nhwc):
     if npts > 0:
         dense = F.conv2d(x.double(), weight.double(), bias.double(), padding=k // 2)[0][:, points[:, 1], points[:, 0]].t()
         torch.testing.assert_close(fast, dense.float(), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("in_nhwc,out_cl", [(False, False), (True, True), (True, False), (False, True)])
+def test_instance_norm_prelu_torch_compile(in_nhwc, out_cl):
+    """Regression: Inductor passes Python float ``eps`` as fp64; Triton kernels must cast it to fp32."""
+    torch.manual_seed(5)
+    fmt = torch.channels_last if in_nhwc else torch.contiguous_format
+    x = (torch.randn(1, 16, 32, 32, device=DEV) * 3.0 + 1.5).to(torch.bfloat16).contiguous(memory_format=fmt)
+    w = (torch.randn(16, device=DEV) * 0.25).to(torch.bfloat16)
+
+    def fn(inp, weight):
+        return ops.instance_norm_prelu(inp, weight, 1e-5, out_channels_last=out_cl)
+
+    torch._dynamo.reset()
+    with torch.inference_mode():
+        eager = fn(x, w)
+        compiled = torch.compile(fn)(x, w)
+    assert compiled.shape == eager.shape and compiled.dtype == eager.dtype
+    assert torch.equal(compiled, eager)
+
+
+def test_rgb_mean_instance_norm_torch_compile():
+    """Regression: ``_rgb_in_apply_kernel`` also passes Python float ``eps`` to ``tl.math.sqrt_rn``."""
+    torch.manual_seed(6)
+    img = torch.rand(1, 3, 64, 64, device=DEV, dtype=torch.float32)
+
+    def fn(inp):
+        return ops.rgb_mean_instance_norm(inp, 1e-5, dtype=torch.bfloat16, unfold=8)
+
+    torch._dynamo.reset()
+    with torch.inference_mode():
+        g_eager, u_eager = fn(img)
+        g_comp, u_comp = torch.compile(fn)(img)
+    assert torch.equal(g_comp, g_eager)
+    assert torch.equal(u_comp, u_eager)
+
+
+def test_disk_upblock_path_torch_compile():
+    """Regression: DISK-like ``upsample_concat`` -> ``instance_norm_prelu`` -> 5x5 conv compiles in BF16."""
+    torch.manual_seed(7)
+    coarse = torch.randn(1, 16, 16, 16, device=DEV, dtype=torch.bfloat16)
+    skip = torch.randn(1, 16, 32, 32, device=DEV, dtype=torch.bfloat16)
+    prelu_w = (torch.randn(32, device=DEV) * 0.25).to(torch.bfloat16)
+    conv = torch.nn.Conv2d(32, 16, 5, padding=2, device=DEV, dtype=torch.bfloat16).eval()
+
+    def block(bot, horiz):
+        cat = ops.upsample_concat(horiz, bot, coarse_first=True)
+        normed = ops.instance_norm_prelu(cat, prelu_w, 1e-5, out_channels_last=False)
+        return conv(normed)
+
+    torch._dynamo.reset()
+    with torch.inference_mode():
+        eager = block(coarse, skip)
+        compiled = torch.compile(block)(coarse, skip)
+    torch.testing.assert_close(compiled, eager, atol=2e-2, rtol=2e-2)
