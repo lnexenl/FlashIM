@@ -71,7 +71,8 @@ def _in_prelu_nchw_kernel(
     mean = tl.sum(cnt * m, axis=0) / tl.maximum(total, 1.0)
     dm = m - mean
     var = tl.sum(m2 + cnt * dm * dm, axis=0) / tl.maximum(total, 1.0)
-    inv_std = tl.math.div_rn(1.0, tl.math.sqrt_rn(var + eps))
+    # Inductor passes Python float scalars as fp64; cast to fp32 so sqrt_rn/div_rn stay fp32 under torch.compile.
+    inv_std = tl.math.div_rn(1.0, tl.math.sqrt_rn(var + tl.cast(eps, tl.float32)))
     w = tl.load(w_ptr + c).to(tl.float32)
 
     idx = pid_s * BLOCK + tl.arange(0, BLOCK)
@@ -150,7 +151,7 @@ def _in_prelu_nhwc_kernel(
     mean = tl.sum(cnt[:, None] * m, axis=0) / tl.maximum(total, 1.0)  # [BLOCK_C]
     dm = m - mean[None, :]
     var = tl.sum(m2 + cnt[:, None] * dm * dm, axis=0) / tl.maximum(total, 1.0)
-    inv_std = tl.math.div_rn(1.0, tl.math.sqrt_rn(var + eps))
+    inv_std = tl.math.div_rn(1.0, tl.math.sqrt_rn(var + tl.cast(eps, tl.float32)))
     w = tl.load(w_ptr + cs, mask=c_mask, other=0.0).to(tl.float32)
 
     ps = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
@@ -294,7 +295,8 @@ def _rgb_in_apply_kernel(
     mean = tl.sum(cnt * m, axis=0) / tl.maximum(total, 1.0)
     dm = m - mean
     var = tl.sum(m2 + cnt * dm * dm, axis=0) / tl.maximum(total, 1.0)
-    inv_std = tl.math.div_rn(1.0, tl.math.sqrt_rn(var + eps))
+    # Inductor passes Python float scalars as fp64; cast to fp32 so sqrt_rn/div_rn stay fp32 under torch.compile.
+    inv_std = tl.math.div_rn(1.0, tl.math.sqrt_rn(var + tl.cast(eps, tl.float32)))
     inv3 = 1.0 / 3.0
 
     idx = pid_s * BLOCK + tl.arange(0, BLOCK)
@@ -382,7 +384,7 @@ def _residual_layernorm_kernel(
     mean = tl.sum(x, axis=1) / C
     diff = tl.where(col_ok[None, :], x - mean[:, None], 0.0)
     var = tl.sum(diff * diff, axis=1) / C
-    rstd = tl.rsqrt(var + eps)
+    rstd = tl.rsqrt(var + tl.cast(eps, tl.float32))
     w = tl.load(w_ptr + col, mask=col_ok, other=0.0).to(tl.float32)
     b = tl.load(b_ptr + col, mask=col_ok, other=0.0).to(tl.float32)
     y = (diff * rstd[:, None]) * w[None, :] + b[None, :]
@@ -421,7 +423,7 @@ def _cat_layernorm_kernel(
     mean = tl.sum(r, axis=1) / C
     diff = tl.where(col_ok[None, :], r - mean[:, None], 0.0)
     var = tl.sum(diff * diff, axis=1) / C
-    rstd = tl.rsqrt(var + eps)
+    rstd = tl.rsqrt(var + tl.cast(eps, tl.float32))
     w = tl.load(w_ptr + col, mask=col_ok, other=0.0).to(tl.float32)
     b = tl.load(b_ptr + col, mask=col_ok, other=0.0).to(tl.float32)
     y = ((diff * rstd[:, None]) * w[None, :] + b[None, :]).to(out_ptr.dtype.element_ty)
@@ -583,7 +585,7 @@ def _pos_cat_layernorm_kernel(
     mean = tl.sum(vf, axis=1) / C
     diff = tl.where(col_ok[None, :], vf - mean[:, None], 0.0)
     var = tl.sum(diff * diff, axis=1) / C
-    rstd = tl.rsqrt(var + eps)
+    rstd = tl.rsqrt(var + tl.cast(eps, tl.float32))
     y = ((diff * rstd[:, None]) * w[None, :] + b[None, :]).to(out_norm_ptr.dtype.element_ty)
     tl.store(out_norm_ptr + norm_row[:, None] * C + col[None, :], y, mask=mask)
 

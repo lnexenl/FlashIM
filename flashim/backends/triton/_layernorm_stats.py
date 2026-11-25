@@ -83,5 +83,5 @@ def torch_layernorm_stats(x_ptr, row_base, N: tl.constexpr, T: tl.constexpr, ITE
 @triton.jit
 def torch_layernorm_apply(x, weight, bias, mean, var, eps):
     """ATen's affine step on FP32 values: ``gamma * (rstd * (x - mean)) + beta`` (contracted), rstd = ``rsqrtf``."""
-    rstd = libdevice.rsqrt(var + eps)
+    rstd = libdevice.rsqrt(var + tl.cast(eps, tl.float32))
     return tl.fma(weight, rstd * (x - mean), bias)

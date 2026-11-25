@@ -23,10 +23,12 @@ from flashim.quant.tensor import Int8Tensor
 @triton.jit
 def _bilinear_source(dst, n_in, scale, ALIGN_CORNERS: tl.constexpr = False):
     """PyTorch's bilinear source index (``align_corners=False`` or ``True``), its two taps, and linear weights."""
+    # Inductor passes Python float scalars as fp64; cast to fp32 so bilinear math and _bf16_round stay fp32.
+    scale_f = tl.cast(scale, tl.float32)
     if ALIGN_CORNERS:
-        src = dst.to(tl.float32) * scale
+        src = dst.to(tl.float32) * scale_f
     else:
-        src = tl.maximum(scale * (dst.to(tl.float32) + 0.5) - 0.5, 0.0)
+        src = tl.maximum(scale_f * (dst.to(tl.float32) + 0.5) - 0.5, 0.0)
     i0 = src.to(tl.int32)
     i1 = tl.where(i0 < n_in - 1, i0 + 1, i0)
     lam1 = src - i0.to(tl.float32)
@@ -514,6 +516,12 @@ def _pil_resize_tile(
     tiles_w = tl.cdiv(OW, BW)
     cols = (tile % tiles_w) * BW + tl.arange(0, BW)
     rows = (tile // tiles_w) * BH + tl.arange(0, BH)
+    scale_x = tl.cast(scale_x, tl.float32)
+    support_x = tl.cast(support_x, tl.float32)
+    inv_x = tl.cast(inv_x, tl.float32)
+    scale_y = tl.cast(scale_y, tl.float32)
+    support_y = tl.cast(support_y, tl.float32)
+    inv_y = tl.cast(inv_y, tl.float32)
     x0, xn, xmc = _aa_span(cols, W, scale_x, support_x)
     x_total = _aa_total(xmc, xn, inv_x, KX)
     ws = (_wx(0, xn, xmc, inv_x, x_total), _wx(1, xn, xmc, inv_x, x_total), _wx(2, xn, xmc, inv_x, x_total),
@@ -760,8 +768,8 @@ ops.bilinear_sample_points.register(
 @triton.jit
 def _bilinear_ac_nhwc(ptr, oh, ow, scale_h, scale_w, h, w, C, c, mask2d):
     """Bilinear ``align_corners=True`` sample of NHWC ``[h, w, C]`` at ``(oh, ow)`` using host-computed scales -> ``[BLOCK_PIX, BLOCK_C]``."""
-    iy = oh * scale_h
-    ix = ow * scale_w
+    iy = oh * tl.cast(scale_h, tl.float32)
+    ix = ow * tl.cast(scale_w, tl.float32)
     y0 = tl.minimum(tl.maximum(iy.to(tl.int32), 0), h - 1)
     x0 = tl.minimum(tl.maximum(ix.to(tl.int32), 0), w - 1)
     y1 = tl.minimum(y0 + 1, h - 1)
