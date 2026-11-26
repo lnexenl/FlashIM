@@ -93,34 +93,6 @@ academic / non-profit research only), and `ripe`, `ripepp`, `ripepp-aachen`, `ri
 (Fraunhofer academic-use license v2.0) are **non-commercial**; `romav2` and `flexglue` contain
 DINOv3 weights under the DINOv3 License. Check [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl/FlashIM/blob/main/THIRD_PARTY_NOTICES.md) before commercial use.
 
-## Results
-
-All numbers are from an **NVIDIA GeForce RTX 5070 Ti (`sm_120`)**. Latencies of every model under one protocol and the
-MegaDepth-1500 / ScanNet-1500 accuracy gate (AUC@5 drop < 0.005 vs `bf16`) are in the
-[inference benchmark](https://github.com/lnexenl/FlashIM/blob/main/docs/benchmarks.md).
-
-**RoMaV2** (dense; `mega1500` 800² + 1024², both directions, forward only, RTX 5070 Ti `sm_120`):
-
-| preset | `eager` | `compile-full` | vs `bf16` (`compile-full`) |
-|---|---:|---:|---:|
-| `bf16` | 348.5 ms | 194.3 ms | 1.00x |
-| `fp8` | 110.7 ms | 106.5 ms | 1.82x |
-| `int8` | 107.1 ms | 93.4 ms | 2.08x |
-
-Pose AUC@5 vs the unoptimized `bf16` (3 seeds, MegaDepth-1500 / ScanNet-1500, `engine="compile"`): `fp8` -0.0044 / -0.0027,
-`int8` -0.0032 / +0.0010 (0 FAIL under the paired-bootstrap gate). On the 900 deliberately hard HardMatch pairs `fp8` costs
-0.0074 mAA@10px, the same as RoMaV2's own FP8 recipe.
-
-**Other families** (`eager / compile`, same GPU, one image or one pair; sizes and every model in the benchmark):
-
-| stage | `bf16` | `int8` | `fp8` |
-|---|---:|---:|---:|
-| `rdd` extract (1200 px, 4096 keypoints) | 31.8 / 25.3 ms | | 26.5 / 22.8 ms |
-| `loma-g` pair (2 x extract + match, 1024 px) | 185.2 / 175.9 ms | 81.8 ms (eager) | 95.4 ms (eager) |
-| `flexglue` `match_keypoints` (512x512) | 35.1 / 33.7 ms | 22.3 / 22.2 ms | 18.0 / 17.9 ms |
-
-The reference RDD implementation without its CUDA extension runs out of memory on 16 GB.
-
 ## Configuring a run
 
 The four presets are named partial configs; config files, dicts, dotted overrides and `load`'s keyword arguments
