@@ -54,7 +54,7 @@ RoMaV2: preloaded bidirectional forward, mega1500 setting (800² LR + 1024² HR)
 | dedode-g | 532.5 / 460.6 | 128.2 / 121.0 | **65.7** / fail | 68.4 / fail |
 | dad | 462.2 / 416.4 | 111.8 / 106.7 | **49.8** / fail | 57.4 / fail |
 | ripe | 110.2 / 72.4 | 31.4 / fail | **18.8** / fail | 25.5 / fail |
-| ripepp | 116.7 / 77.9 | 33.7 / fail | **19.1** / fail | 28.8 / fail |
+| ripepp | 116.7 / 77.9 | 33.7 / fail | **20.4** / fail | 28.8 / fail |
 | aliked | 5.94 / 5.10 | 3.72 / **2.70** |  |  |
 | raco-aliked | 26.8 / 18.1 | 7.03 / **5.76** |  |  |
 | rdd | 68.7 / 61.0 | 31.8 / 25.3 |  | 26.5 / **22.8** |
@@ -80,7 +80,7 @@ RoMaV2: preloaded bidirectional forward, mega1500 setting (800² LR + 1024² HR)
 | aliked-lightglue | 57.7 / 57.3 | 11.8 / 11.1 | **9.85** / 9.97 | → int8 / → int8 |
 | raco-aliked-lightglue | 57.8 / 57.3 | 11.8 / 11.1 | **9.80** / 10.1 | 10.4 / 18.5 |
 | rdd-lightglue | 57.8 / 57.3 | 11.7 / 11.1 | **9.93** / 9.98 | 10.3 / 18.3 |
-| ripepp-lightglue | 61.0 / 60.6 | **12.2** / fail | → bf16 / fail | → bf16 / fail |
+| ripepp-lightglue | 61.0 / 60.6 | 12.2 / fail | **11.8** / fail | → int8 / fail |
 | loma-b128 | 57.6 / 57.2 | 11.7 / 11.0 | **9.77** / - | 10.5 / - |
 | loma-b | 57.6 / 57.1 | 11.7 / 11.0 | **9.81** / - | 10.2 / - |
 | loma-r | 57.9 / 57.2 | 11.7 / 11.0 | **9.82** / - | 10.3 / - |
@@ -104,7 +104,7 @@ One image pair: 2 x `extract` + the matcher's `match_features`, the column being
 | aliked-lightglue | 69.7 / 67.5 | 19.1 / 16.5 | 17.1 / **15.4** | → int8 / → int8 |
 | raco-aliked-lightglue | 111.7 / 93.5 | 25.6 / 22.5 | 23.8 / **21.5** | 24.4 / 30.0 |
 | rdd-lightglue | 195.0 / 179.5 | 75.1 / 61.7 | 73.6 / **60.6** | 63.1 / 63.8 |
-| ripepp-lightglue | 295.1 / 216.4 | **79.4** / fail | → bf16 / fail | → bf16 / fail |
+| ripepp-lightglue | 295.1 / 216.4 | 79.4 / fail | **52.6** / fail | → int8 / fail |
 | loma-b128 | 179.3 / 143.6 | 56.5 / 53.9 | **30.8** / fail | 45.0 / fail |
 | loma-b | 506.1 / 460.1 | 130.1 / 124.2 | **62.4** / fail | 73.5 / fail |
 | loma-r | 507.8 / 461.0 | 130.1 / 124.5 | **62.4** / fail | 73.5 / fail |
@@ -218,19 +218,19 @@ pass, 17 are inconclusive (†: the CI straddles -0.005; a 1500-pair AUC@5 delta
 `superpoint-superglue` and `omniglue` share the protocol of the dense table above (1024 px with 1024 keypoints on
 MegaDepth; `superpoint-superglue` uses its indoor matcher on ScanNet). `ripepp` and `ripepp-lightglue` use the
 sparse-extractor protocol above (1200 px on MegaDepth, 640 x 480 on ScanNet, 4096 keypoints, PoseLib 1.0 px, seeds
-17, 29, 42), compared against each model's own `bf16`. `fp8` of `superpoint-superglue` and `omniglue` is omitted
-(-> `int8`: SuperPoint's `conv1b` has 41.6x block-32 channel outliers, -0.013 to -0.014 AUC@5; OmniGlue's DINOv2
-ViT-B/14 loses 0.005-0.006 under MXFP8). `ripepp-lightglue` omits both `int8` and `fp8` (-> `bf16`): MXFP8 collapses
--0.0538 AUC@5 on MegaDepth-200 while running slower (66.2 ms/pair); static and dynamic rotated INT8 each drop -0.0074
-on MegaDepth-1500 and even `int8` extractor + exact `bf16` matcher drops -0.0056 [-0.0101, -0.0011], while keeping
-`ripepp` in `bf16` leaves only ~2% pair speedup (77.5 vs 79.4 ms).
+17, 29, 42), compared against each model's own `bf16`. `fp8` of `superpoint-superglue`, `omniglue`, and
+`ripepp-lightglue` is omitted (-> `int8`): SuperPoint's `conv1b` has 41.6x block-32 channel outliers (-0.013 to
+-0.014 AUC@5), OmniGlue's DINOv2 ViT-B/14 loses 0.005-0.006 under MXFP8, and `ripepp-lightglue` drops -0.0538 AUC@5 on
+MegaDepth-200 under MXFP8 while running slower than `int8` (66.2 vs 52.6 ms/pair). `ripepp-lightglue` `int8` runs
+RIPE++ in `int8` (31/35 convs, `dec.{1,2}` BF16 for subpixel accuracy) with LightGlue in `bf16` (52.6 vs 79.4 ms/pair,
+1.51x speedup).
 
 | model | MegaDepth bf16 AUC@5 | int8 Δ | fp8 Δ | ScanNet bf16 AUC@5 | int8 Δ | fp8 Δ |
 |---|---:|---:|---:|---:|---:|---:|
 | `superpoint-superglue` | 0.5416 | -0.0028† | → int8 | 0.1717 | +0.0068 | → int8 |
 | `omniglue` | 0.5195 | +0.0024 | → int8 | 0.1748 | +0.0012† | → int8 |
-| `ripepp` | 0.5877 | -0.0001† | +0.0004 | 0.1620 | +0.0010 | -0.0012† |
-| `ripepp-lightglue` | 0.6057 | → bf16 | → bf16 | 0.1495 | → bf16 | → bf16 |
+| `ripepp` | 0.5877 | -0.0040† | +0.0004 | 0.1620 | +0.0020 | -0.0012† |
+| `ripepp-lightglue` | 0.6057 | -0.0011† | → int8 | 0.1495 | -0.0009† | → int8 |
 
 ## Running it
 

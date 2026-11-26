@@ -27,9 +27,10 @@ m = pipeline.match("a.jpg", "b.jpg", resize=1024, max_matches=1024)   # Matches;
 
 A pipeline's preset (`fp32`, `bf16`, `int8`, `fp8`; `fp8` for `lightglue` and `rdd-lightglue` by default) is every
 component's, and each builds the nearest it has: `aliked-lightglue` `int8` runs ALIKED in `bf16` and LightGlue in
-`int8`, and `superpoint-lightglue` `int8` explicitly keeps SuperPoint in `bf16` with rotated `int8` LightGlue. Presets
-omitted because quantization lost pose AUC resolve via `build.NEAREST`: `aliked-lightglue`, `superpoint-lightglue` and
-`disk-lightglue` omit `fp8` (`fp8 -> int8`); `xfeat-lightglue` and `ripepp-lightglue` omit `int8` and `fp8` (`-> bf16`). `rdd-lightglue` and
+`int8`, `superpoint-lightglue` `int8` explicitly keeps SuperPoint in `bf16` with rotated `int8` LightGlue, and
+`ripepp-lightglue` `int8` runs RIPE++ in `int8` (31/35 convs, `dec.{1,2}` BF16) with LightGlue in `bf16`. Presets
+omitted because quantization lost pose AUC resolve via `build.NEAREST`: `aliked-lightglue`, `superpoint-lightglue`,
+`disk-lightglue` and `ripepp-lightglue` omit `fp8` (`fp8 -> int8`); `xfeat-lightglue` omits `int8` and `fp8` (`-> bf16`). `rdd-lightglue` and
 `raco-aliked-lightglue` ship all four presets. `components.extractor.preset` / `components.matcher.preset` set one
 component's ([configuration](../configuration.md)).
 

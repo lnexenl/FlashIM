@@ -132,7 +132,7 @@ reference the other columns are measured against. The numbers are in [benchmarks
 | `loma-b128`, `loma-b`, `loma-l`, `loma-g`, `loma-r` | ✅¹ | 🔍 | 🔍 |
 | `superpoint-superglue` | — | 🔍 | ➡️ int8 |
 | `omniglue` | — | 🔍 | ➡️ int8 |
-| `ripepp-lightglue` | — | ➡️ bf16 | ➡️ bf16 |
+| `ripepp-lightglue` | — | 🔍 | ➡️ int8 |
 
 ¹ `bf16` of every LoMa variant is bit-identical to the unoptimized code: `loma-b128` and `loma-g` on both full datasets, the
 other variants on every pair checked (test pair, 3 MegaDepth-1500 and 3 ScanNet-1500 pairs).
