@@ -47,9 +47,9 @@ def _cells(times: dict, keys) -> list[str]:
 
 
 def _fallback(requested: str, resolved: str) -> str | None:
-    """``→ int8`` when the preset a model built is not the one asked for (the matcher's, for a pipeline)."""
-    last = resolved.split("+")[-1]
-    return None if last == requested else f"→ {last}"
+    """``→ int8`` when no component built the preset asked for (``resolved`` is ``extractor+matcher`` for a pipeline)."""
+    parts = resolved.split("+")
+    return None if requested in parts else f"→ {parts[-1]}"
 
 
 def _table(title: str, intro: str, header: str, models, data) -> list[str]:
@@ -67,6 +67,7 @@ def main() -> None:
     d = args.directory
 
     extract, pair, matcher, pair_level, flex = (defaultdict(dict) for _ in range(5))
+    mixed = {}  # pipelines whose components build different presets: (model, requested) -> "extractor+matcher"
     gpu = ""
     for name in ("run.log", "run_models.log"):  # crashed runs (results below override)
         log = d / name
@@ -95,6 +96,8 @@ def main() -> None:
             flex[key] = r
             continue
         mark = _fallback(preset, r["preset"])
+        if model in PIPELINES and not mark and r["preset"] != f"{preset}+{preset}":
+            mixed[(model, preset)] = r["preset"]
         if r.get("pair_level"):
             pair_level[model][key] = mark or r["match_median_ms"]
             continue
@@ -147,9 +150,15 @@ def main() -> None:
                    "calls after 3 warmups. Each cell is `eager / compile`."), "model", MATCHERS, matcher)
     out += _table("Pair time of sparse pipelines",
                   ("One image pair: 2 x `extract` + the matcher's `match_features`, the column being the "
-                   "matcher's preset; the extractor runs the same preset when it has one, else `bf16` (ALIKED / "
-                   "RaCo-ALIKED int8 and fp8, RDD int8). Same sizes as above. Each cell is `eager / compile`."),
+                   "pipeline's preset, built as `flashim.load` builds it (each component gets the preset its spec "
+                   "gives it; the table below the grid lists the pipelines whose components differ). Same sizes as "
+                   "above. Each cell is `eager / compile`."),
                   "pipeline", PIPELINES, pair)
+    if mixed:
+        out += ["", "Pipelines whose two components build different presets (`extractor+matcher`; a component without the "
+                    "requested preset builds the nearest one it has):", "",
+                "| pipeline | requested | built |", "|---|---|---|"]
+        out += [f"| {m} | {p} | {built} |" for (m, p), built in sorted(mixed.items())]
 
     if flex:
         out += ["", "## FlexGlue (sparse-to-dense)", "",
