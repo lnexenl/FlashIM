@@ -29,6 +29,7 @@ from typing import Any, Literal
 
 import torch
 from torch import nn
+from torch.torch_version import TorchVersion
 
 from flashim.config import RunConfig, load_file, merge, parse_overrides, resolve_preset
 from flashim.log import get_logger, warn_once
@@ -45,6 +46,8 @@ PRECISIONS = ("fp32", "bf16", "int8", "fp8")
 # references: RoMaV2 fp8 3334 ms against int8 1122 ms (bf16 1981 ms), LightGlue 209 against 56 ms, RDD (no INT8) fp8
 # 1151 ms against bf16 398 ms.
 NEAREST = {"fp8": ("int8", "bf16", "fp32"), "int8": ("bf16", "fp32"), "bf16": ("fp32",), "fp32": ("bf16",)}
+
+_NATIVE_PRESET_REQUIREMENTS = {"fp8": ((10, 0), "2.10", "block-scaled MXFP8 GEMM")}
 
 
 @dataclass(frozen=True)
@@ -203,13 +206,21 @@ def _choose_preset(
         if strict:
             raise ValueError(f"{spec.name}: no {preset!r} preset (optimize.strict); available: {sorted(spec.presets)}")
         reason, level = f"{spec.name} has no {preset}", logging.INFO if component else logging.WARNING
+    unavailable = None
+    requirement = _NATIVE_PRESET_REQUIREMENTS.get(built)
+    if requirement and platform is not None and platform.device_type == "cuda":
+        capability, minimum, feature = requirement
+        if platform.has_capability(capability) and TorchVersion(torch.__version__) < minimum:
+            unavailable = f"{feature} requires torch >= {minimum} (installed {torch.__version__})"
     if built == "fp8" and platform is not None and platform.device_type != "cpu" and not platform.supports(
         Feature.FP8_E4M3
     ):
+        unavailable = f"no FP8 on {platform.describe()}"
+    if unavailable is not None:
         if keep is not None:
-            logger.warning("%s: no FP8 on %s, preset 'fp8' kept (%s)", spec.name, platform.describe(), keep)
+            logger.warning("%s: %s, preset 'fp8' kept (%s)", spec.name, unavailable, keep)
         else:
-            built, reason, level = _nearest(spec, "fp8", skip="fp8"), f"no FP8 on {platform.describe()}", logging.WARNING
+            built, reason, level = _nearest(spec, "fp8", skip="fp8"), unavailable, logging.WARNING
     if reason is not None:
         logger.log(level, "%s: preset %r replaced by %r (%s)", spec.name, preset, built, reason)
     return built, reason
@@ -229,7 +240,8 @@ def resolve(
 
     The model, and every component of a pipeline (the pipeline's preset is each component's), builds the nearest
     preset it has (:data:`NEAREST`; ``optimize.strict`` raises instead). With ``platform`` (:func:`load` passes the
-    target device's), ``fp8`` is also replaced on a GPU without FP8, unless the config sets ``optimize.strict`` or
+    target device's), ``fp8`` is also replaced on a GPU without FP8 or on Blackwell with a torch release that
+    predates block-scaled MXFP8 GEMM, unless the config sets ``optimize.strict`` or
     passes a calibration table anywhere (:func:`_keeps_fp8`). With a target platform, known compile failures select
     eager (``optimize.strict`` raises instead). ``preset`` of the result names the preset that is built;
     ``fallbacks`` (a dict) collects ``path -> "asked -> built (why)"``. Without ``platform`` the result does not depend

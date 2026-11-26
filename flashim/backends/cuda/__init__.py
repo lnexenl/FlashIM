@@ -21,11 +21,11 @@ from pathlib import Path
 
 import torch
 
+from flashim.backends.cuda._flags import FLAGS as _FLAGS
 from flashim.platforms.nvidia import nvcc_path
 
 logger = logging.getLogger(__name__)
 _SOURCE_DIR = Path(__file__).parent / "csrc"
-_FLAGS = ("-O3", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", "-allow-unsupported-compiler")
 
 
 def _cache_dir() -> Path:

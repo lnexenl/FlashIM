@@ -1,0 +1,100 @@
+name: Kernel compilation
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+  schedule:
+    - cron: '17 3 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  nvcc:
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: '12.6'
+            arch: '80 86 87 89 90'
+          - cuda: '12.8'
+            arch: '80 86 87 89 90 100 120'
+          - cuda: '13.x'
+            arch: '--all-supported'
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash ci/install_nvcc.sh '${{ matrix.cuda }}'
+      - run: python3 ci/compile_cuda.py --nvcc /usr/local/cuda/bin/nvcc ${{ matrix.arch }}
+
+  triton-compile:
+    runs-on: ubuntu-24.04
+    env:
+      TRITON_STORE_BINARY_ONLY: '1'
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+    strategy:
+      fail-fast: false
+      matrix:
+        torch: ['torch==2.10.0', 'torch==2.11.*', 'torch']
+        arch: [80, 86, 87, 89, 90, 100, 110, 120]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - run: uv venv && uv pip install '${{ matrix.torch }}' torchvision --index-url https://download.pytorch.org/whl/cpu
+      - run: uv pip install -e . packaging
+      - run: uv pip install "$(.venv/bin/python ci/torch_triton_requirement.py)"
+      - id: versions
+        run: .venv/bin/python -c 'from importlib.metadata import version; print("wheels=" + version("torch") + "-" + version("triton"))' >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.triton/cache
+          key: triton-${{ runner.os }}-${{ steps.versions.outputs.wheels }}-sm${{ matrix.arch }}-${{ hashFiles('flashim/backends/**', 'ci/triton.jsonl') }}
+          restore-keys: triton-${{ runner.os }}-${{ steps.versions.outputs.wheels }}-sm${{ matrix.arch }}-
+      - run: .venv/bin/python ci/compile_triton.py --arch ${{ matrix.arch }} --workers 4
+
+  tilelang-compile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - run: sudo bash ci/install_nvcc.sh 13.x
+      - run: uv venv && uv pip install 'torch==2.11.*' torchvision --index-url https://download.pytorch.org/whl/cpu
+      - run: uv pip install -e '.[tilelang]'
+      - run: .venv/bin/python ci/compile_tilelang.py
+        env:
+          CUDA_HOME: /usr/local/cuda-13
+
+  install-smoke:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [cpu, cu126, cu130]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - run: uv venv && uv pip install torch torchvision --index-url https://download.pytorch.org/whl/${{ matrix.index }}
+      - run: uv pip install .
+      - run: .venv/bin/python -I -c 'import torch, flashim; print(torch.__version__); assert flashim.available_models()'
+
+  nightly-torch:
+    if: github.event_name == 'schedule'
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+      - run: uv venv && uv pip install --prerelease allow torch torchvision --index-url https://download.pytorch.org/whl/nightly/cpu
+      - run: uv pip install -e '.[cv]' --group dev
+      - run: .venv/bin/python -m pytest -q -p no:cacheprovider -m 'not cuda and not sm120 and not weights and not oracle and not slow' tests

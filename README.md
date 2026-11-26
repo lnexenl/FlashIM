@@ -35,15 +35,20 @@ INT8), fused kernels (Triton, TileLang, CUDA C++) and `torch.compile`.
 
 ## Install
 
-On Linux x86-64 with Python 3.10 or newer, install the matching PyTorch 2.11 and torchvision 0.26 wheels first,
-then install FlashIM from PyPI. The commands use CPU wheels by default. For an NVIDIA GPU, set `wheel` to the index
-in the table that matches your hardware and driver. Blackwell GPUs need CUDA 12.8 or newer.
+On Linux x86-64 with Python 3.10 or newer, install PyTorch 2.10 or newer with a matching torchvision first, then
+install FlashIM from PyPI. The commands use CPU wheels by default. For an NVIDIA GPU, set `wheel` to the index in the
+table that matches your hardware and driver. Blackwell GPUs need CUDA 12.8 or newer.
 
 ```bash
 wheel=cpu
-python -m pip install torch==2.11.0 torchvision==0.26.0 --index-url "https://download.pytorch.org/whl/$wheel"
+python -m pip install torch torchvision --index-url "https://download.pytorch.org/whl/$wheel"
 python -m pip install flashim
 ```
+
+CI runs the CPU tests on PyTorch 2.10, 2.11 and the newest release, and compiles every CUDA C++, Triton and TileLang
+kernel for each supported NVIDIA architecture. All measured numbers in [docs/benchmarks.md](https://github.com/lnexenl/FlashIM/blob/main/docs/benchmarks.md)
+come from the PyTorch 2.11 reference setup. On Blackwell, the `fp8` preset needs PyTorch 2.10 or newer for its
+block-scaled MXFP8 GEMM; older releases build the nearest preset instead.
 
 | PyTorch build | Wheel index | Linux driver for the wheel's CUDA toolkit version |
 |---|---|---|
@@ -58,7 +63,8 @@ CUDA 13.x. Applications that JIT-compile PTX can require a newer driver. See the
 [toolkit driver versions](https://docs.nvidia.com/cuda/archive/13.0.2/cuda-toolkit-release-notes/index.html#cuda-driver)
 and [compatibility limits](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
 
-FlashIM uses Triton 3.6 on Linux. Optional extras are `flashim[cv]` for OpenCV (SIFT, ORB and pose estimation),
+Linux CUDA PyTorch wheels install their matching Triton (CPU runs do not use Triton). Optional extras are
+`flashim[cv]` for OpenCV (SIFT, ORB and pose estimation),
 `flashim[eval]` for accuracy benchmarks and `flashim[tilelang]` for the TileLang backend. For example, run
 `python -m pip install 'flashim[cv]'`. On Jetson with JetPack 6, use NVIDIA's torch build and
 [`requirements-jetson.txt`](https://github.com/lnexenl/FlashIM/blob/main/requirements-jetson.txt).
