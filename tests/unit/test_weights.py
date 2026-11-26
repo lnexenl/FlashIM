@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import flashim
 from flashim.models.weights_util import Checkpoint, find_weights
 
 WEIGHT_MODULES = ("alike", "aliked", "dad", "dedode", "disk", "dust3r", "eloftr", "flexglue", "lightglue", "loftr",
@@ -81,6 +82,14 @@ def test_explicit_path_and_env_take_precedence(hub, release, tmp_path, monkeypat
     with pytest.raises(FileNotFoundError, match="FLASHIM_TEST_CHECKPOINT"):
         find_weights(release, env="FLASHIM_TEST_CHECKPOINT")
     assert not hub.exists()
+
+
+def test_romav2_load_uses_checkpoint_override(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "custom.pt"
+    torch.save({"custom_weight": torch.ones(1)}, checkpoint)
+    monkeypatch.setenv("FLASHIM_ROMAV2_CHECKPOINT", str(tmp_path / "unused.pt"))
+    with pytest.raises(RuntimeError, match=r'Unexpected key\(s\) in state_dict: "custom_weight"'):
+        flashim.load("romav2", device="cpu", overrides={"checkpoint": str(checkpoint)})
 
 
 def _checkpoints(value):
