@@ -255,13 +255,17 @@ XFEAT_LIGHTGLUE = _pipeline(
     "xfeat-lightglue", "xfeat", "xfeat", "fp32", "XFeat + LighterGlue (verlab weights)",
     presets=("fp32", "bf16"),
 )
-# RIPE++ + LightGlue MXFP8 collapses on MegaDepth-200 (-0.0538 AUC@5 vs bf16, match_ratio 0.676 vs 0.917 for int8)
-# while running slower than int8 on both extract and match (66.2 vs 48.5 ms/pair on sm_120); omitting fp8 resolves
-# fp8 -> int8 via build.NEAREST.
+# RIPE++ + LightGlue: MXFP8 collapses on MegaDepth-200 (-0.0538 AUC@5, match_ratio 0.676) while running slower than
+# int8 (66.2 vs 48.5 ms/pair). Under INT8, full MegaDepth-1500 fails the -0.005 gate for static rotated INT8 (-0.0074
+# [-0.0122, -0.0027]), rotated per-token dynamic INT8 (-0.0074 [-0.0123, -0.0027]), and even int8 extractor + exact bf16
+# matcher (-0.0056 [-0.0101, -0.0011]) because RIPE++ int8's 5% keypoint shift moves features off the RL LightGlue
+# manifold; keeping the extractor in bf16 (67.4/79.4 ms = 85% of pair time) leaves only ~2% pair speedup from an int8
+# matcher (77.5 vs 79.4 ms) while still dropping matcher fidelity (see quant.py). Omitting int8 and fp8 resolves both to
+# bf16 via build.NEAREST (same mechanism as xfeat-lightglue).
 RIPEPP_LIGHTGLUE = _pipeline(
     "ripepp-lightglue", "ripepp", "ripepp", "bf16",
     "RIPE++ detector/descriptor + weakly-supervised LightGlue (RIPE++ RL weights)",
-    presets=("fp32", "bf16", "int8"),
+    presets=("fp32", "bf16"),
 )
 
 

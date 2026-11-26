@@ -53,7 +53,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | [`superpoint-lightglue`](models/lightglue.md) | SuperPoint + LightGlue (cvg weights) | **`fp32`**, `bf16`, `int8` |
 | [`disk-lightglue`](models/lightglue.md) | DISK + LightGlue (cvg weights) | **`fp32`**, `bf16`, `int8` |
 | [`xfeat-lightglue`](models/lightglue.md) | XFeat + LighterGlue (verlab weights) | **`fp32`**, `bf16` |
-| [`ripepp-lightglue`](models/lightglue.md) | RIPE++ + weakly-supervised LightGlue (RIPE++ RL weights; non-commercial) | `fp32`, **`bf16`**, `int8` |
+| [`ripepp-lightglue`](models/lightglue.md) | RIPE++ + weakly-supervised LightGlue (RIPE++ RL weights; non-commercial) | `fp32`, **`bf16`** |
 | [`raco-<model>-lightglue`](models/raco-aliked-lightglue.md#raco-with-other-models) | RaCo keypoints + `superpoint`, `disk`, `xfeat` or `rdd` descriptors + LightGlue with that model's weights | **`fp32`**, `bf16`, `int8`, `fp8` *(`raco-rdd-lightglue` defaults to `fp8`)* |
 | [`loma-<variant>`](models/loma.md) | LoMa: DaD keypoints + LoMa-trained DeDoDe descriptors + LoMa's LightGlue-style matcher (`loma-b128`, `loma-b`, `loma-l`, `loma-g`, `loma-r`; `loma` = `loma-b`) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | [`loma-extractor`](models/loma.md), [`loma-matcher`](models/loma.md) | LoMa's components (variant `b128` \| `b` \| `l` \| `g` \| `r`) | `fp32`, **`bf16`**, `int8`, `fp8` |
@@ -72,9 +72,9 @@ Every learned model is a native PyTorch port that is checked against its upstrea
 
 **Preset notes.**
 - Presets omitted because MXFP8 (or INT8) loses pose AUC and is slower or dominated by the fallback (resolved via `build.NEAREST`):
-  - `fp8` -> `int8`: `dedode` (pure VGG19; `dedode-g` keeps `fp8`), `aliked-lightglue`, `superpoint-lightglue` (runs SuperPoint in `bf16` and LightGlue in rotated `int8`), `disk-lightglue`, `ripepp-lightglue`, `superpoint-superglue`, and `omniglue`.
-  - `fp8` / `int8` -> `bf16`: `xfeat-lightglue` (96-dim LighterGlue drops AUC under both MXFP8 and rotated INT8 and is slower than BF16 on ScanNet-1500), and `ripepp-aachen` / `ripepp-scared` (no Tokyo 24/7 / SCARED calibration & gate datasets available).
-- Targeted BF16 layer exclusions for quantization fidelity: `xfeat` protects `keypoint_head.*` and `block2.*` in `int8` / `fp8`; `superpoint` keeps `conv1b` in BF16 for `fp8` (`extractor_spec(..., fp8_ignore=...)`); `dedode` excludes `descriptor.encoder.layers.{3,7,10}` in `int8`; `ripe` and `ripepp` exclude `net.encoder.layers.{3,7,10}` in `fp8`; `loma-b128` keeps `*.decoder.*` and matcher `transformers.{4,5}.*` in BF16 for `fp8` via `ModelSpec.quant_configs` per-variant `<variant>/<quant>` lookup (other LoMa variants keep full MXFP8).
+  - `fp8` -> `int8`: `dedode` (pure VGG19; `dedode-g` keeps `fp8`), `aliked-lightglue`, `superpoint-lightglue` (runs SuperPoint in `bf16` and LightGlue in rotated `int8`), `disk-lightglue`, `superpoint-superglue`, and `omniglue`.
+  - `fp8` / `int8` -> `bf16`: `xfeat-lightglue` (96-dim LighterGlue drops AUC under both MXFP8 and rotated INT8 and is slower than BF16 on ScanNet-1500), `ripepp-lightglue` (MXFP8 collapses `-0.0538` on MegaDepth-200; static/dynamic rotated INT8 drops `-0.0074` and even `int8` extractor + `bf16` matcher drops `-0.0056` on MegaDepth-1500, while keeping `ripepp` in `bf16` leaves only ~2% pair speedup), and `ripepp-aachen` / `ripepp-scared` (no Tokyo 24/7 / SCARED calibration & gate datasets available).
+- Targeted BF16 layer exclusions for quantization fidelity: `xfeat` protects `keypoint_head.*` and `block2.*` in `int8` / `fp8`; `superpoint` keeps `conv1b` in BF16 for `fp8` (`extractor_spec(..., fp8_ignore=...)`); `dedode` excludes `descriptor.encoder.layers.{3,7,10}` in `int8`; `ripe` excludes `net.encoder.layers.{3,7,10}` and `ripepp` excludes `net.encoder.layers.{3,7,10}` plus `net.decoder.layers.{1,2}.*` in `fp8`; `loma-b128` keeps `*.decoder.*` and matcher `transformers.{4,5}.*` in BF16 for `fp8` via `ModelSpec.quant_configs` per-variant `<variant>/<quant>` lookup (other LoMa variants keep full MXFP8).
 - Licenses that restrict use: `romav2` and `flexglue` (`descriptor.backbone.*` in `flexglue.pth`) contain DINOv3 weights (DINOv3 License), `superglue` / `superpoint-superglue` (Magic Leap, non-commercial), `ripe` / `ripepp` / `ripepp-aachen` / `ripepp-scared` / `ripepp-lightglue` (Fraunhofer academic-use license v2.0, non-commercial), `mast3r` / `dust3r` / `ufm` weights (CC BY-NC-SA 4.0), and `eloftr`, whose upstream changed its license to ZJU3DV's PRL v1.0 on 2026-09-15 (the vendored oracle and the weights are Apache-2.0 from before that); see `THIRD_PARTY_NOTICES.md`.
 
 **Presets** name a precision:
@@ -142,6 +142,6 @@ m = loma.match("a.jpg", "b.jpg", max_matches=4096)           # 4096 keypoints pe
 ripepp = flashim.load("ripepp", "int8")                      # RIPE++ (also "ripepp-aachen", "ripepp-scared")
 m = ripepp.match("a.jpg", "b.jpg", resize=1200, max_matches=4096)  # subpixel keypoints + 256-d hypercolumns + MNN
 
-ripepp_lg = flashim.load("ripepp-lightglue", "int8")         # RIPE++ + weakly-supervised LightGlue
+ripepp_lg = flashim.load("ripepp-lightglue", "bf16")         # RIPE++ + weakly-supervised LightGlue
 m = ripepp_lg.match("a.jpg", "b.jpg", resize=1200, max_matches=4096)
 ```
