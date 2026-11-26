@@ -44,9 +44,9 @@ extractor_preset() {  # pipeline extractor, LightGlue preset -> the extractor's 
 
 for engine in eager compile; do
   for p in fp32 bf16 int8 fp8; do
-    for m in superpoint disk alike xfeat dedode dedode-g dad ripe; do sparse $m $p $engine; done
+    for m in superpoint disk alike xfeat dedode dedode-g dad ripe ripepp; do sparse $m $p $engine; done
     sparse loftr $p $engine --top-k 0
-    for m in superpoint disk xfeat aliked raco-aliked rdd; do
+    for m in superpoint disk xfeat aliked raco-aliked rdd ripepp; do
       sparse "$m-lightglue" $p $engine --overrides "components.extractor.preset=$(extractor_preset $m $p)"
     done
   done

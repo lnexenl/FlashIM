@@ -32,9 +32,12 @@ are independent implementations of the published architectures; the license of e
 ## Weights (downloaded, never shipped)
 
 Checkpoints are fetched from their publishers (URLs and SHA-256 in `flashim/models/*/weights.py`) and keep their own
-licenses. Six are not open-source licenses: **SuperPoint** (`superpoint_v1.pth`, Magic Leap, non-commercial research),
+licenses. Seven families are not open-source licenses: **SuperPoint** (`superpoint_v1.pth`, Magic Leap, non-commercial research),
 **SuperGlue** (`superglue_outdoor.pth` / `superglue_indoor.pth`, Magic Leap, academic or non-profit non-commercial
-research use only), **RIPE** (Fraunhofer academic-use license: internal non-commercial use only), **MASt3R**
+research use only), **RIPE** (`ripe_weights.pth`, Fraunhofer academic-use license v2.0: internal non-commercial use only),
+**RIPE++** (`ripe++.ckpt`, `ripe++_tokyo_megadepth.ckpt`, `ripe++_scared.ckpt`, and `ripe++lightglue.tar`, Fraunhofer
+academic-use license v2.0: internal non-commercial use only; upstream repo partly based on DALF Apache-2.0, DeDoDe MIT,
+DISK Apache-2.0, and matcher code in `JohannesK14/glue-factory` Apache-2.0), **MASt3R**
 (`MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only),
 **DUSt3R** (`DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth`, Naver Corporation, CC BY-NC-SA 4.0, non-commercial use only),
 and **UFM** (`ufm_base.safetensors`, CC BY-NC-SA 4.0, non-commercial use only).
@@ -44,8 +47,8 @@ The DINOv3 weights inside the RoMaV2 checkpoint, and the DINOv3 ConvNeXt-B backb
 ## Test references (`tests/oracles/`)
 
 Upstream reference code for the parity tests, copied with its license next to it and a header in each file; see
-`tests/oracles/README.md`. RIPE, cvg/LightGlue's `superpoint.py` and Magic Leap's `superglue.py` (Magic Leap notice)
-are not copied: the tests download them on demand. `assets/` holds test images taken from RoMaV2 (MIT), MegaDepth and LightGlue-ONNX (Apache-2.0).
+`tests/oracles/README.md`. RIPE, RIPE++, cvg/LightGlue's `superpoint.py` and Magic Leap's `superglue.py` (Magic Leap notice)
+are not copied: the tests download them on demand (or import an installed package / local checkout). `assets/` holds test images taken from RoMaV2 (MIT), MegaDepth and LightGlue-ONNX (Apache-2.0).
 
 ## Calibration tables
 

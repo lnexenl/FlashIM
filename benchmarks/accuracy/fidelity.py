@@ -32,6 +32,7 @@ from flashim.paths import DATA
 PROTOCOL = {  # model -> (resize, top_k), as benchmarks/accuracy/sparse_matrix.sh
     "superpoint": (1600, 4096), "disk": (1600, 4096), "alike": (1600, 4096), "xfeat": (1600, 4096),
     "dedode": (1024, 8192), "dedode-g": (1024, 8192), "dad": (1024, 8192), "ripe": (1024, 4096),
+    "ripepp": (1200, 4096), "ripepp-lightglue": (1200, 4096),
     "loftr": (840, 0), "minima-loftr": (840, 0), "eloftr": (832, 0), "xoftr": (640, 0),
     "mast3r": (512, 0), "dust3r": (512, 5000),
     # LoMa: upstream's benchmark protocol (DaD at a 1024 px long side, 4096 keypoints)

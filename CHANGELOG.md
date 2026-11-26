@@ -4,6 +4,19 @@
 
 ### Added
 
+- RIPE++ (`ripepp`, `ripepp-aachen`, `ripepp-scared`, `ripepp-lightglue`; Fraunhofer HHI, LIMIT@ECCV 2026; non-commercial
+  academic-use weights): native PyTorch port reusing RIPE's VGG19 + ConvRefiner backbone and exact `sm_120` INT8/BF16
+  fusion passes, adding ImageNet normalization, 3×3 softmax subpixel refinement, `align_corners=False` hypercolumn
+  sampling, pixel-center keypoint conversion (`matcher_keypoint_offset=0.5`), and the published weakly-supervised
+  LightGlue matcher (`ripe++lightglue.tar`). `ripepp` ships `fp32` / `bf16` (default) / `int8` (31/35 convs INT8,
+  `net.decoder.layers.{1,2}.*` kept BF16 for subpixel keypoint accuracy) / `fp8` (28/35 convs MXFP8,
+  `net.encoder.layers.{3,7,10}` + `net.decoder.layers.{1,2}.*` BF16); `ripepp-aachen` and `ripepp-scared` ship `fp32` /
+  `bf16`; `ripepp-lightglue` ships `fp32` / `bf16` (default) / `int8` (`ripepp` `int8` + `lightglue` `bf16`, `fp8 ->
+  int8` via `build.NEAREST`). Verified on RTX 5070 Ti (`sm_120`, `eager`, 1200 px / 4096 kp): `ripepp int8` extract
+  `20.4 ms` and `fp8` `28.8 ms` vs `bf16` `33.7 ms` (1.65x / 1.17x), `ripepp-lightglue int8` pair `52.6 ms` vs `bf16`
+  `79.4 ms` (1.51x); MegaDepth-1500 / ScanNet-1500 paired-bootstrap gate (3 seeds, PoseLib 1.0 px, vs own `bf16`, 2 PASS
+  / 4 BORDERLINE / 0 FAIL): `ripepp` `bf16` `0.5877 / 0.1620`, `int8` `-0.0040 / +0.0020`, `fp8` `+0.0004 / -0.0012`;
+  `ripepp-lightglue` `bf16` `0.6057 / 0.1495`, `int8` `-0.0011 / -0.0009`.
 - FlexGlue (`flexglue`, cvg/FlexGlue v0.1): sparse-to-dense matcher with a DINOv3-ConvNeXt descriptor.
   `match_keypoints` matches any extractor's keypoints, `match` samples the dense warp with upstream's gates. Presets
   `fp32` / `bf16` / `int8` / `fp8` (default: MXFP8 transformer linears + INT8 descriptor MLP); `int8` / `fp8` run

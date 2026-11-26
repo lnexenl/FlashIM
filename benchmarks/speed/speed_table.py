@@ -14,14 +14,14 @@ from collections import defaultdict
 from pathlib import Path
 
 PRESETS = ("fp32", "bf16", "int8", "fp8")
-EXTRACTORS = ("superpoint", "disk", "alike", "xfeat", "dedode", "dedode-g", "dad", "ripe", "aliked",
+EXTRACTORS = ("superpoint", "disk", "alike", "xfeat", "dedode", "dedode-g", "dad", "ripe", "ripepp", "aliked",
               "raco-aliked", "rdd", "sift", "orb")
 # a model whose result is one `match` of the pair (no `extract`): dense and semi-dense matchers
 PAIR_LEVEL = ("loftr", "roma", "minima-roma", "tiny-roma", "mast3r", "dust3r", "ufm", "eloftr", "xoftr",
               "minima-loftr")
 # feature-level pipelines: pair time = 2 x extract + match_features
 LIGHTGLUE = ("superpoint-lightglue", "disk-lightglue", "xfeat-lightglue", "aliked-lightglue",
-             "raco-aliked-lightglue", "rdd-lightglue")
+             "raco-aliked-lightglue", "rdd-lightglue", "ripepp-lightglue")
 OTHER_PIPELINES = ("loma-b128", "loma-b", "loma-r", "loma-l", "loma-g", "superpoint-superglue", "omniglue")
 PIPELINES = LIGHTGLUE + OTHER_PIPELINES
 MATCHERS = PIPELINES + ("rdd", "orb", "sift")

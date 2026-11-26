@@ -29,14 +29,14 @@ from flashim.paths import MEGADEPTH_IMAGES
 
 IMAGES = MEGADEPTH_IMAGES
 IMAGE_A, IMAGE_B = IMAGES / "3383162411_67cc9af85e_o.jpg", IMAGES / "299056923_ecd980298c_o.jpg"
-EXTRACTORS = ("superpoint", "alike", "disk", "xfeat", "ripe", "dedode", "dedode-g", "dad")
+EXTRACTORS = ("superpoint", "alike", "disk", "xfeat", "ripe", "ripepp", "dedode", "dedode-g", "dad")
 
 
 def configs() -> list[tuple[str, str, str, list[str], str]]:
     """``(name, model, preset, overrides, kind)``; kind is ``extract`` / ``pipeline`` / ``pair`` / ``dense``."""
     out = [(f"{m}-{p}", m, p, [], "extract") for m in EXTRACTORS for p in ("bf16", "int8", "fp8")]
     out += [(f"{m}-lightglue-{p}", f"{m}-lightglue", p, [f"components.extractor.preset={p}"], "pipeline")
-            for m in ("xfeat", "superpoint", "disk") for p in ("int8", "fp8")]
+            for m in ("xfeat", "superpoint", "disk", "ripepp") for p in ("int8", "fp8")]
     out += [(f"loftr-{p}", "loftr", p, [], "pair") for p in ("bf16", "int8", "fp8")]
     out += [(f"rdd-lightglue-{p}", "rdd-lightglue", p, ["components.extractor.preset=fp8"], "pipeline")
             for p in ("fp8", "int8")]
