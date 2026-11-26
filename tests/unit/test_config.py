@@ -222,6 +222,18 @@ class _Toy(nn.Module):
         self.log: list[str] = []
 
 
+@pytest.fixture(autouse=True)
+def _restore_spec_registry():
+    """The toy specs registered below must not leak into tests that list ``available_models()``."""
+    builder = sys.modules["flashim.build"]
+    specs, paths = dict(builder._SPECS), dict(builder._SPEC_PATHS)
+    yield
+    builder._SPECS.clear()
+    builder._SPECS.update(specs)
+    builder._SPEC_PATHS.clear()
+    builder._SPEC_PATHS.update(paths)
+
+
 def _toy_spec():
     def mark(label):
         return lambda model, ctx: model.log.append(label) or label
