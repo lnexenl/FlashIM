@@ -7,12 +7,15 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, RestrictedWeights, find_weights
+
+RESTRICTION = RestrictedWeights("ufm", "CC-BY-NC-SA-4.0")
 
 CHECKPOINT = Checkpoint(
     "ufm_base.safetensors",
     "https://huggingface.co/infinity1096/UFM-Base/resolve/main/model.safetensors",
     "b11d1c27bb39edd59b95df365f1754d1500af14fdf40940f4826436a4a55fce6",
+    noncommercial=RESTRICTION,
 )
 
 LICENSES = {
@@ -20,6 +23,7 @@ LICENSES = {
     "DINOv2 Apache-2.0); FlashIM re-implementation",
     "weights": "CC BY-NC-SA 4.0 (non-commercial use only; inherits underlying training dataset licenses)",
 }
+MODEL_INFO = ModelInfo(("Apache-2.0", "BSD-3-Clause", "CC-BY-NC-SA-4.0"), (RESTRICTION.license,))
 
 
 def load_state_dict(

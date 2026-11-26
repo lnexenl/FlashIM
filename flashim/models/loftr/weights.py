@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 _MIRROR = "https://cmp.felk.cvut.cz/~mishkdmy/models"
 _MINIMA_RELEASES = "https://github.com/LSXI7/storage/releases/download/MINIMA"
@@ -29,6 +29,7 @@ LICENSES = {
     "code": "Apache-2.0 (LoFTR, zju3dv/LoFTR; kornia); FlashIM re-implementation",
     "weights": "LoFTR outdoor_ds / indoor_ds_new (Apache-2.0); MINIMA-LoFTR (Apache-2.0, LSXI7/MINIMA)",
 }
+MODEL_INFO = ModelInfo(("Apache-2.0",), ("Apache-2.0",))
 
 
 def load_state_dict(variant: str, path: str | Path | None = None, map_location="cpu") -> dict[str, torch.Tensor]:

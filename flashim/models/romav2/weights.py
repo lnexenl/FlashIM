@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT = Checkpoint(
     "romav2.0.1.pt",
@@ -13,9 +13,12 @@ CHECKPOINT = Checkpoint(
 )
 
 LICENSES = {
-    "code": "MIT (RoMaV2); FlashIM re-implementation",
-    "weights": "RoMaV2 checkpoint includes DINOv3 ViT-L/16 weights under the DINOv3 License",
+    "code": "MIT (RoMaV2); DINOv3 / DPT parts under the DINOv3 License Agreement",
+    "weights": "romav2.0.1.pt includes DINOv3 ViT-L/16 under the DINOv3 License. The v2.0.1 README "
+    "specifies MIT for code. Its scope for the other tensors in this mixed checkpoint is unresolved "
+    "(https://github.com/Parskatt/RoMaV2/issues/52).",
 }
+MODEL_INFO = ModelInfo(("LicenseRef-DINOv3", "MIT"), ("LicenseRef-DINOv3", "NOASSERTION"))
 
 
 def load_state_dict(map_location: str | torch.device = "cpu") -> dict[str, torch.Tensor]:

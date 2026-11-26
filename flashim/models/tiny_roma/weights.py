@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT = Checkpoint(
     "tiny_roma_v1_outdoor.pth",
@@ -22,6 +22,7 @@ LICENSES = {
     "code": "MIT (Parskatt/RoMa); XFeat backbone Apache-2.0 (verlab/accelerated_features); FlashIM re-implementation",
     "weights": "MIT (Parskatt/RoMa release; fine-tuned XFeat backbone weights included)",
 }
+MODEL_INFO = ModelInfo(("Apache-2.0", "MIT"), ("MIT",))
 
 
 def load_state_dict(

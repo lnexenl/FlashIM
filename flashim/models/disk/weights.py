@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT = Checkpoint(
     "disk_depth.pth",
@@ -15,8 +15,9 @@ CHECKPOINT = Checkpoint(
 )
 LICENSES = {
     "code": "Apache-2.0 (DISK, cvlab-epfl/disk; kornia); FlashIM re-implementation",
-    "weights": "DISK 'depth' checkpoint",
+    "weights": "depth-save.pth inherits Apache-2.0 from cvlab-epfl/disk's LICENSE.txt",
 }
+MODEL_INFO = ModelInfo(("Apache-2.0",), ("Apache-2.0",))
 
 
 def load_state_dict(path: str | Path | None = None, map_location="cpu") -> dict[str, torch.Tensor]:

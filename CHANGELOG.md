@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- `flashim.model_info(name)`: code and weights license IDs of a model's default configuration (every component of a
+  pipeline) and `commercial_ok` (only Apache-2.0 / BSD-3-Clause / MIT; unknown or restricted terms are `False`).
+  [docs/licenses.md](docs/licenses.md) is generated from it. Weights published in the upstream repository inherit its
+  license, with the basis recorded in each `weights.py`.
+- A one-time warning per model family before downloading non-commercial weights (Magic Leap SuperPoint / SuperGlue,
+  Fraunhofer academic RIPE / RIPE++, CC-BY-NC-SA MASt3R / DUSt3R / UFM).
+
 ### Fixed
 
 - `engine="compile"` on model / preset combinations known to crash in Dynamo or Inductor (INT8 / FP8 `alike`, `xfeat`,

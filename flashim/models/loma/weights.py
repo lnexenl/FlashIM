@@ -15,7 +15,7 @@ from typing import NamedTuple
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 RELEASE = "https://github.com/davnords/storage/releases/download/loma"
 CHECKPOINTS = {
@@ -43,8 +43,13 @@ CHECKPOINTS = {
 LICENSES = {
     "code": "MIT (davnords/LoMa) except the matcher, derived from cvg/LightGlue: Apache-2.0; DaD / DeDoDe "
     "MIT; DINOv2 Apache-2.0; FlashIM re-implementation",
-    "weights": "LoMa release checkpoints loma_{B128,B,L,G,R} (matcher + frozen DaD detector + LoMa-trained "
-    "DeDoDe descriptor, DINOv2 ViT-L/14 inside for B / L / G / R)",
+    "weights": "loma_B128.pth, loma_B.pt and loma_{L,G,R}.pth inherit MIT from the davnords/storage loma "
+    "release's LICENSE. The bundled DaD detector is MIT and the bundled DINOv2 in B/L/G/R is Apache-2.0. "
+    "LoMa's README identifies separate commercial_loma files trained only on commercially licensed datasets.",
+}
+MODEL_INFO = ModelInfo(("Apache-2.0", "MIT"), ("Apache-2.0", "MIT"))
+MODEL_INFO_OVERRIDES = {
+    "b128": ModelInfo(("Apache-2.0", "MIT"), ("MIT",)),
 }
 
 _DINOV2 = "encoder.frozen_dinov2.dinov2_vitl14."

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT_ENV = "FLASHIM_ALIKED_CHECKPOINT"
 _SHA256 = {
@@ -20,8 +20,9 @@ CHECKPOINTS = {name: Checkpoint(f"{name}.pth", f"{_REPO}/{name}.pth", sha) for n
 
 LICENSES = {
     "code": "BSD-3-Clause (ALIKED, Shiaoming/ALIKED); FlashIM re-implementation",
-    "weights": "ALIKED release checkpoints (aliked-t16 / aliked-n16 / aliked-n16rot / aliked-n32)",
+    "weights": "models/aliked-{t16,n16,n16rot,n32}.pth inherit BSD-3-Clause from Shiaoming/ALIKED's LICENSE",
 }
+MODEL_INFO = ModelInfo(("Apache-2.0", "BSD-3-Clause"), ("BSD-3-Clause",))
 
 
 def find_checkpoint(variant: str, path: str | Path | None = None) -> Path:

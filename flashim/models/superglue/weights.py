@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, RestrictedWeights, find_weights
 
 VARIANTS = ("outdoor", "indoor")
 DEFAULT_VARIANT = "outdoor"
@@ -15,16 +15,20 @@ DEFAULT_VARIANT = "outdoor"
 _COMMIT = "ddcf11f42e7e0732a0c4607648f9448ea8d73590"
 _BASE_URL = f"https://raw.githubusercontent.com/magicleap/SuperGluePretrainedNetwork/{_COMMIT}/models/weights"
 
+RESTRICTION = RestrictedWeights("superglue", "LicenseRef-MagicLeap-SuperGlue")
+
 CHECKPOINTS = {
     "outdoor": Checkpoint(
         "superglue_outdoor.pth",
         f"{_BASE_URL}/superglue_outdoor.pth",
         "2f5f5e9bb3febf07b69df633c4c3ff7a17f8af26a023aae2b9303d22339195bd",
+        noncommercial=RESTRICTION,
     ),
     "indoor": Checkpoint(
         "superglue_indoor.pth",
         f"{_BASE_URL}/superglue_indoor.pth",
         "0e710469be25ebe1e2ccf68edcae8b2945b0617c8e7e68412251d9d47f5052b1",
+        noncommercial=RESTRICTION,
     ),
 }
 
@@ -34,6 +38,7 @@ LICENSES = {
     "weights": "superglue_outdoor.pth / superglue_indoor.pth (Magic Leap, Inc.; Academic or non-profit "
     "organization non-commercial research use only)",
 }
+MODEL_INFO = ModelInfo(("Apache-2.0",), (RESTRICTION.license,))
 
 _PROJ_RE = re.compile(r"^gnn\.layers\.\d+\.attn\.proj\.[012]\.(weight|bias)$")
 _MERGE_W_RE = re.compile(r"^gnn\.layers\.\d+\.attn\.merge\.weight$")

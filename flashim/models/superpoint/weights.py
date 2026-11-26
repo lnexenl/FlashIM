@@ -11,15 +11,18 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, RestrictedWeights, find_weights
 
 CHECKPOINT_ENV = "FLASHIM_SUPERPOINT_CHECKPOINT"
 CHECKPOINT_SP_V6_ENV = "FLASHIM_SUPERPOINT_SP_V6_CHECKPOINT"
+
+RESTRICTION = RestrictedWeights("superpoint", "LicenseRef-MagicLeap-SuperPoint")
 
 CHECKPOINT = Checkpoint(
     "superpoint_v1.pth",
     "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth",
     "52b6708629640ca883673b5d5c097c4ddad37d8048b33f09c8ca0d69db12c40e",
+    noncommercial=RESTRICTION,
 )
 CHECKPOINTS = {
     "v1": CHECKPOINT,
@@ -33,6 +36,10 @@ CHECKPOINTS = {
 LICENSES = {
     "code": "FlashIM re-implementation of SuperPoint (Magic Leap / rpautrat/SuperPoint MIT); no upstream code copied (LightGlue's superpoint.py carries a Magic Leap no-redistribution notice)",
     "weights": "superpoint_v1.pth (Magic Leap; non-commercial research license); sp_v6.tgz (rpautrat/SuperPoint, MIT license)",
+}
+MODEL_INFO = ModelInfo(("Apache-2.0",), (RESTRICTION.license,))
+MODEL_INFO_OVERRIDES = {
+    "sp_v6": ModelInfo(("Apache-2.0", "MIT"), ("MIT",)),
 }
 
 # TF variable prefix -> (PyTorch Conv2d name, PyTorch BatchNorm2d name)

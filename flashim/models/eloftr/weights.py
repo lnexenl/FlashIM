@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT = Checkpoint(
     "eloftr_outdoors.safetensors",
@@ -27,6 +27,7 @@ LICENSES = {
         "upstream zju3dv/EfficientLoFTR re-licensed to ZJU3DV PRL v1.0 on 2026-09-15, so newer upstream use is under PRL)"
     ),
 }
+MODEL_INFO = ModelInfo(("Apache-2.0",), ("Apache-2.0",))
 
 
 def load_state_dict(path: str | Path | None = None, map_location: str = "cpu") -> dict[str, torch.Tensor]:

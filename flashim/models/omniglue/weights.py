@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 
 from flashim.models.omniglue.tf_bundle import load_cached_safetensors
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT_ENV = "FLASHIM_OMNIGLUE_CHECKPOINT"
 DINOV2_ENV = "FLASHIM_OMNIGLUE_DINOV2_CHECKPOINT"
@@ -33,6 +33,10 @@ CHECKPOINTS = {
 LICENSES = {
     "code": "Apache-2.0 (Google LLC, OmniGlue; Meta, DINOv2); MIT (rpautrat/SuperPoint sp_v6); FlashIM re-implementation",
     "weights": "og_export.zip (Apache-2.0, Google LLC); dinov2_vitb14_pretrain.pth (Apache-2.0, Meta); sp_v6.tgz (MIT, rpautrat/SuperPoint)",
+}
+MODEL_INFO = ModelInfo(("Apache-2.0", "MIT"), ("Apache-2.0", "MIT"))
+MODEL_INFO_OVERRIDES = {
+    "omniglue-matcher": ModelInfo(("Apache-2.0",), ("Apache-2.0",)),
 }
 
 

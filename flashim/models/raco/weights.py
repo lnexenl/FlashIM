@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT_ENV = "FLASHIM_RACO_CHECKPOINT"
 CHECKPOINT = Checkpoint(
@@ -16,8 +16,9 @@ CHECKPOINT = Checkpoint(
 )
 LICENSES = {
     "code": "Apache-2.0 (RaCo, cvg/RaCo); FlashIM re-implementation",
-    "weights": "cvg/RaCo release raco.pth",
+    "weights": "raco.pth inherits Apache-2.0 from cvg/RaCo's v1.0.0 LICENSE (official model weights release)",
 }
+MODEL_INFO = ModelInfo(("Apache-2.0",), ("Apache-2.0",))
 # The released checkpoint also carries a covariance-estimator head that keypoint extraction does not use.
 _UNUSED_PREFIX = "covariance_estimator_head."
 

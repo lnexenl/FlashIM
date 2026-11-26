@@ -11,7 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lnexenl/FlashIM/blob/main/LICENSE">Apache-2.0</a> ·
+  <a href="#license">Code: Apache-2.0 with MIT and DINOv3 parts</a> ·
+  <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/licenses.md">Weights: per model, some non-commercial</a> ·
   <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/models.md">Models</a> ·
   <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/benchmarks.md">Inference benchmark</a> ·
   <a href="https://github.com/lnexenl/FlashIM/blob/main/docs/configuration.md">Configuration</a> ·
@@ -87,11 +88,11 @@ default; the licenses are in [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl
 | Sparse matchers and pipelines | `lightglue`, `<extractor>-lightglue`, `loma`, `superglue`, `superpoint-superglue`, `omniglue` |
 | Sparse-to-dense | `flexglue` |
 
-**Weight licenses.** Code is Apache-2.0, but weights keep their publishers' licenses and some are not open: `ufm`,
-`mast3r`, `dust3r` (CC BY-NC-SA 4.0), `superpoint` (Magic Leap), `superglue` and `superpoint-superglue` (Magic Leap,
-academic / non-profit research only), and `ripe`, `ripepp`, `ripepp-aachen`, `ripepp-scared`, `ripepp-lightglue`
-(Fraunhofer academic-use license v2.0) are **non-commercial**; `romav2` and `flexglue` contain
-DINOv3 weights under the DINOv3 License. Check [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl/FlashIM/blob/main/THIRD_PARTY_NOTICES.md) before commercial use.
+**Weight licenses.** The default SuperPoint and SuperGlue weights (Magic Leap), RIPE and RIPE++ weights
+(Fraunhofer academic-use license v2.0), and MASt3R, DUSt3R and UFM weights (CC BY-NC-SA 4.0) are
+**non-commercial**, including in pipelines that use them. RoMaV2 and FlexGlue include DINOv3 weights under the
+DINOv3 License Agreement. Look up a model with `flashim.model_info(name)` or see the
+[per-model license table](https://github.com/lnexenl/FlashIM/blob/main/docs/licenses.md).
 
 ## Configuring a run
 
@@ -136,9 +137,10 @@ exceptions inside the package: code ported from [RoMaV2](https://github.com/Pars
 Triton kernels) is under RoMaV2's MIT license ([`licenses/RoMaV2-MIT.txt`](https://github.com/lnexenl/FlashIM/blob/main/licenses/RoMaV2-MIT.txt)),
 and `flashim/models/romav2/dinov3.py` and `dpt.py` follow DINOv3 / DPT code by Meta under the DINOv3 License Agreement
 ([`licenses/DINOv3-License.md`](https://github.com/lnexenl/FlashIM/blob/main/licenses/DINOv3-License.md)). The package's
-license expression is `Apache-2.0 AND MIT AND LicenseRef-DINOv3`. Model weights are downloaded from their publishers,
-never shipped, and keep their upstream licenses (see the warning under [Models](#models)); the full list, including the
-licenses of vendored test code and assets, is in [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl/FlashIM/blob/main/THIRD_PARTY_NOTICES.md).
+license expression is `Apache-2.0 AND MIT AND LicenseRef-DINOv3`. FlashIM downloads model weights from their
+publishers under the terms in the [per-model license table](https://github.com/lnexenl/FlashIM/blob/main/docs/licenses.md).
+For attribution and the licenses of vendored test code and assets, see
+[THIRD_PARTY_NOTICES.md](https://github.com/lnexenl/FlashIM/blob/main/THIRD_PARTY_NOTICES.md).
 
 <p align="center">
   <img alt="" src="https://raw.githubusercontent.com/lnexenl/FlashIM/main/assets/brand/mark-pair.svg" width="64" height="64">&nbsp;&nbsp;
