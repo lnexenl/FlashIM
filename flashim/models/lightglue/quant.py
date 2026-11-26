@@ -41,23 +41,26 @@ Per-pairing MXFP8 evidence (MegaDepth-1500 / ScanNet-1500, 3 seeds 17/29/42, pos
     (-0.0012 [-0.0068, +0.0045]), ScanNet-1500 0.1832 (+0.0033 [-0.0029, +0.0094]).
   - ``disk-lightglue`` ``fp8 -> int8`` (DISK ``int8`` + rotated INT8 LightGlue): MegaDepth-1500 AUC@5 0.6165
     (+0.0039 [-0.0011, +0.0090]), ScanNet-1500 0.1807 (-0.0022 [-0.0094, +0.0052], 35.9s vs 55.8s ``dev fp8``).
-  - ``xfeat-lightglue`` ``fp8 / int8 -> bf16`` (rotated INT8 still drops -0.0066 at p=0.9999 / -0.0049 at p=1.0 on
-    MegaDepth-1500 and is slower than BF16 on ScanNet-1500, 19.5 vs 16.3s): MegaDepth-1500 0.5580 (+0.0000),
-    ScanNet-1500 0.1580 (+0.0000).
-  - ``ripepp-lightglue`` ``fp8 / int8 -> bf16``: MXFP8 collapses on MegaDepth-200 (-0.0538 AUC@5, ``match_ratio`` 0.676,
-    66.2 vs 48.5 ms/pair). Every INT8 scheme tested also fails the -0.005 MegaDepth-1500 gate (3 seeds, PoseLib 1.0 px,
-    vs own ``bf16`` 0.6057, 79.4 ms/pair): static rotated INT8 + SmoothQuant ``ffn.3`` + ``fused_int8_glue`` drops
-    -0.0074 [-0.0122, -0.0027] (0.5984; 20-pair ``agree2px`` 0.7363 / ``match_ratio`` 0.9412; clipping <= 1.71x, ``p=1.0``
-    on ``bf16``/``int8`` feats worsens 20-pair ``agree2px`` to 0.7146 / 0.7216, ``p=0.999``/``0.9995`` barely move ``bf16``-feat
-    agreement from 0.8147 to 0.8233/0.8264, layers 4-5 lose 0.884/0.897 alone); rotated per-token ``DynamicInt8Linear`` +
-    SmoothQuant ``ffn.3`` (81/81 linears INT8, 10.8 ms match) lifts 20-pair agreement (``bf16`` feats 0.8634/0.9819,
-    ``int8`` feats 0.7727/0.9702) yet still drops -0.0074 [-0.0123, -0.0027] on MegaDepth-1500 (0.5983); isolating the
-    extractor with ``int8`` extractor + exact ``bf16`` matcher (50.4 ms/pair) still drops -0.0056 [-0.0101, -0.0011]
-    (0.6002, CI excludes zero) because ``ripepp int8``'s 5% keypoint shift (``kp_overlap`` 0.951) moves features off
-    RIPE++'s RL-trained LightGlue manifold (same mechanism as ``superpoint-lightglue``). Keeping ``ripepp`` in ``bf16``
-    (2 x 33.7 = 67.4 ms, 85% of pair time) leaves only ~2% pair speedup from quantizing LightGlue (77.5 vs 79.4 ms
-    static INT8, 78.0 ms dynamic INT8, 79.0 ms protecting layers 4-5) while still losing matcher fidelity (0.815-0.914).
-    Omitting ``int8`` and ``fp8`` resolves both to ``bf16`` (MegaDepth-1500 0.6057, ScanNet-1500 0.1495, +0.0000).
+  - ``xfeat-lightglue`` ``fp8 / int8 -> bf16`` (``xfeat int8`` extractor passes on its own at +0.0041 [-0.0023, +0.0104]
+    on MegaDepth-1500, while Paley-12 Hadamard rotation inside the 6-layer ``dim=96`` 1-head LighterGlue fixes its 8.00x
+    channel outliers at the cost of 8.85x / 7.35x per-token outliers in ``L4/L5.self_attn.out_proj``, dropping
+    MegaDepth-1500 by -0.0074 [-0.0148, -0.0001] on ``bf16`` feats / -0.0051 on ``int8`` feats with ``conf`` shifted
+    0.707 -> 0.654; rotated per-token ``DynamicInt8Linear`` + SmoothQuant ``ffn.3`` fixes accuracy to -0.0024 / -0.0029
+    but runs slower than BF16, 3.67 vs 3.49 ms match, and static INT8 is slower than BF16 on ScanNet-1500, 19.5 vs
+    16.3 s): MegaDepth-1500 0.5580 (+0.0000), ScanNet-1500 0.1580 (+0.0000).
+  - ``ripepp-lightglue`` ``fp8 -> int8`` (``ripepp`` ``int8`` with ``dec.{1,2}`` BF16 + ``bf16`` LightGlue matcher,
+    52.6 vs 79.4 ms/pair, 1.51x speedup): MXFP8 collapses on MegaDepth-200 (-0.0538 AUC@5, ``match_ratio`` 0.676, 66.2
+    ms/pair). Quantizing RIPE++'s RL-trained LightGlue matcher loses accuracy under every scheme tested on MegaDepth-1500
+    (-0.0034 static rotated / -0.0020 dynamic rotated / -0.0041 protecting L4-5 on ``bf16`` feats, compounding to
+    -0.0046..-0.0081 on quantized feats) because late-layer similarity/matchability logit scale explodes (``sim`` MAE
+    36.85 vs RDD 0.58; ``matchability`` MAE 4.73, bias -0.63; saturated ``conf`` quantiles ``[1.0, 1.0, 1.0]``; outliers
+    are smaller than RDD at ``ch`` <= 5.73x / ``tok`` <= 2.73x). Separately, static INT8 on the 4 high-resolution
+    decoder ``block1`` convs (``dec.{1,2}``) degraded RIPE++'s 3x3 softmax subpixel keypoints (``kp@0.5px`` 0.9030, mean
+    disp 0.067 px), causing -0.0060 [-0.0106, -0.0015] into exact BF16 LightGlue (keypoint/descriptor swap proved
+    ``bf16_kpt + int8_desc`` passes at -0.0011 [-0.0041, +0.0019] while ``int8_kpt + bf16_desc`` drops -0.0072). Keeping
+    ``dec.{1,2}`` BF16 in ``ripepp int8`` (31/35 convs INT8, 20.4 ms extract) and running LightGlue in ``bf16`` (11.8 ms,
+    ``matcher_presets={"int8": "bf16"}``) restores MegaDepth-1500 to 0.6046 (-0.0011 [-0.0052, +0.0030]) at 1.51x faster
+    pair latency.
 """
 
 from __future__ import annotations

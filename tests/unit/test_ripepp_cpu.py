@@ -125,9 +125,12 @@ def test_specs_registered_and_resolved():
     assert lg_cfg.components["extractor"].model == "ripepp"
     assert lg_cfg.components["matcher"].model == "lightglue"
     assert lg_cfg.components["matcher"].variant == "ripepp"
-    # Both MXFP8 and INT8 are omitted on ripepp-lightglue (resolve fp8/int8 -> bf16 via build.NEAREST)
-    assert flashim.resolve("ripepp-lightglue", "fp8").preset == "bf16"
-    assert flashim.resolve("ripepp-lightglue", "int8").preset == "bf16"
+    # MXFP8 is omitted on ripepp-lightglue (resolves fp8 -> int8 via build.NEAREST); int8 keeps LightGlue in bf16
+    assert flashim.resolve("ripepp-lightglue", "fp8").preset == "int8"
+    lg_i8 = flashim.resolve("ripepp-lightglue", "int8")
+    assert lg_i8.preset == "int8"
+    assert lg_i8.components["extractor"].preset == "int8"
+    assert lg_i8.components["matcher"].preset == "bf16"
 
 
 def test_fraunhofer_tls_hint_on_download_failure(monkeypatch):

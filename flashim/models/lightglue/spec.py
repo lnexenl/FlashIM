@@ -202,8 +202,10 @@ def _pipeline(
     *,
     presets: tuple[str, ...] = PRECISIONS,
     extractor_presets: Mapping[str, str] | None = None,
+    matcher_presets: Mapping[str, str] | None = None,
 ) -> ModelSpec:
     ext_presets = extractor_presets or {}
+    mat_presets = matcher_presets or {}
     return ModelSpec(
         name=name,
         role="pipeline",
@@ -213,7 +215,7 @@ def _pipeline(
             preset: {
                 "components": {
                     "extractor": {"model": extractor, "preset": ext_presets.get(preset, preset)},
-                    "matcher": {"model": "lightglue", "preset": preset, "variant": variant},
+                    "matcher": {"model": "lightglue", "preset": mat_presets.get(preset, preset), "variant": variant},
                 }
             }
             for preset in presets
@@ -255,17 +257,19 @@ XFEAT_LIGHTGLUE = _pipeline(
     "xfeat-lightglue", "xfeat", "xfeat", "fp32", "XFeat + LighterGlue (verlab weights)",
     presets=("fp32", "bf16"),
 )
-# RIPE++ + LightGlue: MXFP8 collapses on MegaDepth-200 (-0.0538 AUC@5, match_ratio 0.676) while running slower than
-# int8 (66.2 vs 48.5 ms/pair). Under INT8, full MegaDepth-1500 fails the -0.005 gate for static rotated INT8 (-0.0074
-# [-0.0122, -0.0027]), rotated per-token dynamic INT8 (-0.0074 [-0.0123, -0.0027]), and even int8 extractor + exact bf16
-# matcher (-0.0056 [-0.0101, -0.0011]) because RIPE++ int8's 5% keypoint shift moves features off the RL LightGlue
-# manifold; keeping the extractor in bf16 (67.4/79.4 ms = 85% of pair time) leaves only ~2% pair speedup from an int8
-# matcher (77.5 vs 79.4 ms) while still dropping matcher fidelity (see quant.py). Omitting int8 and fp8 resolves both to
-# bf16 via build.NEAREST (same mechanism as xfeat-lightglue).
+# RIPE++ + LightGlue:
+# - MXFP8 collapses on MegaDepth-200 (-0.0538 AUC@5, match_ratio 0.676, 66.2 ms/pair); omitted (fp8 -> int8).
+# - Quantizing RIPE++'s RL-trained LightGlue matcher drops MegaDepth-1500 AUC@5 under every scheme tested (-0.0034 to
+#   -0.0081 static rotated, -0.0020 to -0.0077 dynamic rotated, -0.0041 to -0.0046 protecting L4-5) because late-layer
+#   similarity/matchability logit scale explodes (sim MAE 36.85 vs RDD 0.58; matchability MAE 4.73, bias -0.63).
+# - Keeping the matcher in bf16 (12.2 ms, 15% of bf16 pair time) while running the RIPE++ extractor in int8 (31/35 convs
+#   INT8 with dec.{1,2} kept BF16 for subpixel accuracy) recovers MegaDepth-1500 to -0.0011 [-0.0052, +0.0030] while
+#   delivering a ~1.5x pair speedup vs bf16 (see quant.py).
 RIPEPP_LIGHTGLUE = _pipeline(
     "ripepp-lightglue", "ripepp", "ripepp", "bf16",
     "RIPE++ detector/descriptor + weakly-supervised LightGlue (RIPE++ RL weights)",
-    presets=("fp32", "bf16"),
+    presets=("fp32", "bf16", "int8"),
+    matcher_presets={"int8": "bf16"},
 )
 
 

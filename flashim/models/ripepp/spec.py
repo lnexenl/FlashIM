@@ -46,6 +46,7 @@ def _spec(name: str, default_variant: str, description: str, *, quantized_preset
         calibration_dir=Path(__file__).parent / "calibration",
         quantized=quant.QUANTIZED,
         protected=quant.PROTECTED,
+        int8_ignore=quant.INT8_IGNORE if quantized_presets else (),
         compile_regions=("net",),
         fused_bf16_blocks=("net.decoder.",),
         channels_last=True,
