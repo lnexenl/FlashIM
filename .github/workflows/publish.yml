@@ -1,0 +1,46 @@
+name: Publish to PyPI
+
+# Release: bump `version` in pyproject.toml and `__version__` in flashim/__init__.py, merge dev -> main, then tag
+# `vX.Y.Z` on main. Needs a PyPI trusted publisher (owner lnexenl, repo FlashIM, workflow publish.yml,
+# environment pypi); no API token is stored.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag must be on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - uses: astral-sh/setup-uv@v6
+      - name: Tag matches package version
+        run: |
+          py=$(uv run --no-project python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          init=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' flashim/__init__.py)
+          [ "v$py" = "$GITHUB_REF_NAME" ] && [ "$init" = "$py" ] || { echo "tag=$GITHUB_REF_NAME pyproject=$py __init__=$init"; exit 1; }
+      - run: uv build
+      - run: uvx twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
