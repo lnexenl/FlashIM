@@ -45,7 +45,7 @@ jobs:
         run: |
           uv venv
           uv pip install "torch>=2.11,<2.12" "torchvision>=0.26,<0.27" --index-url https://download.pytorch.org/whl/cpu
-          uv pip install -e . --group dev
+          uv pip install -e ".[cv]" --group dev  # cv: tests import cv2
       - name: Test
         run: .venv/bin/python -m pytest -q -p no:cacheprovider -m "not cuda and not sm120 and not weights and not oracle and not slow" tests
 
