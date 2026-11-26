@@ -10,6 +10,7 @@ import torch
 from flashim.models.weights_util import Checkpoint, find_weights
 
 _MIRROR = "https://cmp.felk.cvut.cz/~mishkdmy/models"
+_MINIMA_RELEASES = "https://github.com/LSXI7/storage/releases/download/MINIMA"
 CHECKPOINTS = {
     "outdoor": Checkpoint(
         "loftr_outdoor.ckpt", f"{_MIRROR}/loftr_outdoor.ckpt",
@@ -19,14 +20,20 @@ CHECKPOINTS = {
         "loftr_indoor.ckpt", f"{_MIRROR}/loftr_indoor_ds_new.ckpt",
         "be9ff88b323ec27889114719f668ae41aff7034b56a4c4acbd46b8b180b87ed3",
     ),
+    "minima": Checkpoint(
+        "minima_loftr.ckpt", f"{_MINIMA_RELEASES}/minima_loftr.ckpt",
+        "810d19773ff898ba04a68c99a3eff9c112210bf884214bd76aec885e83b0e257",
+    ),
 }
 LICENSES = {
     "code": "Apache-2.0 (LoFTR, zju3dv/LoFTR; kornia); FlashIM re-implementation",
-    "weights": "LoFTR outdoor_ds / indoor_ds_new",
+    "weights": "LoFTR outdoor_ds / indoor_ds_new (Apache-2.0); MINIMA-LoFTR (Apache-2.0, LSXI7/MINIMA)",
 }
 
 
 def load_state_dict(variant: str, path: str | Path | None = None, map_location="cpu") -> dict[str, torch.Tensor]:
+    if variant not in CHECKPOINTS:
+        raise ValueError(f"Unknown LoFTR variant {variant!r}; choose from {sorted(CHECKPOINTS)}")
     file = find_weights(CHECKPOINTS[variant], path=path, env="FLASHIM_LOFTR_CHECKPOINT")
     ckpt = torch.load(file, map_location=map_location, weights_only=True)
     return {k.removeprefix("matcher."): v for k, v in ckpt["state_dict"].items()}

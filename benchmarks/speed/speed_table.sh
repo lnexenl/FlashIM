@@ -7,7 +7,8 @@
 #
 # Sparse / semi-dense models: benchmarks/speed/extractor.py, the unified protocol of sparse_matrix.sh (one
 # MegaDepth image at 1200 px long side, 4096 keypoints; *-lightglue: extract + LightGlue match_features;
-# loftr: match of the pair, all coarse matches). RoMaV2: benchmarks/speed/forward.py (mega1500 setting,
+# loftr: match of the pair, all coarse matches; *-lightglue: as flashim.load builds them, no overrides: the table lists
+# which preset each component got when they differ). RoMaV2: benchmarks/speed/forward.py (mega1500 setting,
 # preloaded bidirectional forward); its compiled engines run in two rounds (they vary 15-25% between
 # processes) and the table keeps the faster one.
 cd "$(dirname "$0")/../.."
@@ -17,9 +18,21 @@ out=$OUT_DIR/sparse.jsonl
 touch "$out"
 export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$HOME/.cache/flashim/inductor}
 
+want() {  # is this model selected (all of them when ONLY is empty)?
+  [[ -z ${ONLY:-} || " $ONLY " == *" $1 "* ]]
+}
+if [[ -n ${ONLY:-} && -n ${RERUN:-} ]]; then  # forget the old results of the selected models
+  for m in $ONLY; do
+    grep -vF "\"tag\": \"$m|" "$out" > "$out.tmp" || true
+    mv "$out.tmp" "$out"
+    [[ $m == romav2 ]] && rm -f "$OUT_DIR"/romav2_*.json
+  done
+fi
+
 sparse() {  # model preset engine [extra extractor.py args...]
   local model=$1 preset=$2 engine=$3; shift 3
   local tag="$model|$preset|$engine" line
+  want "$model" || return 0
   grep -qF "\"tag\": \"$tag\"" "$out" && return 0
   echo "== $tag"
   line=$(.venv/bin/python benchmarks/speed/extractor.py --model "$model" --preset "$preset" \
@@ -28,6 +41,7 @@ sparse() {  # model preset engine [extra extractor.py args...]
 }
 
 romav2() {  # preset engine round
+  want romav2 || return 0
   local file="$OUT_DIR/romav2_$1_$2_r$3.json"
   [ -s "$file" ] && return 0
   echo "== romav2|$1|$2|r$3"
@@ -35,19 +49,12 @@ romav2() {  # preset engine round
     2> "$OUT_DIR/romav2_$1_$2_r$3.err" || echo "FAILED romav2|$1|$2|r$3"
 }
 
-extractor_preset() {  # pipeline extractor, LightGlue preset -> the extractor's preset (same, else bf16)
-  case "$1:$2" in
-    aliked:int8 | aliked:fp8 | raco-aliked:int8 | raco-aliked:fp8 | rdd:int8) echo bf16 ;;
-    *) echo "$2" ;;
-  esac
-}
-
 for engine in eager compile; do
   for p in fp32 bf16 int8 fp8; do
-    for m in superpoint disk alike xfeat dedode dedode-g dad ripe; do sparse $m $p $engine; done
+    for m in superpoint disk alike xfeat dedode dedode-g dad ripe ripepp; do sparse $m $p $engine; done
     sparse loftr $p $engine --top-k 0
-    for m in superpoint disk xfeat aliked raco-aliked rdd; do
-      sparse "$m-lightglue" $p $engine --overrides "components.extractor.preset=$(extractor_preset $m $p)"
+    for m in superpoint disk xfeat aliked raco-aliked rdd ripepp; do
+      sparse "$m-lightglue" $p $engine  # each component builds the preset its spec gives it (what flashim.load returns)
     done
   done
   for p in fp32 bf16; do sparse aliked $p $engine; sparse raco-aliked $p $engine; done

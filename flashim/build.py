@@ -78,8 +78,9 @@ class ModelSpec:
     load: Callable[[RunConfig], nn.Module] | None
     presets: Mapping[str, Mapping[str, Any]]  # a subset of PRECISIONS -> config overlay
     default_preset: str
-    quant_configs: Mapping[str, Any] = field(default_factory=dict)  # name -> QuantConfig
-    calibrations: Mapping[str, Path] = field(default_factory=dict)  # quant (or "<variant>/<quant>") -> default table
+    quant_configs: Mapping[str, Any] = field(default_factory=dict)  # quant (or "<variant>/<quant>") -> QuantConfig
+    # quant (or "<variant>/<quant>") -> default table; a tuple for a config mixing MXFP8 and INT8 (one table of each)
+    calibrations: Mapping[str, Path | tuple[Path, ...]] = field(default_factory=dict)
     protected: tuple[str, ...] = ()
     passes: Mapping[str, Pass] = field(default_factory=dict)
     engines: Mapping[str, EngineSpec] = field(default_factory=lambda: {"eager": EAGER})
@@ -277,13 +278,22 @@ def _resolve(
 
 
 def _load_calibration(spec: ModelSpec, config: RunConfig, int8: bool):
-    from flashim.quant.calibration import CalibrationTable, Int8CalibrationTable
+    """The table(s) of ``config``'s quant config. A spec default that is a tuple (a config mixing MXFP8 and INT8)
+    loads one table per file; a table or path the user passes then replaces only the default of its own kind."""
+    from flashim.quant.calibration import CalibrationTable, Int8CalibrationTable, load_table
 
+    quant = config.precision.quant
+    default = spec.calibrations.get(f"{config.variant}/{quant}") or spec.calibrations.get(quant)
     table = config.optimize.options.get("calibration_table")  # an already-loaded table (not serializable)
+    if isinstance(default, tuple):
+        given = table if table is not None else (load_table(config.precision.calibration)
+                                                 if config.precision.calibration else None)
+        if isinstance(given, tuple) or given is None:
+            return given or tuple(load_table(p) for p in default)
+        return (given, *(t for t in map(load_table, default) if not isinstance(t, type(given))))
     if table is not None:
         return table
-    quant = config.precision.quant
-    path = config.precision.calibration or spec.calibrations.get(f"{config.variant}/{quant}") or spec.calibrations.get(quant)
+    path = config.precision.calibration or default
     if path is None:
         raise ValueError(f"{spec.name}: quant config {config.precision.quant!r} needs a calibration table")
     return (Int8CalibrationTable if int8 else CalibrationTable).load(path)
@@ -308,17 +318,37 @@ def _quantize(model: nn.Module, ctx: BuildContext) -> None:
     from flashim.quant.apply import quantize_model
 
     spec, config = ctx.spec, ctx.config
-    quant = spec.quant_configs[config.precision.quant]
-    int8 = any(scheme.weights.type == "int" for scheme in quant.config_groups.values())
-    if not int8 and not ctx.platform.supports(Feature.MXFP8_SCALED_MM):
+    quant = (
+        spec.quant_configs.get(f"{config.variant}/{config.precision.quant}")
+        or spec.quant_configs[config.precision.quant]
+    )
+    schemes = [s for s in quant.config_groups.values() if s.targets]
+    static_schemes = [s for s in schemes if s.input_activations is not None and not s.input_activations.dynamic]
+    has_mxfp8 = any(s.weights.type == "float" for s in schemes)
+    if has_mxfp8 and not ctx.platform.supports(Feature.MXFP8_SCALED_MM):
         message = f"{spec.name}: no native MXFP8 GEMM on {ctx.platform.describe()}; quantized linears are emulated"
         if config.optimize.strict:
             raise RuntimeError(message)
         logger.warning(message)
         ctx.report.emulated_quant = True
-    table = _load_calibration(spec, config, int8)
+    has_static_fp8 = any(s.weights.type == "float" for s in static_schemes)
+    int8 = not has_static_fp8 and any(s.weights.type == "int" for s in schemes)
+    explicit_cal = bool(
+        config.optimize.options.get("calibration_table") is not None or config.precision.calibration
+    )
+    registered_cal = bool(
+        spec.calibrations.get(f"{config.variant}/{config.precision.quant}")
+        or spec.calibrations.get(config.precision.quant)
+    )
+    needs_cal = bool(static_schemes) or explicit_cal or (int8 and registered_cal)
+    table = _load_calibration(spec, config, int8) if needs_cal else None
     model.quant_report = quantize_model(model, quant, table, protected=spec.protected)
-    model.calibration_metadata = dict(table.metadata)
+    model.calibration_metadata = (
+        None if table is None else (
+            {f"{type(t).__name__}.{k}": v for t in table for k, v in t.metadata.items()}
+            if isinstance(table, tuple) else dict(table.metadata)
+        )
+    )
     ctx.report.quant = model.quant_report.summary()
 
 

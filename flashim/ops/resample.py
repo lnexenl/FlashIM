@@ -1,5 +1,6 @@
 """Resampling: bilinear upsampling (``align_corners=False``) of a coarse map joined to a full-resolution one by
-concatenation or addition, in one pass (multi-scale decoders: DeDoDe / DaD / RIPE); PIL's bicubic image resize
+concatenation or addition, in one pass (multi-scale decoders: DeDoDe / DaD / RIPE); standalone bilinear upsampling
+(with optional static INT8 output quantization for DPT heads); PIL's bicubic image resize
 (8-bit rounding after each separable pass) to one or several sizes."""
 
 from __future__ import annotations
@@ -14,11 +15,27 @@ from flashim.ops._registry import Op
 from flashim.quant.tensor import Int8Tensor, quantize_int8_static
 
 
-def _upsample_concat_reference(features: Tensor, coarse: Tensor) -> Tensor:
-    """``cat((features, upsample(coarse)), 1)``: ``coarse`` ``[B, Cc, h, w]`` upsampled bilinearly (``align_corners=False``,
-    in FP32) to ``features``' ``[B, Cf, H, W]`` size and cast to its dtype -> ``[B, Cf + Cc, H, W]``."""
-    upsampled = F.interpolate(coarse.float(), size=features.shape[-2:], mode="bilinear", align_corners=False)
-    return torch.cat((features, upsampled.to(features.dtype)), dim=1)
+def _upsample_bilinear_reference(
+    x: Tensor, size: tuple[int, int], *, align_corners: bool = True, out_scale: Tensor | None = None
+) -> Tensor | Int8Tensor:
+    """Bilinear upsampling of ``x`` ``[B, C, Hi, Wi]`` to ``size = (Ho, Wo)``. When ``out_scale`` is given, rounds to
+    BF16 and statically quantizes the channels-last output to an :class:`Int8Tensor` ``[B, Ho, Wo, C]`` for the next
+    INT8 convolution."""
+    out = F.interpolate(x, size=size, mode="bilinear", align_corners=align_corners)
+    if out_scale is not None:
+        return quantize_int8_static(out.to(torch.bfloat16).permute(0, 2, 3, 1), out_scale)
+    return out
+
+
+upsample_bilinear = Op("upsample_bilinear", _upsample_bilinear_reference)
+
+
+def _upsample_concat_reference(features: Tensor, coarse: Tensor, *, coarse_first: bool = False) -> Tensor:
+    """``cat((features, upsample(coarse)), 1)`` (or ``cat((upsample(coarse), features), 1)`` when ``coarse_first``):
+    ``coarse`` ``[B, Cc, h, w]`` upsampled bilinearly (``align_corners=False``, in FP32) to ``features``'
+    ``[B, Cf, H, W]`` size and cast to its dtype -> ``[B, Cf + Cc, H, W]``."""
+    upsampled = F.interpolate(coarse.float(), size=features.shape[-2:], mode="bilinear", align_corners=False).to(features.dtype)
+    return torch.cat((upsampled, features), dim=1) if coarse_first else torch.cat((features, upsampled), dim=1)
 
 
 upsample_concat = Op("upsample_concat", _upsample_concat_reference)
@@ -34,10 +51,15 @@ def _upsample_concat_int8_reference(features: Tensor, coarse: Tensor, scale: Ten
 upsample_concat_int8 = Op("upsample_concat_int8", _upsample_concat_int8_reference)
 
 
-def _upsample_add_reference(coarse: Tensor, delta: Tensor) -> Tensor:
-    """``upsample(coarse) + delta`` in FP32: ``coarse`` ``[B, C, h, w]`` upsampled bilinearly (``align_corners=False``) to
-    ``delta``'s ``[B, C, H, W]`` size -> FP32."""
-    upsampled = F.interpolate(coarse.float(), size=delta.shape[-2:], mode="bilinear", align_corners=False)
+def _upsample_add_reference(
+    coarse: Tensor, delta: Tensor, *, align_corners: bool = False, out_dtype: torch.dtype | None = None
+) -> Tensor:
+    """``upsample(coarse) + delta``: ``coarse`` ``[B, C, h, w]`` upsampled bilinearly to ``delta``'s ``[B, C, H, W]``
+    size and added to ``delta``. Defaults (``align_corners=False, out_dtype=None``) return FP32; setting ``out_dtype``
+    rounds the interpolated map and sum to that dtype."""
+    upsampled = F.interpolate(coarse.float(), size=delta.shape[-2:], mode="bilinear", align_corners=align_corners)
+    if out_dtype is not None:
+        return upsampled.to(out_dtype) + delta.to(out_dtype)
     return upsampled + delta.float()
 
 
@@ -70,3 +92,66 @@ def _pil_bicubic_resize_reference(image: Tensor, sizes: Sequence[tuple[int, int]
 
 
 pil_bicubic_resize = Op("pil_bicubic_resize", _pil_bicubic_resize_reference)
+
+
+def _bilinear_sample_points_reference(
+    features: Sequence[Tensor],
+    grid: Tensor,
+    *,
+    align_corners: bool = True,
+    padding_mode: str = "zeros",
+    out_dtype: torch.dtype | None = None,
+) -> Tensor:
+    """Bilinearly sample each ``[1, C_i, H_i, W_i]`` map of ``features`` in FP32 at normalized ``grid [K, 2]``
+    ``(x, y)`` coordinates (``padding_mode`` ``"zeros"`` or ``"border"``) and concatenate along channels ->
+    ``[K, sum(C_i)]``."""
+    dtype = torch.float32 if out_dtype is None else out_dtype
+    total_c = sum(f.shape[1] for f in features)
+    if grid.shape[0] == 0:
+        return torch.empty((0, total_c), device=grid.device, dtype=dtype)
+    g = grid.float().view(1, 1, -1, 2)
+    out = torch.cat(
+        [
+            F.grid_sample(f.float(), g, mode="bilinear", padding_mode=padding_mode, align_corners=align_corners)[
+                0, :, 0
+            ].t()
+            for f in features
+        ],
+        dim=-1,
+    )
+    return out if out.dtype == dtype else out.to(dtype)
+
+
+bilinear_sample_points = Op("bilinear_sample_points", _bilinear_sample_points_reference)
+
+
+def _multiscale_score_reference(
+    f1: Tensor, f2: Tensor, f3: Tensor, f4: Tensor, weight: Tensor, bias: Tensor | None = None
+) -> Tensor:
+    """4-scale bilinear fusion (``align_corners=True`` to ``f1``'s size) + 1-channel FP32 1x1 projection:
+    ``conv1x1(cat([f1, up(f2), up(f3), up(f4)], 1).float(), weight, bias)`` -> ``[B, 1, H, W]`` FP32.
+    ``weight`` is ``[4 * C]`` FP32, ``bias`` is ``[1]`` (or scalar) FP32 or ``None``."""
+    size = f1.shape[-2:]
+    upsampled = [F.interpolate(f.float(), size=size, mode="bilinear", align_corners=True) for f in (f2, f3, f4)]
+    fused = torch.cat([f1.float(), *upsampled], dim=1)
+    w = weight.float().reshape(1, -1, 1, 1)
+    b = None if bias is None else bias.float().reshape(1)
+    return F.conv2d(fused, w, b)
+
+
+multiscale_score = Op("multiscale_score", _multiscale_score_reference)
+
+
+def _gather_windows_reference(
+    feat: Tensor, ids: Tensor, coarse_w: int, win: int, stride: int
+) -> Tensor:
+    """Gather ``win x win`` spatial windows around coarse grid cells ``ids [M]`` from ``feat [1, C, H, W]`` (zero
+    padded at borders, identical to ``F.unfold(feat, (win, win), stride=stride, padding=win // 2)`` indexed by
+    ``ids``). Returns ``[M, win * win, C]``."""
+    if ids.numel() == 0:
+        return feat.new_empty((0, win * win, feat.shape[1]))
+    unfold = F.unfold(feat, kernel_size=(win, win), stride=stride, padding=win // 2)
+    return unfold.reshape(1, feat.shape[1], win * win, -1).permute(0, 3, 2, 1)[0, ids].contiguous()
+
+
+gather_windows = Op("gather_windows", _gather_windows_reference)

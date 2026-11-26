@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from flashim import ops
 from flashim.utils import device_constant, grid_sample
 
 
@@ -73,8 +74,11 @@ def dual_softmax_match(
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Mutual-nearest-neighbour matches of the dual-softmax matrix; returns indices into ``desc0`` / ``desc1``
     and the match confidence."""
-    sim = (desc0 @ desc1.t()) * inv_temperature
-    prob = sim.softmax(dim=-2) * sim.softmax(dim=-1)
-    mutual = (prob == prob.amax(dim=-1, keepdim=True)) & (prob == prob.amax(dim=-2, keepdim=True)) & (prob >= threshold)
-    pairs = torch.nonzero(mutual)
-    return pairs[:, 0], pairs[:, 1], prob[pairs[:, 0], pairs[:, 1]]
+    if desc0.shape[0] == 0 or desc1.shape[0] == 0:
+        empty = torch.zeros(0, dtype=torch.long, device=desc0.device)
+        return empty, empty, desc0.new_zeros(0, dtype=torch.float32)
+    sim = (desc0.float() @ desc1.float().t()) * inv_temperature
+    log_conf, index, mutual = ops.dual_softmax_mutual(sim)
+    conf = log_conf.exp()
+    ia = torch.nonzero(mutual & (conf >= threshold))[:, 0]
+    return ia, index[ia], conf[ia]

@@ -21,6 +21,8 @@ class Conv(nn.Sequential):
     """``conv(prelu(instance_norm(x)))`` (norm / gate skipped for the input conv); the input is cast to the conv's
     weight dtype, so a conv left in FP32 under a BF16 compute dtype (the output head) receives FP32."""
 
+    fused_prologue: bool = False  # enabled by ``fused_instance_norm_prelu`` pass (bf16/int8/fp8; fp32 keeps PyTorch)
+
     def __init__(self, cin: int, cout: int, size: int, skip_norm_and_gate: bool = False) -> None:
         norm = nn.Sequential() if skip_norm_and_gate else nn.InstanceNorm2d(cin)
         gate = nn.Sequential() if skip_norm_and_gate else nn.PReLU(cin)
@@ -28,6 +30,15 @@ class Conv(nn.Sequential):
 
     def prologue(self, x: Tensor) -> Tensor:
         """``gate(norm(x))``: the convolution's input."""
+        if (
+            self.fused_prologue
+            and isinstance(self[0], nn.InstanceNorm2d)
+            and isinstance(self[1], nn.PReLU)
+            and len(self[2]) == 0
+        ):
+            # Plain NCHW convs and CUDA C++ conv2d_single_output want NCHW; quantized convs consume NHWC directly.
+            out_cl = False if isinstance(self[3], (nn.Conv2d, SplitHeadConv)) else None
+            return ops.instance_norm_prelu(x, self[1].weight, self[0].eps, out_channels_last=out_cl)
         return self[2](self[1](self[0](x)))
 
     def forward(self, x: Tensor) -> Tensor:
@@ -42,11 +53,15 @@ class DownBlock(nn.Sequential):
 
 
 class UpBlock(nn.Module):
+    fused_upsample: bool = False  # enabled by ``fused_upblock`` pass (bf16/int8/fp8; fp32 keeps PyTorch reference)
+
     def __init__(self, bottom: int, horizontal: int, cout: int, size: int) -> None:
         super().__init__()
         self.conv = Conv(bottom + horizontal, cout, size)
 
     def conv_input(self, bottom: Tensor, horizontal: Tensor) -> Tensor:
+        if self.fused_upsample:
+            return ops.upsample_concat(horizontal.to(bottom.dtype), bottom, coarse_first=True)
         # A quantized conv leaves `bottom` channels-last; the skip input is NCHW. Mixed layouts send the concat to its
         # slow generic kernel and the upsample to the NHWC one, so the small (low-resolution) input goes NCHW first.
         big = F.interpolate(bottom.contiguous(), scale_factor=2, mode="bilinear", align_corners=False)
@@ -152,17 +167,7 @@ class DISK(sparse.SparseExtractor):
 
     def nms_mask(self, heatmap: Tensor) -> Tensor:
         """Pixels strictly greater than every other pixel of their ``window x window`` neighbourhood (border excluded)."""
-        r = self.nms_window // 2
-        h, w = heatmap.shape[-2:]
-        centre = heatmap[..., r : h - r, r : w - r]
-        keep = torch.ones_like(centre, dtype=torch.bool)
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if dy or dx:
-                    keep &= centre > heatmap[..., r + dy : h - r + dy, r + dx : w - r + dx]
-        mask = torch.zeros_like(heatmap, dtype=torch.bool)
-        mask[..., r : h - r, r : w - r] = keep
-        return mask
+        return ops.strict_nms_mask(heatmap, self.nms_window)
 
     def describe_keypoints(self, image: Tensor, keypoints: Tensor) -> Tensor:
         """DISK describes whole pixels (its 5x5 head has no sub-pixel reading): fractional keypoints round to the
@@ -179,16 +184,20 @@ class DISK(sparse.SparseExtractor):
             descriptors = self.dense(image)[1][0][:, index[:, 1], index[:, 0]].t()
         return F.normalize(descriptors, dim=-1)
 
+    def _detect_trunk_split(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        head = self.unet.path_up[-1].conv[3]
+        features = self.unet(image.to(self.compute_dtype), head_input=True)
+        heatmap = ops.conv2d_single_output(features, head.heat.weight, head.heat.bias)
+        selected = ops.strict_nms_mask(heatmap, self.nms_window, self.score_threshold)[0, 0]
+        return features, heatmap, selected
+
     def detect(self, image: Tensor, top_k: int | None) -> tuple[Tensor, Tensor, Tensor]:
         head = self.unet.path_up[-1].conv[3]
         if isinstance(head, SplitHeadConv):  # the descriptor half of the head only at the selected keypoints
-            features = self.unet(image.to(self.compute_dtype), head_input=True)
-            # FP32 heatmap straight from the compute-dtype features (no FP32 copy of them): full FP32 accumulation in
-            # the Triton impl, more exact than the cuDNN TF32 the dense head used (max rel 2e-6 vs 2e-4 of float64)
-            heatmap = ops.conv2d_single_output(features, head.heat.weight, head.heat.bias)
+            features, heatmap, selected = self._run_graphed("detect_trunk", self._detect_trunk_split, image)
         else:
             heatmap, descriptor_map = self.dense(image)
-        selected = self.nms_mask(heatmap)[0, 0] & (heatmap[0, 0] > self.score_threshold)
+            selected = ops.strict_nms_mask(heatmap, self.nms_window, self.score_threshold)[0, 0]
         ys, xs = selected.nonzero(as_tuple=True)
         keypoints, scores, _ = sparse.select_top_k(torch.stack((xs, ys), -1), heatmap[0, 0, ys, xs], top_k)
         if isinstance(head, SplitHeadConv):

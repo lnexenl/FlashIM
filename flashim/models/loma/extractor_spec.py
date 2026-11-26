@@ -77,8 +77,16 @@ _SPEC = extractor_spec(
 )
 # Every pass the presets run, in order (``loma-l``'s int8 pipeline drops the numerics-changing stem passes: spec.py).
 PASSES = tuple(_SPEC.presets["fp32"]["optimize"]["passes"])
+# B128 uses a VGG19-only 128-dim descriptor (no DINOv2 ViT): quantizing the 1x1 ConvRefiner decoders to E4M3 adds
+# ~2.7% per-layer quantization noise on both detector and descriptor decoders (dropping ScanNet-1500 AUC@5 by ~0.010
+# even on dev, while being slower than BF16 1x1 convs). Keep B128's heavy 3x3 VGG encoders in MXFP8 and its decoders
+# in BF16; B / L / G / R keep the shared DeDoDe-G fp8 config.
+_B128_FP8 = dataclasses.replace(
+    _SPEC.quant_configs["fp8"], ignore=(*_SPEC.quant_configs["fp8"].ignore, "*.decoder.*"), name="b128/fp8"
+)
 SPEC = dataclasses.replace(
     _SPEC,
+    quant_configs={**_SPEC.quant_configs, "b128/fp8": _B128_FP8},
     calibrations={  # without a variant: B's
         **{quant: CALIBRATION_DIR / f"loma-extractor_b_{quant}.safetensors" for quant in _SPEC.quant_configs},
         **{f"{variant}/{quant}": CALIBRATION_DIR / f"loma-extractor_{table}_{quant}.safetensors"

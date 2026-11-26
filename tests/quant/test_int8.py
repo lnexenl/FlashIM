@@ -1,3 +1,5 @@
+import copy
+
 import pytest
 import torch
 from torch import nn
@@ -171,8 +173,11 @@ def test_hadamard_is_orthogonal_and_symmetric():
     h = hadamard(64, dtype=torch.float64)
     torch.testing.assert_close(h @ h.T, torch.eye(64, dtype=torch.float64))
     assert torch.equal(h, h.T) and h.abs().unique().numel() == 1
+    h96 = hadamard(96, dtype=torch.float64)
+    torch.testing.assert_close(h96 @ h96.T, torch.eye(96, dtype=torch.float64))
+    assert h96.abs().unique().numel() == 1
     with pytest.raises(ValueError):
-        hadamard(96)
+        hadamard(100)
 
 
 def _outlier_input(rows=512, channels=128):
@@ -270,6 +275,30 @@ def test_quantize_model_token_scheme_needs_no_calibration():
     assert isinstance(model[0], DynamicInt8Linear) and isinstance(model[2], StaticInt8Linear)
     assert report.linears == {"0": "int8_linear_dynamic", "2": "int8_linear"}
     assert model(torch.randn(3, 32)).shape == (3, 16)
+
+
+def test_quantize_model_mixes_mxfp8_and_int8_schemes():
+    """One table of each kind; each scheme reads its own, and a missing kind is a TypeError."""
+    from flashim.quant import scheme
+    from flashim.quant.apply import quantize_model
+    from flashim.quant.calibration import Calibrator, Int8CalibrationTable
+    from flashim.quant.methods.linear import StaticMXFP8Linear
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(64, 64), nn.GELU(), nn.Linear(64, 16))
+    config = scheme.QuantConfig({
+        "fp8": scheme.QuantScheme(("0",), scheme.MXFP8, scheme.MXFP8),
+        "int8": scheme.QuantScheme(("2",), scheme.INT8_WEIGHTS, scheme.INT8_ACTIVATIONS),
+    })
+    with Calibrator(model, ["0"]) as observer, torch.no_grad():
+        model(torch.randn(8, 64))
+    fp8_table, int8_table = observer.table(), Int8CalibrationTable({"2": torch.tensor(0.01)})
+    with pytest.raises(TypeError, match="INT8 scheme"):
+        quantize_model(copy.deepcopy(model), config, fp8_table)
+    report = quantize_model(model, config, (int8_table, fp8_table))
+    assert isinstance(model[0], StaticMXFP8Linear) and isinstance(model[2], StaticInt8Linear)
+    assert report.linears["2"] == "int8_linear" and len(report.linears) == 2
+    assert model(torch.randn(3, 64)).shape == (3, 16)
 
 
 @pytest.mark.cuda

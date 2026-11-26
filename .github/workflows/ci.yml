@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      # Only files the change touched: the tree has pre-existing findings (50 on 2026-11-26) that are not this PR's.
+      - name: Ruff on changed files
+        run: |
+          base=${{ github.event.pull_request.base.sha || github.event.before }}
+          files=$(git diff --name-only --diff-filter=d "$base" HEAD -- '*.py' || true)
+          [ -z "$files" ] || echo "$files" | xargs uvx ruff@0.16.8 check
+
+  # GitHub runners have no GPU: only the CPU-runnable tests. `cuda` / `sm120` tests, model weights and the vendored
+  # oracles are covered locally (AGENTS.md, "Verifying changes").
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]  # 3.10 = JetPack 6 floor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (CPU torch, no CUDA wheels)
+        run: |
+          uv venv
+          uv pip install "torch>=2.11,<2.12" "torchvision>=0.26,<0.27" --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -e ".[cv]" --group dev  # cv: tests import cv2
+      - name: Test
+        run: .venv/bin/python -m pytest -q -p no:cacheprovider -m "not cuda and not sm120 and not weights and not oracle and not slow" tests
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - name: Check metadata and wheel contents
+        run: |
+          uvx twine check dist/*
+          unzip -l dist/*.whl | grep -q 'flashim/__init__.py'
+          unzip -l dist/*.whl | grep -q 'calibration/.*safetensors'

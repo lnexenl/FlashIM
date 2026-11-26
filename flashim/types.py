@@ -13,15 +13,16 @@ class DenseMatchResult:
     """Dense correspondences from image A to B (and B to A when bidirectional).
 
     ``warp_*``: ``[B, H, W, 2]`` target coordinates in normalized ``[-1, 1]``
-    (``align_corners=False``); ``confidence_*``: raw ``[B, H, W, 4]`` (overlap
-    logit + precision parameters); ``overlap_*``: ``[B, H, W, 1]`` in ``[0, 1]``;
-    ``precision_*``: ``[B, H, W, 2, 2]`` precision matrices.
+    (``align_corners=False``); ``confidence_*``: raw ``[B, H, W, C]`` (overlap
+    logit, plus precision parameters for models that predict them); ``overlap_*``:
+    ``[B, H, W, 1]`` in ``[0, 1]``; ``precision_*``: ``[B, H, W, 2, 2]``
+    precision matrices (``None`` for models without covariance output, e.g. RoMa).
     """
 
     warp_AB: Tensor
     confidence_AB: Tensor
     overlap_AB: Tensor
-    precision_AB: Tensor
+    precision_AB: Tensor | None = None
     warp_BA: Tensor | None = None
     confidence_BA: Tensor | None = None
     overlap_BA: Tensor | None = None

@@ -87,7 +87,7 @@ def _local_corr_kernel(
                 f1_ptr + (b * s1b + cy * s1h + cx * s1w)[:, None] + ch[None, :] * s1c,
                 mask=inb[:, None] & cmask[None, :], other=0.0,
             )
-            dot = tl.sum(f0 * f1, axis=1) * scale
+            dot = tl.sum(f0 * f1, axis=1) * tl.cast(scale, tl.float32)
             # corner column u is the left corner of tap column u and the right corner of tap column u - 1
             hx = tl.where(t[None, :] == u, 1.0 - frac_x, tl.where(t[None, :] == u - 1, frac_x, 0.0))
             hx = hx * dot[:, None]
@@ -99,14 +99,25 @@ def _local_corr_kernel(
 
 
 def local_corr(
-    feature0: Tensor, feature1: Tensor, warp: Tensor, radius: int, *, block_m: int = 16, num_warps: int = 4
+    feature0: Tensor, feature1: Tensor, warp: Tensor, radius: int, *, block_m: int | None = None, num_warps: int = 4
 ) -> Tensor:
     """FP32, any strides (channels-last views gather their channel vectors coalesced); ``[B, K, H, W]`` out.
 
     16 rows x 4 warps was the fastest spill-free tile at all four RoMaV2 refiner calls (sm_120; C=192 r=3 at
     200^2 / 320^2: 0.84 / 1.87 ms, C=48 r=1 at 400^2 / 640^2: 0.19 / 0.29 ms; 3.5-5.2x the former
-    ``fused-local-corr`` package)."""
+    ``fused-local-corr`` package). For C > 256 (RoMa v1: C=512 r=3/7), 8 rows x 4 warps keeps ``f0`` resident without
+    spills and beats tiled C loops (sm_120: 108^2 r=3 1.14 vs 1.15-1.78 ms, 40^2 r=7 0.57 vs 0.79-0.98 ms; ncu
+    61-70% compute-memory SOL, 18.8-21.5x over the torch reference). NCHW inputs with C >= 32 are copied to
+    channels-last first so gathers stay coalesced (256 ch 216^2 r=2: 15.95 -> 1.47 ms + ~0.12 ms copy; 512 ch 108^2
+    r=3: 13.09 -> 1.14 ms)."""
     batch, channels, h, w = feature0.shape
+    if channels >= 32:
+        if feature0.stride(1) != 1:
+            feature0 = feature0.contiguous(memory_format=torch.channels_last)
+        if feature1.stride(1) != 1:
+            feature1 = feature1.contiguous(memory_format=torch.channels_last)
+    if block_m is None:
+        block_m = 16 if channels <= 256 else 8
     taps = 2 * radius + 1
     cc = triton.next_power_of_2(channels)
     out = torch.empty((batch, taps * taps, h, w), device=feature0.device, dtype=torch.float32)
@@ -317,16 +328,19 @@ def dual_softmax_mutual_three_pass(
     return log_conf, index, mutual
 
 
-# Elements from which the two-pass variant wins on an L20: 1.07-1.34x from 256 MiB up (16800 x 16500: 4.76 -> 3.81 ms,
-# 8192^2: 1.15 -> 0.86 ms), 0.81x at 187 MiB and 0.41x at 95 MiB, where the matrix stays in L2 and the three-pass row
-# tiles keep more CTAs busy. The crossover depends on the L2 size, so other architectures keep three passes until measured.
+# Elements from which the two-pass variant wins on L20 (sm_89) and RTX 5070 Ti (sm_120):
+# - L20: 1.07-1.34x from 256 MiB up (16800 x 16500: 4.76 -> 3.81 ms, 8192^2: 1.15 -> 0.86 ms), 0.81x at 187 MiB.
+# - sm_120: 16800 x 16500: 4.025 -> 3.725 ms (1.08x), 12000^2: 2.109 -> 1.524 ms (1.38x),
+#   8192^2: 1.039 -> 0.738 ms (1.41x); 4096^2 (64 MiB): 0.272 vs 0.289 ms (three-pass wins in L2).
+# The crossover depends on L2 size, so other architectures keep three passes until measured.
 TWO_PASS_MIN_ELEMENTS = 1 << 26
+TWO_PASS_CAPABILITIES = ((8, 9), (12, 0))
 
 
 def dual_softmax_mutual(
     sim: Tensor, row_bias: Tensor | None = None, col_bias: Tensor | None = None
 ) -> tuple[Tensor, Tensor, Tensor]:
-    if sim.numel() >= TWO_PASS_MIN_ELEMENTS and platform_for(sim.device).capability == (8, 9):
+    if sim.numel() >= TWO_PASS_MIN_ELEMENTS and platform_for(sim.device).capability in TWO_PASS_CAPABILITIES:
         return dual_softmax_mutual_two_pass(sim, row_bias, col_bias)
     return dual_softmax_mutual_three_pass(sim, row_bias, col_bias)
 
@@ -366,6 +380,551 @@ def dual_softmax_mutual_two_pass(
     return log_conf, index, mutual
 
 
+# -- fast reciprocal nearest neighbors (MASt3R online-argmax dot product) --------------------------------
+
+
+@triton.jit
+def _argmax_dot_split_kernel(
+    q_ptr,
+    db_ptr,
+    val_out_ptr,
+    idx_out_ptr,
+    Q,
+    N,
+    CHUNK_N,
+    SPLIT_N,
+    BLOCK_D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    INPUT_PREC: tl.constexpr,
+):
+    """Online argmax of ``q [Q, BLOCK_D] @ db [N, BLOCK_D]^T`` (zero-padded to power-of-two ``BLOCK_D`` for
+    aligned unmasked loads) over split ``pid_s`` of ``N`` without materializing the ``[Q, N]`` similarity matrix
+    in DRAM. Uses branchless ``tl.max(..., return_indices=True)`` (faster and avoids Triton 3.6's sm_100 TMEM
+    layout pass failure on a branched argmax)."""
+    pid_m = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_m = offs_m < Q
+
+    q = tl.load(
+        q_ptr + offs_m[:, None].to(tl.int64) * BLOCK_D + offs_d[None, :],
+        mask=mask_m[:, None],
+        other=0.0,
+    )
+
+    n_start = pid_s * CHUNK_N
+    n_end = tl.minimum(n_start + CHUNK_N, N)
+    best_val = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    best_idx = tl.zeros((BLOCK_M,), dtype=tl.int32)
+
+    full_end = n_start + ((n_end - n_start) // BLOCK_N) * BLOCK_N
+    for j0 in range(n_start, full_end, BLOCK_N):
+        cols = j0 + tl.arange(0, BLOCK_N)
+        k = tl.load(db_ptr + cols[:, None].to(tl.int64) * BLOCK_D + offs_d[None, :])
+        s = tl.dot(q, tl.trans(k), input_precision=INPUT_PREC, out_dtype=tl.float32)
+        tile_max, tile_idx = tl.max(s, axis=1, return_indices=True)
+        better = tile_max > best_val
+        best_val = tl.where(better, tile_max, best_val)
+        best_idx = tl.where(better, j0 + tile_idx, best_idx)
+
+    if full_end < n_end:
+        cols = full_end + tl.arange(0, BLOCK_N)
+        col_ok = cols < n_end
+        k = tl.load(
+            db_ptr + cols[:, None].to(tl.int64) * BLOCK_D + offs_d[None, :],
+            mask=col_ok[:, None],
+            other=0.0,
+        )
+        s = tl.where(
+            col_ok[None, :],
+            tl.dot(q, tl.trans(k), input_precision=INPUT_PREC, out_dtype=tl.float32),
+            -float("inf"),
+        )
+        tile_max, tile_idx = tl.max(s, axis=1, return_indices=True)
+        better = tile_max > best_val
+        best_val = tl.where(better, tile_max, best_val)
+        best_idx = tl.where(better, full_end + tile_idx, best_idx)
+
+    out_off = offs_m.to(tl.int64) * SPLIT_N + pid_s
+    tl.store(val_out_ptr + out_off, best_val, mask=mask_m)
+    tl.store(idx_out_ptr + out_off, best_idx, mask=mask_m)
+
+
+def _argmax_dot_triton(
+    queries: Tensor,
+    db: Tensor,
+    *,
+    block_m: int = 64,
+    block_n: int = 128,
+    num_warps: int = 4,
+    num_stages: int | None = None,
+    target_ctas: int | None = None,
+    input_precision: str = "ieee",
+) -> Tensor:
+    q_count, block_d = queries.shape
+    n_count = db.shape[0]
+    if q_count == 0:
+        return torch.empty(0, dtype=torch.int64, device=queries.device)
+    bm = 32 if q_count <= 32 else (64 if q_count <= 64 and block_m > 64 else block_m)
+    is_lowp = queries.dtype in (torch.float16, torch.bfloat16)
+    stages = (4 if is_lowp else 3) if num_stages is None else num_stages
+    ctas = (210 if is_lowp else 140) if target_ctas is None else target_ctas
+    m_blocks = triton.cdiv(q_count, bm)
+    # Saturate SMs even on later iterations where active query count drops to tens/hundreds.
+    max_splits = max(1, min(128, n_count // (block_n * 2)))
+    split_n = min(max_splits, max(1, triton.cdiv(ctas, m_blocks)))
+    chunk_n = triton.cdiv(n_count, split_n)
+    # Round chunk_n up to a multiple of block_n so every non-final split avoids tail masking.
+    chunk_n = triton.cdiv(chunk_n, block_n) * block_n
+    split_n = triton.cdiv(n_count, chunk_n)
+
+    vals = torch.empty((q_count, split_n), device=queries.device, dtype=torch.float32)
+    idxs = torch.empty((q_count, split_n), device=queries.device, dtype=torch.int32)
+    _argmax_dot_split_kernel[(m_blocks, split_n)](
+        queries,
+        db,
+        vals,
+        idxs,
+        q_count,
+        n_count,
+        chunk_n,
+        split_n,
+        BLOCK_D=block_d,
+        BLOCK_M=bm,
+        BLOCK_N=block_n,
+        INPUT_PREC=input_precision,
+        num_warps=num_warps,
+        num_stages=stages,
+    )
+    if split_n == 1:
+        return idxs[:, 0].to(torch.int64)
+    best_split = vals.argmax(dim=1, keepdim=True)
+    return idxs.gather(1, best_split)[:, 0].to(torch.int64)
+
+
+def _argmax_dot_dedup(q_idx: Tensor, src: Tensor, dst: Tensor, *, already_unique: bool = False) -> Tensor:
+    """Deduplicate active query indices before running the Triton dot-argmax (bit-identical; skips repeated
+    pixels that many forward queries collapse onto, while avoiding radix-sort overhead on tiny or already-unique sets)."""
+    if not already_unique and q_idx.numel() > 64:
+        u_idx, inv = torch.unique(q_idx, return_inverse=True)
+        return _argmax_dot_triton(src[u_idx], dst)[inv]
+    return _argmax_dot_triton(src[q_idx], dst)
+
+
+def fast_reciprocal_nn(
+    desc1: Tensor,
+    desc2: Tensor,
+    subsample: int = 8,
+    max_iter: int = 10,
+    block_size: int = 8192,
+    dist: str = "dot",
+) -> tuple[Tensor, Tensor]:
+    """Triton online-argmax ``fast_reciprocal_nn``: pads descriptors once to power-of-two width for aligned
+    unmasked loads, deduplicates repeated active queries per iteration, and streams dot-argmax without
+    materializing the ``[Q, N]`` similarity matrix.
+
+    Measured on sm_120 (RTX 5070 Ti, MASt3R 384x512x24): FP32 ``ieee`` 23.20 -> 6.27 ms (3.70x, bit-identical);
+    FP16 tensor cores 23.20 -> 2.22 ms (10.45x).
+    """
+    h1, w1, dim1 = desc1.shape
+    _h2, w2, dim2 = desc2.shape
+    if dim1 != dim2:
+        raise ValueError(f"Descriptor dim mismatch: {dim1} vs {dim2}")
+    device = desc1.device
+    start = subsample // 2
+    if start >= h1 or start >= w1:
+        empty = torch.empty((0, 2), dtype=torch.int64, device=device)
+        return empty, empty
+    block_d = max(16, triton.next_power_of_2(dim1))
+    pad = block_d - dim1
+    pts1 = desc1.reshape(-1, dim1)
+    pts2 = desc2.reshape(-1, dim2)
+    if pad:
+        pts1 = torch.nn.functional.pad(pts1, (0, pad))
+        pts2 = torch.nn.functional.pad(pts2, (0, pad))
+    pts1 = pts1.contiguous()
+    pts2 = pts2.contiguous()
+
+    ys = torch.arange(start, h1, subsample, device=device, dtype=torch.int64)
+    xs = torch.arange(start, w1, subsample, device=device, dtype=torch.int64)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    xy1 = (grid_x + w1 * grid_y).reshape(-1)
+    xy2 = torch.full_like(xy1, -1)
+    old_xy1 = xy1.clone()
+    old_xy2 = xy2.clone()
+    notyet = torch.ones(xy1.shape[0], dtype=torch.bool, device=device)
+
+    for step in range(max_iter):
+        active = notyet.nonzero(as_tuple=True)[0]
+        if active.numel() == 0:
+            break
+        xy2[active] = _argmax_dot_dedup(xy1[active], pts1, pts2, already_unique=(step == 0))
+        notyet &= old_xy2 != xy2
+
+        active = notyet.nonzero(as_tuple=True)[0]
+        if active.numel() == 0:
+            break
+        xy1[active] = _argmax_dot_dedup(xy2[active], pts2, pts1)
+        notyet &= old_xy1 != xy1
+
+        old_xy2.copy_(xy2)
+        old_xy1.copy_(xy1)
+
+    converged = ~notyet
+    c1, c2 = xy1[converged], xy2[converged]
+    if c1.numel() == 0:
+        empty = torch.empty((0, 2), dtype=torch.int64, device=device)
+        return empty, empty
+    packed = torch.unique((c1 << 32) | c2, sorted=True)
+    idx1 = packed >> 32
+    idx2 = packed & 0xFFFFFFFF
+    out1 = torch.stack((idx1 % w1, idx1 // w1), dim=-1)
+    out2 = torch.stack((idx2 % w2, idx2 // w2), dim=-1)
+    return out1, out2
+
+
+# -- exact 3D L2 reciprocal nearest neighbors (DUSt3R Morton-AABB) ---------------------------------------
+
+
+@triton.jit
+def _morton3d_kernel(
+    pts_ptr,
+    code_ptr,
+    n,
+    lo_x,
+    lo_y,
+    lo_z,
+    inv_x,
+    inv_y,
+    inv_z,
+    BLOCK: tl.constexpr,
+):
+    """30-bit Z-order Morton code (10 bits/axis) on ``signed_log1p(pts)`` so exponential depth ranges
+    (DUSt3R ``depth_mode=exp``) get uniform spatial resolution. Only affects sort order, never distances."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    base = offs.to(tl.int64) * 3
+    x = tl.load(pts_ptr + base, mask=mask, other=0.0)
+    y = tl.load(pts_ptr + base + 1, mask=mask, other=0.0)
+    z = tl.load(pts_ptr + base + 2, mask=mask, other=0.0)
+
+    ux = tl.where(x >= 0.0, tl.log(1.0 + x), -tl.log(1.0 - x))
+    uy = tl.where(y >= 0.0, tl.log(1.0 + y), -tl.log(1.0 - y))
+    uz = tl.where(z >= 0.0, tl.log(1.0 + z), -tl.log(1.0 - z))
+
+    ix = tl.minimum(tl.maximum(((ux - tl.cast(lo_x, tl.float32)) * tl.cast(inv_x, tl.float32)).to(tl.int32), 0), 1023)
+    iy = tl.minimum(tl.maximum(((uy - tl.cast(lo_y, tl.float32)) * tl.cast(inv_y, tl.float32)).to(tl.int32), 0), 1023)
+    iz = tl.minimum(tl.maximum(((uz - tl.cast(lo_z, tl.float32)) * tl.cast(inv_z, tl.float32)).to(tl.int32), 0), 1023)
+
+    ix = (ix | (ix << 16)) & 0x030000FF
+    ix = (ix | (ix << 8)) & 0x0300F00F
+    ix = (ix | (ix << 4)) & 0x030C30C3
+    ix = (ix | (ix << 2)) & 0x09249249
+
+    iy = (iy | (iy << 16)) & 0x030000FF
+    iy = (iy | (iy << 8)) & 0x0300F00F
+    iy = (iy | (iy << 4)) & 0x030C30C3
+    iy = (iy | (iy << 2)) & 0x09249249
+
+    iz = (iz | (iz << 16)) & 0x030000FF
+    iz = (iz | (iz << 8)) & 0x0300F00F
+    iz = (iz | (iz << 4)) & 0x030C30C3
+    iz = (iz | (iz << 2)) & 0x09249249
+
+    tl.store(code_ptr + offs, ix | (iy << 1) | (iz << 2), mask=mask)
+
+
+@triton.jit
+def _gather_leaf_aabb_kernel(
+    pts_ptr,
+    order_ptr,
+    px_ptr,
+    py_ptr,
+    pz_ptr,
+    orig_ptr,
+    lmin_x_ptr,
+    lmax_x_ptr,
+    lmin_y_ptr,
+    lmax_y_ptr,
+    lmin_z_ptr,
+    lmax_z_ptr,
+    n,
+    LEAF: tl.constexpr,
+):
+    """Gather sorted 3D points into contiguous SoA ``(px, py, pz, orig_idx)`` and compute per-leaf AABBs."""
+    leaf = tl.program_id(0)
+    offs = leaf * LEAF + tl.arange(0, LEAF)
+    valid = offs < n
+    clamped = tl.minimum(offs, n - 1)
+    orig = tl.load(order_ptr + clamped).to(tl.int32)
+    base = orig.to(tl.int64) * 3
+    x = tl.load(pts_ptr + base)
+    y = tl.load(pts_ptr + base + 1)
+    z = tl.load(pts_ptr + base + 2)
+
+    tl.store(px_ptr + offs, x, mask=valid)
+    tl.store(py_ptr + offs, y, mask=valid)
+    tl.store(pz_ptr + offs, z, mask=valid)
+    tl.store(orig_ptr + offs, orig, mask=valid)
+
+    tl.store(lmin_x_ptr + leaf, tl.min(x, axis=0))
+    tl.store(lmax_x_ptr + leaf, tl.max(x, axis=0))
+    tl.store(lmin_y_ptr + leaf, tl.min(y, axis=0))
+    tl.store(lmax_y_ptr + leaf, tl.max(y, axis=0))
+    tl.store(lmin_z_ptr + leaf, tl.min(z, axis=0))
+    tl.store(lmax_z_ptr + leaf, tl.max(z, axis=0))
+
+
+@triton.jit
+def _super_aabb_kernel(
+    lmin_x_ptr,
+    lmax_x_ptr,
+    lmin_y_ptr,
+    lmax_y_ptr,
+    lmin_z_ptr,
+    lmax_z_ptr,
+    smin_x_ptr,
+    smax_x_ptr,
+    smin_y_ptr,
+    smax_y_ptr,
+    smin_z_ptr,
+    smax_z_ptr,
+    n_leaves,
+    SUPER: tl.constexpr,
+):
+    """Reduce ``SUPER`` leaf AABBs into one super-block AABB."""
+    sb = tl.program_id(0)
+    offs = tl.minimum(sb * SUPER + tl.arange(0, SUPER), n_leaves - 1)
+    tl.store(smin_x_ptr + sb, tl.min(tl.load(lmin_x_ptr + offs), axis=0))
+    tl.store(smax_x_ptr + sb, tl.max(tl.load(lmax_x_ptr + offs), axis=0))
+    tl.store(smin_y_ptr + sb, tl.min(tl.load(lmin_y_ptr + offs), axis=0))
+    tl.store(smax_y_ptr + sb, tl.max(tl.load(lmax_y_ptr + offs), axis=0))
+    tl.store(smin_z_ptr + sb, tl.min(tl.load(lmin_z_ptr + offs), axis=0))
+    tl.store(smax_z_ptr + sb, tl.max(tl.load(lmax_z_ptr + offs), axis=0))
+
+
+@triton.jit
+def _l2_nn_3d_morton_kernel(
+    qx_ptr,
+    qy_ptr,
+    qz_ptr,
+    seed_leaf_ptr,
+    px_ptr,
+    py_ptr,
+    pz_ptr,
+    db_orig_ptr,
+    lmin_x_ptr,
+    lmax_x_ptr,
+    lmin_y_ptr,
+    lmax_y_ptr,
+    lmin_z_ptr,
+    lmax_z_ptr,
+    smin_x_ptr,
+    smax_x_ptr,
+    smin_y_ptr,
+    smax_y_ptr,
+    smin_z_ptr,
+    smax_z_ptr,
+    out_idx_ptr,
+    n_q,
+    n_db,
+    n_leaves,
+    n_super,
+    BLOCK_M: tl.constexpr,
+    LEAF: tl.constexpr,
+    SUPER: tl.constexpr,
+):
+    """Exact L2 nearest neighbor in 3D via 2-level AABB pruning over Morton-sorted leaves.
+
+    Every CTA holds ``BLOCK_M`` spatially adjacent queries, seeds their upper bound from the nearest
+    Morton leaves, and skips any super-block or leaf whose AABB lower bound strictly exceeds the CTA's
+    worst current squared distance (with a 1e-5 relative FP32 safety margin). Exact ties break to the
+    smallest original database index (bit-identical to exact brute-force L2).
+    """
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < n_q
+    clamped_m = tl.minimum(offs_m, n_q - 1)
+
+    qx = tl.load(qx_ptr + clamped_m)
+    qy = tl.load(qy_ptr + clamped_m)
+    qz = tl.load(qz_ptr + clamped_m)
+
+    q_min_x = tl.min(qx, axis=0)
+    q_max_x = tl.max(qx, axis=0)
+    q_min_y = tl.min(qy, axis=0)
+    q_max_y = tl.max(qy, axis=0)
+    q_min_z = tl.min(qz, axis=0)
+    q_max_z = tl.max(qz, axis=0)
+
+    best_d2 = tl.full((BLOCK_M,), float("inf"), dtype=tl.float32)
+    best_idx = tl.full((BLOCK_M,), 0x7FFFFFFF, dtype=tl.int32)
+
+    offs_n = tl.arange(0, LEAF)
+
+    # Seed from the nearest Morton leaf and its immediate neighbor to get a tight initial upper bound.
+    seed = tl.load(seed_leaf_ptr + pid_m)
+    seed_lo = tl.maximum(seed - 1, 0)
+    seed_hi = tl.minimum(seed + 1, n_leaves - 1)
+    for leaf in range(seed_lo, seed_hi + 1):
+        db_offs = leaf * LEAF + offs_n
+        valid_n = db_offs < n_db
+        px = tl.load(px_ptr + db_offs, mask=valid_n, other=0.0)
+        py = tl.load(py_ptr + db_offs, mask=valid_n, other=0.0)
+        pz = tl.load(pz_ptr + db_offs, mask=valid_n, other=0.0)
+        orig = tl.load(db_orig_ptr + db_offs, mask=valid_n, other=0x7FFFFFFF)
+        dx = qx[:, None] - px[None, :]
+        dy = qy[:, None] - py[None, :]
+        dz = qz[:, None] - pz[None, :]
+        d2 = tl.where(valid_n[None, :], dx * dx + dy * dy + dz * dz, float("inf"))
+        tile_d2 = tl.min(d2, axis=1)
+        tile_idx = tl.min(tl.where(d2 == tile_d2[:, None], orig[None, :], 0x7FFFFFFF), axis=1)
+        better = (tile_d2 < best_d2) | ((tile_d2 == best_d2) & (tile_idx < best_idx))
+        best_d2 = tl.where(better, tile_d2, best_d2)
+        best_idx = tl.where(better, tile_idx, best_idx)
+
+    cta_r2 = tl.max(tl.where(mask_m, best_d2, 0.0), axis=0)
+
+    # Exact 2-level AABB-pruned scan over all super-blocks and leaves.
+    for sb in range(n_super):
+        sx0 = tl.load(smin_x_ptr + sb)
+        sx1 = tl.load(smax_x_ptr + sb)
+        sy0 = tl.load(smin_y_ptr + sb)
+        sy1 = tl.load(smax_y_ptr + sb)
+        sz0 = tl.load(smin_z_ptr + sb)
+        sz1 = tl.load(smax_z_ptr + sb)
+        sdx = tl.maximum(0.0, tl.maximum(q_min_x - sx1, sx0 - q_max_x))
+        sdy = tl.maximum(0.0, tl.maximum(q_min_y - sy1, sy0 - q_max_y))
+        sdz = tl.maximum(0.0, tl.maximum(q_min_z - sz1, sz0 - q_max_z))
+        if sdx * sdx + sdy * sdy + sdz * sdz <= cta_r2 * 1.00001 + 1e-12:
+            leaf_start = sb * SUPER
+            leaf_end = tl.minimum(leaf_start + SUPER, n_leaves)
+            for leaf in range(leaf_start, leaf_end):
+                lx0 = tl.load(lmin_x_ptr + leaf)
+                lx1 = tl.load(lmax_x_ptr + leaf)
+                ly0 = tl.load(lmin_y_ptr + leaf)
+                ly1 = tl.load(lmax_y_ptr + leaf)
+                lz0 = tl.load(lmin_z_ptr + leaf)
+                lz1 = tl.load(lmax_z_ptr + leaf)
+                ldx = tl.maximum(0.0, tl.maximum(q_min_x - lx1, lx0 - q_max_x))
+                ldy = tl.maximum(0.0, tl.maximum(q_min_y - ly1, ly0 - q_max_y))
+                ldz = tl.maximum(0.0, tl.maximum(q_min_z - lz1, lz0 - q_max_z))
+                if ldx * ldx + ldy * ldy + ldz * ldz <= cta_r2 * 1.00001 + 1e-12:
+                    db_offs = leaf * LEAF + offs_n
+                    valid_n = db_offs < n_db
+                    px = tl.load(px_ptr + db_offs, mask=valid_n, other=0.0)
+                    py = tl.load(py_ptr + db_offs, mask=valid_n, other=0.0)
+                    pz = tl.load(pz_ptr + db_offs, mask=valid_n, other=0.0)
+                    orig = tl.load(db_orig_ptr + db_offs, mask=valid_n, other=0x7FFFFFFF)
+                    dx = qx[:, None] - px[None, :]
+                    dy = qy[:, None] - py[None, :]
+                    dz = qz[:, None] - pz[None, :]
+                    d2 = tl.where(valid_n[None, :], dx * dx + dy * dy + dz * dz, float("inf"))
+                    tile_d2 = tl.min(d2, axis=1)
+                    tile_idx = tl.min(tl.where(d2 == tile_d2[:, None], orig[None, :], 0x7FFFFFFF), axis=1)
+                    better = (tile_d2 < best_d2) | ((tile_d2 == best_d2) & (tile_idx < best_idx))
+                    best_d2 = tl.where(better, tile_d2, best_d2)
+                    best_idx = tl.where(better, tile_idx, best_idx)
+                    cta_r2 = tl.max(tl.where(mask_m, best_d2, 0.0), axis=0)
+
+    tl.store(out_idx_ptr + offs_m, best_idx, mask=mask_m)
+
+
+def _prepare_morton_index(
+    pts: Tensor, lo_log: tuple[float, float, float], inv_span: tuple[float, float, float], leaf: int = 64, super_b: int = 32
+):
+    n = pts.shape[0]
+    device = pts.device
+    pts_c = pts.contiguous()
+    codes = torch.empty(n, dtype=torch.int32, device=device)
+    _morton3d_kernel[(triton.cdiv(n, 256),)](
+        pts_c, codes, n, lo_log[0], lo_log[1], lo_log[2], inv_span[0], inv_span[1], inv_span[2], BLOCK=256, num_warps=4
+    )
+    order = torch.argsort(codes)
+    codes_s = codes[order]
+
+    n_leaves = triton.cdiv(n, leaf)
+    n_super = triton.cdiv(n_leaves, super_b)
+    px = torch.empty(n, dtype=torch.float32, device=device)
+    py = torch.empty(n, dtype=torch.float32, device=device)
+    pz = torch.empty(n, dtype=torch.float32, device=device)
+    orig = torch.empty(n, dtype=torch.int32, device=device)
+    lmin_x = torch.empty(n_leaves, dtype=torch.float32, device=device)
+    lmax_x = torch.empty(n_leaves, dtype=torch.float32, device=device)
+    lmin_y = torch.empty(n_leaves, dtype=torch.float32, device=device)
+    lmax_y = torch.empty(n_leaves, dtype=torch.float32, device=device)
+    lmin_z = torch.empty(n_leaves, dtype=torch.float32, device=device)
+    lmax_z = torch.empty(n_leaves, dtype=torch.float32, device=device)
+    _gather_leaf_aabb_kernel[(n_leaves,)](
+        pts_c, order, px, py, pz, orig, lmin_x, lmax_x, lmin_y, lmax_y, lmin_z, lmax_z, n, LEAF=leaf, num_warps=2
+    )
+    smin_x = torch.empty(n_super, dtype=torch.float32, device=device)
+    smax_x = torch.empty(n_super, dtype=torch.float32, device=device)
+    smin_y = torch.empty(n_super, dtype=torch.float32, device=device)
+    smax_y = torch.empty(n_super, dtype=torch.float32, device=device)
+    smin_z = torch.empty(n_super, dtype=torch.float32, device=device)
+    smax_z = torch.empty(n_super, dtype=torch.float32, device=device)
+    _super_aabb_kernel[(n_super,)](
+        lmin_x, lmax_x, lmin_y, lmax_y, lmin_z, lmax_z,
+        smin_x, smax_x, smin_y, smax_y, smin_z, smax_z,
+        n_leaves, SUPER=super_b, num_warps=1,
+    )
+    return (
+        order, codes_s, px, py, pz, orig,
+        (lmin_x, lmax_x, lmin_y, lmax_y, lmin_z, lmax_z),
+        (smin_x, smax_x, smin_y, smax_y, smin_z, smax_z),
+        n_leaves, n_super,
+    )
+
+
+def _query_morton_nn(q_idx_data, db_idx_data, *, block_m: int = 32, leaf: int = 64, super_b: int = 32) -> Tensor:
+    q_order, q_codes, qx, qy, qz, *_ = q_idx_data
+    _, db_codes, px, py, pz, db_orig, laabb, saabb, n_leaves, n_super = db_idx_data
+    n_q = qx.shape[0]
+    n_db = px.shape[0]
+    n_blocks = triton.cdiv(n_q, block_m)
+    mid_offs = (torch.arange(n_blocks, device=qx.device, dtype=torch.int64) * block_m + block_m // 2).clamp(max=n_q - 1)
+    seed_leaf = (torch.searchsorted(db_codes, q_codes[mid_offs]) // leaf).clamp(max=n_leaves - 1).to(torch.int32)
+
+    out_sorted = torch.empty(n_q, dtype=torch.int32, device=qx.device)
+    _l2_nn_3d_morton_kernel[(n_blocks,)](
+        qx, qy, qz, seed_leaf,
+        px, py, pz, db_orig,
+        *laabb, *saabb,
+        out_sorted, n_q, n_db, n_leaves, n_super,
+        BLOCK_M=block_m, LEAF=leaf, SUPER=super_b, num_warps=2,
+    )
+    out = torch.empty(n_q, dtype=torch.int64, device=qx.device)
+    out[q_order] = out_sorted.to(torch.int64)
+    return out
+
+
+def reciprocal_nn(pts1: Tensor, pts2: Tensor, block_size: int = 4096) -> tuple[Tensor, Tensor]:
+    """Exact 3D Euclidean reciprocal nearest neighbors via Morton-sorted 2-level AABB pruning."""
+    del block_size
+    device = pts1.device
+    if pts1.shape[0] == 0 or pts2.shape[0] == 0:
+        empty = torch.empty(0, dtype=torch.int64, device=device)
+        return empty, empty
+
+    lo = torch.minimum(pts1.amin(dim=0), pts2.amin(dim=0))
+    hi = torch.maximum(pts1.amax(dim=0), pts2.amax(dim=0))
+    lo_log = (lo.sign() * torch.log1p(lo.abs())).tolist()
+    hi_log = (hi.sign() * torch.log1p(hi.abs())).tolist()
+    inv_span = tuple(1023.0 / max(h - l, 1e-6) for l, h in zip(lo_log, hi_log))
+
+    idx1_data = _prepare_morton_index(pts1, lo_log, inv_span)
+    idx2_data = _prepare_morton_index(pts2, lo_log, inv_span)
+    nn1_in_2 = _query_morton_nn(idx1_data, idx2_data)
+    nn2_in_1 = _query_morton_nn(idx2_data, idx1_data)
+
+    idx2 = torch.arange(pts2.shape[0], device=device, dtype=torch.int64)
+    reciprocal = nn1_in_2[nn2_in_1] == idx2
+    return nn2_in_1[reciprocal], idx2[reciprocal]
+
+
 # -- registrations ---------------------------------------------------------------------------------------
 
 def _local_corr_eligible(feature0: Tensor, feature1: Tensor, warp: Tensor, radius: int) -> bool:
@@ -374,8 +933,8 @@ def _local_corr_eligible(feature0: Tensor, feature1: Tensor, warp: Tensor, radiu
         feature0.dtype == feature1.dtype == warp.dtype == torch.float32
         and feature1.shape == feature0.shape
         and tuple(warp.shape) == (batch, h, w, 2)
-        and channels <= 256
-        and 0 <= radius <= 3
+        and channels <= 512
+        and 0 <= radius <= 7
         and max(_span(feature0), _span(feature1), _span(warp), batch * (2 * radius + 1) ** 2 * h * w) < 2**31
     )
 
@@ -399,3 +958,438 @@ def _dual_softmax_mutual_impl(
     sim: Tensor, row_bias: Tensor | None = None, col_bias: Tensor | None = None
 ) -> tuple[Tensor, Tensor, Tensor]:
     return dual_softmax_mutual(sim, row_bias, col_bias)
+
+
+# -- fused tiled mutual-nearest-neighbour matching (ops.mutual_nn_match) ----------------------------------
+# Avoids materializing the full [M, N] FP32 similarity matrix (4.2 GB at M=N=32k for RIPE): each row block
+# computes [BLOCK_M, BLOCK_N] inner-product tiles in registers, tracks row max/argmax online and writes only
+# [m_blocks, N] column partials (65 MB at 32k), reduced in a tiny second pass.
+
+
+@triton.jit
+def _mnn_tiled_kernel(
+    a_ptr, b_ptr, row_val_ptr, row_idx_ptr, col_val_ptr, col_idx_ptr,
+    M, N, D, sa_m, sa_k, sb_n, sb_k,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, PRECISION: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_ok = rows < M
+    row_best = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    row_best_idx = tl.zeros((BLOCK_M,), dtype=tl.int32)
+    a_row_base = a_ptr + rows[:, None].to(tl.int64) * sa_m
+
+    for n_start in range(0, N, BLOCK_N):
+        cols = n_start + tl.arange(0, BLOCK_N)
+        col_ok = cols < N
+        b_col_base = b_ptr + cols[None, :].to(tl.int64) * sb_n
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_start in range(0, D, BLOCK_K):
+            ks = k_start + tl.arange(0, BLOCK_K)
+            k_ok = ks < D
+            a = tl.load(a_row_base + ks[None, :].to(tl.int64) * sa_k, mask=row_ok[:, None] & k_ok[None, :], other=0.0)
+            b = tl.load(b_col_base + ks[:, None].to(tl.int64) * sb_k, mask=k_ok[:, None] & col_ok[None, :], other=0.0)
+            if PRECISION == 2:
+                acc = tl.dot(a, b, acc, input_precision="ieee")
+            elif PRECISION == 1:
+                acc = tl.dot(a, b, acc, input_precision="tf32")
+            else:
+                acc = tl.dot(a, b, acc)
+        tile = tl.where(row_ok[:, None] & col_ok[None, :], acc, -float("inf"))
+        r_val, r_idx = tl.max(tile, axis=1, return_indices=True)
+        better = r_val > row_best
+        row_best = tl.where(better, r_val, row_best)
+        row_best_idx = tl.where(better, n_start + r_idx, row_best_idx)
+        c_val, c_idx = tl.max(tile, axis=0, return_indices=True)
+        partial = pid_m.to(tl.int64) * N + cols
+        tl.store(col_val_ptr + partial, c_val, mask=col_ok)
+        tl.store(col_idx_ptr + partial, pid_m * BLOCK_M + c_idx, mask=col_ok)
+
+    tl.store(row_val_ptr + rows, row_best, mask=row_ok)
+    tl.store(row_idx_ptr + rows, row_best_idx, mask=row_ok)
+
+
+@triton.jit
+def _mnn_col_reduce_kernel(col_val_ptr, col_idx_ptr, nn10_ptr, N, M_BLOCKS, BLOCK_N: tl.constexpr):
+    cols = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_ok = cols < N
+    best = tl.full((BLOCK_N,), -float("inf"), dtype=tl.float32)
+    best_idx = tl.zeros((BLOCK_N,), dtype=tl.int32)
+    for mb in range(M_BLOCKS):
+        off = mb.to(tl.int64) * N + cols
+        val = tl.load(col_val_ptr + off, mask=col_ok, other=-float("inf"))
+        idx = tl.load(col_idx_ptr + off, mask=col_ok, other=0)
+        better = val > best
+        best = tl.where(better, val, best)
+        best_idx = tl.where(better, idx, best_idx)
+    tl.store(nn10_ptr + cols, best_idx, mask=col_ok)
+
+
+# Above 8192^2 (256 MB materialized FP32), TF32 tensor cores run 4.4x faster than IEEE FP32 (9.92 vs 43.50 ms at
+# 32k x 24k); at <= 8192^2 (all standard <=4096-kpt benchmarks), IEEE FP32 takes 0.56 ms (vs 0.39 ms TF32) and
+# matches PyTorch's dense FP32 matmul exactly (no borderline MNN match flips).
+_MNN_TF32_MIN_PAIRS = 64 * 1024 * 1024
+
+
+def mutual_nn_match(desc0: Tensor, desc1: Tensor, threshold: float = 0.0) -> tuple[Tensor, Tensor, Tensor]:
+    m, d = desc0.shape
+    n = desc1.shape[0]
+    device = desc0.device
+    if m == 0 or n == 0:
+        empty = torch.zeros(0, dtype=torch.long, device=device)
+        return empty, empty, desc0.new_zeros(0, dtype=torch.float32)
+    is_fp32 = desc0.dtype == torch.float32
+    precision = (1 if m * n > _MNN_TF32_MIN_PAIRS else 2) if is_fp32 else 0
+    block_m = 64 if (m < 2048 or is_fp32) else 128
+    block_n = 64 if (n < 1024 or precision == 2) else 128
+    block_k = 32 if is_fp32 else 64
+    # Measured on sm_120 (32320 x 23731 x 256 BF16): (128, 128, 64, nw=4, ns=2) = 5.38 ms vs 6.57 ms at nw=8
+    # (and 22.54 ms / 3.23 GB peak VRAM for the materialized FP32 reference).
+    num_warps = 4
+    m_blocks = triton.cdiv(m, block_m)
+    row_val = torch.empty(m, device=device, dtype=torch.float32)
+    row_idx = torch.empty(m, device=device, dtype=torch.int32)
+    col_val = torch.empty((m_blocks, n), device=device, dtype=torch.float32)
+    col_idx = torch.empty((m_blocks, n), device=device, dtype=torch.int32)
+    _mnn_tiled_kernel[(m_blocks,)](
+        desc0, desc1, row_val, row_idx, col_val, col_idx,
+        m, n, d, desc0.stride(0), desc0.stride(1), desc1.stride(0), desc1.stride(1),
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, PRECISION=precision,
+        num_warps=num_warps, num_stages=2,
+    )
+    nn10 = torch.empty(n, device=device, dtype=torch.int32)
+    _mnn_col_reduce_kernel[(triton.cdiv(n, 256),)](col_val, col_idx, nn10, n, m_blocks, BLOCK_N=256, num_warps=4)
+    nn01 = row_idx.long()
+    ids0 = torch.arange(m, device=device)
+    idx0 = torch.nonzero((nn10[nn01].long() == ids0) & (row_val >= threshold))[:, 0]
+    return idx0, nn01[idx0], row_val[idx0]
+
+
+def _mnn_eligible(desc0: Tensor, desc1: Tensor, threshold: float = 0.0) -> bool:
+    return (
+        desc0.ndim == desc1.ndim == 2
+        and desc0.shape[1] == desc1.shape[1]
+        and desc0.dtype == desc1.dtype
+        and desc0.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and desc0.is_cuda and desc1.is_cuda
+    )
+
+
+ops.mutual_nn_match.register(
+    "triton", device=DeviceSpec("cuda", min_capability=(8, 0)), requires=[Feature.TRITON], when=_mnn_eligible
+)(mutual_nn_match)
+
+
+# -- one-way union softmax match (single DRAM pass over sim [L, S]) --------------------------------------
+
+
+@triton.jit
+def _union_softmax_band_kernel(
+    sim_ptr,
+    col_prob_ptr,
+    col_idx_ptr,
+    row_max_ptr,
+    row_sum_ptr,
+    row_idx_ptr,
+    L,
+    S,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """One ``BLOCK_N``-column band streaming once over ``sim [L, S]``: computes each column's exact softmax max
+    probability ``1 / sum_i exp(sim[i, j] - max_i)`` and argmax row, while emitting per-row band partials
+    ``(max, sum_exp, argmax_col)`` at ``[band, row]``."""
+    band = tl.program_id(0)
+    cols = band * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_ok = cols < S
+    col_peak = tl.full((BLOCK_N,), -float("inf"), dtype=tl.float32)
+    col_sum = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    col_best = tl.zeros((BLOCK_N,), dtype=tl.int32)
+    for start in range(0, L, BLOCK_M):
+        rows = start + tl.arange(0, BLOCK_M)
+        row_ok = rows < L
+        ok = row_ok[:, None] & col_ok[None, :]
+        tile = tl.load(sim_ptr + rows[:, None].to(tl.int64) * S + cols[None, :], mask=ok, other=-float("inf"))
+        t_cmax, t_cidx = tl.max(tile, axis=0, return_indices=True)
+        better = t_cmax > col_peak
+        new_peak = tl.where(better, t_cmax, col_peak)
+        col_best = tl.where(better, start + t_cidx, col_best)
+        col_sum = col_sum * tl.exp(col_peak - new_peak) + tl.sum(tl.exp(tile - new_peak[None, :]), axis=0)
+        col_peak = new_peak
+
+        t_rmax, t_ridx = tl.max(tile, axis=1, return_indices=True)
+        t_rsum = tl.sum(tl.exp(tile - t_rmax[:, None]), axis=1)
+        partial = band.to(tl.int64) * L + rows
+        tl.store(row_max_ptr + partial, t_rmax, mask=row_ok)
+        tl.store(row_sum_ptr + partial, t_rsum, mask=row_ok)
+        tl.store(row_idx_ptr + partial, band * BLOCK_N + t_ridx, mask=row_ok)
+
+    tl.store(col_prob_ptr + cols, 1.0 / col_sum, mask=col_ok)
+    tl.store(col_idx_ptr + cols, col_best, mask=col_ok)
+
+
+@triton.jit
+def _union_softmax_row_reduce_kernel(
+    row_max_ptr, row_sum_ptr, row_idx_ptr, row_prob_ptr, row_best_ptr, L, BANDS, BLOCK_M: tl.constexpr
+):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_ok = rows < L
+    peak = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    total = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    best = tl.zeros((BLOCK_M,), dtype=tl.int32)
+    for band in range(BANDS):
+        off = band.to(tl.int64) * L + rows
+        bmax = tl.load(row_max_ptr + off, mask=row_ok, other=-float("inf"))
+        bsum = tl.load(row_sum_ptr + off, mask=row_ok, other=0.0)
+        bidx = tl.load(row_idx_ptr + off, mask=row_ok, other=0)
+        better = bmax > peak
+        new_peak = tl.where(better, bmax, peak)
+        best = tl.where(better, bidx, best)
+        total = total * tl.exp(peak - new_peak) + bsum * tl.exp(bmax - new_peak)
+        peak = new_peak
+    tl.store(row_prob_ptr + rows, 1.0 / total, mask=row_ok)
+    tl.store(row_best_ptr + rows, best, mask=row_ok)
+
+
+def union_softmax_match(sim: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    rows, cols = sim.shape
+    device = sim.device
+    block_m, block_n, reduce_m = 64, 64, 128
+    bands = triton.cdiv(cols, block_n)
+    col_prob = torch.empty(cols, device=device, dtype=torch.float32)
+    col_idx = torch.empty(cols, device=device, dtype=torch.int32)
+    row_prob = torch.empty(rows, device=device, dtype=torch.float32)
+    row_idx = torch.empty(rows, device=device, dtype=torch.int32)
+    p_max = torch.empty((bands, rows), device=device, dtype=torch.float32)
+    p_sum = torch.empty((bands, rows), device=device, dtype=torch.float32)
+    p_idx = torch.empty((bands, rows), device=device, dtype=torch.int32)
+    _union_softmax_band_kernel[(bands,)](
+        sim, col_prob, col_idx, p_max, p_sum, p_idx, rows, cols, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=4
+    )
+    _union_softmax_row_reduce_kernel[(triton.cdiv(rows, reduce_m),)](
+        p_max, p_sum, p_idx, row_prob, row_idx, rows, bands, BLOCK_M=reduce_m, num_warps=4
+    )
+    return row_prob, row_idx.long(), col_prob, col_idx.long()
+
+
+def _union_softmax_eligible(sim: Tensor) -> bool:
+    return not torch.is_grad_enabled() and sim.ndim == 2 and sim.dtype == torch.float32 and sim.is_contiguous() and sim.numel() > 0
+
+
+ops.union_softmax_match.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_union_softmax_eligible
+)(union_softmax_match)
+
+
+# -- batched small-window dual-softmax argmax (register-resident [W, W]) ---------------------------------
+
+
+@triton.jit
+def _batched_dual_softmax_argmax_kernel(
+    f0_ptr,
+    f1_ptr,
+    conf_ptr,
+    i_ptr,
+    j_ptr,
+    scale,
+    W0: tl.constexpr,
+    W1: tl.constexpr,
+    C: tl.constexpr,
+    BLOCK_W0: tl.constexpr,
+    BLOCK_W1: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    m = tl.program_id(0).to(tl.int64)
+    r = tl.arange(0, BLOCK_W0)
+    k = tl.arange(0, BLOCK_W1)
+    c = tl.arange(0, BLOCK_C)
+    mr = r < W0
+    mk = k < W1
+    mc = c < C
+
+    a = tl.load(f0_ptr + (m * W0 + r[:, None]) * C + c[None, :], mask=mr[:, None] & mc[None, :], other=0.0)
+    b = tl.load(f1_ptr + (m * W1 + k[:, None]) * C + c[None, :], mask=mk[:, None] & mc[None, :], other=0.0)
+    sim = tl.dot(a, tl.trans(b)) * tl.cast(scale, tl.float32)
+
+    s_row = tl.where(mk[None, :], sim, -float("inf"))
+    rmax = tl.max(s_row, axis=1)
+    rlse = rmax + tl.log(tl.sum(tl.exp(s_row - rmax[:, None]), axis=1))
+
+    s_col = tl.where(mr[:, None], sim, -float("inf"))
+    cmax = tl.max(s_col, axis=0)
+    clse = cmax + tl.log(tl.sum(tl.exp(s_col - cmax[None, :]), axis=0))
+
+    log_conf = tl.where(mr[:, None] & mk[None, :], 2.0 * sim - rlse[:, None] - clse[None, :], -float("inf"))
+    row_best_val, row_best_j = tl.max(log_conf, axis=1, return_indices=True)
+    best_log_conf, best_i = tl.max(row_best_val, axis=0, return_indices=True)
+    best_j = tl.sum(tl.where(r == best_i, row_best_j, 0), axis=0)
+
+    tl.store(conf_ptr + m, tl.exp(best_log_conf))
+    tl.store(i_ptr + m, best_i)
+    tl.store(j_ptr + m, best_j)
+
+
+def batched_dual_softmax_argmax(f0: Tensor, f1: Tensor, scale: float) -> tuple[Tensor, Tensor, Tensor]:
+    m, w0, c = f0.shape
+    w1 = f1.shape[1]
+    if m == 0:
+        empty_i = torch.empty((0,), device=f0.device, dtype=torch.long)
+        return torch.empty((0,), device=f0.device, dtype=torch.float32), empty_i, empty_i
+    f0_c = f0.contiguous()
+    f1_c = f1.contiguous()
+    conf = torch.empty((m,), device=f0.device, dtype=torch.float32)
+    i_out = torch.empty((m,), device=f0.device, dtype=torch.int32)
+    j_out = torch.empty((m,), device=f0.device, dtype=torch.int32)
+    _batched_dual_softmax_argmax_kernel[(m,)](
+        f0_c,
+        f1_c,
+        conf,
+        i_out,
+        j_out,
+        scale,
+        W0=w0,
+        W1=w1,
+        C=c,
+        BLOCK_W0=max(16, triton.next_power_of_2(w0)),
+        BLOCK_W1=max(16, triton.next_power_of_2(w1)),
+        BLOCK_C=max(16, triton.next_power_of_2(c)),
+        num_warps=4,
+    )
+    return conf, i_out.long(), j_out.long()
+
+
+def _batched_dual_softmax_eligible(f0: Tensor, f1: Tensor, scale: float) -> bool:
+    return (
+        not torch.is_grad_enabled()
+        and f0.ndim == 3
+        and f1.ndim == 3
+        and f0.shape[0] == f1.shape[0]
+        and f0.shape[2] == f1.shape[2]
+        and f0.dtype in (torch.bfloat16, torch.float16)
+        and f1.dtype == f0.dtype
+        and 0 < f0.shape[1] <= 64
+        and 0 < f1.shape[1] <= 64
+        and 0 < f0.shape[2] <= 256
+    )
+
+
+ops.batched_dual_softmax_argmax.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_batched_dual_softmax_eligible
+)(batched_dual_softmax_argmax)
+
+
+def _fast_reciprocal_nn_eligible(
+    desc1: Tensor,
+    desc2: Tensor,
+    subsample: int = 8,
+    max_iter: int = 10,
+    block_size: int = 8192,
+    dist: str = "dot",
+) -> bool:
+    return (
+        dist == "dot"
+        and desc1.ndim == 3
+        and desc2.ndim == 3
+        and desc1.shape[2] == desc2.shape[2]
+        and 1 <= desc1.shape[2] <= 128
+        and desc1.dtype == desc2.dtype
+        and desc1.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and desc1.shape[0] * desc1.shape[1] < 2**31
+        and desc2.shape[0] * desc2.shape[1] < 2**31
+    )
+
+
+ops.fast_reciprocal_nn.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_fast_reciprocal_nn_eligible
+)(fast_reciprocal_nn)
+
+
+# -- tiled low-D squared-L2 reciprocal nearest neighbors (ops.reciprocal_nn for D <= 8) ------------------
+
+
+@triton.jit
+def _argmin_sqdist_kernel(
+    x_ptr, y_ptr, out_ptr, M, N, D: tl.constexpr, DP: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    dims = tl.arange(0, DP)
+    row_ok = rows < M
+    xi = tl.load(
+        x_ptr + rows[:, None].to(tl.int64) * D + dims[None, :],
+        mask=row_ok[:, None] & (dims[None, :] < D),
+        other=0.0,
+    ).to(tl.float32)
+    best_d = tl.full((BLOCK_M,), float("inf"), dtype=tl.float32)
+    best_j = tl.zeros((BLOCK_M,), dtype=tl.int32)
+    for start in range(0, N, BLOCK_N):
+        cols = start + tl.arange(0, BLOCK_N)
+        col_ok = cols < N
+        d2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for c in tl.static_range(D):
+            xc = tl.sum(tl.where(dims[None, :] == c, xi, 0.0), axis=1)
+            yc = tl.load(y_ptr + cols.to(tl.int64) * D + c, mask=col_ok, other=0.0).to(tl.float32)
+            diff = xc[:, None] - yc[None, :]
+            d2 += diff * diff
+        d2 = tl.where(col_ok[None, :], d2, float("inf"))
+        tile_min = tl.min(d2, axis=1)
+        tile_j = tl.min(tl.where(d2 == tile_min[:, None], cols[None, :], N), axis=1)
+        better = tile_min < best_d
+        best_d = tl.where(better, tile_min, best_d)
+        best_j = tl.where(better, tile_j, best_j)
+    tl.store(out_ptr + rows, best_j.to(tl.int64), mask=row_ok)
+
+
+def reciprocal_nn_tiled(pts1: Tensor, pts2: Tensor, block_size: int = 4096) -> tuple[Tensor, Tensor]:
+    """Tiled exact L2 reciprocal nearest neighbors for small ``D <= 8`` (avoids O(M*N) distance buffers)."""
+    n1, d = pts1.shape
+    n2 = pts2.shape[0]
+    if n1 == 0 or n2 == 0:
+        empty = torch.empty(0, dtype=torch.int64, device=pts1.device)
+        return empty, empty
+    p1, p2 = pts1.float().contiguous(), pts2.float().contiguous()
+    nn1_in_2 = torch.empty(n1, device=pts1.device, dtype=torch.int64)
+    nn2_in_1 = torch.empty(n2, device=pts2.device, dtype=torch.int64)
+    dp = triton.next_power_of_2(d)
+    block_m, block_n = 64, 128
+    _argmin_sqdist_kernel[(triton.cdiv(n1, block_m),)](
+        p1, p2, nn1_in_2, n1, n2, D=d, DP=dp, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=4
+    )
+    _argmin_sqdist_kernel[(triton.cdiv(n2, block_m),)](
+        p2, p1, nn2_in_1, n2, n1, D=d, DP=dp, BLOCK_M=block_m, BLOCK_N=block_n, num_warps=4
+    )
+    idx2 = torch.arange(n2, device=pts2.device, dtype=torch.int64)
+    reciprocal = nn1_in_2[nn2_in_1] == idx2
+    return nn2_in_1[reciprocal], idx2[reciprocal]
+
+
+def _reciprocal_nn_eligible(pts1: Tensor, pts2: Tensor, block_size: int = 4096) -> bool:
+    return (
+        pts1.ndim == 2
+        and pts2.ndim == 2
+        and pts1.shape[1] == 3
+        and pts2.shape[1] == 3
+        and pts1.dtype == torch.float32
+        and pts2.dtype == torch.float32
+        and 0 < pts1.shape[0] < 2**31
+        and 0 < pts2.shape[0] < 2**31
+    )
+
+
+def _reciprocal_nn_tiled_eligible(pts1: Tensor, pts2: Tensor, block_size: int = 4096) -> bool:
+    return (
+        pts1.is_cuda
+        and pts2.is_cuda
+        and pts1.ndim == 2
+        and pts2.ndim == 2
+        and pts1.shape[1] == pts2.shape[1]
+        and 1 <= pts1.shape[1] <= 8
+        and not _reciprocal_nn_eligible(pts1, pts2, block_size)
+    )
+
+
+ops.reciprocal_nn.register(
+    "triton", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_reciprocal_nn_eligible
+)(reciprocal_nn)
+ops.reciprocal_nn.register(
+    "triton_tiled", device=DeviceSpec("cuda"), requires=[Feature.TRITON], when=_reciprocal_nn_tiled_eligible
+)(reciprocal_nn_tiled)

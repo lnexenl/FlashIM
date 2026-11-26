@@ -32,9 +32,11 @@ from flashim.quant.methods.linear import StaticMXFP8Linear
 from flashim.quant.tensor import Int8Tensor, QuantizedTensor, QuantizedWeight
 
 # Where a conv writes the next conv's quantized input from its epilogue (``chain_output``), bit-identical to the separate
-# quantize pass. Measured on an L20 (see ``StaticMXFP8Conv2d``) and on an H20: a conv + ReLU pair 0.324 -> 0.304 ms (FP8,
-# 64 -> 64 3x3 at 448x600), 0.802 -> 0.770 (FP8, 256 -> 256 at 224x300), 0.210 -> 0.198 (INT8, 64 -> 64 at 448x600).
-CHAINED_CAPABILITIES = ((8, 9), (9, 0))
+# quantize pass. Measured on L20 (sm_89), H20 (sm_90), and RTX 5070 Ti (sm_120):
+# - H20: 64->64 3x3 at 448x600 0.324 -> 0.304 ms (FP8), 0.210 -> 0.198 (INT8); 256->256 at 224x300 0.802 -> 0.770 (FP8).
+# - sm_120: 2x64 3x3 at 800x800 1.498 -> 1.179 ms (1.27x FP8), 1.425 -> 1.120 ms (1.27x INT8);
+#   1x128 3x3 at 448x600 0.946 -> 0.825 ms (1.15x FP8), 0.859 -> 0.743 ms (1.16x INT8).
+CHAINED_CAPABILITIES = ((8, 9), (9, 0), (12, 0))
 # INT8 also on sm_87 (no FP8 there). Measured on a Jetson AGX Orin, bit-identical: RoMaV2's eight INT8 VGG convs,
 # batch 2, 32.8 -> 30.5 ms at 800x800 and 51.9 -> 48.0 ms at 1024x1024.
 INT8_CHAINED_CAPABILITIES = (*CHAINED_CAPABILITIES, (8, 7))
@@ -108,16 +110,16 @@ class StaticInt8Conv2d(StaticInt8Linear):
 
     def forward(
         self, x: Tensor | Int8Tensor, relu: bool = False, residual: Tensor | None = None,
-        quantize_for: nn.Module | None = None,
+        residual_scale: Tensor | None = None, quantize_for: nn.Module | None = None,
     ) -> Tensor | Int8Tensor:
-        """``relu(conv(x) [+ residual])`` with the ReLU and the residual (``[B, Cout, Ho, Wo]``) in the epilogue.
-        ``x`` may be the :class:`Int8Tensor` a previous layer produced for this one (``quantize_for``, as in
-        ``StaticMXFP8Conv2d.forward``)."""
+        """``relu(conv(x) [+ residual [* residual_scale]])`` with the ReLU and residual (``[B, Cout, Ho, Wo]``) in
+        the epilogue. ``x`` may be the :class:`Int8Tensor` a previous layer produced for this one."""
         q, dtype = self._quantized_input(x)
         chained = quantize_for is not None and dtype == torch.bfloat16 and self.feeds(quantize_for)
         out = ops.int8_conv2d(
             q.values, self.weight_int8, self.input_scale, self.weight_scale, self.bias, *self._geometry_args(),
             relu=relu, residual=None if residual is None else residual.permute(0, 2, 3, 1),
+            **({"residual_scale": residual_scale} if residual_scale is not None else {}),
             **({"out_scale": quantize_for.input_scale} if chained else {}),
         )
         if chained:
@@ -216,9 +218,9 @@ class StaticMXFP8Conv2d(StaticMXFP8Linear):
 
     def forward(
         self, x: Tensor | QuantizedTensor, relu: bool = False, residual: Tensor | None = None,
-        quantize_for: nn.Module | None = None,
+        residual_scale: Tensor | None = None, quantize_for: nn.Module | None = None,
     ) -> Tensor | QuantizedTensor:
-        """``relu(conv(x) [+ residual])``; ReLU and the residual (``[B, Cout, Ho, Wo]``) in the fused kernel's epilogue.
+        """``relu(conv(x) [+ residual [* residual_scale]])``; ReLU and residual in the fused kernel's epilogue.
         ``x`` may be the :class:`QuantizedTensor` a previous layer produced for this one; ``quantize_for`` (a layer
         this one :meth:`feeds`, called next with the result and nothing else) makes this layer return such a tensor."""
         if isinstance(x, QuantizedTensor):
@@ -237,6 +239,7 @@ class StaticMXFP8Conv2d(StaticMXFP8Linear):
                 q.values, self.channel_exponent, weight, self.weight_exponent, self.bias_bf16,
                 kh, kw, sh, sw, ph, pw, dh, dw, relu=relu,
                 residual=None if residual is None else residual.permute(0, 2, 3, 1),
+                **({"residual_scale": residual_scale} if residual_scale is not None else {}),
                 **({"out_exponent": quantize_for.channel_exponent} if chained else {}),
             )
             if chained:
@@ -247,7 +250,8 @@ class StaticMXFP8Conv2d(StaticMXFP8Linear):
         out = self._finish(self.gemm(act, None), (cols.shape[0],), dtype)
         out = out.reshape(q.values.shape[0], ho, wo, -1).permute(0, 3, 1, 2)
         if residual is not None:
-            out = out + residual
+            term = residual if residual_scale is None else residual * residual_scale[None, :, None, None].to(residual.dtype)
+            out = out + term
         return F.relu(out, inplace=True) if relu else out
 
     def extra_repr(self) -> str:

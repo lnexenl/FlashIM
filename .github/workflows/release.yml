@@ -1,0 +1,49 @@
+name: Release (bump version)
+
+# Run from the Actions tab: pick patch / minor / major. Opens a PR `release/vX.Y.Z` into `dev` that bumps
+# `project.version` in pyproject.toml (+ uv.lock) and stamps CHANGELOG.md. Merge it, merge dev -> main, and
+# publish.yml publishes the new version to PyPI and tags it. Nothing here pushes to main or dev.
+# Needs: Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests".
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version part to increase
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+      - uses: astral-sh/setup-uv@v6
+      - name: Bump
+        id: bump
+        run: |
+          uv version --bump "${{ inputs.bump }}" --no-sync
+          new=$(uv version --short)
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          # "## Unreleased" stays on top, its content becomes the new release
+          sed -i "0,/^## Unreleased$/s//## Unreleased\n\n## $new ($(date -u +%F))/" CHANGELOG.md
+      - name: Open PR into dev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          branch="release/v$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add pyproject.toml uv.lock CHANGELOG.md
+          git commit -m "release: v$VERSION"
+          git push origin "$branch"
+          gh pr create --base dev --head "$branch" --title "release: v$VERSION" \
+            --body "Version bump (\`${{ inputs.bump }}\`). After merging, merge \`dev\` into \`main\`: publish.yml releases v$VERSION to PyPI and tags it."

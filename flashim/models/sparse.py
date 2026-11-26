@@ -8,14 +8,21 @@ matching (``match``: :class:`~flashim.models.base.FeatureMatcher`). Batch size i
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from flashim import ops
+from flashim.log import get_logger, warn_once
 from flashim.models.base import FeatureMatcher
 from flashim.models.romav2.model import ImageLike, load_image
 from flashim.types import Matches, SparseFeatures
 from flashim.utils import device_constant, set_submodule
+
+logger = get_logger("models.sparse")
 
 
 def target_size(height: int, width: int, long_side: int | None, div_by: int = 8) -> tuple[int, int]:
@@ -34,17 +41,7 @@ def rgb_to_gray(image: Tensor) -> Tensor:
 
 def simple_nms(scores: Tensor, radius: int) -> Tensor:
     """SuperPoint's fast non-maximum suppression over ``[B, H, W]`` (or ``[B, 1, H, W]``) score maps."""
-    def max_pool(x):
-        return F.max_pool2d(x, kernel_size=radius * 2 + 1, stride=1, padding=radius)
-
-    zeros = torch.zeros_like(scores)
-    max_mask = scores == max_pool(scores)
-    for _ in range(2):
-        supp_mask = max_pool(max_mask.float()) > 0
-        supp_scores = torch.where(supp_mask, zeros, scores)
-        new_max_mask = supp_scores == max_pool(supp_scores)
-        max_mask = max_mask | (new_max_mask & (~supp_mask))
-    return torch.where(max_mask, scores, zeros)
+    return ops.simple_nms(scores, radius)
 
 
 def select_top_k(keypoints: Tensor, scores: Tensor, k: int | None) -> tuple[Tensor, Tensor, Tensor]:
@@ -97,12 +94,62 @@ class SparseExtractor(FeatureMatcher, nn.Module):
 
     fp32_modules: tuple[str, ...] = ()  # submodule paths kept in FP32 under a reduced compute dtype
     compute_dtype = torch.float32
+    graphs: int = 0  # per-shape CUDA graphs for static-shape trunk (0 = eager; pass ``cuda_graph``)
 
     # Filled by the builder.
     preset: str | None = None
     engine: str | None = None
     quant_report = None
     calibration_metadata = None
+
+    def _run_graphed(self, tag: str, fn: Callable, *args):
+        """Replay a static-shape trunk ``fn(*args)`` from a per-shape CUDA graph (up to :attr:`graphs` recent shapes),
+        eliminating Python / Triton eager dispatch overhead; bit-identical to eager. Falls back cleanly to eager on
+        CPU, inside autograd/compile, or if capture fails."""
+        if (
+            not self.graphs
+            or torch.is_grad_enabled()
+            or torch.compiler.is_compiling()
+            or not any(isinstance(a, Tensor) and a.is_cuda for a in args)
+        ):
+            return fn(*args)
+        from flashim.engines.cuda_graph import CudaGraphRunner
+
+        cache = self.__dict__.setdefault("_graph_runners", OrderedDict())
+        key = (tag, tuple((a.shape, a.dtype, a.device) if isinstance(a, Tensor) else a for a in args))
+        runner = cache.get(key)
+        if runner is not None:
+            cache.move_to_end(key)
+            return runner(*args)
+        # Wait until a shape recurs before paying capture + private-pool VRAM (avoids thrashing on
+        # variable-aspect-ratio datasets where many shapes appear only once).
+        seen = self.__dict__.setdefault("_graph_seen", {})
+        hits = seen.get(key, 0) + 1
+        seen[key] = hits
+        if hits < 2:
+            return fn(*args)
+        runner = CudaGraphRunner(fn, warmups=2)
+        failed = False
+        try:
+            outputs = runner(*args)
+        except RuntimeError as exc:
+            warn_once(
+                logger, f"sparse-graph-{id(self)}",
+                "%s: CUDA graph capture failed, running eagerly from now on (%s)", type(self).__name__, exc,
+            )
+            self.graphs = 0
+            failed = True
+        if failed:
+            # Release the failed runner, cached private pools, and exception traceback frames before eager fallback.
+            del runner
+            cache.clear()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            return fn(*args)
+        cache[key] = runner
+        while len(cache) > self.graphs:
+            cache.popitem(last=False)
+        return outputs
 
     @property
     def device(self) -> torch.device:

@@ -83,7 +83,9 @@ def test_romav2_presets_match_the_legacy_flags():
     fast = resolve("romav2", "fp8")
     assert fast.precision.quant == "fp8" and PRESETS["fp8"].batched_directions
     assert fast.optimize.passes == (
-        "fold_refiners", "fused_bf16_s1", "fused_refiner_io", "fused_mx_blocks", "batched_directions",
+        "fold_refiners", "fold_fine_features", "fold_layer_scale", "fused_bf16_s1", "fused_refiner_io",
+        "fused_mx_blocks", "batched_directions", "batched_matcher", "fused_rope", "fused_block_epilogues",
+        "sage_attention",
     )
     assert resolve("romav2", "bf16").optimize.passes == ()
     with pytest.raises(ValueError, match="needs a quantized preset"):
@@ -190,6 +192,26 @@ def test_lightglue_variants_default_to_their_own_calibration_table(monkeypatch):
         "lightglue_aliked_int8_mega", "lightglue_raco-aliked_fp8_mega", "lightglue_fp8_mega", "lightglue_int8_mega",
     ]
 
+
+def test_lightglue_failing_fp8_pairings_fall_back_via_nearest():
+    """ALIKED / SuperPoint / DISK / XFeat LightGlue pipelines omit failing FP8 presets so build.NEAREST resolves
+    ``fp8`` to their nearest passing preset, while RDD / RaCo-ALIKED keep ``fp8``."""
+    for name in ("rdd-lightglue", "raco-aliked-lightglue"):
+        cfg = resolve(name, "fp8", platform=WITH_FP8)
+        assert cfg.preset == "fp8" and cfg.components["matcher"].preset == "fp8"
+
+    for name, expected in (
+        ("aliked-lightglue", ("int8", "bf16", "int8")),
+        ("superpoint-lightglue", ("int8", "bf16", "int8")),
+        ("disk-lightglue", ("int8", "int8", "int8")),
+        ("xfeat-lightglue", ("bf16", "bf16", "bf16")),
+    ):
+        fallbacks: dict[str, str] = {}
+        cfg = resolve(name, "fp8", platform=WITH_FP8, fallbacks=fallbacks)
+        assert (cfg.preset, cfg.components["extractor"].preset, cfg.components["matcher"].preset) == expected
+        assert name in fallbacks and f"fp8 -> {expected[0]}" in fallbacks[name]
+        assert not _uses_fp8(cfg)
+
 # -- builder stages on a fake model ------------------------------------------------------------------------
 
 
@@ -198,6 +220,18 @@ class _Toy(nn.Module):
         super().__init__()
         self.lin = nn.Linear(4, 4)
         self.log: list[str] = []
+
+
+@pytest.fixture(autouse=True)
+def _restore_spec_registry():
+    """The toy specs registered below must not leak into tests that list ``available_models()``."""
+    builder = sys.modules["flashim.build"]
+    specs, paths = dict(builder._SPECS), dict(builder._SPEC_PATHS)
+    yield
+    builder._SPECS.clear()
+    builder._SPECS.update(specs)
+    builder._SPEC_PATHS.clear()
+    builder._SPEC_PATHS.update(paths)
 
 
 def _toy_spec():
@@ -268,3 +302,20 @@ def test_match_defaults_come_from_the_inference_section():
     for bad in (0, -1, 2.5, True):
         with pytest.raises(ValueError, match="max_matches"):
             model.match(None, None, max_matches=bad)
+
+
+def test_superpoint_fp8_ignores_conv1b_only():
+    spec = get_spec("superpoint")
+    assert spec.quant_configs["fp8"].scheme_for("conv1b") is None
+    assert spec.quant_configs["fp8"].scheme_for("conv2a") is not None
+    assert spec.quant_configs["int8"].scheme_for("conv1b") is not None
+
+
+def test_xfeat_protects_keypoint_head_and_block2():
+    spec = get_spec("xfeat")
+    for preset in ("fp8", "int8"):
+        cfg = spec.quant_configs[preset]
+        assert cfg.scheme_for("keypoint_head.0.layer.0") is None
+        assert cfg.scheme_for("block2.0.layer.0") is None
+        assert cfg.scheme_for("block3.0.layer.0") is not None
+        assert cfg.scheme_for("block_fusion.0.layer.0") is not None

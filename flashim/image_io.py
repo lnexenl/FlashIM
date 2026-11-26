@@ -23,6 +23,17 @@ from flashim.log import get_logger, warn_once
 logger = get_logger(__name__)
 
 JPEG_SUFFIXES = (".jpg", ".jpeg")
+_DECODE_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _decode_stream(device: torch.device) -> torch.cuda.Stream:
+    """Per-device side stream isolating ``decode_jpeg``'s output allocations from the caller's stream."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _DECODE_STREAMS.get(idx)
+    if stream is None:
+        stream = torch.cuda.Stream(device=idx)
+        _DECODE_STREAMS[idx] = stream
+    return stream
 
 
 def chroma_layout(data: bytes) -> int | None:
@@ -51,9 +62,23 @@ def decode_jpeg_cuda(path: str | Path, device: torch.device, fancy: bool = True)
     layout = chroma_layout(data)
     if layout is None:
         return None
+    # torchvision's CUDAJpegDecoder allocates its output with torch::empty() on the *current* stream (so PyTorch's
+    # caching allocator can return a block still in flight on the caller's stream), then decodes on nvJPEG's own
+    # private pool stream without waiting for the caller's stream first — racing WAW/WAR with prior caller kernels.
+    # Running decode_jpeg on a private stream keeps its allocations out of the caller's pool, record_stream() holds
+    # each decoded buffer until the caller finishes reading it, and wait_stream() orders the caller behind the decode
+    # without stalling the caller's in-flight GPU work.
+    caller_stream = torch.cuda.current_stream(device)
+    decode_stream = _decode_stream(device)
+    decode_stream.synchronize()
     try:
-        rgb = decode_jpeg(torch.frombuffer(bytearray(data), dtype=torch.uint8), mode=ImageReadMode.RGB, device=device)
+        with torch.cuda.stream(decode_stream):
+            rgb = decode_jpeg(
+                torch.frombuffer(bytearray(data), dtype=torch.uint8), mode=ImageReadMode.RGB, device=device
+            )
     except (RuntimeError, NotImplementedError) as exc:  # e.g. arithmetic coding, 12-bit, torchvision without nvJPEG
         warn_once(logger, "nvjpeg-fallback", "nvJPEG cannot decode %s (%s); using PIL", path, str(exc).splitlines()[0])
         return None
+    caller_stream.wait_stream(decode_stream)
+    rgb.record_stream(caller_stream)
     return ops.jpeg_fancy_upsample(rgb, layout) if fancy and layout else rgb

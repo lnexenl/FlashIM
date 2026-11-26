@@ -165,13 +165,19 @@ def refiner_input(
     if block_m is None:  # keep ~3 [BLOCK_M, PP] FP32 tiles in registers
         block_m = max(16, min(128, 4096 // pp))
     out = torch.empty((batch, h, w, c_total), device=f_a.device, dtype=torch.bfloat16)
+    if emb_weight.shape != (e, 2) or emb_weight.dtype != torch.float32 or not emb_weight.is_contiguous():
+        emb_weight = emb_weight.reshape(e, 2).float().contiguous()
+    if emb_bias.dtype != torch.float32 or not emb_bias.is_contiguous():
+        emb_bias = emb_bias.float().contiguous()
+    if scale_factor.dtype != torch.float32 or not scale_factor.is_contiguous():
+        scale_factor = scale_factor.float().contiguous()
     _refiner_input_kernel[(triton.cdiv(rows, block_m),)](
         f_a,
         f_b,
         warp,
-        emb_weight.reshape(e, 2).float().contiguous(),
-        emb_bias.float().contiguous(),
-        scale_factor.float().contiguous(),
+        emb_weight,
+        emb_bias,
+        scale_factor,
         out,
         rows,
         1.0 / math.sqrt(p),
@@ -269,10 +275,14 @@ def refiner_heads(
     prev_confidence = prev_confidence.float().contiguous()
     warp = torch.empty((batch, h, w, 2), device=z.device, dtype=torch.float32)
     confidence = torch.empty((batch, h, w, 4), device=z.device, dtype=torch.float32)
+    if weight.dtype != torch.float32 or not weight.is_contiguous():
+        weight = weight.float().contiguous()
+    if bias.dtype != torch.float32 or not bias.is_contiguous():
+        bias = bias.float().contiguous()
     _refiner_heads_kernel[(triton.cdiv(rows, block_m),)](
         z,
-        weight.float().contiguous(),
-        bias.float().contiguous(),
+        weight,
+        bias,
         prev_warp,
         prev_confidence,
         warp,

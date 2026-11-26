@@ -10,13 +10,19 @@
 use; a built model keeps it as ``model.run_config`` and reports what was applied in ``model.build_report``.
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _version
+
 from flashim.build import PRECISIONS, build_config, get_spec, load, resolve, spec_names
 from flashim.config import RunConfig
 from flashim.log import set_verbosity
 from flashim.registry import SPECS as _SPECS  # noqa: F401  (registers the models)
 from flashim.types import DenseMatchResult, Matches, SparseFeatures
 
-__version__ = "0.1.0"
+try:  # the single source of the version is `project.version` in pyproject.toml (.github/workflows/release.yml bumps it)
+    __version__ = _version("flashim")
+except PackageNotFoundError:  # source tree on PYTHONPATH, not installed
+    __version__ = "0+unknown"
 
 
 def available_models() -> dict[str, str]:

@@ -83,18 +83,26 @@ class DPTHead(nn.Module):
             nn.Conv2d(features // 2, 32, 3, padding=1), nn.ReLU(inplace=True), nn.Conv2d(32, out_dim, 1)
         )
         self.scratch = scratch
+        # Channels-last activations & conv weights (set by romav2's batched_matcher pass).
+        self.channels_last = False
 
     def forward(self, tokens: list[Tensor]) -> Tensor:
         """``tokens``: list of ``[B, h, w, D]``; returns ``[B, 4h, 4w, out_dim]`` (FP32)."""
         batch, h, w, _ = tokens[0].shape
         factor = len(self.out_channels) // len(tokens)
-        tokens = [t for t in tokens for _ in range(factor)]
         with torch.autocast(tokens[0].device.type, torch.bfloat16):
-            out = []
-            for index, x in enumerate(tokens):
-                x = self.norm(x.reshape(batch, -1, x.shape[-1]))
-                x = x.permute(0, 2, 1).reshape(batch, x.shape[-1], h, w)
-                out.append(self.resize_layers[index](self.projects[index](x)))
+            normed = []
+            for t in tokens:
+                x = self.norm(t.reshape(batch, -1, t.shape[-1]))
+                if self.channels_last:
+                    x = x.reshape(batch, h, w, x.shape[-1]).permute(0, 3, 1, 2)  # zero-copy NHWC view
+                else:
+                    x = x.permute(0, 2, 1).reshape(batch, x.shape[-1], h, w)
+                normed.append(x)
+            out = [
+                self.resize_layers[index](self.projects[index](normed[index // factor]))
+                for index in range(len(self.out_channels))
+            ]
             fused = self._fuse(out)
             size = (h * self.patch_size // self.down_ratio, w * self.patch_size // self.down_ratio)
             fused = F.interpolate(fused, size=size, mode="bilinear", align_corners=True)

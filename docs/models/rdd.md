@@ -30,26 +30,26 @@ offsets + attention logits), biases in the GEMM epilogue, LayerNorm→quantize p
 `linear1` + bias + GELU + quantize + `linear2` (the 1024-wide hidden activation never leaves the SM; bit-identical to the
 two-GEMM path).
 
+The ConvNeXt-tiny backbone runs in `channels_last` with folded `Block.gamma` and zero-copy NHWC LayerNorm, the detector
+and matchibility branches fold eval BatchNorm (`rdd.detector` wall time `8.56 -> 5.78 ms` at 1600 px on RTX 5070 Ti
+`sm_120`, `eager`), and `match_features` uses Triton `ops.dual_softmax_mutual` (`4096x4096`, `bf16`, RTX 5070 Ti
+`sm_120`, `eager`: `5.76 -> 0.75 ms`, 7.67x).
+
 `engine="compile"` compiles the backbone, input projections, detector and encoder once per input resolution.
 `precision.overrides.detector=bf16` runs the detector's conv trunk in BF16 (score head FP32); it is off by default because it
 changes about 12% of the 4096 keypoints.
 
 ## Speed
 
-`extract()` at 1056x1600, image preloaded, keypoints + descriptors included, RTX 5070 Ti:
-
-| configuration | extract | peak memory |
-|---|---|---|
-| RDD reference (PyTorch deformable path, no CUDA extension) | OOM (16 GB) | |
-| `fp32` eager | 110.9 ms | 2.0 GiB |
-| `bf16` eager | 57.6 ms | 1.1 GiB |
-| `bf16` + `compile` | 40.3 ms | 1.1 GiB |
-| `fp8` eager | 49.3 ms | 1.3 GiB |
-| `fp8` + `compile` | 35.4 ms | 1.1 GiB |
+`extract()` of one 1200 px image (4096 keypoints, image preloaded, keypoints + descriptors included), RTX 5070 Ti
+(`sm_120`), `eager / compile`: `fp32` 68.7 / 61.0 ms, `bf16` 31.8 / 25.3 ms, `fp8` 26.5 / 22.8 ms. Method and every other
+model: [inference benchmark](../benchmarks.md#sparse-extractors). The RDD reference (PyTorch deformable path, no CUDA
+extension) runs out of memory on 16 GB.
 
 ## Accuracy
 
-MegaDepth-1500 pose AUC, RDD protocol (1600 px, 4096 keypoints, mutual NN, OpenCV RANSAC), RGB input:
+MegaDepth-1500 pose AUC, RDD protocol (1600 px, 4096 keypoints, mutual NN, OpenCV RANSAC, RTX 5070 Ti `sm_120`, `eager`
+unless noted), RGB input:
 
 | configuration | AUC@5 | AUC@10 | AUC@20 |
 |---|---|---|---|
@@ -58,6 +58,8 @@ MegaDepth-1500 pose AUC, RDD protocol (1600 px, 4096 keypoints, mutual NN, OpenC
 | `fp8` | 0.5418 | 0.6974 | 0.8137 |
 | `fp8` + `compile` | 0.5287 | 0.6887 | 0.8071 |
 
-The run-to-run spread of these sparse pipelines is about ±0.01, so FP8 costs no measurable accuracy. RDD's own script
-feeds OpenCV BGR images; `fp32` scores 0.5155 AUC@5 that way. Run with `benchmarks/accuracy/run_sparse.py`; the matrix is
-`benchmarks/accuracy/rdd_matrix.sh`.
+The run-to-run spread of these sparse pipelines is about ±0.01, so FP8 costs no measurable accuracy. Under the
+MegaDepth-1500 / ScanNet-1500 paired-bootstrap gate (RTX 5070 Ti `sm_120`, `eager`, 3 seeds, PoseLib 1.0 px), both
+`rdd bf16` and `rdd fp8` pass on both datasets ([benchmarks.md](../benchmarks.md#accuracy)).
+RDD's own script feeds OpenCV BGR images; `fp32` scores 0.5155 AUC@5 that way. Run with `benchmarks/accuracy/run_sparse.py`;
+the matrix is `benchmarks/accuracy/rdd_matrix.sh`.

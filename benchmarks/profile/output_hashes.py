@@ -1,9 +1,11 @@
 """Output fingerprints of every model / preset, for "is this change bit-identical?" checks across two source trees.
 
 Each configuration runs on the fixed MegaDepth pair (eager): sparse extractors ``extract`` image A and ``match_features``
-A/B, pipelines and pair-level models ``match`` A/B, RoMaV2 ``match`` with 5000 seeded samples. For each, the sha256 of
-every output tensor, the tensors themselves (``<out>/<config>.pt``, for tolerance diffs when they are not identical)
-and ``ops.call_counts()`` (which impls ran) are written. Run it once per tree and compare:
+A/B, pipelines and pair-level models ``match`` A/B, RoMaV2 ``match`` with 5000 seeded samples, the models added in 2026-11
+(``native``: ``match`` with the model's own defaults under a fixed torch seed). For each, the sha256 of every output
+tensor, the tensors themselves (``<out>/<config>.pt``, for tolerance diffs when they are not identical),
+``ops.call_counts()`` (which impls ran) and ``model.build_report.fallbacks`` (a component without the pipeline's preset
+builds another one) are written. Run it once per tree and compare:
 
     PYTHONPATH=/path/to/base-worktree python benchmarks/profile/output_hashes.py --out results/hashes/base
     python benchmarks/profile/output_hashes.py --out results/hashes/new
@@ -27,14 +29,14 @@ from flashim.paths import MEGADEPTH_IMAGES
 
 IMAGES = MEGADEPTH_IMAGES
 IMAGE_A, IMAGE_B = IMAGES / "3383162411_67cc9af85e_o.jpg", IMAGES / "299056923_ecd980298c_o.jpg"
-EXTRACTORS = ("superpoint", "alike", "disk", "xfeat", "ripe", "dedode", "dedode-g", "dad")
+EXTRACTORS = ("superpoint", "alike", "disk", "xfeat", "ripe", "ripepp", "dedode", "dedode-g", "dad")
 
 
 def configs() -> list[tuple[str, str, str, list[str], str]]:
     """``(name, model, preset, overrides, kind)``; kind is ``extract`` / ``pipeline`` / ``pair`` / ``dense``."""
     out = [(f"{m}-{p}", m, p, [], "extract") for m in EXTRACTORS for p in ("bf16", "int8", "fp8")]
     out += [(f"{m}-lightglue-{p}", f"{m}-lightglue", p, [f"components.extractor.preset={p}"], "pipeline")
-            for m in ("xfeat", "superpoint", "disk") for p in ("int8", "fp8")]
+            for m in ("xfeat", "superpoint", "disk", "ripepp") for p in ("int8", "fp8")]
     out += [(f"loftr-{p}", "loftr", p, [], "pair") for p in ("bf16", "int8", "fp8")]
     out += [(f"rdd-lightglue-{p}", "rdd-lightglue", p, ["components.extractor.preset=fp8"], "pipeline")
             for p in ("fp8", "int8")]
@@ -43,17 +45,26 @@ def configs() -> list[tuple[str, str, str, list[str], str]]:
     out += [("raco-aliked-lightglue-bf16x", "raco-aliked-lightglue", "int8", ["components.extractor.preset=bf16"],
              "pipeline")]
     out += [(f"romav2-{p}", "romav2", p, [], "dense") for p in ("bf16", "fp8", "int8")]
+    out += [(f"loma-b-{p}", "loma-b", p, [], "pipeline") for p in ("bf16", "int8")]
+    # models added in 2026-11: the model's own defaults (resolution, matches), one fixed torch seed
+    native = ("roma", "tiny-roma", "minima-roma", "mast3r", "dust3r", "ufm", "eloftr", "xoftr", "minima-loftr",
+              "superpoint-superglue", "omniglue")
+    out += [(f"{m}-{p}", m, p, [], "native") for m in native for p in ("bf16", "int8")]
+    out += [(f"flexglue-{p}", "flexglue", p, [], "native") for p in ("fp32", "bf16", "int8", "fp8")]
     return out
 
 
 def tensors_of(obj, prefix: str) -> dict[str, torch.Tensor]:
+    if obj is None:
+        return {}
     if isinstance(obj, torch.Tensor):
         return {prefix: obj.detach().cpu()}
     fields = obj.as_dict() if hasattr(obj, "as_dict") else getattr(obj, "__dict__", {})
     return {f"{prefix}.{k}": v.detach().cpu() for k, v in fields.items() if isinstance(v, torch.Tensor)}
 
 
-def run(name: str, model_name: str, preset: str, overrides: list[str], kind: str) -> dict[str, torch.Tensor]:
+def run(name: str, model_name: str, preset: str, overrides: list[str], kind: str):
+    """``(output tensors, model.build_report.fallbacks)``."""
     import flashim
     from flashim.models.romav2.model import load_image
 
@@ -69,15 +80,20 @@ def run(name: str, model_name: str, preset: str, overrides: list[str], kind: str
             out |= tensors_of(model.match(a, b, resize=1200, max_matches=4096), "M")
         elif kind == "pair":
             out |= tensors_of(model.match(a, b, resize=1200), "M")
+        elif kind == "native":
+            torch.manual_seed(0)
+            result = model.match(a, b)
+            out |= tensors_of(result, "M") | tensors_of(getattr(result, "dense", None), "M.dense")
         else:
             generator = torch.Generator(device=model.device).manual_seed(0)
             result = model.match(a, b, max_matches=5000, generator=generator)
             out |= tensors_of(result, "M") | tensors_of(result.dense, "M")
-    return out
+    return out, [str(f) for f in getattr(getattr(model, "build_report", None), "fallbacks", None) or []]
 
 
 def digest(t: torch.Tensor) -> str:
-    t = t.contiguous()
+    # ``contiguous()`` keeps odd strides of size-1 dims, which ``view(uint8)`` rejects: copy into dense strides
+    t = torch.empty_like(t, memory_format=torch.contiguous_format).copy_(t)
     raw = t.view(torch.uint8) if t.dtype != torch.bool else t.to(torch.uint8)
     return hashlib.sha256(raw.numpy().tobytes()).hexdigest()[:16] + f":{tuple(t.shape)}:{str(t.dtype)[6:]}"
 
@@ -91,13 +107,14 @@ def record(out_dir: Path, wanted: list[str]) -> None:
             continue
         ops.reset_call_counts()
         try:
-            tensors = run(name, model_name, preset, overrides, kind)
+            tensors, fallbacks = run(name, model_name, preset, overrides, kind)
+            hashes = {k: digest(v) for k, v in tensors.items()}
         except Exception as exc:  # noqa: BLE001 -- keep going: a broken config is itself a finding
             print(f"{name}: FAILED {type(exc).__name__}: {exc}", flush=True)
             (out_dir / f"{name}.json").write_text(json.dumps({"error": f"{type(exc).__name__}: {exc}"}) + "\n")
             continue
         torch.save(tensors, out_dir / f"{name}.pt")
-        report = {"hashes": {k: digest(v) for k, v in tensors.items()}, "calls": ops.call_counts()}
+        report = {"hashes": hashes, "calls": ops.call_counts(), "fallbacks": fallbacks}
         (out_dir / f"{name}.json").write_text(json.dumps(report, indent=1, sort_keys=True) + "\n")
         print(f"{name}: {len(tensors)} tensors", flush=True)
         torch.cuda.empty_cache()
@@ -115,6 +132,10 @@ def compare(base: Path, new: Path) -> None:
             continue
         differ = sorted(k for k in a["hashes"].keys() | b["hashes"].keys() if a["hashes"].get(k) != b["hashes"].get(k))
         calls = "" if a["calls"] == b["calls"] else f"  calls {a['calls']} -> {b['calls']}"
+        if a.get("fallbacks") != b.get("fallbacks"):
+            calls += f"  fallbacks {a.get('fallbacks')} -> {b.get('fallbacks')}"
+        elif b.get("fallbacks"):
+            calls += f"  (fallbacks in both: {b['fallbacks']})"
         if not differ:
             print(f"{path.stem:32s} identical{calls}")
             continue

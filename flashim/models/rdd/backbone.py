@@ -21,6 +21,8 @@ class LayerNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if self.data_format == "channels_last":
             return F.layer_norm(x, (self.dim,), self.weight, self.bias, self.eps)
+        if x.is_contiguous(memory_format=torch.channels_last) and x.shape[-2:] != (1, 1):
+            return F.layer_norm(x.permute(0, 2, 3, 1), (self.dim,), self.weight, self.bias, self.eps).permute(0, 3, 1, 2)
         dtype = x.dtype
         x = x.float()
         mean = x.mean(1, keepdim=True)
@@ -41,15 +43,30 @@ class Block(nn.Module):
         self.pwconv2 = nn.Linear(4 * dim, dim)
         self.gamma = nn.Parameter(torch.ones(dim))
 
+    def fold_gamma(self) -> bool:
+        """Fold ``gamma`` into ``pwconv2`` (exact in real arithmetic; run before BF16 cast)."""
+        if self.gamma is None:
+            return False
+        with torch.no_grad():
+            g = self.gamma.to(self.pwconv2.weight.dtype)
+            self.pwconv2.weight.mul_(g[:, None])
+            if self.pwconv2.bias is not None:
+                self.pwconv2.bias.mul_(g.to(self.pwconv2.bias.dtype))
+        self.register_parameter("gamma", None)
+        return True
+
     def forward(self, x: Tensor) -> Tensor:
         y = self.dwconv(x).permute(0, 2, 3, 1)
         y = self.pwconv2(self.act(self.pwconv1(self.norm(y))))
-        y = (self.gamma * y).permute(0, 3, 1, 2)
-        return x + y
+        if self.gamma is not None:
+            y = self.gamma * y
+        return x + y.permute(0, 3, 1, 2)
 
 
 class ConvNeXt(nn.Module):
     """Feature pyramid: returns the output of each of the four stages."""
+
+    channels_last: bool = False
 
     def __init__(self, depths: tuple[int, ...], dims: tuple[int, ...]) -> None:
         super().__init__()
@@ -66,6 +83,8 @@ class ConvNeXt(nn.Module):
         self.stages = nn.ModuleList(nn.Sequential(*[Block(dim) for _ in range(depth)]) for depth, dim in zip(depths, dims))
 
     def forward(self, x: Tensor) -> list[Tensor]:
+        if self.channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
         features = []
         for downsample, stage in zip(self.downsample_layers, self.stages):
             x = stage(downsample(x))
