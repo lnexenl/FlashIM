@@ -47,8 +47,36 @@ The `int8` / `fp8` presets use calibration tables computed on each pairing's fea
   fallback).
 
 Matcher and pair latencies of every pairing (`eager / compile`, 4096 keypoints per image, RTX 5070 Ti `sm_120`) are in the
-[inference benchmark](../benchmarks.md#sparse-matchers): for example `rdd-lightglue` `match_features` takes 11.7 / 11.1 ms in
-`bf16`, 9.93 / 9.98 ms in `int8` and 10.3 / 18.3 ms in `fp8`.
+[inference benchmark](../benchmarks.md#sparse-matchers): for example `rdd-lightglue` `match_features` takes 11.7 / 13.5 ms in
+`bf16`, 9.89 / 10.1 ms in `int8` and 10.3 / 17.9 ms in `fp8`.
+
+## Why int8 loses accuracy for some pairings
+
+Most pairings keep their pose AUC under `int8`; two did not, for different reasons (MegaDepth-1500, 3 seeds, RTX 5070 Ti
+`sm_120`, `eager`, cached features, paired bootstrap against the `bf16` extractor + `bf16` matcher):
+
+- **`ripepp-lightglue`** (`-0.0075` with the extractor and the matcher in `int8`): two causes that add up.
+  - *The extractor, not LightGlue, dominates.* `int8` extractor + `bf16` matcher is `-0.0060 [-0.0106, -0.0015]`; swapping only
+    the descriptors (`bf16` keypoints + `int8` descriptors) is `-0.0011`, swapping only the keypoints is `-0.0072`. The loss
+    is the sub-pixel keypoint localization: RIPE++'s 3x3 softmax refinement is sensitive to the four small
+    `net.decoder.layers.{1,2}.*` convolutions in `int8` (keypoints within 0.5 px of the `bf16` ones: 0.903 -> 0.952 once
+    they stay in `bf16`). A plain mutual-nearest-neighbour match hides it (`ripepp` `int8` with MNN, before the exclusion,
+    was `-0.0001`), a trained matcher does not.
+  - *The matcher is more sensitive than the others.* Its weakly supervised (reinforcement-learning) layers 4-8 and assignment
+    head work at extreme logit temperatures (mean absolute error of the similarity matrix under `int8` 36.85, against 0.58
+    for `rdd-lightglue`) and its confidences saturate, so `int8` LightGlue alone costs `-0.0034` (it is not channel or token
+    outliers, not a calibration mismatch and not a shift of `filter_threshold`). `int8` LightGlue therefore stays `bf16`
+    in this pairing.
+  - Shipped: `int8` runs RIPE++ in `int8` with `net.decoder.layers.{1,2}.*` in `bf16` and LightGlue in `bf16`:
+    `-0.0011 [-0.0052, +0.0030]`, 52.6 ms per pair against 79.4 ms in `bf16`.
+- **`xfeat-lightglue`** (`-0.0074`): the `int8` extractor loses nothing (`+0.0041`); the 6-layer, 96-dimensional matcher does.
+  The Paley-12 Hadamard rotation removes its 8x channel outliers but creates per-token outliers (8.85x and 7.35x) in the
+  attention output projections of layers 4 and 5, which shifts the similarity and matchability scores (mean confidence
+  0.707 -> 0.654). Per-token dynamic `int8` restores the accuracy (`-0.0024` / `-0.0029`) but is slower than `bf16`
+  (3.67 against 3.49 ms), so the pairing stays `bf16`.
+
+When an `int8` pairing loses accuracy, split the loss into extractor and matcher precision first (the grid above), then
+look at the keypoint localization and at the similarity/matchability error of the matcher.
 
 ## Accuracy
 
