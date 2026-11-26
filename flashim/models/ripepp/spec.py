@@ -14,7 +14,7 @@ from flashim.models.dedode.spec import (
 )
 from flashim.models.ripepp import quant
 from flashim.models.ripepp.model import RIPEPP
-from flashim.models.sparse_spec import extractor_spec
+from flashim.models.sparse_spec import RIPE_COMPILE_FAILURES, extractor_spec
 
 
 def _loader(default_variant: str):
@@ -48,6 +48,7 @@ def _spec(name: str, default_variant: str, description: str, *, quantized_preset
         protected=quant.PROTECTED,
         int8_ignore=quant.INT8_IGNORE if quantized_presets else (),
         compile_regions=("net",),
+        compile_failures=RIPE_COMPILE_FAILURES if quantized_presets else None,
         fused_bf16_blocks=("net.decoder.",),
         channels_last=True,
         extra_passes=_PASSES,

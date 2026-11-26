@@ -135,11 +135,18 @@ One MegaDepth pair, 512x512 descriptor: `match_keypoints` with 2048 RDD keypoint
 
 ## Compile failures
 
-`engine="compile"` crashes for these configurations; `eager` runs them all.
+The `fail` cells record crashes on `sm_120` with torch 2.11 during Dynamo tracing or Inductor scheduling, before GPU
+code generation. On every CUDA architecture, `flashim.load(..., engine="compile")` selects `eager` for these
+configurations before loading weights. The guard applies to the measured torch minor and to older and newer versions
+until a repeat measurement shows that compilation succeeds and the entry is removed. The first
+request for each affected combination logs a warning. `model.build_report.fallbacks` records the change on every build.
+`strict=True` raises a `ValueError` with the reason. A pipeline requested with `engine="compile"` falls back as a
+whole when its extractor needs eager. For `ripepp-lightglue`, requesting `fp8` builds the pipeline's `int8` preset
+(`int8` extractor, `bf16` matcher) before the engine guard runs. The latency tables retain the original compile results.
 
 - **INT8 / FP8 sparse extractors, LoMa and RIPE++** (`alike`, `xfeat`, `dedode`, `dedode-g`, `dad`, `ripe`, `ripepp`,
-  `loma-*`, `xoftr`; `int8` and `fp8`, and `ripepp-lightglue` `int8`): Dynamo rejects the autotuned INT8 convolution kernels
-  (`AssertionError: ListVariable ... is already tracked for mutation`, torch 2.11); they run eager.
+  `loma-*`, `xoftr`; `int8` and `fp8`, and `ripepp-lightglue` `int8`): Dynamo rejects the autotuned INT8 or MXFP8
+  convolution kernels (`AssertionError: ListVariable ... is already tracked for mutation`, torch 2.11).
 - **`ripe`, `ripepp`, `ripepp-lightglue`** (`bf16`; `fp32` compiles): `InductorError: KeyError` in the Inductor scheduler
   (torch 2.11).
 

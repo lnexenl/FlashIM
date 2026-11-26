@@ -222,6 +222,7 @@ def _pipeline(
         },
         default_preset=default,
         compose=_compose,
+        compile_failure_components=("extractor",),
     )
 
 

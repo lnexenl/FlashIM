@@ -11,7 +11,7 @@ from torch import nn
 from flashim.build import BuildContext, Pass
 from flashim.config import RunConfig
 from flashim.models.loftr.model import LoFTREncoderLayer
-from flashim.models.sparse_spec import extractor_spec
+from flashim.models.sparse_spec import QUANT_COMPILE_FAILURES, extractor_spec
 from flashim.models.xoftr.model import (
     CrossBidirectionalAttention,
     WindowAttention,
@@ -140,6 +140,7 @@ _BASE_SPEC = extractor_spec(
     quantized=QUANTIZED,
     protected=PROTECTED,
     compile_regions=("backbone",),
+    compile_failures=QUANT_COMPILE_FAILURES,
     role="dense",
     extra_passes={
         "fp8_mixed_int8": Pass(

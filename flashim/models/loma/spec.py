@@ -50,6 +50,7 @@ def _pipeline(variant: str) -> ModelSpec:
         },
         default_preset=DEFAULT_PRESET,
         compose=_compose,
+        compile_failure_components=("extractor",),
     )
 
 

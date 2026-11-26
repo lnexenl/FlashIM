@@ -25,7 +25,7 @@ from flashim.models.dedode.spec import (
     VIT_EPILOGUE_PASSES,
     VIT_LINEARS,
 )
-from flashim.models.sparse_spec import extractor_spec
+from flashim.models.sparse_spec import QUANT_COMPILE_FAILURES, extractor_spec
 
 
 def _load(config: RunConfig) -> DeDoDe:
@@ -52,6 +52,7 @@ SPEC = extractor_spec(
     protected=PROTECTED,
     int8_dynamic=VIT_LINEARS,  # per-token dynamic INT8 ViT, as dedode-g / loma-extractor (see dedode.spec.VIT_IGNORE)
     compile_regions=("detector", "descriptor"),
+    compile_failures=QUANT_COMPILE_FAILURES,
     # 16 ConvRefiner hidden blocks (32 / 64 channels) as one BF16 kernel each: BF16 extract 141.0 -> 133.0 ms
     fused_bf16_blocks=("detector.decoder.", "descriptor.decoder."),
     channels_last=True,  # BF16 extract at 1200 px, interleaved in one process (sm_120): 135 -> 127 ms

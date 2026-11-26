@@ -114,6 +114,35 @@ def test_set_verbosity_per_subsystem():
             logging.getLogger(name).setLevel(level)
 
 
+def test_default_warning_reaches_stderr(monkeypatch, capsys):
+    monkeypatch.setattr(logging.root, "handlers", [])
+    logger = log.get_logger("test")
+    logger.info("details")
+    logger.warning("fallback")
+    assert capsys.readouterr().err == "fallback\n"
+
+
+@pytest.mark.parametrize("configure_first", [True, False])
+@pytest.mark.parametrize("name", ["", "flashim"])
+def test_application_handlers_receive_one_record(monkeypatch, capsys, configure_first, name):
+    logger = log.get_logger("flashim")
+    monkeypatch.setattr(logging.root, "handlers", [])
+    monkeypatch.setattr(logger, "handlers", [])
+    monkeypatch.setattr(logger, "level", logging.WARNING)
+    monkeypatch.setattr(log, "_handler", None)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("app %(message)s"))
+    if configure_first:
+        logging.getLogger(name).addHandler(handler)
+    log.set_verbosity("info")
+    if not configure_first:
+        log.get_logger("test").info("details")
+        assert "details" in capsys.readouterr().err
+        logging.getLogger(name).addHandler(handler)
+    log.get_logger("test").warning("fallback")
+    assert capsys.readouterr().err == "app fallback\n"
+
+
 @pytest.mark.cuda
 def test_cuda_reference_fallback_logged_with_reasons(caplog):
     OPS.pop("t_fallback", None)

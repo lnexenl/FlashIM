@@ -8,7 +8,7 @@ from pathlib import Path
 from flashim.config import RunConfig
 from flashim.models.alike.config import VARIANTS
 from flashim.models.alike.model import ALIKE
-from flashim.models.sparse_spec import extractor_spec
+from flashim.models.sparse_spec import QUANT_COMPILE_FAILURES, extractor_spec
 
 DEFAULT_VARIANT = "alike-n"
 
@@ -36,6 +36,7 @@ SPEC = extractor_spec(
     quantized=QUANTIZED,
     protected=PROTECTED,
     compile_regions=("block1", "block2", "block3", "block4"),
+    compile_failures=QUANT_COMPILE_FAILURES,
     # BF16 extract at 1200 px (sm_120, once ops.multiscale_score replaces NHWC interpolate+cat): 2.43 -> 2.09 ms
     channels_last=True,
 )

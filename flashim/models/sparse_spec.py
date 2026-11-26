@@ -33,6 +33,13 @@ from flashim.quant.scheme import (
     QuantScheme,
 )
 
+AUTOTUNE_FAILURE = "Dynamo ListVariable assertion with autotuned INT8/MXFP8 convolutions (measured torch 2.11, sm_120)"
+QUANT_COMPILE_FAILURES = {preset: AUTOTUNE_FAILURE for preset in ("int8", "fp8")}
+RIPE_COMPILE_FAILURES = {
+    **QUANT_COMPILE_FAILURES,
+    "bf16": "Inductor scheduler KeyError (measured torch 2.11, sm_120)",
+}
+
 
 def _set_precision(model: nn.Module, config: RunConfig) -> None:
     if config.precision.compute_dtype != "fp32":
@@ -95,6 +102,7 @@ def extractor_spec(
     int8_dynamic: Sequence[str] = (),
     fp8_ignore: Sequence[str] = (),
     compile_regions: Sequence[str] = (),
+    compile_failures: Mapping[str, str] | None = None,
     has_batchnorm: bool = True,
     extra_passes: Mapping[str, Pass] | None = None,
     extra_presets: Mapping[str, Mapping[str, Any]] | None = None,
@@ -156,5 +164,6 @@ def extractor_spec(
         protected=tuple(protected),
         passes=passes,
         engines={"eager": EngineSpec(), "compile": EngineSpec(tuple(compile_regions), recompile_limit=64)},
+        compile_failures=compile_failures or {},
         set_precision=_set_precision,
     )
