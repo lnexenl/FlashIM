@@ -23,6 +23,12 @@ to BF16 or protecting a layer; protecting layers is the last resort and needs th
    - a residual stream that peaks far above BF16's resolution (CroCo: ~350-650 where the BF16 ULP is 4) -> FP16 compute
      (`mast3r`, `dust3r`).
 3. Attention: SageAttention-style INT8 QK / FP8 PV vs BF16 attention, per block range (`loma` `vit_attention` layers).
+4. A pipeline (extractor + trained matcher): split the loss with an extractor x matcher precision grid on cached
+   features first, and swap only the keypoints or only the descriptors. A trained matcher exposes what a plain
+   nearest-neighbour match hides: sub-pixel keypoint drift from a few small high-resolution convs (`ripepp`: the decoder
+   `block1` convs, `net.decoder.layers.{1,2}.*`) and, for a weakly supervised matcher, extreme logit temperatures (compare
+   the mean error of the similarity matrix with a matcher that passes). A rotation that removes channel outliers can create
+   per-token ones (`xfeat-lightglue`, Paley-12 on 96 dims): check both outlier types after folding it.
 
 ## Decide
 

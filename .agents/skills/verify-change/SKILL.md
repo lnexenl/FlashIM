@@ -47,6 +47,17 @@ python benchmarks/profile/output_hashes.py --compare results/hashes/base results
 - Profile before explaining a slowdown: `torch.profiler` CUDA activities, `ncu` on the suspect kernel and read the limiter
   (e.g. L1/TEX % for gathers). A time table is `benchmarks/speed/speed_table.sh`.
 - A speedup claim names GPU / arch, model, preset, engine and shape.
+- **The latency tables are part of the change.** A change that can move a model's latency (model, op, backend kernel,
+  quantization pass, preset, default) re-measures the affected rows and updates `docs/benchmarks.md`, plus the README and
+  model-page numbers that quote them, in the same PR; the PR says which rows were re-measured. The scripts are resumable
+  and skip a configuration that has a result; re-measure only what the change touches with
+  `ONLY="disk disk-lightglue" RERUN=1 benchmarks/speed/speed_table.sh` (model names as in the tags, `romav2` included;
+  `RERUN=1` drops their old results first, without it only the missing configurations run; the same switches work in
+  `speed_table_models.sh`). One configuration per process, GPU lock held, nothing else on the GPU; then
+  `benchmarks/speed/speed_table.py` writes the markdown.
+  A new model goes into `speed_table_models.sh` and the lists of `speed_table.py`; `tests/unit/test_speed_table_coverage.py`
+  fails for a registered model that has no row (or an entry in its `NOT_A_ROW`). Nothing speed-related is quoted from an
+  older run: numbers in the docs come from the current table.
 
 ## Tests and lint
 
