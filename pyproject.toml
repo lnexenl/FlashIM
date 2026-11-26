@@ -1,6 +1,6 @@
 [project]
 name = "flashim"
-version = "0.1.0"
+version = "0.1.1"
 description = "FlashIM: fast, quantized, multi-platform inference for image matching"
 readme = "README.md"
 # FlashIM is Apache-2.0; code ported from RoMaV2 is MIT, the DINOv3 / DPT code it took from Meta is under the DINOv3
