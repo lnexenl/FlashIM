@@ -62,7 +62,11 @@ planned) and **quantization** (MXFP8, INT8). Models are native PyTorch ports ver
 Before you call a change done: the tests above pass, `ruff` is clean on your files, and the PR says what was verified and what
 was not. Refactor -> bit-identical outputs and call counts. Numerics or presets -> the AUC gate. A speed claim -> interleaved
 best-of-N old vs new tree, with GPU / arch, model, preset, engine and shape. Only sm_120 can be run locally: other
-architectures are compile-checked and reported as such. Long GPU jobs (one command over about 10 minutes, or a whole dataset) need the user's OK. Details: `verify-change`.
+architectures are compile-checked and reported as such. **Every change that can change a model's latency (a model, op,
+backend kernel, quantization pass, preset or default) re-measures the affected rows of the latency tables with
+`benchmarks/speed/speed_table.sh` / `speed_table_models.sh` and updates `docs/benchmarks.md` (and the README / model page
+numbers that quote it) in the same PR; a new model adds its rows (`tests/unit/test_speed_table_coverage.py` fails
+without them); the PR lists the rows it re-measured.** Long GPU jobs (one command over about 10 minutes, or a whole dataset) need the user's OK. Details: `verify-change`.
 
 ## Gotchas
 
