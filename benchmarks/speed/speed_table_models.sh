@@ -11,6 +11,8 @@
 # matches, semi-dense ones all their matches. FlexGlue: benchmarks/speed/flexglue.py (2048 RDD keypoints for
 # `match_keypoints`, 5000 samples for the dense `match()`, 512x512 descriptor).
 # Presets a model does not have are not run (they would only repeat the preset they fall back to).
+# Re-measure only what a change touches: ONLY="loma-g flexglue" RERUN=1 benchmarks/speed/speed_table_models.sh
+# (ONLY: space-separated model names as in the tags; RERUN=1 deletes their old results first).
 cd "$(dirname "$0")/../.."
 OUT_DIR=${OUT_DIR:-results/speed/table}
 mkdir -p "$OUT_DIR"
@@ -18,9 +20,20 @@ out=$OUT_DIR/models.jsonl
 touch "$out"
 export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$HOME/.cache/flashim/inductor}
 
+want() {  # is this model selected (all of them when ONLY is empty)?
+  [[ -z ${ONLY:-} || " $ONLY " == *" $1 "* ]]
+}
+if [[ -n ${ONLY:-} && -n ${RERUN:-} ]]; then  # forget the old results of the selected models
+  for m in $ONLY; do
+    grep -vF "\"tag\": \"$m|" "$out" > "$out.tmp" || true
+    mv "$out.tmp" "$out"
+  done
+fi
+
 run() {  # model preset engine resize top_k
   local model=$1 preset=$2 engine=$3 resize=$4 topk=$5
   local tag="$model|$preset|$engine" line
+  want "$model" || return 0
   grep -qF "\"tag\": \"$tag\"" "$out" && return 0
   echo "== $tag"
   line=$(.venv/bin/python benchmarks/speed/extractor.py --model "$model" --preset "$preset" --engine "$engine" \
@@ -30,6 +43,7 @@ run() {  # model preset engine resize top_k
 
 flexglue() {  # preset engine
   local tag="flexglue|$1|$2" line
+  want flexglue || return 0
   grep -qF "\"tag\": \"$tag\"" "$out" && return 0
   echo "== $tag"
   line=$(.venv/bin/python benchmarks/speed/flexglue.py --preset "$1" --engine "$2" --tag "$tag" \
