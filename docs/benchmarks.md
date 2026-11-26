@@ -54,7 +54,7 @@ RoMaV2: preloaded bidirectional forward, mega1500 setting (800² LR + 1024² HR)
 | dedode-g | 532.5 / 460.6 | 128.2 / 121.0 | **65.7** / fail | 68.4 / fail |
 | dad | 462.2 / 416.4 | 111.8 / 106.7 | **49.8** / fail | 57.4 / fail |
 | ripe | 110.2 / 72.4 | 31.4 / fail | **18.8** / fail | 25.5 / fail |
-| ripepp | 116.7 / 77.9 | 33.7 / fail | **20.4** / fail | 28.8 / fail |
+| ripepp | 109.6 / 76.4 | 32.9 / fail | **20.5** / fail | 26.6 / fail |
 | aliked | 5.94 / 5.10 | 3.72 / **2.70** |  |  |
 | raco-aliked | 26.8 / 18.1 | 7.03 / **5.76** |  |  |
 | rdd | 68.7 / 61.0 | 31.8 / 25.3 |  | 26.5 / **22.8** |
@@ -74,13 +74,13 @@ RoMaV2: preloaded bidirectional forward, mega1500 setting (800² LR + 1024² HR)
 
 | model | fp32 | bf16 | int8 | fp8 |
 |---|---|---|---|---|
-| superpoint-lightglue | 55.4 / 55.0 | 11.9 / 10.7 | 10.3 / **10.1** | → int8 / → int8 |
-| disk-lightglue | 57.7 / 57.4 | 11.7 / 11.8 | **9.76** / 10.6 | → int8 / → int8 |
-| xfeat-lightglue | 16.6 / 16.4 | 3.52 / **3.27** | → bf16 / - | → bf16 / - |
-| aliked-lightglue | 57.7 / 57.3 | 11.8 / 11.1 | **9.85** / 9.97 | → int8 / → int8 |
-| raco-aliked-lightglue | 57.8 / 57.3 | 11.8 / 11.1 | **9.80** / 10.1 | 10.4 / 18.5 |
-| rdd-lightglue | 57.8 / 57.3 | 11.7 / 11.1 | **9.93** / 9.98 | 10.3 / 18.3 |
-| ripepp-lightglue | 61.0 / 60.6 | 12.2 / fail | **11.8** / fail | → int8 / fail |
+| superpoint-lightglue | 70.2 / 54.5 | 11.8 / 10.8 | **10.1** / 10.1 | → int8 / → int8 |
+| disk-lightglue | 57.7 / 57.3 | 11.7 / 11.2 | **9.77** / 9.99 | → int8 / → int8 |
+| xfeat-lightglue | 16.6 / 16.3 | 3.52 / **3.30** | → bf16 / → bf16 | → bf16 / → bf16 |
+| aliked-lightglue | 57.6 / 57.2 | 11.7 / 11.2 | **9.78** / 10.0 | → int8 / → int8 |
+| raco-aliked-lightglue | 57.7 / 57.4 | 11.7 / 11.1 | **9.81** / 10.0 | 10.2 / 17.8 |
+| rdd-lightglue | 57.9 / 57.4 | 11.7 / 13.5 | **9.89** / 10.1 | 10.3 / 17.9 |
+| ripepp-lightglue | 57.9 / 57.4 | **11.7** / - | 11.8 / - | → bf16 / - |
 | loma-b128 | 57.6 / 57.2 | 11.7 / 11.0 | **9.77** / - | 10.5 / - |
 | loma-b | 57.6 / 57.1 | 11.7 / 11.0 | **9.81** / - | 10.2 / - |
 | loma-r | 57.9 / 57.2 | 11.7 / 11.0 | **9.82** / - | 10.3 / - |
@@ -94,17 +94,17 @@ RoMaV2: preloaded bidirectional forward, mega1500 setting (800² LR + 1024² HR)
 
 ## Pair time of sparse pipelines
 
-One image pair: 2 x `extract` + the matcher's `match_features`, the column being the matcher's preset; the extractor runs the same preset when it has one, else `bf16` (ALIKED / RaCo-ALIKED int8 and fp8, RDD int8). Same sizes as above. Each cell is `eager / compile`.
+One image pair: 2 x `extract` + the matcher's `match_features`, the column being the pipeline's preset, built as `flashim.load` builds it (each component gets the preset its spec gives it; the table below the grid lists the pipelines whose components differ). Same sizes as above. Each cell is `eager / compile`.
 
 | pipeline | fp32 | bf16 | int8 | fp8 |
 |---|---|---|---|---|
-| superpoint-lightglue | 80.1 / 79.1 | 21.4 / 19.6 | 13.3 / **13.1** | → int8 / → int8 |
-| disk-lightglue | 85.3 / 79.3 | 24.6 / 24.2 | **20.0** / 21.4 | → int8 / → int8 |
-| xfeat-lightglue | 19.8 / 19.4 | 6.57 / **6.23** | → bf16 / fail | → bf16 / fail |
-| aliked-lightglue | 69.7 / 67.5 | 19.1 / 16.5 | 17.1 / **15.4** | → int8 / → int8 |
-| raco-aliked-lightglue | 111.7 / 93.5 | 25.6 / 22.5 | 23.8 / **21.5** | 24.4 / 30.0 |
-| rdd-lightglue | 195.0 / 179.5 | 75.1 / 61.7 | 73.6 / **60.6** | 63.1 / 63.8 |
-| ripepp-lightglue | 295.1 / 216.4 | 79.4 / fail | **52.6** / fail | → int8 / fail |
+| superpoint-lightglue | 99.5 / 78.5 | 21.3 / 19.7 | 19.6 / **19.0** | → int8 / → int8 |
+| disk-lightglue | 85.4 / 79.2 | 24.5 / 23.0 | **20.0** / 20.3 | → int8 / → int8 |
+| xfeat-lightglue | 19.7 / 19.4 | 6.59 / **6.27** | → bf16 / → bf16 | → bf16 / → bf16 |
+| aliked-lightglue | 69.5 / 67.4 | 18.9 / 16.7 | 17.1 / **15.4** | → int8 / → int8 |
+| raco-aliked-lightglue | 111.6 / 93.6 | 25.5 / 22.6 | 23.6 / **21.5** | 24.0 / 29.4 |
+| rdd-lightglue | 195.5 / 179.5 | 75.2 / 64.1 | 73.4 / 64.6 | **63.2** / 63.9 |
+| ripepp-lightglue | 277.4 / 201.5 | 72.9 / fail | **52.2** / fail | → bf16 / fail |
 | loma-b128 | 179.3 / 143.6 | 56.5 / 53.9 | **30.8** / fail | 45.0 / fail |
 | loma-b | 506.1 / 460.1 | 130.1 / 124.2 | **62.4** / fail | 73.5 / fail |
 | loma-r | 507.8 / 461.0 | 130.1 / 124.5 | **62.4** / fail | 73.5 / fail |
@@ -112,6 +112,17 @@ One image pair: 2 x `extract` + the matcher's `match_features`, the column being
 | loma-g | 765.6 / 711.8 | 185.2 / 175.9 | **81.8** / fail | 95.4 / fail |
 | superpoint-superglue | 24.3 / 24.2 | 9.67 / 9.38 | **4.10** / 6.55 |  |
 | omniglue | 68.3 / 66.6 | 23.8 / 23.2 | **19.2** / 23.9 |  |
+
+Pipelines whose two components build different presets (`extractor+matcher`; a component without the requested preset builds the nearest one it has):
+
+| pipeline | requested | built |
+|---|---|---|
+| aliked-lightglue | int8 | bf16+int8 |
+| raco-aliked-lightglue | fp8 | bf16+fp8 |
+| raco-aliked-lightglue | int8 | bf16+int8 |
+| rdd-lightglue | int8 | bf16+int8 |
+| ripepp-lightglue | int8 | int8+bf16 |
+| superpoint-lightglue | int8 | bf16+int8 |
 
 ## FlexGlue (sparse-to-dense)
 
@@ -126,10 +137,11 @@ One MegaDepth pair, 512x512 descriptor: `match_keypoints` with 2048 RDD keypoint
 
 `engine="compile"` crashes for these configurations; `eager` runs them all.
 
-- **INT8 / FP8 sparse extractors and LoMa** (`alike`, `xfeat`, `dedode`, `dedode-g`, `dad`, `loma-*`, `xfeat-lightglue`,
-  `xoftr`; `int8` and `fp8`): Dynamo rejects the autotuned INT8 convolution kernels (`AssertionError: ListVariable ... is
-  already tracked for mutation`, torch 2.11); they run eager.
-- **`ripe`**, **`ripepp`**, **`ripepp-lightglue`** (`bf16`, `int8`, `fp8`; `fp32` compiles): `bf16` hits `InductorError: KeyError` in the Inductor scheduler, and `int8` / `fp8` hit the Dynamo `ListVariable` autotuned-conv bug above (torch 2.11).
+- **INT8 / FP8 sparse extractors, LoMa and RIPE++** (`alike`, `xfeat`, `dedode`, `dedode-g`, `dad`, `ripe`, `ripepp`,
+  `loma-*`, `xoftr`; `int8` and `fp8`, and `ripepp-lightglue` `int8`): Dynamo rejects the autotuned INT8 convolution kernels
+  (`AssertionError: ListVariable ... is already tracked for mutation`, torch 2.11); they run eager.
+- **`ripe`, `ripepp`, `ripepp-lightglue`** (`bf16`; `fp32` compiles): `InductorError: KeyError` in the Inductor scheduler
+  (torch 2.11).
 
 ## Accuracy
 

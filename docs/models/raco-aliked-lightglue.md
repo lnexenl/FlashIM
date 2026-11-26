@@ -85,8 +85,8 @@ descriptors.
 ## Speed
 
 `extract` of one 1200 px image (4096 keypoints, RTX 5070 Ti `sm_120`, `eager / compile`): `raco-aliked` `fp32` 26.8 / 18.1 ms,
-`bf16` 7.03 / 5.76 ms. Pair time of `raco-aliked-lightglue` (2 x `extract` + `match_features`): `fp32` 111.7 / 93.5 ms, `bf16`
-25.6 / 22.5 ms, `int8` 23.8 / 21.5 ms, `fp8` 24.4 / 30.0 ms. The comparison with the LightGlue-ONNX TensorRT engine is not
+`bf16` 7.03 / 5.76 ms. Pair time of `raco-aliked-lightglue` (2 x `extract` + `match_features`): `fp32` 111.6 / 93.6 ms, `bf16`
+25.5 / 22.6 ms, `int8` 23.6 / 21.5 ms, `fp8` 24.0 / 29.4 ms. The comparison with the LightGlue-ONNX TensorRT engine is not
 measured on the current code.
 
 ## Accuracy
