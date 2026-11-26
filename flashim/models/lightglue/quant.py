@@ -44,6 +44,10 @@ Per-pairing MXFP8 evidence (MegaDepth-1500 / ScanNet-1500, 3 seeds 17/29/42, pos
   - ``xfeat-lightglue`` ``fp8 / int8 -> bf16`` (rotated INT8 still drops -0.0066 at p=0.9999 / -0.0049 at p=1.0 on
     MegaDepth-1500 and is slower than BF16 on ScanNet-1500, 19.5 vs 16.3s): MegaDepth-1500 0.5580 (+0.0000),
     ScanNet-1500 0.1580 (+0.0000).
+  - ``ripepp-lightglue`` ``fp8 -> int8`` (MXFP8 drops -0.0538 AUC@5 on MegaDepth-200 with match_ratio 0.676 vs 0.917
+    for rotated INT8 and runs slower than ``int8``, 66.2 vs 48.5 ms/pair at 1200 px / 4096 kp on sm_120): rotated INT8
+    passes with 0 FAIL — MegaDepth-1500 0.5984 (-0.0074 [-0.0122, -0.0027] vs ``bf16`` 0.6057, BORDERLINE),
+    ScanNet-1500 0.1538 (+0.0044 [-0.0033, +0.0119] vs ``bf16`` 0.1495, PASS).
 """
 
 from __future__ import annotations

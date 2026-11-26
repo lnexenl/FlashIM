@@ -17,6 +17,7 @@ from flashim.models.lightglue import quant, weights
 from flashim.models.lightglue.config import (
     ALIKED_CONFIG,
     DISK_CONFIG,
+    RIPEPP_CONFIG,
     SUPERPOINT_CONFIG,
     XFEAT_CONFIG,
     LightGlueConfig,
@@ -31,6 +32,7 @@ VARIANTS = {
     "superpoint": SUPERPOINT_CONFIG,
     "disk": DISK_CONFIG,
     "xfeat": XFEAT_CONFIG,
+    "ripepp": RIPEPP_CONFIG,
 }
 
 
@@ -43,6 +45,11 @@ def _load(config: RunConfig) -> LightGlue:
         from flashim.models.xfeat.weights import load_lighterglue_state_dict
 
         state = load_lighterglue_state_dict(arch.num_heads, arch.num_layers, config.checkpoint)
+        return LightGlue.from_pretrained(arch, state_dict=state, device=config.device)
+    if variant == "ripepp":
+        from flashim.models.ripepp.weights import load_lightglue_state_dict
+
+        state = load_lightglue_state_dict(arch.num_heads, arch.num_layers, config.checkpoint)
         return LightGlue.from_pretrained(arch, state_dict=state, device=config.device)
     if variant in weights.CVG_FILES:
         state = weights.load_cvg_state_dict(variant, arch.num_heads, arch.num_layers, config.checkpoint)
@@ -142,7 +149,7 @@ _QUANTIZED = {name: p for name, p in quant.PRESETS.items() if p.config is not No
 SPEC = ModelSpec(
     name="lightglue",
     role="matcher",
-    description="LightGlue sparse matcher: SparseFeatures x SparseFeatures -> matches (variant rdd | aliked | raco-aliked | superpoint | disk | xfeat)",
+    description="LightGlue sparse matcher: SparseFeatures x SparseFeatures -> matches (variant rdd | aliked | raco-aliked | superpoint | disk | xfeat | ripepp)",
     load=_load,
     presets={
         "fp32": {},
@@ -247,6 +254,14 @@ DISK_LIGHTGLUE = _pipeline(
 XFEAT_LIGHTGLUE = _pipeline(
     "xfeat-lightglue", "xfeat", "xfeat", "fp32", "XFeat + LighterGlue (verlab weights)",
     presets=("fp32", "bf16"),
+)
+# RIPE++ + LightGlue MXFP8 collapses on MegaDepth-200 (-0.0538 AUC@5 vs bf16, match_ratio 0.676 vs 0.917 for int8)
+# while running slower than int8 on both extract and match (66.2 vs 48.5 ms/pair on sm_120); omitting fp8 resolves
+# fp8 -> int8 via build.NEAREST.
+RIPEPP_LIGHTGLUE = _pipeline(
+    "ripepp-lightglue", "ripepp", "ripepp", "bf16",
+    "RIPE++ detector/descriptor + weakly-supervised LightGlue (RIPE++ RL weights)",
+    presets=("fp32", "bf16", "int8"),
 )
 
 

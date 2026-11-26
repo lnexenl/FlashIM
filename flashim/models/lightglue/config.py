@@ -31,5 +31,7 @@ ALIKED_CONFIG = LightGlueConfig(input_dim=128, dim=256, filter_threshold=0.1, re
 # transformer and keypoint normalization as the ALIKED one, input widths 256 / 128.
 SUPERPOINT_CONFIG = LightGlueConfig(input_dim=256, dim=256, filter_threshold=0.1, reference_size_order=False)
 DISK_CONFIG = ALIKED_CONFIG
+# RIPE++ weakly-supervised LightGlue (``ripe++lightglue.tar``): 256-d descriptors, 9 layers, 4 heads, filter 0.1.
+RIPEPP_CONFIG = SUPERPOINT_CONFIG
 # XFeat's "LighterGlue" (``xfeat-lighterglue.pt``): 64 -> 96 input projection, one head, six layers.
 XFEAT_CONFIG = LightGlueConfig(input_dim=64, dim=96, num_heads=1, num_layers=6, filter_threshold=0.1, reference_size_order=False)
