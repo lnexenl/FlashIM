@@ -31,8 +31,10 @@ weight lookup (`flashim/models/*/weights.py`).
 | `omniglue/` | https://github.com/google-research/omniglue (`src/omniglue/`, `third_party/dinov2/`; TF-CPU subprocess runner `tf_oracle.py`, set `$FLASHIM_OMNIGLUE_TF_PYTHON`, see `omniglue/README.md`) | Apache-2.0 |
 
 Not vendored: cvg/LightGlue's `lightglue/superpoint.py`, Magic Leap's `SuperGluePretrainedNetwork` (`models/superglue.py`,
-both carry a Magic Leap notice forbidding reproduction and distribution) and RIPE. All three are downloaded on demand by
-their tests (`tests/parity/_fetch.py`). RIPE (https://github.com/fraunhoferhhi/RIPE) is not vendored: its license (Fraunhofer academic use, version 2.0) grants
-internal non-commercial use only and no other rights, so its code cannot be shipped here. `tests/parity/ripe` downloads
-the files it needs (pinned by commit and SHA-256) into `~/.cache/flashim/oracles` when you run it, or uses the checkout
-in `$FLASHIM_RIPE_ROOT`; it skips without network access.
+both carry a Magic Leap notice forbidding reproduction and distribution), RIPE, and RIPE++. All four are downloaded on
+demand by their tests (`tests/parity/_fetch.py`). RIPE (https://github.com/fraunhoferhhi/RIPE) and RIPE++
+(https://github.com/fraunhoferhhi/RIPEpp) are not vendored: their license (Fraunhofer academic use, version 2.0) grants
+internal non-commercial use only and no other rights, so their code cannot be shipped here. `tests/parity/ripe` and
+`tests/parity/ripepp` download the files they need (pinned by commit and SHA-256) into `~/.cache/flashim/oracles` when
+you run them, or use an existing checkout in `$FLASHIM_RIPE_ROOT` / `$FLASHIM_RIPEPP_ROOT` (or an installed `ripepp`
+package); they skip without network access.

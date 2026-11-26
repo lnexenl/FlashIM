@@ -46,6 +46,8 @@ PROTOCOLS: tuple[ModelProtocol, ...] = (
     ModelProtocol("minima-loftr", "mega1500", "minima-loftr", 840, 0, (), "840px"),
     ModelProtocol("minima-roma", "mega1500", "minima-roma", 0, 5000, (), "native 560->864"),
     ModelProtocol("omniglue", "mega1500", "omniglue", 1024, 1024, (), "1024px, 1024 kpts"),
+    ModelProtocol("ripepp", "mega1500", "ripepp", 1200, 4096, (), "1200px, 4096 kpts (same as ripe)"),
+    ModelProtocol("ripepp-lightglue", "mega1500", "ripepp-lightglue", 1200, 4096, (), "1200px, 4096 kpts"),
     # -- ScanNet-1500 (640x480) --
     ModelProtocol("roma", "scannet1500", "roma-indoor", 0, 5000, (), "native 560->864 indoor"),
     ModelProtocol("tiny-roma", "scannet1500", "tiny-roma", 640, 5000, (), "640x480"),
@@ -66,6 +68,8 @@ PROTOCOLS: tuple[ModelProtocol, ...] = (
     ModelProtocol("minima-loftr", "scannet1500", "minima-loftr", 640, 0, (), "640x480"),
     ModelProtocol("minima-roma", "scannet1500", "minima-roma", 0, 5000, (), "native 560->864"),
     ModelProtocol("omniglue", "scannet1500", "omniglue", 640, 1024, (), "640x480, 1024 kpts"),
+    ModelProtocol("ripepp", "scannet1500", "ripepp", 640, 4096, (), "640x480, 4096 kpts (same as ripe)"),
+    ModelProtocol("ripepp-lightglue", "scannet1500", "ripepp-lightglue", 640, 4096, (), "640x480, 4096 kpts"),
 )
 
 DEFAULT_PRESETS = ("fp32", "bf16", "int8", "fp8")

@@ -72,6 +72,7 @@ _ORDERED_PAIRS: tuple[tuple[ModelProtocol, ModelProtocol], ...] = (
     _sparse_pair("dedode-g"),
     _sparse_pair("dad"),
     _sparse_pair("ripe"),
+    _sparse_pair("ripepp"),
     # LightGlue pairings
     _sparse_pair("superpoint-lightglue"),
     _sparse_pair("xfeat-lightglue"),
@@ -79,6 +80,7 @@ _ORDERED_PAIRS: tuple[tuple[ModelProtocol, ModelProtocol], ...] = (
     _sparse_pair("aliked-lightglue"),
     _sparse_pair("raco-aliked-lightglue"),
     _sparse_pair("rdd-lightglue"),
+    _sparse_pair("ripepp-lightglue"),
     # Semi-dense matcher
     _sparse_pair("loftr", top_k=0, note="semi-dense, all coarse matches"),
     # LoMa variants (upstream 1024 px on MegaDepth, 640x480 on ScanNet)
