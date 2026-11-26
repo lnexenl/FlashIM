@@ -114,11 +114,12 @@ def _guarded_lines(tree: ast.Module) -> set[int]:
 
 
 def test_python_310_compatible():
+    try_star = getattr(ast, "TryStar", ())  # ast.TryStar is 3.11+: on 3.10 the parser rejects except* before this runs
     problems = []
     for _, path, tree in _sources():
         guarded = _guarded_lines(tree)
         for node in ast.walk(tree):
-            if isinstance(node, ast.TryStar):
+            if isinstance(node, try_star):
                 problems.append(f"{path.relative_to(ROOT)}:{node.lineno} uses except* (3.11+)")
             names = []
             if isinstance(node, ast.Import):
