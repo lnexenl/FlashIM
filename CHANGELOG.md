@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.1 (2026-11-26)
+
 ### Added
 
 - RIPE++ (`ripepp`, `ripepp-aachen`, `ripepp-scared`, `ripepp-lightglue`; Fraunhofer HHI, LIMIT@ECCV 2026; non-commercial
