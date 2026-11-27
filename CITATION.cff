@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use FlashIM, please cite this software."
+title: "FlashIM"
+version: "0.1.1"
+authors:
+  - name: "lnexenl"
+repository-code: "https://github.com/lnexenl/FlashIM"
+license:
+  - "Apache-2.0"
+  - "MIT"

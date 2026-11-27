@@ -11,6 +11,7 @@
 
 ### Added
 
+- Contributor documentation, community policies, issue forms, and citation metadata for open-source contributions.
 - CI compiles every CUDA C++ kernel with nvcc 12.6 / 12.8 / newest 13.x, every recorded Triton specialization
   (`ci/triton.jsonl`) and the TileLang kernels for each supported NVIDIA architecture, without a GPU; CPU tests run on
   torch 2.10 / 2.11 / newest, plus a weekly nightly-torch job.

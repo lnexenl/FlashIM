@@ -147,6 +147,18 @@ default; the licenses are in [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl
 DINOv3 License Agreement. Look up a model with `flashim.model_info(name)` or see the
 [per-model license table](https://github.com/lnexenl/FlashIM/blob/main/docs/licenses.md).
 
+## How FlashIM relates to other projects
+
+- [Kornia](https://github.com/kornia/kornia) is a differentiable computer-vision library with GPU image processing,
+  geometry, and local-feature models; FlashIM focuses on a single inference API for matching-model ports and kernels.
+- [hloc](https://github.com/cvg/Hierarchical-Localization) is a toolbox for 6-DoF visual localization using retrieval,
+  feature matching, and structure from motion; FlashIM covers only the matching step (no localization pipeline or
+  hloc integration).
+- [vismatch](https://github.com/gmberton/vismatch) provides a unified API for trying 50+ image-matching models;
+  FlashIM adds native PyTorch ports checked against upstream oracles, custom kernels, and measured quantized presets.
+- [Glue Factory](https://github.com/cvg/glue-factory) is a library for training and evaluating point and line matching
+  networks; FlashIM packages inference behind one `load` / `match` API, with INT8 / FP8 presets gated by pose AUC.
+
 ## Configuring a run
 
 The four presets are named partial configs; config files, dicts, dotted overrides and `load`'s keyword arguments
@@ -179,8 +191,9 @@ uv run python benchmarks/speed/forward.py --preset fp8 --engine compile
 uv run python benchmarks/accuracy/run.py --dataset mega1500 --preset fp8 --seed 17
 ```
 
-Agents and contributors: start with [AGENTS.md](https://github.com/lnexenl/FlashIM/blob/main/AGENTS.md) (layering rules,
-how to add an op, backend, model or platform, and how changes are verified). The layout and op dispatch are described in
+[Contributors](https://github.com/lnexenl/FlashIM/blob/main/CONTRIBUTING.md): start with the human contribution guide.
+Coding agents: start with [AGENTS.md](https://github.com/lnexenl/FlashIM/blob/main/AGENTS.md) (layering rules, how to add
+an op, backend, model or platform, and how changes are verified). The layout and op dispatch are described in
 [docs/architecture.md](https://github.com/lnexenl/FlashIM/blob/main/docs/architecture.md).
 
 ## License

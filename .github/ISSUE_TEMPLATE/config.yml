@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and usage help
+    url: https://github.com/lnexenl/FlashIM/issues
+    about: Ask usage and configuration questions in GitHub Issues.
