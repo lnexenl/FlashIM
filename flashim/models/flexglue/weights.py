@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT_ENV = "FLASHIM_FLEXGLUE_CHECKPOINT"
 # cvg/FlexGlue's v0.1 release (the matcher and its DINOv3-ConvNeXt descriptor in one file).
@@ -22,6 +22,7 @@ LICENSES = {
     "weights": "cvg/FlexGlue release flexglue.pth: the DINOv3 ConvNeXt-B backbone (descriptor.backbone.*) under the "
     "DINOv3 License; the matcher and descriptor heads MIT",
 }
+MODEL_INFO = ModelInfo(("MIT",), ("LicenseRef-DINOv3", "MIT"))
 
 # Upstream's per-layer correspondence head names its covisibility logit layer ``disambiguate``.
 _RENAMED = ((".disambiguate.", ".covisibility."),)

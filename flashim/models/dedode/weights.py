@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 RELEASES = "https://github.com/Parskatt/DeDoDe/releases/download"
 CHECKPOINTS = {
@@ -30,7 +30,12 @@ CHECKPOINTS = {
 }
 LICENSES = {
     "code": "MIT (Parskatt/DeDoDe); DINOv2 Apache-2.0; FlashIM re-implementation",
-    "weights": "DeDoDe v2 detector / descriptors, DINOv2 ViT-L/14 (frozen, DeDoDe-G)",
+    "weights": "Parskatt/DeDoDe's README licenses dedode_detector_L_v2.pth and dedode_descriptor_{B,G}.pth "
+    "under MIT and the separate dinov2_vitl14_pretrain.pth in DeDoDe-G under Apache-2.0",
+}
+MODEL_INFO = ModelInfo(("MIT",), ("MIT",))
+MODEL_INFO_OVERRIDES = {
+    "dedode-g": ModelInfo(("Apache-2.0", "MIT"), ("Apache-2.0", "MIT")),
 }
 
 

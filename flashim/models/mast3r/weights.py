@@ -7,18 +7,22 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, RestrictedWeights, find_weights
+
+RESTRICTION = RestrictedWeights("mast3r", "CC-BY-NC-SA-4.0")
 
 CHECKPOINT = Checkpoint(
     "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
     "https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
     "e28f91b488554653e2b46ddae9c78c1143e0bcb2e27d3e26cdb0b717f1568eb2",
+    noncommercial=RESTRICTION,
 )
 
 LICENSES = {
     "code": "CC BY-NC-SA 4.0 (MASt3R / DUSt3R / CroCo, Naver Corporation; non-commercial use only); FlashIM re-implementation",
     "weights": "CC BY-NC-SA 4.0 (non-commercial use only; subject to training dataset licenses, see upstream CHECKPOINTS_NOTICE)",
 }
+MODEL_INFO = ModelInfo(("CC-BY-NC-SA-4.0",), (RESTRICTION.license,))
 
 
 def load_state_dict(

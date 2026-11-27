@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 _SHA256 = {
     "alike-t": "c0840329a6b88518d914b03af2be956f5607055a389ba17441db02bb94f7d12e",
@@ -16,7 +16,11 @@ _SHA256 = {
 }
 _REPO = "https://github.com/Shiaoming/ALIKE/raw/main/models"
 CHECKPOINTS = {name: Checkpoint(f"{name}.pth", f"{_REPO}/{name}.pth", sha) for name, sha in _SHA256.items()}
-LICENSES = {"code": "BSD-3-Clause (Shiaoming/ALIKE); FlashIM re-implementation", "weights": "ALIKE release checkpoints"}
+LICENSES = {
+    "code": "BSD-3-Clause (Shiaoming/ALIKE); FlashIM re-implementation",
+    "weights": "models/alike-{t,s,n,l}.pth inherit BSD-3-Clause from Shiaoming/ALIKE's LICENSE",
+}
+MODEL_INFO = ModelInfo(("BSD-3-Clause",), ("BSD-3-Clause",))
 
 
 def load_state_dict(variant: str, path: str | Path | None = None, map_location="cpu") -> dict[str, torch.Tensor]:

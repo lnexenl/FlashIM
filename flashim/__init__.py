@@ -16,6 +16,7 @@ from importlib.metadata import version as _version
 from flashim.build import PRECISIONS, build_config, get_spec, load, resolve, spec_names
 from flashim.config import RunConfig
 from flashim.log import set_verbosity
+from flashim.model_info import ModelInfo, model_info
 from flashim.registry import SPECS as _SPECS  # noqa: F401  (registers the models)
 from flashim.types import DenseMatchResult, Matches, SparseFeatures
 
@@ -33,11 +34,13 @@ __all__ = [
     "PRECISIONS",
     "DenseMatchResult",
     "Matches",
+    "ModelInfo",
     "RunConfig",
     "SparseFeatures",
     "available_models",
     "build_config",
     "load",
+    "model_info",
     "resolve",
     "set_verbosity",
 ]

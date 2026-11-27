@@ -1,6 +1,7 @@
 import hashlib
 import importlib
 import re
+from pathlib import Path
 
 import pytest
 import torch
@@ -32,6 +33,35 @@ def test_downloads_once_into_the_hub_folder(hub, release):
     assert find_weights(release).read_bytes() == b"local copy"
 
 
+def test_license_warning_precedes_download_once_per_model(hub, monkeypatch, caplog):
+    from flashim import log
+    from flashim.models.superglue.weights import CHECKPOINTS
+    from flashim.models.superpoint.weights import CHECKPOINTS as superpoint
+
+    monkeypatch.setattr(log, "_warned", set())
+    warnings_before_download = []
+
+    def download(url, target, hash_prefix):
+        warnings_before_download.append([record.getMessage() for record in caplog.records
+                                         if "non-commercial" in record.getMessage()])
+        Path(target).touch()
+
+    monkeypatch.setattr(torch.hub, "download_url_to_file", download)
+    hub.mkdir(parents=True)
+    cached = hub / CHECKPOINTS["indoor"].filename
+    cached.touch()
+    assert find_weights(CHECKPOINTS["indoor"]) == cached
+    assert find_weights(superpoint["v1"], path=cached) == cached
+    assert not caplog.records
+    cached.unlink()
+    for checkpoint in (superpoint["sp_v6"], CHECKPOINTS["indoor"], CHECKPOINTS["outdoor"], superpoint["v1"]):
+        assert find_weights(checkpoint).is_file()
+    assert [len(messages) for messages in warnings_before_download] == [0, 1, 1, 2]
+    first_model, second_model = warnings_before_download[-1]
+    assert "superglue" in first_model and "LicenseRef-MagicLeap-SuperGlue" in first_model
+    assert "superpoint" in second_model and "LicenseRef-MagicLeap-SuperPoint" in second_model
+
+
 def test_hash_mismatch_leaves_nothing(hub, release):
     bad = Checkpoint(release.filename, release.url, "0" * 64)
     with pytest.raises(FileNotFoundError, match="downloading"):
@@ -59,6 +89,20 @@ def _checkpoints(value):
     elif isinstance(value, dict):
         for item in value.values():
             yield from _checkpoints(item)
+
+
+@pytest.mark.parametrize("family", ["dust3r", "mast3r", "ripe", "ripepp", "superglue", "superpoint", "ufm"])
+def test_noncommercial_checkpoints_match_model_info(family):
+    from flashim import model_info
+
+    module = importlib.import_module(f"flashim.models.{family}.weights")
+    checkpoints = {checkpoint for value in vars(module).values() for checkpoint in _checkpoints(value)}
+    for checkpoint in checkpoints:
+        if checkpoint.filename == "sp_v6.tgz":
+            assert checkpoint.noncommercial is None
+        else:
+            assert checkpoint.noncommercial.model == family
+            assert checkpoint.noncommercial.license in model_info(family).weights_licenses
 
 
 def test_every_model_pins_its_release():

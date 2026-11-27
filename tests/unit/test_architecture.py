@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import re
+from importlib.util import resolve_name
 from pathlib import Path
 
 import pytest
@@ -32,15 +33,19 @@ def _sources() -> list[tuple[str, Path, ast.Module]]:
     return [(_module_name(p), p, ast.parse(p.read_text())) for p in sorted(PACKAGE.rglob("*.py"))]
 
 
-def _imports(tree: ast.Module) -> list[tuple[int, str]]:
+def _imports(tree: ast.Module, path: Path) -> list[tuple[int, str]]:
     """``(line, absolute dotted name)`` of every import in the file, function-level ones included."""
     found = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             found += [(node.lineno, alias.name) for alias in node.names]
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            found.append((node.lineno, node.module))
-            found += [(node.lineno, f"{node.module}.{alias.name}") for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                package = ".".join(path.parent.relative_to(ROOT).parts)
+                module = resolve_name("." * node.level + module, package)
+            found.append((node.lineno, module))
+            found += [(node.lineno, f"{module}.{alias.name}") for alias in node.names]
     return found
 
 
@@ -63,7 +68,7 @@ FORBIDDEN = {
     "backends": {"layers", "models", "quant.passes", "build", "registry"},
     "layers": {"backends", "models", "quant.passes"},
     "quant.passes": {"backends", "models"},
-    "models": {"backends"},
+    "models": {"backends", "build", "model_info", "registry"},
 }
 # The registry loads the backends lazily, that is its job: the only modules of ``ops`` that may import ``backends``.
 OPS_MAY_LOAD_BACKENDS = {"flashim.ops", "flashim.ops._registry"}
@@ -74,11 +79,13 @@ def test_import_layering():
     for module, path, tree in _sources():
         area = _area(module)
         forbidden = FORBIDDEN.get(area, set())
-        for line, name in _imports(tree):
+        for line, name in _imports(tree, path):
             target = _area(name)
             if target is None or target == area or target not in forbidden:
                 continue
             if area == "ops" and target == "backends" and module in OPS_MAY_LOAD_BACKENDS:
+                continue
+            if area == "models" and target == "build" and (path.stem == "spec" or path.stem.endswith("_spec")):
                 continue
             violations.append(f"{path.relative_to(ROOT)}:{line} imports {name} ({area} must not import {target})")
     assert not violations, (
@@ -142,7 +149,7 @@ def test_tilelang_files_do_not_use_future_annotations():
     for _, path, tree in _sources():
         if "backends/tilelang" not in path.as_posix():
             continue
-        imports_tilelang = any(name.split(".")[0] == "tilelang" for _, name in _imports(tree))
+        imports_tilelang = any(name.split(".")[0] == "tilelang" for _, name in _imports(tree, path))
         has_future = any(
             isinstance(node, ast.ImportFrom) and node.module == "__future__"
             and any(alias.name == "annotations" for alias in node.names)
