@@ -1,0 +1,45 @@
+name: Model request
+description: Suggest an image-matching model or pipeline for FlashIM
+title: "[Model]: "
+labels: [model-request]
+body:
+  - type: input
+    id: model-name
+    attributes:
+      label: Model or pipeline name
+      placeholder: "Example: NewModel"
+    validations:
+      required: true
+  - type: input
+    id: upstream-repository
+    attributes:
+      label: Upstream repository
+      description: Link to the canonical source repository.
+      placeholder: "https://github.com/..."
+    validations:
+      required: true
+  - type: input
+    id: paper
+    attributes:
+      label: Paper
+      description: Link to the paper, preprint, or project page.
+      placeholder: "https://arxiv.org/..."
+    validations:
+      required: true
+  - type: textarea
+    id: licenses
+    attributes:
+      label: Code and weights licenses
+      description: Give the license for the upstream code and each requested checkpoint or weights file.
+      placeholder: |
+        Code:
+        Weights:
+    validations:
+      required: true
+  - type: textarea
+    id: rationale
+    attributes:
+      label: Why would this be useful?
+      description: Describe the task, model category, or platform that motivates the request.
+    validations:
+      required: true
