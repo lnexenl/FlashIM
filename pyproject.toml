@@ -81,4 +81,4 @@ markers = [
 
 [tool.ruff]
 line-length = 110
-extend-exclude = ["tests/oracles"]  # vendored upstream reference code, kept as published
+extend-exclude = ["tests/oracles", ".agents/skills/ncu-report-skill"]  # vendored or hash-locked third-party code, kept as published

@@ -21,12 +21,8 @@ jobs:
         with:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v6
-      # Only files the change touched: the tree has pre-existing findings (50 on 2026-11-26) that are not this PR's.
-      - name: Ruff on changed files
-        run: |
-          base=${{ github.event.pull_request.base.sha || github.event.before }}
-          files=$(git diff --name-only --diff-filter=d "$base" HEAD -- '*.py' || true)
-          [ -z "$files" ] || echo "$files" | xargs uvx ruff@0.16.8 check
+      - name: Ruff
+        run: uvx ruff@0.16.8 check .
 
   # GitHub runners have no GPU: only the CPU-runnable tests. `cuda` / `sm120` tests, model weights and the vendored
   # oracles are covered locally (AGENTS.md, "Verifying changes").
