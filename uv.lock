@@ -382,7 +382,6 @@ dependencies = [
     { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "torch" },
     { name = "torchvision" },
-    { name = "triton", marker = "sys_platform == 'linux'" },
 ]
 
 [package.optional-dependencies]
@@ -423,10 +422,9 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.5" },
     { name = "tilelang", marker = "sys_platform == 'linux' and extra == 'tilelang'", specifier = "==0.1.14" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
-    { name = "torch", specifier = ">=2.11,<2.12" },
-    { name = "torchvision", specifier = ">=0.26,<0.27" },
+    { name = "torch", specifier = ">=2.10" },
+    { name = "torchvision", specifier = ">=0.25" },
     { name = "tqdm", marker = "extra == 'eval'", specifier = ">=4.67.1" },
-    { name = "triton", marker = "sys_platform == 'linux'", specifier = ">=3.6,<3.7" },
 ]
 provides-extras = ["cv", "eval", "tilelang"]
 

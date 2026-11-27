@@ -284,7 +284,7 @@ def test_build_falls_back_for_the_target_platform_and_reports_it(monkeypatch):
     assert model.preset == "fp8" and model.build_report.fallbacks == {}
 
 
-SM120 = dataclasses.replace(WITH_FP8, arch="sm_120", capability=(12, 0))
+SM120 =dataclasses.replace(WITH_FP8, arch="sm_120", capability=(12, 0))
 
 
 @pytest.mark.parametrize("name", ["alike", "xfeat", "dedode", "dedode-g", "dad", "ripe", "ripepp", "xoftr",
@@ -351,6 +351,21 @@ def test_engine_fallback_reaches_both_build_entry_points(monkeypatch, caplog):
     assert len([r for r in caplog.records if "measured failure" in r.getMessage()]) == 1
     with pytest.raises(ValueError, match="toy fp32 engine 'compile'.*measured failure"):
         load("toy", strict=True, config=config)
+
+
+def test_native_fp8_torch_requirement_in_build_report(monkeypatch):
+    spec = dataclasses.replace(
+        _toy_spec(), name="toy-mx", presets={"fp8": {}, "bf16": {}}, default_preset="fp8"
+    )
+    register_spec(spec.name, spec)
+    platform = dataclasses.replace(WITH_FP8, capability=(12, 0), arch="sm_120")
+    monkeypatch.setattr(sys.modules["flashim.build"], "platform_for", lambda device: platform)
+    monkeypatch.setattr(torch, "__version__", "2.9.1+cpu")
+    model = load(spec.name, device="cpu")
+    assert model.preset == "bf16"
+    assert model.build_report.fallbacks == {
+        spec.name: "fp8 -> bf16 (block-scaled MXFP8 GEMM requires torch >= 2.10 (installed 2.9.1+cpu))"
+    }
 
 
 class _ToyMatcher(ImageMatcher, _Toy):

@@ -35,7 +35,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]  # 3.10 = JetPack 6 floor
+        include:
+          - {python-version: '3.10', torch: 'torch==2.10.0'}
+          - {python-version: '3.12', torch: 'torch==2.11.*'}
+          - {python-version: '3.13', torch: 'torch'}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -44,7 +47,7 @@ jobs:
       - name: Install (CPU torch, no CUDA wheels)
         run: |
           uv venv
-          uv pip install "torch>=2.11,<2.12" "torchvision>=0.26,<0.27" --index-url https://download.pytorch.org/whl/cpu
+          uv pip install '${{ matrix.torch }}' torchvision --index-url https://download.pytorch.org/whl/cpu
           uv pip install -e ".[cv]" --group dev  # cv: tests import cv2
       - name: Test
         run: .venv/bin/python -m pytest -q -p no:cacheprovider -m "not cuda and not sm120 and not weights and not oracle and not slow" tests

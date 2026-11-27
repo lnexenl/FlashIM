@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from flashim import ops
+from flashim.platforms import Feature, platform_for
 from flashim.quant.calibration import Calibrator, Int8Calibrator
 from flashim.quant.methods.conv2d import StaticInt8Conv2d, StaticMXFP8Conv2d, im2col_bytes
 
@@ -26,6 +27,17 @@ def test_im2col_matches_unfold():
     ref = torch.nn.functional.unfold(x.permute(0, 3, 1, 2).float(), 3, padding=1, stride=2)  # (c, ky, kx) order
     ref = ref.reshape(2, 5, 9, -1).permute(0, 3, 2, 1).reshape(2 * ho * wo, -1)  # -> (ky, kx, c)
     assert torch.equal(cols.float(), ref)
+
+
+def test_mxfp8_conv_generic_triton():
+    if not platform_for("cuda").supports(Feature.TRITON, Feature.FP8_E4M3):
+        pytest.skip("needs Triton with E4M3")
+    x = torch.ones(1, 16, 16, 32, device="cuda").to(torch.float8_e4m3fn)
+    weight = torch.ones(64, 32, device="cuda").to(torch.float8_e4m3fn)
+    exponent = torch.zeros(1, dtype=torch.int8, device="cuda")
+    weight_exponent = torch.zeros(64, 1, dtype=torch.int8, device="cuda")
+    out = ops.mxfp8_conv2d.get("triton")(x, exponent, weight, weight_exponent, None, 1, 1, 1, 1, 0, 0, 1, 1)
+    assert torch.equal(out, torch.full((1, 16, 16, 64), 32, device="cuda", dtype=torch.bfloat16))
 
 
 @pytest.mark.parametrize("case", CASES)

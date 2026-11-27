@@ -5,7 +5,11 @@ Latency and accuracy of the current code, per model family: [dense and semi-dens
 keypoints), the [pair time of sparse pipelines](#pair-time-of-sparse-pipelines) (two extractions plus the match) and
 [FlexGlue](#flexglue-sparse-to-dense). Check [Accuracy](#accuracy) before picking the fastest cell.
 
-- **Setup**: NVIDIA GeForce RTX 5070 Ti (`sm_120`), torch 2.11.0+cu130, triton 3.6.
+- **GPU-measured reference.** All numbers on this page use PyTorch 2.11. The latency tables use an NVIDIA GeForce
+  RTX 5070 Ti (`sm_120`), torch 2.11.0+cu130 and Triton 3.6.
+- **Supported versions.** CI runs CPU tests and compiles kernels at the PyTorch 2.10.0 floor, 2.11 and the latest
+  stable release. The CUDA C++ jobs use the JetPack 6, Blackwell and CUDA 13 toolkits. GPU execution, latency and
+  accuracy are verified locally on the reference configuration.
 - **Timing**: median of 50 calls timed with CUDA events, after 10 untimed warmups (compilation included), one
   configuration per process. Compiled RoMaV2 runs are the best of two processes (they vary 15-25% between processes).
 - **Input**: images are decoded and on the GPU before the timing starts. The sparse models resize inside the timed call.
