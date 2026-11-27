@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import FRAUNHOFER_ACADEMIC, Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT_ENV = "FLASHIM_LIGHTGLUE_CHECKPOINT"
 # ``weights/rdd_lg.pth`` of the Google Drive folder linked from https://github.com/xtcpete/rdd (its only
@@ -21,9 +21,11 @@ CHECKPOINT = Checkpoint(
 
 LICENSES = {
     "code": "Apache-2.0 (LightGlue, cvg/LightGlue; RDD, xtcpete/rdd); FlashIM re-implementation",
-    "weights": "RDD release checkpoint rdd_lg.pth (LightGlue trained on RDD descriptors), or cvg/LightGlue's "
-    "per-extractor releases (<variant>_lightglue.pth, see CVG_FILES)",
+    "weights": "rdd_lg.pth is hosted on Google Drive without checkpoint-specific terms in xtcpete/rdd's README. "
+    "cvg/LightGlue's README licenses the CVG_FILES matcher weights under Apache-2.0. xfeat-lighterglue.pt "
+    "inherits Apache-2.0 from verlab/accelerated_features' LICENSE. ripe++lightglue.tar is Fraunhofer academic.",
 }
+MODEL_INFO = ModelInfo(("Apache-2.0",), ("NOASSERTION",))
 
 _UNUSED = re.compile(r"^confidence_thresholds|^log_assignment\.\d+\.r$")
 _OLD_LAYOUT = re.compile(r"^(self_attn|cross_attn)\.(\d+)\.")  # cvg releases before ``transformers.N.*``
@@ -77,6 +79,10 @@ CVG_FILES = {variant: f"{variant.replace('-', '_')}_lightglue.pth" for variant i
 CVG_CHECKPOINTS = {
     variant: Checkpoint(file, f"{_CVG_RELEASE}/{file}", _CVG_SHA256[variant])
     for variant, file in CVG_FILES.items()
+}
+MODEL_INFO_OVERRIDES = {
+    **dict.fromkeys((*CVG_FILES, "xfeat"), ModelInfo(("Apache-2.0",), ("Apache-2.0",))),
+    "ripepp": ModelInfo(("Apache-2.0",), (FRAUNHOFER_ACADEMIC,)),
 }
 
 

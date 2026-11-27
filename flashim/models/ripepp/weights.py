@@ -23,26 +23,37 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import (
+    FRAUNHOFER_ACADEMIC,
+    Checkpoint,
+    ModelInfo,
+    RestrictedWeights,
+    find_weights,
+)
 
 _HF_BASE = "https://huggingface.co/spaces/JohannesK14/RIPE/resolve/main/weights"
 _HHI_BASE = "https://cvg.hhi.fraunhofer.de/RIPE%2B%2B"
+
+RESTRICTION = RestrictedWeights("ripepp", FRAUNHOFER_ACADEMIC)
 
 CHECKPOINTS = {
     "default": Checkpoint(
         "ripe++.ckpt",
         f"{_HF_BASE}/ripe++.ckpt",
         "709ebb1f000914d45c08e3edf64727993ee339519e2174231de86954efb95577",
+        noncommercial=RESTRICTION,
     ),
     "aachen": Checkpoint(
         "ripe++_tokyo_megadepth.ckpt",
         f"{_HHI_BASE}/ripe++_tokyo_megadepth.ckpt",
         "99ea66bab7db563dc9c177e3b9a612196fccdf7166d3bdb853a7f1e70a399def",
+        noncommercial=RESTRICTION,
     ),
     "scared": Checkpoint(
         "ripe++_scared.ckpt",
         f"{_HHI_BASE}/ripe++_scared.ckpt",
         "d5df1afe185a7abf7b33be436633010b01ed12ce221031e7e5368c2453146eb8",
+        noncommercial=RESTRICTION,
     ),
 }
 VARIANT_ALIASES = {"aachen_day_night": "aachen"}
@@ -51,6 +62,7 @@ LIGHTGLUE_CHECKPOINT = Checkpoint(
     "ripe++lightglue.tar",
     f"{_HF_BASE}/ripe++lightglue.tar",
     "61c48c4649339dfa550805d8ca1d6b269c67a0ee525d8daf4bc0c18d2d2db0cf",
+    noncommercial=RESTRICTION,
 )
 
 LICENSES = {
@@ -64,6 +76,7 @@ LICENSES = {
         "(RIPE++, LIMIT@ECCV 2026; Fraunhofer Academic Use License v2.0 — non-commercial use only)"
     ),
 }
+MODEL_INFO = ModelInfo(("Apache-2.0", FRAUNHOFER_ACADEMIC, "MIT"), (FRAUNHOFER_ACADEMIC,))
 
 _HHI_TLS_HINT = (
     " (Note: cvg.hhi.fraunhofer.de omits the 'GEANT TLS ECC 1' intermediate certificate "

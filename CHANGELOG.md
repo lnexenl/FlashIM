@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Changed
+
+- PyTorch is no longer pinned to 2.11: `torch>=2.10`, `torchvision>=0.25`, and no explicit `triton` requirement (CUDA
+  torch wheels pin their own; Jetson keeps Triton 3.6 in `requirements-jetson.txt`). The floor is measured: torch 2.9's
+  Triton 3.5 fails a FlashIM kernel on `sm_100`. On Blackwell, `fp8` with torch < 2.10 builds the nearest preset
+  (`build_report.fallbacks` names the installed version). Measured numbers remain those of the torch 2.11 setup.
+
+### Added
+
+- Contributor documentation, community policies, issue forms, and citation metadata for open-source contributions.
+- CI compiles every CUDA C++ kernel with nvcc 12.6 / 12.8 / newest 13.x, every recorded Triton specialization
+  (`ci/triton.jsonl`) and the TileLang kernels for each supported NVIDIA architecture, without a GPU; CPU tests run on
+  torch 2.10 / 2.11 / newest, plus a weekly nightly-torch job.
+
+- `flashim.model_info(name)`: code and weights license IDs of a model's default configuration (every component of a
+  pipeline) and `commercial_ok` (only Apache-2.0 / BSD-3-Clause / MIT; unknown or restricted terms are `False`).
+  [docs/licenses.md](docs/licenses.md) is generated from it. Weights published in the upstream repository inherit its
+  license, with the basis recorded in each `weights.py`.
+- A one-time warning per model family before downloading non-commercial weights (Magic Leap SuperPoint / SuperGlue,
+  Fraunhofer academic RIPE / RIPE++, CC-BY-NC-SA MASt3R / DUSt3R / UFM).
+
+### Fixed
+
+- `engine="compile"` on model / preset combinations known to crash in Dynamo or Inductor (INT8 / FP8 `alike`, `xfeat`,
+  `dedode*`, `dad`, `ripe*`, `loma-*`, `xoftr`; BF16 `ripe*`) no longer fails at the first `match` / `extract`: the
+  build runs `eager` with a warning and a `<path>.engine` entry in `build_report.fallbacks`, or raises with
+  `strict=True`. The failures are declared in each model's `spec.py` (`ModelSpec.compile_failures`), measured on torch
+  2.11 / `sm_120`, and apply on every CUDA architecture and torch version until re-measured.
+- Warnings and errors (backend load failures, missing `nvcc`, preset and engine fallbacks) reach stderr when the
+  application has not configured logging: the `NullHandler` on the `flashim` logger is gone.
+- `romav2` honours `config.checkpoint` (`overrides={"checkpoint": path}`) like every other model; it used to load the
+  default checkpoint regardless.
+
 ## 0.1.1 (2026-11-26)
 
 ### Added

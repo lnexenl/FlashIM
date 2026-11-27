@@ -32,7 +32,9 @@ COMPILE_FULL_REGIONS = (
 
 
 def _load(config: RunConfig) -> RoMaV2:
-    return RoMaV2.from_pretrained(RoMaV2Config(**config.arch), device=config.device)
+    return RoMaV2.from_pretrained(
+        RoMaV2Config(**config.arch), checkpoint=config.checkpoint, device=config.device
+    )
 
 
 def _fold_refiners(model: RoMaV2, ctx: BuildContext) -> list[str]:

@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from flashim.models.dedode.weights import CHECKPOINTS as _DEDODE_CHECKPOINTS
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 RELEASES = "https://github.com/Parskatt/storage/releases/download/roma"
 MINIMA_RELEASES = "https://github.com/LSXI7/storage/releases/download/MINIMA"
@@ -34,6 +34,10 @@ DINOV2 = _DEDODE_CHECKPOINTS["dinov2"]
 LICENSES = {
     "code": "MIT (Parskatt/RoMa); DINOv2 Apache-2.0; FlashIM re-implementation",
     "weights": "RoMa outdoor / indoor (MIT), MINIMA-RoMa (Apache-2.0, LSXI7/MINIMA), DINOv2 ViT-L/14 (Apache-2.0, frozen)",
+}
+MODEL_INFO = ModelInfo(("Apache-2.0", "MIT"), ("Apache-2.0", "MIT"))
+MODEL_INFO_OVERRIDES = {
+    "minima": ModelInfo(("Apache-2.0", "MIT"), ("Apache-2.0",)),
 }
 
 

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT_ENV = "FLASHIM_RDD_CHECKPOINT"
 # ``weights/rdd.pth`` of the Google Drive folder linked from https://github.com/xtcpete/rdd (its only
@@ -21,8 +21,10 @@ CHECKPOINT = Checkpoint(
 
 LICENSES = {
     "code": "Apache-2.0 (RDD, xtcpete/rdd); FlashIM re-implementation",
-    "weights": "RDD release checkpoint; ConvNeXt backbone initialised from Meta's ImageNet-22k weights",
+    "weights": "rdd.pth (ConvNeXt initialized from Meta's ImageNet-22k weights) is on Google Drive. "
+    "The xtcpete/rdd README links the files but gives no checkpoint-specific license.",
 }
+MODEL_INFO = ModelInfo(("Apache-2.0",), ("NOASSERTION",))
 
 # Upstream module paths -> FlashIM paths (the wrapper modules `descriptor.` / `Joiner` / `encoder.` are flattened).
 _RENAMES = (

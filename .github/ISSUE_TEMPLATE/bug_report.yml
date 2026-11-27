@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a reproducible problem with FlashIM
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues first. Remove checkpoint contents and other sensitive data from reports.
+  - type: input
+    id: flashim-version
+    attributes:
+      label: FlashIM version
+      description: The value of `flashim.__version__`.
+      placeholder: "0.1.1"
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include Python, PyTorch, CUDA, driver, and GPU details.
+      placeholder: |
+        Python:
+        PyTorch:
+        CUDA toolkit / driver:
+        GPU and architecture:
+    validations:
+      required: true
+  - type: textarea
+    id: run-config
+    attributes:
+      label: Run configuration and build report
+      description: Paste `model.run_config` and `model.build_report`, including any `fallbacks`.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest code, inputs, and commands that reproduce the issue.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+      description: Tell us what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and traceback
+      description: Include relevant logs or a traceback, with secrets removed.
+      render: text

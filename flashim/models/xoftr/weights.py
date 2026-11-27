@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT_ENV = "FLASHIM_XOFTR_CHECKPOINT"
 # ``weights_xoftr_640.ckpt`` in the Google Drive folder linked from https://github.com/OnderT/XoFTR (its only
@@ -23,6 +23,7 @@ LICENSES = {
     "code": "Apache-2.0 (XoFTR, OnderT/XoFTR, derived from zju3dv/LoFTR); FlashIM re-implementation",
     "weights": "XoFTR weights_xoftr_640.ckpt (OnderT/XoFTR, Apache-2.0)",
 }
+MODEL_INFO = ModelInfo(("Apache-2.0",), ("Apache-2.0",))
 
 
 def find_checkpoint(path: str | Path | None = None) -> Path:

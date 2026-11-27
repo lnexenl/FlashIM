@@ -23,15 +23,16 @@ from __future__ import annotations
 import importlib
 import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
 import torch
 from torch import nn
+from torch.torch_version import TorchVersion
 
 from flashim.config import RunConfig, load_file, merge, parse_overrides, resolve_preset
-from flashim.log import get_logger
+from flashim.log import get_logger, warn_once
 from flashim.platforms import Feature, Platform, default_device, platform_for
 
 logger = get_logger("build")
@@ -45,6 +46,8 @@ PRECISIONS = ("fp32", "bf16", "int8", "fp8")
 # references: RoMaV2 fp8 3334 ms against int8 1122 ms (bf16 1981 ms), LightGlue 209 against 56 ms, RDD (no INT8) fp8
 # 1151 ms against bf16 398 ms.
 NEAREST = {"fp8": ("int8", "bf16", "fp32"), "int8": ("bf16", "fp32"), "bf16": ("fp32",), "fp32": ("bf16",)}
+
+_NATIVE_PRESET_REQUIREMENTS = {"fp8": ((10, 0), "2.10", "block-scaled MXFP8 GEMM")}
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,11 @@ class ModelSpec:
     validate: Callable[[RunConfig], None] | None = None
     # Composite models: build the components (``config.components``, already resolved) and combine them.
     compose: Callable[[RunConfig, Callable[[RunConfig], nn.Module]], nn.Module] | None = None
+    # Preset -> failure reason including the measured torch minor and GPU architecture. Each entry applies to every
+    # CUDA architecture and torch version (older and newer) until a new measurement supports removing it.
+    compile_failures: Mapping[str, str] = field(default_factory=dict)
+    # Components whose full benchmarked call this pipeline uses (e.g. extract, rather than describe_keypoints).
+    compile_failure_components: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         unknown = sorted(set(self.presets) - set(PRECISIONS))
@@ -119,7 +127,7 @@ class BuildReport:
     skipped: dict[str, str] = field(default_factory=dict)  # skipped pass -> reason
     quant: dict[str, Any] | None = None
     emulated_quant: bool = False
-    fallbacks: dict[str, str] = field(default_factory=dict)  # model / component path -> "asked -> built (why)" preset
+    fallbacks: dict[str, str] = field(default_factory=dict)  # preset path or path.engine -> "asked -> built (why)"
     compiled_regions: list[str] = field(default_factory=list)
     components: dict[str, BuildReport] = field(default_factory=dict)
 
@@ -198,13 +206,21 @@ def _choose_preset(
         if strict:
             raise ValueError(f"{spec.name}: no {preset!r} preset (optimize.strict); available: {sorted(spec.presets)}")
         reason, level = f"{spec.name} has no {preset}", logging.INFO if component else logging.WARNING
+    unavailable = None
+    requirement = _NATIVE_PRESET_REQUIREMENTS.get(built)
+    if requirement and platform is not None and platform.device_type == "cuda":
+        capability, minimum, feature = requirement
+        if platform.has_capability(capability) and TorchVersion(torch.__version__) < minimum:
+            unavailable = f"{feature} requires torch >= {minimum} (installed {torch.__version__})"
     if built == "fp8" and platform is not None and platform.device_type != "cpu" and not platform.supports(
         Feature.FP8_E4M3
     ):
+        unavailable = f"no FP8 on {platform.describe()}"
+    if unavailable is not None:
         if keep is not None:
-            logger.warning("%s: no FP8 on %s, preset 'fp8' kept (%s)", spec.name, platform.describe(), keep)
+            logger.warning("%s: %s, preset 'fp8' kept (%s)", spec.name, unavailable, keep)
         else:
-            built, reason, level = _nearest(spec, "fp8", skip="fp8"), f"no FP8 on {platform.describe()}", logging.WARNING
+            built, reason, level = _nearest(spec, "fp8", skip="fp8"), unavailable, logging.WARNING
     if reason is not None:
         logger.log(level, "%s: preset %r replaced by %r (%s)", spec.name, preset, built, reason)
     return built, reason
@@ -224,13 +240,16 @@ def resolve(
 
     The model, and every component of a pipeline (the pipeline's preset is each component's), builds the nearest
     preset it has (:data:`NEAREST`; ``optimize.strict`` raises instead). With ``platform`` (:func:`load` passes the
-    target device's), ``fp8`` is also replaced on a GPU without FP8, unless the config sets ``optimize.strict`` or
-    passes a calibration table anywhere (:func:`_keeps_fp8`). ``preset`` of the result names the preset that is built;
+    target device's), ``fp8`` is also replaced on a GPU without FP8 or on Blackwell with a torch release that
+    predates block-scaled MXFP8 GEMM, unless the config sets ``optimize.strict`` or
+    passes a calibration table anywhere (:func:`_keeps_fp8`). With a target platform, known compile failures select
+    eager (``optimize.strict`` raises instead). ``preset`` of the result names the preset that is built;
     ``fallbacks`` (a dict) collects ``path -> "asked -> built (why)"``. Without ``platform`` the result does not depend
     on the machine: build it with :func:`build_config` to run an FP8 preset emulated on such a GPU."""
     user = merge(_user_overlay(config), parse_overrides(overrides))
     keep = None if platform is None else _keeps_fp8(user)
-    return _resolve(name, preset, user, platform, keep, False, "", fallbacks)
+    resolved = _resolve(name, preset, user, platform, keep, False, "", fallbacks)
+    return _guard_engines(resolved, platform, fallbacks) if platform is not None else resolved
 
 
 def _user_overlay(config: RunConfig | Mapping[str, Any] | str | Path | None) -> dict[str, Any]:
@@ -275,6 +294,56 @@ def _resolve(
 
 
 # -- building ---------------------------------------------------------------------------------------------
+
+
+def _compile_failure(config: RunConfig, platform: Platform) -> str | None:
+    """First measured failure in the components sharing a compile request."""
+    if config.engine.kind != "compile":
+        return None
+    spec = get_spec(config.model)
+    reason = spec.compile_failures.get(config.preset)
+    if reason and platform.device_type == "cuda":
+        precision = resolve_preset(spec.presets, config.preset).get("precision", {})
+        if (config.precision.quant, config.precision.compute_dtype) == (
+            precision.get("quant"), precision.get("compute_dtype", "fp32")
+        ):
+            return f"{config.model} {config.preset}: {reason}"
+    for name in spec.compile_failure_components:
+        child = config.components[name]
+        target = platform if child.device == config.device else platform_for(child.device)
+        failure = _compile_failure(child, target)
+        if failure:
+            return failure
+    return None
+
+
+def _eager(config: RunConfig, reason: str) -> RunConfig:
+    if config.engine.kind != "compile":
+        return config
+    if config.optimize.strict:
+        raise ValueError(f"{config.model} {config.preset} engine 'compile' unavailable (optimize.strict): {reason}")
+    return config.replace(
+        engine=replace(config.engine, kind="eager"),
+        components={name: _eager(child, reason) for name, child in config.components.items()},
+    )
+
+
+def _guard_engines(config: RunConfig, platform: Platform, fallbacks: dict[str, str] | None, path: str = "") -> RunConfig:
+    reason = _compile_failure(config, platform)
+    if reason:
+        config = _eager(config, reason)
+        combo = f"{config.model} {config.preset} engine 'compile'"
+        if fallbacks is not None:
+            fallbacks[f"{path or config.model}.engine"] = f"compile -> eager ({reason})"
+        warn_once(logger, f"{combo}:{reason}", "%s replaced by 'eager' (%s)", combo, reason)
+    if names := get_spec(config.model).compile_failure_components:
+        children = dict(config.components)
+        for name in names:
+            child = children[name]
+            target = platform if child.device == config.device else platform_for(child.device)
+            children[name] = _guard_engines(child, target, fallbacks, f"{path}.{name}".lstrip("."))
+        return config.replace(components=children)
+    return config
 
 
 def _load_calibration(spec: ModelSpec, config: RunConfig, int8: bool):
@@ -373,6 +442,13 @@ def _apply_engine(model: nn.Module, ctx: BuildContext) -> None:
 
 def build_config(config: RunConfig) -> nn.Module:
     """Build a model from a resolved config (see :func:`resolve`; no preset is replaced here)."""
+    fallbacks: dict[str, str] = {}
+    model = _build_config(_guard_engines(config, platform_for(config.device), fallbacks))
+    model.build_report.fallbacks = fallbacks
+    return model
+
+
+def _build_config(config: RunConfig) -> nn.Module:
     spec = get_spec(config.model)
     spec.check(config)
     if config.optimize.ops:
@@ -381,7 +457,7 @@ def build_config(config: RunConfig) -> nn.Module:
         logger.info("%s: FLASHIM_OPS overrides %r (process-wide)", spec.name, config.optimize.ops)
         ops.configure(config.optimize.ops)
     if spec.compose is not None:
-        model = spec.compose(config, build_config)
+        model = spec.compose(config, _build_config)
         report = BuildReport(config.digest(), platform_for(config.device).describe())
         report.components = {
             name: child.build_report for name, child in model.named_children() if hasattr(child, "build_report")
@@ -436,8 +512,8 @@ def load(
     ``load("romav2", "fp8", engine="compile", overrides={"arch.setting": "mega1500"})``.
 
     ``device`` / ``engine`` / ``strict`` apply to every component of a pipeline; ``calibration`` (a table path or a
-    loaded table) only to single models (a component's: ``components.<name>.precision.calibration``). Presets the model
-    or the platform replaced are in ``model.build_report.fallbacks``."""
+    loaded table) only to single models (a component's: ``components.<name>.precision.calibration``).
+    ``model.build_report.fallbacks`` records preset and engine replacements."""
     overlay: dict[str, Any] = {}
     if device is not None:
         overlay["device"] = str(device)
@@ -455,7 +531,7 @@ def load(
     user = merge(merge(_user_overlay(config), parse_overrides(overrides)), overlay)
     fallbacks: dict[str, str] = {}
     platform = platform_for(user.get("device") or default_device())
-    model = build_config(resolve(name, preset, user, platform=platform, fallbacks=fallbacks))
+    model = _build_config(resolve(name, preset, user, platform=platform, fallbacks=fallbacks))
     model.build_report.fallbacks = fallbacks
     return model
 

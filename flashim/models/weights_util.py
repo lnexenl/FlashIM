@@ -11,7 +11,29 @@ from pathlib import Path
 
 import torch
 
+from flashim.log import warn_once
+
 logger = logging.getLogger("flashim.weights")
+
+FRAUNHOFER_ACADEMIC = "LicenseRef-Fraunhofer-Academic-2.0"
+
+
+@dataclass(frozen=True)
+class ModelInfo:
+    code_licenses: tuple[str, ...]
+    weights_licenses: tuple[str, ...]
+
+    @property
+    def commercial_ok(self) -> bool:
+        """True when every recorded license is known to permit commercial use."""
+        permissive = {"Apache-2.0", "BSD-3-Clause", "MIT"}
+        return bool(self.code_licenses) and permissive.issuperset(self.code_licenses + self.weights_licenses)
+
+
+@dataclass(frozen=True)
+class RestrictedWeights:
+    model: str
+    license: str
 
 
 @dataclass(frozen=True)
@@ -21,6 +43,7 @@ class Checkpoint:
     filename: str
     url: str
     sha256: str
+    noncommercial: RestrictedWeights | None = None
 
 
 def checkpoint_dir() -> Path:
@@ -39,6 +62,10 @@ def find_weights(checkpoint: Checkpoint, *, path: str | Path | None = None, env:
     target = checkpoint_dir() / checkpoint.filename
     if target.is_file():
         return target
+    if restriction := checkpoint.noncommercial:
+        warn_once(logger, f"weights.license.{restriction.model}",
+                  "%s weights are for non-commercial use under %s (downloading %s)",
+                  restriction.model, restriction.license, checkpoint.filename)
     logger.warning("downloading %s -> %s", checkpoint.url, target)
     target.parent.mkdir(parents=True, exist_ok=True)
     try:  # downloads to a temporary file next to the target, renamed once the hash matches

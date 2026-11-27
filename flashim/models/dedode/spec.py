@@ -13,7 +13,7 @@ from flashim.build import BuildContext, Pass
 from flashim.config import RunConfig
 from flashim.models.dedode import blocks, weights
 from flashim.models.dedode.model import DEDODE_SAMPLER, DeDoDe
-from flashim.models.sparse_spec import extractor_spec
+from flashim.models.sparse_spec import QUANT_COMPILE_FAILURES, extractor_spec
 from flashim.quant.passes.transformer_block import enable_fused_epilogues, fold_layer_scale
 
 _VIT_PREFIX = "descriptor.encoder.dinov2.blocks."
@@ -368,6 +368,7 @@ def _spec(
         int8_ignore=int8_ignore,
         int8_dynamic=int8_dynamic,
         compile_regions=("detector", "descriptor"),
+        compile_failures=QUANT_COMPILE_FAILURES if has_fp8 else {"int8": QUANT_COMPILE_FAILURES["int8"]},
         # BF16 extract at 1200 px, interleaved in one process (sm_120): dedode 128 -> 102 ms, dedode-g 184 -> 160 ms.
         channels_last=True,
         # ConvRefiner hidden blocks with 32 / 64 / 128 channels as one BF16 kernel each (26 blocks). BF16 extract at

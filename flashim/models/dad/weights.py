@@ -6,14 +6,19 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT = Checkpoint(
     "dad.pth",
     "https://github.com/Parskatt/dad/releases/download/v0.1.0/dad.pth",
     "7d827844649faf5213ba97e7adb43e16b936dd3d11ab2d0fc0d602c67fae781f",
 )
-LICENSES = {"code": "MIT (Parskatt/dad); FlashIM re-implementation", "weights": "DaD v0.1.0 release (dad.pth)"}
+LICENSES = {
+    "code": "MIT (Parskatt/dad); FlashIM re-implementation",
+    "weights": "dad.pth inherits MIT from Parskatt/dad's v0.1.0 LICENSE. The default DeDoDe-G descriptor "
+    "uses MIT and DINOv2 Apache-2.0 weights per Parskatt/DeDoDe's README.",
+}
+MODEL_INFO = ModelInfo(("Apache-2.0", "MIT"), ("Apache-2.0", "MIT"))
 
 
 def load_state_dict(path: str | Path | None = None, map_location="cpu") -> dict[str, torch.Tensor]:

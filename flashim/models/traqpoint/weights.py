@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 CHECKPOINT_ENV = "FLASHIM_TRAQPOINT_CHECKPOINT"
 # Pinned Hugging Face commit of https://huggingface.co/lihao20888/traqpoint (linked from
@@ -23,6 +23,7 @@ LICENSES = {
     "weights": "TraqPoint release traqpoint_best.pth (Apache-2.0); DINOv3 ConvNeXt-B backbone "
     "(descriptor.backbone.0.dino.*) fine-tuned from Meta's dinov3_convnext_base under the DINOv3 License",
 }
+MODEL_INFO = ModelInfo(("Apache-2.0",), ("Apache-2.0", "LicenseRef-DINOv3"))
 
 # Upstream module paths -> FlashIM paths (flatten wrapper prefixes `descriptor.` / `backbone.0.dino.`).
 _RENAMES = (

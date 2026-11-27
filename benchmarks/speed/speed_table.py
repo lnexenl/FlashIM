@@ -155,8 +155,8 @@ def main() -> None:
                    "above. Each cell is `eager / compile`."),
                   "pipeline", PIPELINES, pair)
     if mixed:
-        out += ["", "Pipelines whose two components build different presets (`extractor+matcher`; a component without the "
-                    "requested preset builds the nearest one it has):", "",
+        out += ["", ("Pipelines whose two components build different presets (`extractor+matcher`; a component without the "
+                    "requested preset builds the nearest one it has):"), "",
                 "| pipeline | requested | built |", "|---|---|---|"]
         out += [f"| {m} | {p} | {built} |" for (m, p), built in sorted(mixed.items())]
 

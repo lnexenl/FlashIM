@@ -32,6 +32,13 @@ A pipeline's preset is each component's, and each builds its own nearest one: `a
 `int8`. On a GPU without FP8 `fp8` is replaced the same way ([platforms.md](platforms.md)). What was replaced is logged
 and listed in `model.build_report.fallbacks`; `optimize.strict=true` raises instead.
 
+For a [known compile failure](benchmarks.md#compile-failures), `load` selects eager and records the reason under
+`<model>.engine` (or `<component path>.engine` for a component-specific request). `strict=True` raises before
+loading weights. The reason includes the torch minor and GPU architecture where the failure was measured. Each guard
+applies to every CUDA architecture across older, measured, and newer torch versions until a repeat measurement
+supports removing it. Warnings and errors go to stderr by default. Application logging handlers control their output
+when configured, and `FLASHIM_LOG=info` enables build and dispatch details.
+
 ## Matching
 
 Every model that matches an image pair answers the same call:

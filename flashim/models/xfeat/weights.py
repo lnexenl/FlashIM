@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from flashim.models.weights_util import Checkpoint, find_weights
+from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
 
 _REPO = "https://github.com/verlab/accelerated_features/raw/main/weights"
 CHECKPOINTS = {
@@ -16,7 +16,12 @@ CHECKPOINTS = {
         ("xfeat-lighterglue.pt", "766102df37f11189efe5b0811d1f47c72b22629b79bfabfcfff9d2a2f84654b8"),
     )
 }
-LICENSES = {"code": "Apache-2.0 (verlab/accelerated_features); FlashIM re-implementation", "weights": "XFeat release"}
+LICENSES = {
+    "code": "Apache-2.0 (verlab/accelerated_features); FlashIM re-implementation",
+    "weights": "weights/xfeat.pt and weights/xfeat-lighterglue.pt inherit Apache-2.0 from "
+    "verlab/accelerated_features' LICENSE",
+}
+MODEL_INFO = ModelInfo(("Apache-2.0",), ("Apache-2.0",))
 
 
 def _find(name: str, path):

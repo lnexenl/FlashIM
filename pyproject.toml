@@ -23,9 +23,8 @@ classifiers = [
 # 3.10: JetPack 6's L4T torch is cp310 only (requirements-jetson.txt)
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.11,<2.12",
-    "torchvision>=0.26,<0.27",
-    "triton>=3.6,<3.7 ; sys_platform == 'linux'",
+    "torch>=2.10",
+    "torchvision>=0.25",
     "einops>=0.8.1",
     "numpy>=2.0",
     "pillow>=12.0.0",
@@ -82,4 +81,4 @@ markers = [
 
 [tool.ruff]
 line-length = 110
-extend-exclude = ["tests/oracles"]  # vendored upstream reference code, kept as published
+extend-exclude = ["tests/oracles", ".agents/skills/ncu-report-skill"]  # vendored or hash-locked third-party code, kept as published

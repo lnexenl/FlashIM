@@ -284,6 +284,90 @@ def test_build_falls_back_for_the_target_platform_and_reports_it(monkeypatch):
     assert model.preset == "fp8" and model.build_report.fallbacks == {}
 
 
+SM120 =dataclasses.replace(WITH_FP8, arch="sm_120", capability=(12, 0))
+
+
+@pytest.mark.parametrize("name", ["alike", "xfeat", "dedode", "dedode-g", "dad", "ripe", "ripepp", "xoftr",
+                                  "ripepp-lightglue", "loma", "loma-b128", "loma-b", "loma-g", "loma-l", "loma-r"])
+@pytest.mark.parametrize("preset", ["int8", "fp8"])
+def test_measured_compile_failures_resolve_to_eager(name, preset):
+    fallbacks = {}
+    config = resolve(name, preset, overrides=["engine.kind=compile"], platform=SM120, fallbacks=fallbacks)
+    assert config.engine.kind == "eager" and all(c.engine.kind == "eager" for c in config.components.values())
+    assert "ListVariable" in fallbacks[f"{name}.engine"]
+    if preset != config.preset:
+        assert "fp8 -> int8" in fallbacks[name]
+
+
+@pytest.mark.parametrize("name", ["ripe", "ripepp", "ripepp-lightglue"])
+def test_inductor_compile_failure_is_strict(name):
+    with pytest.raises(ValueError, match=f"{name} bf16 engine 'compile'.*Inductor scheduler KeyError"):
+        resolve(name, "bf16", overrides=["engine.kind=compile", "optimize.strict=true"], platform=SM120)
+
+
+def test_engine_guard_respects_target_and_component_overrides():
+    options = ["engine.kind=compile"]
+    for target in (Platform("cpu"), Platform("rocm", arch="gfx942")):
+        assert resolve("xfeat", "int8", overrides=options, platform=target).engine.kind == "compile"
+    for name, preset in [("ripepp-aachen", "bf16"), ("ripepp-scared", "bf16"), ("ripe", "fp32"), ("disk", "int8"),
+                         ("raco-xfeat", "int8"), ("raco-xfeat-lightglue", "fp8")]:
+        config = resolve(name, preset, overrides=options, platform=SM120)
+        assert config.engine.kind == "compile" and all(c.engine.kind == "compile" for c in config.components.values())
+    config = resolve("loma-b", "int8", overrides=[*options, "components.extractor.preset=bf16"], platform=SM120)
+    assert all(child.engine.kind == "compile" for child in config.components.values())
+    config = resolve("xfeat", "int8", config={"precision": {"quant": None}}, overrides=options, platform=SM120)
+    assert config.engine.kind == "compile"
+    fallbacks = {}
+    config = resolve("loma-b", "int8", overrides=["components.extractor.engine.kind=compile"],
+                     platform=SM120, fallbacks=fallbacks)
+    assert config.components["extractor"].engine.kind == "eager" and list(fallbacks) == ["extractor.engine"]
+
+
+@pytest.mark.parametrize("torch_version", ["2.10.0", "2.11.0", "2.12.0"])
+@pytest.mark.parametrize(("model", "preset", "reason"), [
+    ("xfeat", "int8", "ListVariable"), ("ripepp-lightglue", "bf16", "Inductor scheduler KeyError"),
+])
+def test_cuda_guard_across_torch_versions(monkeypatch, torch_version, model, preset, reason):
+    monkeypatch.setattr(torch, "__version__", torch_version)
+    options = ["engine.kind=compile"]
+    fallbacks = {}
+    config = resolve(model, preset, overrides=options, platform=NO_FP8, fallbacks=fallbacks)
+    assert config.engine.kind == "eager"
+    assert reason in fallbacks[f"{model}.engine"] and "measured torch 2.11, sm_120" in fallbacks[f"{model}.engine"]
+    with pytest.raises(ValueError, match=f"{model} {preset} engine 'compile'.*{reason}.*measured torch 2.11, sm_120"):
+        resolve(model, preset, overrides=[*options, "optimize.strict=true"], platform=NO_FP8)
+
+
+def test_engine_fallback_reaches_both_build_entry_points(monkeypatch, caplog):
+    spec = dataclasses.replace(_toy_spec(), engines={"compile": EngineSpec(), "eager": EngineSpec()},
+                               compile_failures={"fp32": "measured failure"})
+    register_spec("toy", spec)
+    monkeypatch.setattr(sys.modules["flashim.build"], "platform_for", lambda device: SM120)
+    config = resolve("toy", "fp32", overrides={"engine.kind": "compile", "optimize.passes": []})
+    for model in (load("toy", config=config), flashim.build_config(config)):
+        assert model.engine == model.run_config.engine.kind == "eager"
+        assert model.build_report.config_digest == model.run_config.digest()
+        assert model.build_report.fallbacks == {"toy.engine": "compile -> eager (toy fp32: measured failure)"}
+    assert len([r for r in caplog.records if "measured failure" in r.getMessage()]) == 1
+    with pytest.raises(ValueError, match="toy fp32 engine 'compile'.*measured failure"):
+        load("toy", strict=True, config=config)
+
+
+def test_native_fp8_torch_requirement_in_build_report(monkeypatch):
+    spec = dataclasses.replace(
+        _toy_spec(), name="toy-mx", presets={"fp8": {}, "bf16": {}}, default_preset="fp8"
+    )
+    register_spec(spec.name, spec)
+    platform = dataclasses.replace(WITH_FP8, capability=(12, 0), arch="sm_120")
+    monkeypatch.setattr(sys.modules["flashim.build"], "platform_for", lambda device: platform)
+    monkeypatch.setattr(torch, "__version__", "2.9.1+cpu")
+    model = load(spec.name, device="cpu")
+    assert model.preset == "bf16"
+    assert model.build_report.fallbacks == {
+        spec.name: "fp8 -> bf16 (block-scaled MXFP8 GEMM requires torch >= 2.10 (installed 2.9.1+cpu))"
+    }
+
+
 class _ToyMatcher(ImageMatcher, _Toy):
     match_defaults: Mapping[str, int] = {"max_matches": 7}
 

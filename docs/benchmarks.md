@@ -5,7 +5,11 @@ Latency and accuracy of the current code, per model family: [dense and semi-dens
 keypoints), the [pair time of sparse pipelines](#pair-time-of-sparse-pipelines) (two extractions plus the match) and
 [FlexGlue](#flexglue-sparse-to-dense). Check [Accuracy](#accuracy) before picking the fastest cell.
 
-- **Setup**: NVIDIA GeForce RTX 5070 Ti (`sm_120`), torch 2.11.0+cu130, triton 3.6.
+- **GPU-measured reference.** All numbers on this page use PyTorch 2.11. The latency tables use an NVIDIA GeForce
+  RTX 5070 Ti (`sm_120`), torch 2.11.0+cu130 and Triton 3.6.
+- **Supported versions.** CI runs CPU tests and compiles kernels at the PyTorch 2.10.0 floor, 2.11 and the latest
+  stable release. The CUDA C++ jobs use the JetPack 6, Blackwell and CUDA 13 toolkits. GPU execution, latency and
+  accuracy are verified locally on the reference configuration.
 - **Timing**: median of 50 calls timed with CUDA events, after 10 untimed warmups (compilation included), one
   configuration per process. Compiled RoMaV2 runs are the best of two processes (they vary 15-25% between processes).
 - **Input**: images are decoded and on the GPU before the timing starts. The sparse models resize inside the timed call.
@@ -137,11 +141,18 @@ One MegaDepth pair, 512x512 descriptor: `match_keypoints` with 2048 RDD keypoint
 
 ## Compile failures
 
-`engine="compile"` crashes for these configurations; `eager` runs them all.
+The `fail` cells record crashes on `sm_120` with torch 2.11 during Dynamo tracing or Inductor scheduling, before GPU
+code generation. On every CUDA architecture, `flashim.load(..., engine="compile")` selects `eager` for these
+configurations before loading weights. The guard applies to the measured torch minor and to older and newer versions
+until a repeat measurement shows that compilation succeeds and the entry is removed. The first
+request for each affected combination logs a warning. `model.build_report.fallbacks` records the change on every build.
+`strict=True` raises a `ValueError` with the reason. A pipeline requested with `engine="compile"` falls back as a
+whole when its extractor needs eager. For `ripepp-lightglue`, requesting `fp8` builds the pipeline's `int8` preset
+(`int8` extractor, `bf16` matcher) before the engine guard runs. The latency tables retain the original compile results.
 
 - **INT8 / FP8 sparse extractors, LoMa and RIPE++** (`alike`, `xfeat`, `dedode`, `dedode-g`, `dad`, `ripe`, `ripepp`,
-  `loma-*`, `xoftr`; `int8` and `fp8`, and `ripepp-lightglue` `int8`): Dynamo rejects the autotuned INT8 convolution kernels
-  (`AssertionError: ListVariable ... is already tracked for mutation`, torch 2.11); they run eager.
+  `loma-*`, `xoftr`; `int8` and `fp8`, and `ripepp-lightglue` `int8`): Dynamo rejects the autotuned INT8 or MXFP8
+  convolution kernels (`AssertionError: ListVariable ... is already tracked for mutation`, torch 2.11).
 - **`ripe`, `ripepp`, `ripepp-lightglue`** (`bf16`; `fp32` compiles): `InductorError: KeyError` in the Inductor scheduler
   (torch 2.11).
 
