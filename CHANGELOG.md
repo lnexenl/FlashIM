@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- `engine="compile"` on model / preset combinations known to crash in Dynamo or Inductor (INT8 / FP8 `alike`, `xfeat`,
+  `dedode*`, `dad`, `ripe*`, `loma-*`, `xoftr`; BF16 `ripe*`) no longer fails at the first `match` / `extract`: the
+  build runs `eager` with a warning and a `<path>.engine` entry in `build_report.fallbacks`, or raises with
+  `strict=True`. The failures are declared in each model's `spec.py` (`ModelSpec.compile_failures`), measured on torch
+  2.11 / `sm_120`, and apply on every CUDA architecture and torch version until re-measured.
+- Warnings and errors (backend load failures, missing `nvcc`, preset and engine fallbacks) reach stderr when the
+  application has not configured logging: the `NullHandler` on the `flashim` logger is gone.
+
 ## 0.1.1 (2026-11-26)
 
 ### Added

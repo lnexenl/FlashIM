@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from flashim.config import RunConfig
-from flashim.models.sparse_spec import extractor_spec
+from flashim.models.sparse_spec import QUANT_COMPILE_FAILURES, extractor_spec
 from flashim.models.xfeat.model import XFeat
 
 # Quantized: the 64/128-channel trunk convolutions (blocks 3-5), the fusion block and the reliability heatmap trunk.
@@ -34,5 +34,6 @@ SPEC = extractor_spec(
     quantized=QUANTIZED,
     protected=PROTECTED,
     compile_regions=("skip1", "block1", "block2", "block3", "block4", "block5", "block_fusion", "heatmap_head", "keypoint_head"),
+    compile_failures=QUANT_COMPILE_FAILURES,
     cuda_graph=True,
 )

@@ -1,6 +1,6 @@
 """FlashIM logging: stdlib :mod:`logging` under the ``flashim`` namespace.
 
-The library only emits records; it installs no handler unless asked. Opt in with the ``FLASHIM_LOG`` env var or
+With no logging handlers, Python writes warnings and errors to stderr. Opt in to more detail with ``FLASHIM_LOG`` or
 :func:`set_verbosity`. ``FLASHIM_LOG`` is a comma-separated list of levels, optionally per subsystem (the
 ``flashim.`` prefix may be omitted)::
 
@@ -32,8 +32,6 @@ _handler: logging.Handler | None = None
 _warned: set[str] = set()
 NVTX = os.environ.get("FLASHIM_NVTX", "0") == "1"
 
-logging.getLogger(ROOT).addHandler(logging.NullHandler())
-
 
 def get_logger(name: str) -> logging.Logger:
     """Logger for ``name`` (a module ``__name__`` or a subsystem such as ``"ops"``), always under ``flashim``."""
@@ -50,9 +48,14 @@ def _parse_level(level: str | int) -> int:
     return levels[level.strip().upper()]
 
 
+def _use_stderr(record: logging.LogRecord) -> bool:
+    logger = get_logger(ROOT)
+    return not (any(h is not _handler for h in logger.handlers) or (logger.propagate and logging.root.handlers))
+
+
 def set_verbosity(spec: str | int, *, handler: bool = True) -> None:
-    """Set levels from a ``FLASHIM_LOG``-style spec (or one level) and, unless ``handler=False`` (the application
-    configures logging itself), attach a stderr handler to the ``flashim`` logger."""
+    """Set levels from a ``FLASHIM_LOG``-style spec (or one level). With ``handler=True``, also write to stderr
+    when the application has no handler."""
     global _handler
     tokens = [spec] if isinstance(spec, int) else [t for t in spec.split(",") if t.strip()]
     for token in tokens:
@@ -61,8 +64,9 @@ def set_verbosity(spec: str | int, *, handler: bool = True) -> None:
             get_logger(name.strip()).setLevel(_parse_level(level))
         else:
             logging.getLogger(ROOT).setLevel(_parse_level(token))
-    if handler and _handler is None:
+    if handler and _handler is None and not get_logger(ROOT).hasHandlers():
         _handler = logging.StreamHandler()
+        _handler.addFilter(_use_stderr)
         _handler.setFormatter(logging.Formatter(_FORMAT, "%H:%M:%S"))
         logging.getLogger(ROOT).addHandler(_handler)
 

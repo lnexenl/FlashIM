@@ -49,6 +49,8 @@ def main() -> None:
 
     resize = args.resize or None
     model = flashim.load(args.model, args.preset, engine=args.engine, overrides=args.overrides)
+    if model.run_config.engine.kind != args.engine:
+        parser.exit(1, f"Skipping {args.model} {args.preset} {args.engine}: {model.build_report.fallbacks}\n")
     from flashim.models.romav2.model import load_image
 
     image = load_image(str(IMAGE), model.device)

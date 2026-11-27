@@ -12,7 +12,7 @@ from flashim.models.dedode.spec import (
     STEM_EXACT_PASSES,
 )
 from flashim.models.ripe.model import RIPE
-from flashim.models.sparse_spec import extractor_spec
+from flashim.models.sparse_spec import RIPE_COMPILE_FAILURES, extractor_spec
 
 # Same structure as DeDoDe's detector: quantize the VGG convs after the first and every ConvRefiner 1x1 (the depthwise
 # 5x5s stay BF16); protected: the first conv, ``out_conv`` (heatmap logits) and the descriptor reduction (960 -> 256).
@@ -50,6 +50,7 @@ _SPEC = extractor_spec(
     quantized=QUANTIZED,
     protected=PROTECTED,
     compile_regions=("net",),
+    compile_failures=RIPE_COMPILE_FAILURES,
     # 16 ConvRefiner hidden blocks (64 / 128 channels) as one BF16 kernel each: BF16 extract 55.5 -> 36.8 ms
     fused_bf16_blocks=("net.decoder.",),
     channels_last=True,  # BF16 extract at 1200 px, interleaved in one process (sm_120): 76 -> 56 ms

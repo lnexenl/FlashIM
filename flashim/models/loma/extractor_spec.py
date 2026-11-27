@@ -31,7 +31,7 @@ from flashim.models.dedode.spec import (
     VIT_LINEARS,
 )
 from flashim.models.loma.extractor import DESCRIPTORS, LoMaExtractor
-from flashim.models.sparse_spec import extractor_spec
+from flashim.models.sparse_spec import QUANT_COMPILE_FAILURES, extractor_spec
 
 CALIBRATION_DIR = Path(__file__).parent / "calibration"
 # variant -> its descriptor weight set's calibration tables (B / L / G: one descriptor, bit-equal in the checkpoints)
@@ -70,6 +70,7 @@ _SPEC = extractor_spec(
     protected=PROTECTED,
     int8_dynamic=VIT_LINEARS,  # per-token dynamic INT8 ViT, as dedode-g's int8 (see dedode.spec.VIT_IGNORE)
     compile_regions=("detector", "descriptor"),
+    compile_failures=QUANT_COMPILE_FAILURES,
     fused_bf16_blocks=("detector.decoder.", "descriptor.decoder."),  # as DaD's spec
     channels_last=True,
     extra_passes=_PASSES,
