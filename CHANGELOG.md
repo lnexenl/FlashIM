@@ -20,6 +20,8 @@
   2.11 / `sm_120`, and apply on every CUDA architecture and torch version until re-measured.
 - Warnings and errors (backend load failures, missing `nvcc`, preset and engine fallbacks) reach stderr when the
   application has not configured logging: the `NullHandler` on the `flashim` logger is gone.
+- `romav2` honours `config.checkpoint` (`overrides={"checkpoint": path}`) like every other model; it used to load the
+  default checkpoint regardless.
 
 ## 0.1.1 (2026-11-26)
 

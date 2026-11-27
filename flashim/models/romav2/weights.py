@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 
 from flashim.models.weights_util import Checkpoint, ModelInfo, find_weights
@@ -21,8 +23,9 @@ LICENSES = {
 MODEL_INFO = ModelInfo(("LicenseRef-DINOv3", "MIT"), ("LicenseRef-DINOv3", "NOASSERTION"))
 
 
-def load_state_dict(map_location: str | torch.device = "cpu") -> dict[str, torch.Tensor]:
-    """``romav2.0.1.pt`` from ``$FLASHIM_ROMAV2_CHECKPOINT``, else the torch hub checkpoint folder (where
-    ``torch.hub`` cached it before), downloaded on first use."""
-    file = find_weights(CHECKPOINT, env="FLASHIM_ROMAV2_CHECKPOINT")
+def load_state_dict(
+    map_location: str | torch.device = "cpu", *, path: str | Path | None = None
+) -> dict[str, torch.Tensor]:
+    """Load from a path, ``$FLASHIM_ROMAV2_CHECKPOINT``, or the torch hub cache."""
+    file = find_weights(CHECKPOINT, path=path, env="FLASHIM_ROMAV2_CHECKPOINT")
     return torch.load(file, map_location=map_location, weights_only=True)

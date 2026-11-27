@@ -33,33 +33,75 @@ INT8), fused kernels (Triton, TileLang, CUDA C++) and `torch.compile`.
 - **One interface.** Every model loads with `flashim.load(name, preset)`, where the preset is `fp32`, `bf16`, `int8` or
   `fp8`, and matches with `model.match(a, b)`, which returns the same `Matches` for dense, detector-free and sparse models.
 
-## Quick start
+## Install
 
-FlashIM is not on PyPI yet; install from source (Linux, Python 3.10 or newer, an NVIDIA GPU is recommended):
+On Linux x86-64 with Python 3.10 or newer, install the matching PyTorch 2.11 and torchvision 0.26 wheels first,
+then install FlashIM from PyPI. The commands use CPU wheels by default. For an NVIDIA GPU, set `wheel` to the index
+in the table that matches your hardware and driver. Blackwell GPUs need CUDA 12.8 or newer.
 
 ```bash
-pip install "flashim[cv] @ git+https://github.com/lnexenl/FlashIM"   # or, in a checkout: uv sync --extra eval
+wheel=cpu
+python -m pip install torch==2.11.0 torchvision==0.26.0 --index-url "https://download.pytorch.org/whl/$wheel"
+python -m pip install flashim
 ```
 
-The `cv` extra adds OpenCV (SIFT, ORB), `eval` the accuracy benchmarks' dependencies. Jetson (JetPack 6) installs from
-[`requirements-jetson.txt`](https://github.com/lnexenl/FlashIM/blob/main/requirements-jetson.txt) (NVIDIA's torch build).
+| PyTorch build | Wheel index | Linux driver for the wheel's CUDA toolkit version |
+|---|---|---|
+| CPU only | `cpu` | None |
+| CUDA 12.6 | `cu126` | 560.35.05+ |
+| CUDA 12.8 | `cu128` | 570.124.06+ |
+| CUDA 12.9 | `cu129` | 575.57.08+ |
+| CUDA 13.0 | `cu130` | 580.95.05+ |
+
+NVIDIA also supports minor-version compatibility from Linux driver 525.60.13 for CUDA 12.x and the R580 series for
+CUDA 13.x. Applications that JIT-compile PTX can require a newer driver. See the [PyTorch wheel index](https://download.pytorch.org/whl/torch/),
+[toolkit driver versions](https://docs.nvidia.com/cuda/archive/13.0.2/cuda-toolkit-release-notes/index.html#cuda-driver)
+and [compatibility limits](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
+
+FlashIM uses Triton 3.6 on Linux. Optional extras are `flashim[cv]` for OpenCV (SIFT, ORB and pose estimation),
+`flashim[eval]` for accuracy benchmarks and `flashim[tilelang]` for the TileLang backend. For example, run
+`python -m pip install 'flashim[cv]'`. On Jetson with JetPack 6, use NVIDIA's torch build and
+[`requirements-jetson.txt`](https://github.com/lnexenl/FlashIM/blob/main/requirements-jetson.txt).
+
+## Quick start
+
+### Match two images on CPU
+
+Run the example from the repository root to use the bundled Sacré-Cœur photos. If you installed from PyPI and have
+no checkout, fetch the same two images into your current directory first.
+
+```bash
+mkdir -p assets
+for photo in sacre_coeur1.jpg sacre_coeur2.jpg; do
+  curl -fsSL "https://raw.githubusercontent.com/lnexenl/FlashIM/v0.1.1/assets/$photo" -o "assets/$photo"
+done
+```
+
+XFeat runs in eager mode and downloads its 5.96 MiB checkpoint on first use. Each row of `keypoints_A` and
+`keypoints_B` gives the pixel coordinates of one match in the original images. Use `device="cuda"` to run on a GPU.
 
 ```python
 import flashim
 
-flashim.available_models()                                   # every registered name
+model = flashim.load("xfeat", "fp32", device="cpu", engine="eager")
+matches = model.match("assets/sacre_coeur1.jpg", "assets/sacre_coeur2.jpg", resize=640, max_matches=2048)
+print(matches.keypoints_A.shape, matches.keypoints_B.shape, matches.confidence.shape)
+```
 
-model = flashim.load("romav2", "fp8", engine="compile-full", overrides={"arch.setting": "mega1500"})
-m = model.match("a.jpg", "b.jpg", max_matches=5000)          # Matches: 5000 balanced samples of the dense warp
-m.keypoints_A, m.keypoints_B, m.confidence                   # [N, 2] pixels of each original image, [N]
-m.dense.warp_AB                                              # the full dense prediction (DenseMatchResult)
+### Dense matching on GPU
 
-pipeline = flashim.load("raco-aliked-lightglue", "bf16", engine="compile")
-m = pipeline.match("a.jpg", "b.jpg", resize=1024, max_matches=1024)   # Matches: 1024 keypoints per image
-m.indices_A, m.features_A                                    # match indices into each image's keypoints
+For repeated RoMaV2 FP8 inference on Blackwell, `compile-full` was the fastest FP8 engine in the
+[GPU benchmark](https://github.com/lnexenl/FlashIM/blob/main/docs/benchmarks.md#dense-and-semi-dense-models).
+The first match can take several minutes to compile. Reuse the model across pairs to benefit from the compiled kernels.
 
-loma = flashim.load("loma-g")                                # DaD + LoMa descriptors + matcher
-m = loma.match("a.jpg", "b.jpg", max_matches=4096)           # 4096 keypoints per image (default 2048)
+```python
+import flashim
+
+model = flashim.load(
+    "romav2", "fp8", device="cuda", engine="compile-full", overrides={"arch.setting": "mega1500"}
+)
+matches = model.match("assets/sacre_coeur1.jpg", "assets/sacre_coeur2.jpg", max_matches=5000)
+warp = matches.dense.warp_AB
 ```
 
 `match(a, b, *, resize, max_matches, threshold)` is the same for every model: `resize` is the long side of the working
@@ -73,6 +115,11 @@ Image paths given to a model on CUDA are decoded on the GPU when they are JPEGs 
 Weights download on first use into the torch hub checkpoint folder (`$TORCH_HOME/hub/checkpoints`) and are checked
 against SHA-256 hashes pinned in `flashim/models/<model>/weights.py`; `checkpoint` or `FLASHIM_<MODEL>_CHECKPOINT` points to
 a local file. See [docs/checkpoints.md](https://github.com/lnexenl/FlashIM/blob/main/docs/checkpoints.md).
+
+```python
+models = flashim.available_models()  # dict[str, str]: model name -> description
+```
+See [docs/models.md](https://github.com/lnexenl/FlashIM/blob/main/docs/models.md) for the full list, presets, and per-model usage examples.
 
 ## Models
 

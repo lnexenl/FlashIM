@@ -164,13 +164,14 @@ class RoMaV2(ImageMatcher, nn.Module):
         cls,
         config: RoMaV2Config | None = None,
         *,
+        checkpoint: str | Path | None = None,
         device: torch.device | str | None = None,
         state_dict: dict[str, Tensor] | None = None,
     ) -> RoMaV2:
         device = torch.device(device or default_device())
         with torch.device("meta"):
             model = cls(config)
-        state = state_dict if state_dict is not None else weights.load_state_dict("cpu")
+        state = state_dict if state_dict is not None else weights.load_state_dict(path=checkpoint)
         # assign=True adopts checkpoint dtypes: DINOv3 in BF16, everything else FP32.
         model.load_state_dict(state, strict=True, assign=True)
         if model.config.truncate_descriptor:
