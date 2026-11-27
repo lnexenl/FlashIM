@@ -29,7 +29,7 @@ from flashim.paths import MEGADEPTH_IMAGES
 
 IMAGES = MEGADEPTH_IMAGES
 IMAGE_A, IMAGE_B = IMAGES / "3383162411_67cc9af85e_o.jpg", IMAGES / "299056923_ecd980298c_o.jpg"
-EXTRACTORS = ("superpoint", "alike", "disk", "xfeat", "ripe", "ripepp", "dedode", "dedode-g", "dad")
+EXTRACTORS = ("superpoint", "alike", "disk", "xfeat", "ripe", "ripepp", "dedode", "dedode-g", "dad", "traqpoint")
 
 
 def configs() -> list[tuple[str, str, str, list[str], str]]:

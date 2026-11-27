@@ -83,14 +83,14 @@ default; the licenses are in [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl
 | Dense | `romav2`, `roma`, `roma-indoor`, `minima-roma`, `tiny-roma`, `ufm` |
 | Dense 3D | `mast3r`, `dust3r` (FP16 compute under `bf16` / `int8` / `fp8`) |
 | Detector-free | `loftr`, `minima-loftr`, `eloftr`, `xoftr` |
-| Sparse extractors | `rdd`, `aliked`, `raco`, `raco-aliked`, `superpoint`, `disk`, `alike`, `xfeat`, `dedode`, `dedode-g`, `dad`, `ripe`, `ripepp`, `ripepp-aachen`, `ripepp-scared`, `sift`, `orb` |
+| Sparse extractors | `rdd`, `traqpoint`, `aliked`, `raco`, `raco-aliked`, `superpoint`, `disk`, `alike`, `xfeat`, `dedode`, `dedode-g`, `dad`, `ripe`, `ripepp`, `ripepp-aachen`, `ripepp-scared`, `sift`, `orb` |
 | Sparse matchers and pipelines | `lightglue`, `<extractor>-lightglue`, `loma`, `superglue`, `superpoint-superglue`, `omniglue` |
 | Sparse-to-dense | `flexglue` |
 
 **Weight licenses.** Code is Apache-2.0, but weights keep their publishers' licenses and some are not open: `ufm`,
 `mast3r`, `dust3r` (CC BY-NC-SA 4.0), `superpoint` (Magic Leap), `superglue` and `superpoint-superglue` (Magic Leap,
 academic / non-profit research only), and `ripe`, `ripepp`, `ripepp-aachen`, `ripepp-scared`, `ripepp-lightglue`
-(Fraunhofer academic-use license v2.0) are **non-commercial**; `romav2` and `flexglue` contain
+(Fraunhofer academic-use license v2.0) are **non-commercial**; `romav2`, `flexglue` and `traqpoint` contain
 DINOv3 weights under the DINOv3 License. Check [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl/FlashIM/blob/main/THIRD_PARTY_NOTICES.md) before commercial use.
 
 ## Configuring a run

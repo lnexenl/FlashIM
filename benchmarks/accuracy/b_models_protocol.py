@@ -48,6 +48,7 @@ PROTOCOLS: tuple[ModelProtocol, ...] = (
     ModelProtocol("omniglue", "mega1500", "omniglue", 1024, 1024, (), "1024px, 1024 kpts"),
     ModelProtocol("ripepp", "mega1500", "ripepp", 1200, 4096, (), "1200px, 4096 kpts (same as ripe)"),
     ModelProtocol("ripepp-lightglue", "mega1500", "ripepp-lightglue", 1200, 4096, (), "1200px, 4096 kpts"),
+    ModelProtocol("traqpoint", "mega1500", "traqpoint", 1600, 4096, (), "1600px, 4096 kpts (upstream mega_1500)"),
     # -- ScanNet-1500 (640x480) --
     ModelProtocol("roma", "scannet1500", "roma-indoor", 0, 5000, (), "native 560->864 indoor"),
     ModelProtocol("tiny-roma", "scannet1500", "tiny-roma", 640, 5000, (), "640x480"),
@@ -70,6 +71,7 @@ PROTOCOLS: tuple[ModelProtocol, ...] = (
     ModelProtocol("omniglue", "scannet1500", "omniglue", 640, 1024, (), "640x480, 1024 kpts"),
     ModelProtocol("ripepp", "scannet1500", "ripepp", 640, 4096, (), "640x480, 4096 kpts (same as ripe)"),
     ModelProtocol("ripepp-lightglue", "scannet1500", "ripepp-lightglue", 640, 4096, (), "640x480, 4096 kpts"),
+    ModelProtocol("traqpoint", "scannet1500", "traqpoint", 640, 4096, (), "640x480, 4096 kpts (upstream scannet_1500)"),
 )
 
 DEFAULT_PRESETS = ("fp32", "bf16", "int8", "fp8")

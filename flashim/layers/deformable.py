@@ -74,10 +74,15 @@ class MSDeformAttn(nn.Module):
 
 class DeformableEncoderLayer(nn.Module):
     """Post-norm Deformable DETR encoder layer: ``norm1(src + self_attn(src + pos))``, then
-    ``norm2(src + linear2(GELU(linear1(src))))``."""
+    ``norm2(src + linear2(act(linear1(src))))`` (``activation``: ``"gelu"`` or ``"relu"``)."""
 
-    def __init__(self, d_model: int, d_ffn: int, n_levels: int, n_heads: int, n_points: int) -> None:
+    def __init__(
+        self, d_model: int, d_ffn: int, n_levels: int, n_heads: int, n_points: int, activation: str = "gelu"
+    ) -> None:
         super().__init__()
+        if activation not in ("gelu", "relu"):
+            raise ValueError(f"unsupported activation {activation!r} (expected 'gelu' or 'relu')")
+        self.activation = activation
         self.self_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
         self.norm1 = nn.LayerNorm(d_model)
         self.linear1 = nn.Linear(d_model, d_ffn)
@@ -86,7 +91,8 @@ class DeformableEncoderLayer(nn.Module):
 
     def forward(self, src: Tensor, pos: Tensor, reference: Tensor, shapes: tuple[tuple[int, int], ...]) -> Tensor:
         src = self.norm1(src + self.self_attn(src + pos, src, reference, shapes))
-        return self.norm2(src + self.linear2(F.gelu(self.linear1(src))))
+        act = F.relu if self.activation == "relu" else F.gelu
+        return self.norm2(src + self.linear2(act(self.linear1(src))))
 
 
 class DeformableEncoder(nn.Module):

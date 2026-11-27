@@ -12,6 +12,7 @@ next elementwise kernel (LayerNorm / GELU), so no dense activation is quantized 
 
 from __future__ import annotations
 
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from flashim import ops
@@ -62,10 +63,14 @@ class QuantizedDeformableEncoder(nn.Module):
                 out, src, layer.norm1.weight, layer.norm1.bias, layer.norm1.eps,
                 layer.linear1.input_exponent, input_bias=attn.output_proj.bias, return_dense=True,
             )
-            ffn = ops.mxfp8_gelu_mlp(
-                h_q, layer.linear1.packed_weight(), layer.linear1.bias, layer.linear2.input_exponent,
-                layer.linear2.packed_weight(),
-            )[:, : layer.linear2.out_features].reshape(n, length, -1)
+            if getattr(layer, "activation", "gelu") == "relu":
+                hidden = F.relu(layer.linear1.matmul(h_q, bias=True))
+                ffn = layer.linear2.matmul(ops.quantize_mxfp8(hidden, layer.linear2.input_exponent))
+            else:
+                ffn = ops.mxfp8_gelu_mlp(
+                    h_q, layer.linear1.packed_weight(), layer.linear1.bias, layer.linear2.input_exponent,
+                    layer.linear2.packed_weight(),
+                )[:, : layer.linear2.out_features].reshape(n, length, -1)
             if index + 1 < self.num_layers:
                 src_q, src = ops.layernorm_quantize(
                     ffn, h, layer.norm2.weight, layer.norm2.bias, layer.norm2.eps,

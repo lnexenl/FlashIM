@@ -26,6 +26,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | model | what it is | presets |
 |---|---|---|
 | [`rdd`](models/rdd.md) | RDD sparse detector + descriptor (ConvNeXt-tiny, multi-scale deformable transformer) | `fp32`, `bf16`, **`fp8`** |
+| `traqpoint` | TraqPoint sparse detector + descriptor (DINOv3 ConvNeXt-B, 4-level deformable transformer, RL detector; DINOv3 License for backbone weights) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | [`aliked`](models/aliked.md) | ALIKED sparse detector + descriptor (deformable-conv encoder, SDDH) | **`fp32`**, `bf16` |
 | [`raco`](models/raco-aliked-lightglue.md) | RaCo keypoint detector + ranker | **`fp32`**, `bf16` |
 | [`raco-aliked`](models/raco-aliked-lightglue.md) | RaCo keypoints + ALIKED descriptors | **`fp32`**, `bf16` |
@@ -75,7 +76,7 @@ Every learned model is a native PyTorch port that is checked against its upstrea
   - `fp8` -> `int8`: `dedode` (pure VGG19; `dedode-g` keeps `fp8`), `aliked-lightglue`, `superpoint-lightglue` (runs SuperPoint in `bf16` and LightGlue in rotated `int8`), `disk-lightglue`, `ripepp-lightglue` (runs RIPE++ in `int8` and LightGlue in `bf16`), `superpoint-superglue`, and `omniglue`.
   - `fp8` / `int8` -> `bf16`: `xfeat-lightglue` (96-dim LighterGlue drops AUC under MXFP8 and rotated static INT8 due to 8.85x post-rotation token outliers, while dynamic INT8 is slower than BF16, 3.67 vs 3.49 ms), and `ripepp-aachen` / `ripepp-scared` (no Tokyo 24/7 / SCARED calibration & gate datasets available).
 - Targeted BF16 layer exclusions for quantization fidelity: `xfeat` protects `keypoint_head.*` and `block2.*` in `int8` / `fp8`; `superpoint` keeps `conv1b` in BF16 for `fp8` (`extractor_spec(..., fp8_ignore=...)`); `dedode` excludes `descriptor.encoder.layers.{3,7,10}` in `int8`; `ripe` excludes `net.encoder.layers.{3,7,10}` in `fp8`; `ripepp` excludes `net.decoder.layers.{1,2}.*` in `int8` and `net.encoder.layers.{3,7,10}` plus `net.decoder.layers.{1,2}.*` in `fp8`; `loma-b128` keeps `*.decoder.*` and matcher `transformers.{4,5}.*` in BF16 for `fp8` via `ModelSpec.quant_configs` per-variant `<variant>/<quant>` lookup (other LoMa variants keep full MXFP8).
-- Licenses that restrict use: `romav2` and `flexglue` (`descriptor.backbone.*` in `flexglue.pth`) contain DINOv3 weights (DINOv3 License), `superglue` / `superpoint-superglue` (Magic Leap, non-commercial), `ripe` / `ripepp` / `ripepp-aachen` / `ripepp-scared` / `ripepp-lightglue` (Fraunhofer academic-use license v2.0, non-commercial), `mast3r` / `dust3r` / `ufm` weights (CC BY-NC-SA 4.0), and `eloftr`, whose upstream changed its license to ZJU3DV's PRL v1.0 on 2026-09-15 (the vendored oracle and the weights are Apache-2.0 from before that); see `THIRD_PARTY_NOTICES.md`.
+- Licenses that restrict use: `romav2`, `flexglue` (`descriptor.backbone.*` in `flexglue.pth`) and `traqpoint` (`descriptor.backbone.0.dino.*` in `traqpoint_best.pth`) contain DINOv3 weights (DINOv3 License), `superglue` / `superpoint-superglue` (Magic Leap, non-commercial), `ripe` / `ripepp` / `ripepp-aachen` / `ripepp-scared` / `ripepp-lightglue` (Fraunhofer academic-use license v2.0, non-commercial), `mast3r` / `dust3r` / `ufm` weights (CC BY-NC-SA 4.0), and `eloftr`, whose upstream changed its license to ZJU3DV's PRL v1.0 on 2026-09-15 (the vendored oracle and the weights are Apache-2.0 from before that); see `THIRD_PARTY_NOTICES.md`.
 
 **Presets** name a precision:
 
@@ -144,4 +145,7 @@ m = ripepp.match("a.jpg", "b.jpg", resize=1200, max_matches=4096)  # subpixel ke
 
 ripepp_lg = flashim.load("ripepp-lightglue", "int8")         # RIPE++ (int8) + weakly-supervised LightGlue (bf16)
 m = ripepp_lg.match("a.jpg", "b.jpg", resize=1200, max_matches=4096)
+
+tp = flashim.load("traqpoint")                               # TraqPoint (DINOv3 ConvNeXt-B + deformable transformer + RL detector)
+m = tp.match("a.jpg", "b.jpg", resize=1600, max_matches=4096)
 ```
