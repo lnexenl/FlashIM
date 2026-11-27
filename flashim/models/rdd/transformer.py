@@ -42,11 +42,26 @@ def reference_points(shapes: tuple[tuple[int, int], ...], device: torch.device) 
 class DeformableTransformer(nn.Module):
     """Flattens the feature levels, adds position + level embeddings and runs the encoder."""
 
-    def __init__(self, d_model: int, num_heads: int, num_layers: int, d_ffn: int, num_levels: int, num_points: int) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        num_layers: int,
+        d_ffn: int,
+        num_levels: int,
+        num_points: int,
+        activation: str = "gelu",
+    ) -> None:
         super().__init__()
         self.d_model = d_model
         self.encoder = DeformableEncoder(
-            num_layers, d_model=d_model, d_ffn=d_ffn, n_levels=num_levels, n_heads=num_heads, n_points=num_points
+            num_layers,
+            d_model=d_model,
+            d_ffn=d_ffn,
+            n_levels=num_levels,
+            n_heads=num_heads,
+            n_points=num_points,
+            activation=activation,
         )
         self.level_embed = nn.Parameter(torch.zeros(num_levels, d_model))
         self._geometry: dict[tuple, tuple[Tensor, Tensor]] = {}

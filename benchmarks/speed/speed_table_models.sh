@@ -56,6 +56,7 @@ for engine in eager compile; do
     for m in loma-b128 loma-b loma-r loma-l loma-g; do run $m $p $engine 1024 4096; done
     for m in roma minima-roma tiny-roma mast3r dust3r ufm; do run $m $p $engine 0 5000; done
     for m in eloftr xoftr minima-loftr; do run $m $p $engine 0 0; done
+    run traqpoint $p $engine 1200 4096
     flexglue $p $engine
   done
   for p in fp32 bf16 int8; do

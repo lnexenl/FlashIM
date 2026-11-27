@@ -26,6 +26,7 @@ every model that matches images returns `Matches` from `match(a, b)` ([configura
 | model | what it is | presets |
 |---|---|---|
 | [`rdd`](models/rdd.md) | RDD sparse detector + descriptor (ConvNeXt-tiny, multi-scale deformable transformer) | `fp32`, `bf16`, **`fp8`** |
+| `traqpoint` | TraqPoint sparse detector + descriptor (DINOv3 ConvNeXt-B, 4-level deformable transformer, RL detector; DINOv3 License for backbone weights) | `fp32`, **`bf16`**, `int8`, `fp8` |
 | [`aliked`](models/aliked.md) | ALIKED sparse detector + descriptor (deformable-conv encoder, SDDH) | **`fp32`**, `bf16` |
 | [`raco`](models/raco-aliked-lightglue.md) | RaCo keypoint detector + ranker | **`fp32`**, `bf16` |
 | [`raco-aliked`](models/raco-aliked-lightglue.md) | RaCo keypoints + ALIKED descriptors | **`fp32`**, `bf16` |
@@ -144,4 +145,7 @@ m = ripepp.match("a.jpg", "b.jpg", resize=1200, max_matches=4096)  # subpixel ke
 
 ripepp_lg = flashim.load("ripepp-lightglue", "int8")         # RIPE++ (int8) + weakly-supervised LightGlue (bf16)
 m = ripepp_lg.match("a.jpg", "b.jpg", resize=1200, max_matches=4096)
+
+tp = flashim.load("traqpoint")                               # TraqPoint (DINOv3 ConvNeXt-B + deformable transformer + RL detector)
+m = tp.match("a.jpg", "b.jpg", resize=1600, max_matches=4096)
 ```

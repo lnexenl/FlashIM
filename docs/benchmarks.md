@@ -62,6 +62,7 @@ RoMaV2: preloaded bidirectional forward, mega1500 setting (800² LR + 1024² HR)
 | aliked | 5.94 / 5.10 | 3.72 / **2.70** |  |  |
 | raco-aliked | 26.8 / 18.1 | 7.03 / **5.76** |  |  |
 | rdd | 68.7 / 61.0 | 31.8 / 25.3 |  | 26.5 / **22.8** |
+| traqpoint | 90.5 / 79.5 | 37.5 / 30.8 | 33.6 / 29.0 | 32.2 / **28.3** |
 | sift | **25.4** / - |  |  |  |
 | orb | **10.3** / - |  |  |  |
 | loma-b128 | 60.8 / 43.2 | 22.4 / 21.4 | **10.5** / fail | 17.3 / fail |
@@ -93,6 +94,7 @@ RoMaV2: preloaded bidirectional forward, mega1500 setting (800² LR + 1024² HR)
 | superpoint-superglue | 6.72 / 6.81 | 2.81 / 2.92 | **1.81** / 4.21 |  |
 | omniglue | 7.57 / 7.50 | 3.96 / 3.96 | **3.04** / 6.53 |  |
 | rdd | 0.75 / 0.76 | 0.75 / **0.74** |  | 0.75 / 0.75 |
+| traqpoint | 0.75 / 0.76 | 0.75 / 0.75 | **0.74** / 0.75 | 0.75 / 0.75 |
 | orb | **0.29** / - |  |  |  |
 | sift | **0.89** / - |  |  |  |
 
@@ -241,7 +243,8 @@ pass, 17 are inconclusive (†: the CI straddles -0.005; a 1500-pair AUC@5 delta
 `superpoint-superglue` and `omniglue` share the protocol of the dense table above (1024 px with 1024 keypoints on
 MegaDepth; `superpoint-superglue` uses its indoor matcher on ScanNet). `ripepp` and `ripepp-lightglue` use the
 sparse-extractor protocol above (1200 px on MegaDepth, 640 x 480 on ScanNet, 4096 keypoints, PoseLib 1.0 px, seeds
-17, 29, 42), compared against each model's own `bf16`. `fp8` of `superpoint-superglue`, `omniglue`, and
+17, 29, 42), compared against each model's own `bf16`; `traqpoint` uses 1600 px on MegaDepth and 640 x 480 on ScanNet
+with 4096 keypoints (its upstream protocol). `fp8` of `superpoint-superglue`, `omniglue`, and
 `ripepp-lightglue` is omitted (-> `int8`): SuperPoint's `conv1b` has 41.6x block-32 channel outliers (-0.013 to
 -0.014 AUC@5), OmniGlue's DINOv2 ViT-B/14 loses 0.005-0.006 under MXFP8, and `ripepp-lightglue` drops -0.0538 AUC@5 on
 MegaDepth-200 under MXFP8 while running slower than `int8` (66.2 vs 52.6 ms/pair). `ripepp-lightglue` `int8` runs
@@ -254,6 +257,7 @@ RIPE++ in `int8` (31/35 convs, `dec.{1,2}` BF16 for subpixel accuracy) with Ligh
 | `omniglue` | 0.5195 | +0.0024 | → int8 | 0.1748 | +0.0012† | → int8 |
 | `ripepp` | 0.5877 | -0.0040† | +0.0004 | 0.1620 | +0.0020 | -0.0012† |
 | `ripepp-lightglue` | 0.6057 | -0.0011† | → int8 | 0.1495 | -0.0009† | → int8 |
+| `traqpoint` | 0.6494 | +0.0022 | +0.0028 | 0.2114 | +0.0028 | -0.0020† |
 
 ## Running it
 

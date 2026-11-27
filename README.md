@@ -137,14 +137,14 @@ default; the licenses are in [THIRD_PARTY_NOTICES.md](https://github.com/lnexenl
 | Dense | `romav2`, `roma`, `roma-indoor`, `minima-roma`, `tiny-roma`, `ufm` |
 | Dense 3D | `mast3r`, `dust3r` (FP16 compute under `bf16` / `int8` / `fp8`) |
 | Detector-free | `loftr`, `minima-loftr`, `eloftr`, `xoftr` |
-| Sparse extractors | `rdd`, `aliked`, `raco`, `raco-aliked`, `superpoint`, `disk`, `alike`, `xfeat`, `dedode`, `dedode-g`, `dad`, `ripe`, `ripepp`, `ripepp-aachen`, `ripepp-scared`, `sift`, `orb` |
+| Sparse extractors | `rdd`, `traqpoint`, `aliked`, `raco`, `raco-aliked`, `superpoint`, `disk`, `alike`, `xfeat`, `dedode`, `dedode-g`, `dad`, `ripe`, `ripepp`, `ripepp-aachen`, `ripepp-scared`, `sift`, `orb` |
 | Sparse matchers and pipelines | `lightglue`, `<extractor>-lightglue`, `loma`, `superglue`, `superpoint-superglue`, `omniglue` |
 | Sparse-to-dense | `flexglue` |
 
 **Weight licenses.** The default SuperPoint and SuperGlue weights (Magic Leap), RIPE and RIPE++ weights
 (Fraunhofer academic-use license v2.0), and MASt3R, DUSt3R and UFM weights (CC BY-NC-SA 4.0) are
-**non-commercial**, including in pipelines that use them. RoMaV2 and FlexGlue include DINOv3 weights under the
-DINOv3 License Agreement. Look up a model with `flashim.model_info(name)` or see the
+**non-commercial**, including in pipelines that use them. RoMaV2, FlexGlue and TraqPoint include DINOv3 weights under
+the DINOv3 License Agreement. Look up a model with `flashim.model_info(name)` or see the
 [per-model license table](https://github.com/lnexenl/FlashIM/blob/main/docs/licenses.md).
 
 ## How FlashIM relates to other projects

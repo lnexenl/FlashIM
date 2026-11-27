@@ -94,6 +94,7 @@ checkpoint license. FlashIM's LoMa defaults use the original training set. See [
 | `superpoint-lightglue` | Apache-2.0 | Apache-2.0, LicenseRef-MagicLeap-SuperPoint | false |
 | `superpoint-superglue` | Apache-2.0 | LicenseRef-MagicLeap-SuperGlue, LicenseRef-MagicLeap-SuperPoint | false |
 | `tiny-roma` | Apache-2.0, MIT | MIT | true |
+| `traqpoint` | Apache-2.0 | Apache-2.0, LicenseRef-DINOv3 | false |
 | `ufm` | Apache-2.0, BSD-3-Clause, CC-BY-NC-SA-4.0 | CC-BY-NC-SA-4.0 | false |
 | `xfeat` | Apache-2.0 | Apache-2.0 | true |
 | `xfeat-lightglue` | Apache-2.0 | Apache-2.0 | true |
